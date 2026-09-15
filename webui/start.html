@@ -245,6 +245,7 @@
             <div class="float-actions" id="float-actions">
                 <button class="save-btn" id="save-only-btn">仅保存</button>
                 <button class="save-btn-restart" id="save-restart-btn">保存并重启TTS</button>
+                <button class="btn btn-gray" id="check-update-btn">检查更新</button>
                 <button class="btn btn-gray" id="export-config-btn">导出配置</button>
                 <button class="btn btn-gray" id="import-config-btn">导入配置</button>
                 <input type="file" id="import-config-file" accept=".json" style="display:none;">
@@ -863,7 +864,7 @@
             'anti_spam_max_in_window': { label: '窗口内最大消息数', description: '窗口内超过该条数后忽略后续消息', hint: '默认 5 条。', required: false, type: 'int', condition: { anti_spam_enabled: true }, default: 5 },
             'update_check_enabled': { label: '检查更新', description: '启动后按间隔向 GitHub 检查新版本，发现更新时弹窗提醒', hint: '需要在应用内查看弹窗；纯浏览器访问同样会提示。', required: false, type: 'boolean', default: true },
             'update_check_interval_hours': { label: '更新检查间隔（小时）', description: '两次检查之间的最小间隔', hint: '默认 24 小时。', required: false, type: 'int', condition: { update_check_enabled: true }, default: 24 },
-            'update_include_prerelease': { label: '提醒测试版更新', description: '检查更新时一并考虑预发布版本，发现更新的 beta/rc 也弹窗提醒', hint: '默认关闭：只提醒正式版。', required: false, type: 'boolean', condition: { update_check_enabled: true }, default: false }
+            'update_include_prerelease': { label: '提醒Pre-release测试版更新', description: '检查更新时一并考虑 GitHub 上勾选了「Pre-release」的版本，发现更新的 beta/rc 也弹窗提醒', hint: '默认关闭。', required: false, type: 'boolean', condition: { update_check_enabled: true }, default: false }
         };
 
         function showLoginOverlay() {
@@ -1039,6 +1040,38 @@
                     showUpdateModal(r);
                 }
             } catch (e) { /* 401 已由弹窗处理；其它错误静默 */ }
+        }
+        function describeUpdateResult(r) {
+            if (!r) return '没有拿到检查结果。';
+            const seen = (typeof r.releases_seen === 'number') ? `（GitHub 上可见发布 ${r.releases_seen} 个）` : '';
+            const warn = r.insecure ? '\n\n注意：本机无法校验证书（多半装了自签根证书的安全软件/加速器），本次结果未经验证。' : '';
+            if (r.enabled === false) return '更新检查已在配置里关闭（检查更新）。';
+            if (r.error) return `检查失败：${r.error}\n\n常见原因：网络/代理无法访问 api.github.com（可参阅日志里的 [更新检查] 行）；或最新版本还是草稿状态（草稿不对外可见）。`;
+            if (r.has_update) return `发现新版本 ${r.latest}${r.prerelease ? '（测试版）' : ''}，当前 ${r.current}。${warn}`;
+            return `已是最新版本。\n当前 ${r.current}，GitHub 上最新 ${r.latest || '未知'}`
+                + `${r.prerelease ? '（测试版）' : ''}${seen}。${warn}`;
+        }
+        const checkUpdateBtn = document.getElementById('check-update-btn');
+        if (checkUpdateBtn) {
+            checkUpdateBtn.addEventListener('click', async () => {
+                const label = checkUpdateBtn.textContent;
+                checkUpdateBtn.disabled = true;
+                checkUpdateBtn.textContent = '检查中…';
+                try {
+                    const r = await apiGet('api/update/check');
+                    if (r && r.enabled !== false && r.has_update) {
+                        window._ltvmUpdate = r;
+                        showUpdateModal(r);
+                    } else {
+                        alert(describeUpdateResult(r));
+                    }
+                } catch (e) {
+                    alert('检查更新失败：' + e);
+                } finally {
+                    checkUpdateBtn.disabled = false;
+                    checkUpdateBtn.textContent = label;
+                }
+            });
         }
         function fmtTs(ts) {
             if (!ts) return '-';

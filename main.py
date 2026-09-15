@@ -63,6 +63,7 @@ from modules.llm_helpers import (RoleContext, build_chat_messages, chat_once,
                                 urls_in_text, is_search_request, is_search_dissatisfied,
                                 lang_text_broken, translate_to_lang)
 from modules.tts import synthesize_sentence, get_audio_duration, resolve_tts_path
+from modules.tls import verified_context
 from modules.tts_service import (process_manager, ensure_tts_service,
                                  auto_start_and_switch_tts)
 
@@ -3374,6 +3375,8 @@ class WebUIServer:
         self.html_path = get_resource_path("webui") / "start.html"
         self.app = web.Application(client_max_size=200 * 1080 * 1080)
         self._update_state_file = memory_manager.data_path / "update_check.json"
+        self._update_checked_this_run = False
+        self._update_last_result = None
         self._auth_file = memory_manager.data_path / "webui_auth.json"
         self._password = ""
         self._auth_token = None
@@ -3484,50 +3487,107 @@ class WebUIServer:
         if not self.config.get("update_check_enabled", True):
             return web.json_response({"enabled": False, "has_update": False})
         from modules.updater import APP_VERSION
-        cache = self._update_cache()
-        cached_result = cache.get("result") or {}
-        if cached_result.get("current") and cached_result.get("current") != APP_VERSION:
-            cache = {}  # 旧版本缓存作废，避免显示过期版本号
-        interval = float(self.config.get("update_check_interval_hours", 24) or 24) * 3600
-        if cache.get("checked_at") and time.time() - float(cache["checked_at"]) < interval:
-            return web.json_response(cached_result)
-        return await self.handle_update_check(request)
+        include_pre = bool(self.config.get("update_include_prerelease", False))
+        try:
+            interval = max(0.0, float(self.config.get("update_check_interval_hours", 24)))
+        except (TypeError, ValueError):
+            interval = 24.0
+        interval *= 3600
+        first_this_run = not self._update_checked_this_run
+        self._update_checked_this_run = True
+        if not first_this_run and interval > 0:
+            if self._update_last_result \
+                    and time.time() - self._update_last_result[0] < interval:
+                return web.json_response(self._update_last_result[1])
+            cache = self._update_cache()
+            cached_result = cache.get("result") or {}
+            try:
+                cached_age = time.time() - float(cache.get("checked_at") or 0)
+            except (TypeError, ValueError):
+                cached_age = interval
+            if cached_result.get("current") == APP_VERSION \
+                    and bool(cache.get("include_prerelease", False)) == include_pre \
+                    and cache.get("checked_at") and cached_age < interval:
+                return web.json_response(cached_result)
+        payload = await self._update_check_payload()
+        self._update_last_result = (time.time(), payload)
+        return web.json_response(payload)
 
     async def handle_update_check(self, request):
         if not self.config.get("update_check_enabled", True):
             return web.json_response({"enabled": False, "has_update": False})
+        return web.json_response(await self._update_check_payload())
+
+    async def _fetch_releases(self, api_url: str):
+        from modules.tls import verified_context, unverified_context, is_cert_error
+        headers = {"Accept": "application/vnd.github+json", "User-Agent": "ltvm-update-check"}
+        try:
+            async with httpx.AsyncClient(timeout=10, proxy=None, trust_env=False,
+                                         follow_redirects=True,
+                                         verify=verified_context()) as client:
+                resp = await client.get(api_url, headers=headers)
+                resp.raise_for_status()
+                return resp.json(), False
+        except Exception as e:
+            if not is_cert_error(e):
+                raise
+            print(f"[更新检查] 证书校验失败（{type(e).__name__}），改用不校验证书的方式重试："
+                  "常见原因是本机装了自签根证书（安全软件/网络加速器/公司代理），"
+                  "系统证书库与 certifi 都没有它")
+            async with httpx.AsyncClient(timeout=10, proxy=None, trust_env=False,
+                                         follow_redirects=True,
+                                         verify=unverified_context()) as client:
+                resp = await client.get(api_url, headers=headers)
+                resp.raise_for_status()
+                return resp.json(), True
+
+    async def _update_check_payload(self) -> dict:
+        """向 GitHub 查一次最新版本并返回结果（含失败原因），成功时写入缓存。"""
         from modules.updater import APP_VERSION, is_newer, pick_latest_release
+        include_pre = bool(self.config.get("update_include_prerelease", False))
         try:
             repo = "slpk1ng/Local_TTS_Voice_Modulation.exe"
             api_url = f"https://api.github.com/repos/{repo}/releases?per_page=30"
             release_home = f"https://github.com/{repo}/releases/latest"
-            include_pre = bool(self.config.get("update_include_prerelease", False))
-            async with httpx.AsyncClient(timeout=10, proxy=None, trust_env=False,
-                                         follow_redirects=True) as client:
-                resp = await client.get(api_url, headers={"Accept": "application/vnd.github+json",
-                                                          "User-Agent": "ltvm-update-check"})
-                resp.raise_for_status()
-                releases = resp.json()
-            picked = pick_latest_release(releases, include_pre)
+            releases, insecure = await self._fetch_releases(api_url)
+            items = releases if isinstance(releases, list) else ([releases] if releases else [])
+            visible = [r for r in items if isinstance(r, dict) and not r.get("draft")]
+            seen = len(visible)
+            pre_seen = len([r for r in visible if r.get("prerelease")])
+            picked = pick_latest_release(items, include_pre)
+            checked_at = time.time()
             if not picked.get("tag"):
-                return web.json_response({"enabled": True, "current": APP_VERSION,
-                                          "has_update": False,
-                                          "error": "仓库里没有可用的发布版本"})
+                print(f"[更新检查] 未找到可用发布（可见发布 {seen} 个）")
+                return {"enabled": True, "current": APP_VERSION, "has_update": False,
+                        "checked_at": checked_at, "include_prerelease": include_pre,
+                        "releases_seen": seen, "insecure": insecure,
+                        "error": "GitHub 上没有可用的发布版本"
+                                 "（草稿状态的发布对检查接口不可见，需要先正式发布）"}
             latest = picked["tag"]
-            page_url = picked.get("url") or release_home
-
             current = APP_VERSION
             has_update = is_newer(latest, current)
+            page_url = str(picked.get("url") or "")
+            if "github.com" not in page_url:
+                page_url = release_home
             result = {"enabled": True, "current": current, "latest": latest,
                       "has_update": has_update, "url": page_url,
                       "prerelease": picked.get("prerelease", False),
-                      "name": picked.get("name", "")}
-            self._update_save({"checked_at": time.time(), "result": result})
-            return web.json_response(result)
+                      "checked_at": checked_at, "include_prerelease": include_pre,
+                      "releases_seen": seen, "prerelease_seen": pre_seen,
+                      "insecure": insecure, "name": picked.get("name", "")}
+            self._update_save({"checked_at": checked_at, "result": result,
+                               "include_prerelease": include_pre})
+            print(f"[更新检查] 可见发布 {seen} 个（标记为预发布 {pre_seen} 个，"
+                  f"检查时{'包含' if include_pre else '不含'}预发布）："
+                  f"最新 {latest}{'（预发布）' if result['prerelease'] else ''}，"
+                  f"当前 {current} → {'发现新版本' if has_update else '已是最新'}"
+                  + ("（证书未校验）" if insecure else ""))
+            return result
         except Exception as e:
-            return web.json_response({"enabled": True, "current": APP_VERSION,
-                                      "has_update": False,
-                                      "error": f"{type(e).__name__}: {e}"})
+            print(f"[更新检查] 失败: {type(e).__name__}: {e}")
+            return {"enabled": True, "current": APP_VERSION, "has_update": False,
+                    "checked_at": time.time(), "include_prerelease": include_pre,
+                    "error": f"{type(e).__name__}: {e}"}
 
     def setup_routes(self):
         r = self.app.router
@@ -3765,7 +3825,8 @@ class WebUIServer:
             api_key = str(self.config.get("llm_api_key", "") or "")
             if backend != "ollama" and api_key:
                 headers["Authorization"] = f"Bearer {api_key}"
-            async with httpx.AsyncClient(timeout=10, trust_env=False, headers=headers) as client:
+            async with httpx.AsyncClient(timeout=10, trust_env=False, headers=headers,
+                                         verify=verified_context()) as client:
                 resp = await client.get(url)
                 resp.raise_for_status()
                 data = resp.json()

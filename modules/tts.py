@@ -9,6 +9,8 @@ from typing import Optional
 import httpx
 import numpy as np
 
+from .tls import verified_context
+
 
 def get_audio_duration(file_path: str) -> float:
     try:
@@ -47,7 +49,8 @@ def resolve_tts_path(input_path: str) -> str:
 async def check_tts_service(config) -> bool:
     base_url = config.get("client_base_url", "http://127.0.0.1:9880")
     try:
-        async with httpx.AsyncClient(timeout=2, trust_env=False) as client:
+        async with httpx.AsyncClient(timeout=2, trust_env=False,
+                                     verify=verified_context()) as client:
             resp = await client.get(f"{base_url}/docs")
             return resp.status_code < 500
     except Exception:
@@ -449,7 +452,8 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
             try:
                 print(f"正在合成: 情绪={emotion} | 语言={lang} | 切分={variant} | "
                       f"文本={clean_text} (第 {index + 1}/{len(variants)} 次)")
-                async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+                async with httpx.AsyncClient(timeout=timeout, trust_env=False,
+                                             verify=verified_context()) as client:
                     resp = await client.get(f"{base_url}/tts", params=_build_params(variant))
             except Exception as e:
                 if transient_left > 0:

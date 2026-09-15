@@ -15,6 +15,7 @@ from typing import Optional, List, Dict, AsyncGenerator
 import httpx
 
 from .tts import strip_urls_for_tts
+from .tls import verified_context
 
 
 def conn_fail_hint(endpoint: str, base_url: str, backend: str) -> str:
@@ -388,7 +389,8 @@ async def check_llm_service(ctx) -> tuple:
         endpoint = f"{base_url}/models"
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     try:
-        async with httpx.AsyncClient(timeout=6, proxy=None, trust_env=False) as client:
+        async with httpx.AsyncClient(timeout=6, proxy=None, trust_env=False,
+                                     verify=verified_context()) as client:
             resp = await client.get(endpoint, headers=headers)
         if resp.status_code < 500:
             return True, endpoint
@@ -1342,7 +1344,8 @@ async def chat_once(ctx: RoleContext, messages: list, tools=None) -> Dict:
     data = None
     for attempt in range(2):
         try:
-            async with httpx.AsyncClient(timeout=timeout, proxy=None, trust_env=False) as client:
+            async with httpx.AsyncClient(timeout=timeout, proxy=None, trust_env=False,
+                                         verify=verified_context()) as client:
                 resp = await client.post(endpoint, json=payload, headers=headers)
                 if resp.status_code >= 400:
                     detail = resp.text[:400]
@@ -1393,7 +1396,8 @@ async def _stream_chat_inner(ctx: RoleContext, messages: list) -> AsyncGenerator
     backend, endpoint, payload, headers, timeout = _endpoint_and_payload(ctx, messages, True)
     start = time.time()
     first_token_ms = None
-    async with httpx.AsyncClient(timeout=timeout, proxy=None, trust_env=False) as client:
+    async with httpx.AsyncClient(timeout=timeout, proxy=None, trust_env=False,
+                                 verify=verified_context()) as client:
         async with client.stream("POST", endpoint, json=payload, headers=headers) as resp:
             if resp.status_code >= 400:
                 detail = ""
@@ -3509,7 +3513,7 @@ async def get_image_reply(ctx: RoleContext, user_text: str, history: list,
             }
             api_key = ctx.get("llm_api_key", "")
             headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, verify=verified_context()) as client:
             resp = await client.post(endpoint, json=payload, headers=headers)
             resp.raise_for_status()
             data = resp.json()
@@ -3835,7 +3839,8 @@ async def download_image(url: str) -> bytes:
     if any(d in host for d in ("qq.com", "qpic.cn", "gtimg.cn")):
         headers["Referer"] = f"https://{host}/"
     
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True, proxy=None, trust_env=False) as client:
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True, proxy=None,
+                                 trust_env=False, verify=verified_context()) as client:
         try:
             resp = await client.get(url, headers=headers)
             resp.raise_for_status()

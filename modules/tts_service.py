@@ -8,6 +8,8 @@ from urllib.parse import urlparse
 
 import httpx
 
+from .tls import verified_context
+
 
 class ProcessManager:
     _instance = None
@@ -56,7 +58,8 @@ _tts_started_flag = False
 async def check_tts_service(config) -> bool:
     base_url = config.get("client_base_url", "http://127.0.0.1:9880")
     try:
-        async with httpx.AsyncClient(timeout=2, trust_env=False) as client:
+        async with httpx.AsyncClient(timeout=2, trust_env=False,
+                                     verify=verified_context()) as client:
             resp = await client.get(f"{base_url}/docs")
             return resp.status_code < 500
     except Exception:

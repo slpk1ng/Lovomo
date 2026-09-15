@@ -41,6 +41,8 @@ from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse
 
 import httpx
 
+from .tls import verified_context
+
 DEFAULT_TOOLS = [
     {
         "name": "get_current_time",
@@ -173,7 +175,18 @@ def _validate_url(url: str, allow_private: bool = False) -> str:
     if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
         raise ValueError("仅允许访问 http/https URL")
     if not allow_private and _blocked_host(parsed.hostname):
-        raise ValueError("禁止访问本机、内网或保留地址")
+        host = parsed.hostname
+        resolved = ""
+        try:
+            resolved = socket.gethostbyname(host)
+        except Exception:
+            resolved = ""
+        detail = f"{host} → {resolved}" if resolved else host
+        raise ValueError(
+            f"禁止访问本机、内网或保留地址（{detail}）。"
+            "如果这是个正常的公网网址，多半是本机的 hosts 被网络加速/代理软件改写了"
+            "（常见于 Steam 加速工具把域名指向 127.0.0.1），"
+            "在该软件里关掉这个域名的加速即可正常访问")
     return parsed.geturl()
 
 
@@ -1290,7 +1303,8 @@ async def _fetch_page(tool: dict, url: str) -> Tuple[bool, str]:
     body = ""
     try:
         async with httpx.AsyncClient(timeout=timeout, trust_env=False,
-                                     follow_redirects=False) as client:
+                                     follow_redirects=False,
+                                     verify=verified_context()) as client:
             current = url
             resp = None
             for _ in range(5):
@@ -1827,7 +1841,8 @@ class ToolRegistry:
                 return
             try:
                 async with httpx.AsyncClient(timeout=min(timeout, 6), trust_env=False,
-                                             follow_redirects=True) as client:
+                                             follow_redirects=True,
+                                             verify=verified_context()) as client:
                     resp = await client.get(url, headers=headers)
                     final = str(resp.url)
                     resolved = "" if _is_verify_url(final) else final
@@ -1853,7 +1868,8 @@ class ToolRegistry:
         current_params = params
         current_method = method
         async with httpx.AsyncClient(timeout=timeout, trust_env=False,
-                                     follow_redirects=False) as client:
+                                     follow_redirects=False,
+                                     verify=verified_context()) as client:
             for _ in range(4):
                 if current_method == "POST":
                     resp = await client.post(current, json=json_body, headers=headers,
@@ -1881,7 +1897,8 @@ class ToolRegistry:
     async def _weather_from_url(self, url: str, city: str, timeout: int) -> str:
         url = await asyncio.to_thread(_validate_url, url)
         async with httpx.AsyncClient(timeout=timeout, trust_env=False,
-                                     follow_redirects=True) as client:
+                                     follow_redirects=True,
+                                     verify=verified_context()) as client:
             resp = await client.get(url, headers={"User-Agent": "curl/8.0"})
             resp.raise_for_status()
             data = resp.json()
@@ -1897,7 +1914,8 @@ class ToolRegistry:
 
     async def _open_meteo_weather(self, city: str, lat=None, lon=None) -> str:
         async with httpx.AsyncClient(timeout=15, trust_env=False,
-                                     follow_redirects=True) as client:
+                                     follow_redirects=True,
+                                     verify=verified_context()) as client:
             name = city or "当前位置"
             if lat is None or lon is None:
                 best = None
@@ -1948,7 +1966,8 @@ class ToolRegistry:
         if parsed_url.hostname != template_host:
             return False, "HTTP 工具不允许通过参数修改目标主机"
         url = _validate_url(url, allow_private=True)
-        async with httpx.AsyncClient(timeout=timeout, trust_env=False, follow_redirects=False) as client:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False, follow_redirects=False,
+                                     verify=verified_context()) as client:
             if method == "POST":
                 resp = await client.post(url, json=args, headers=headers)
             else:

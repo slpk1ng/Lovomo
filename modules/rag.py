@@ -15,6 +15,8 @@ from typing import List, Optional
 import numpy as np
 import httpx
 
+from .tls import verified_context
+
 CHUNK_SIZE_DEFAULT = 500
 OVERLAP_DEFAULT = 80
 
@@ -86,7 +88,8 @@ class RAGManager:
                 return None
         try:
             if backend == "ollama":
-                async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
+                async with httpx.AsyncClient(timeout=120, trust_env=False,
+                                             verify=verified_context()) as client:
                     errors = []
                     resp = await client.post(f"{base_url}/api/embed",
                                              json={"model": model, "input": texts})
@@ -118,7 +121,8 @@ class RAGManager:
             else:
                 endpoint = embedding_url or f"{base_url}/embeddings"
                 headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-                async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
+                async with httpx.AsyncClient(timeout=120, trust_env=False,
+                                             verify=verified_context()) as client:
                     resp = await client.post(endpoint,
                                              json={"model": model, "input": texts},
                                              headers=headers)
