@@ -32,13 +32,16 @@ class ProcessManager:
             name = entry["name"]
             try:
                 if os.name == 'nt':
-                    subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)], capture_output=True)
+                    subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)],
+                                   capture_output=True, timeout=15)
+                    proc.wait(timeout=5)
                 else:
                     proc.terminate()
                     proc.wait(timeout=5)
             except Exception:
                 try:
                     proc.kill()
+                    proc.wait(timeout=5)
                 except Exception as e:
                     print(f"关闭子进程 {name} 失败: {e}")
         self.processes.clear()
@@ -72,13 +75,15 @@ async def ensure_tts_service(config) -> bool:
         return False  # 冷却期内直接失败，不阻塞消息管线
     if not config.get("auto_start_tts", False):
         return False
+    # 先写冷却标记再启动：启动快速失败（脚本缺失等）或并发消息到达时，
+    # 其他消息不必各等 60 秒；启动成功后下一次 check 会把冷却清零
+    _ensure_fail_until = time.time() + 60
     threading.Thread(target=auto_start_and_switch_tts, args=(config,), daemon=True).start()
     import asyncio
     for _ in range(12):
         await asyncio.sleep(5)
         if await check_tts_service(config):
             return True
-    _ensure_fail_until = time.time() + 60
     return False
 
 
@@ -175,7 +180,7 @@ def auto_start_and_switch_tts(config):
                 creationflags=creation_flags,
             )
             process_manager.register(tts_proc, name="GPT-SoVITS TTS")
-            print("已启动 TTS 服务，等待就绪...")
+            print("已启动 TTS 服务，请等待就绪...")
         except Exception as e:
             print(f"启动 TTS 失败: {e}")
             return
@@ -185,7 +190,7 @@ def auto_start_and_switch_tts(config):
             try:
                 resp = httpx.get(f"{base_url}/docs", timeout=2)
                 if resp.status_code < 500:
-                    print("TTS 服务已就绪。")
+                    print("TTS 服务已就绪，加载模型中...")
                     break
             except Exception:
                 continue

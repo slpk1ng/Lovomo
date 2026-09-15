@@ -41,7 +41,10 @@ class DatabaseManager:
                     llm_ms REAL DEFAULT 0,
                     tts_ms REAL DEFAULT 0,
                     sentence_count INTEGER DEFAULT 0,
-                    ok INTEGER DEFAULT 1
+                    ok INTEGER DEFAULT 1,
+                    llm_calls INTEGER DEFAULT 0,
+                    tts_calls INTEGER DEFAULT 0,
+                    tool_calls INTEGER DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS idx_interactions_ts ON interactions(ts);
                 CREATE TABLE IF NOT EXISTS todos (
@@ -57,6 +60,12 @@ class DatabaseManager:
                 );
                 CREATE INDEX IF NOT EXISTS idx_todos_status ON todos(status);
             """)
+            # 旧库迁移：interactions 表补调用次数列（已存在则忽略）
+            for col in ("llm_calls", "tts_calls", "tool_calls"):
+                try:
+                    conn.execute(f"ALTER TABLE interactions ADD COLUMN {col} INTEGER DEFAULT 0")
+                except Exception:
+                    pass
             conn.commit()
 
     def execute(self, sql, params=()):
@@ -79,15 +88,18 @@ class DatabaseManager:
     # ---------- 交互统计 ----------
     def record_interaction(self, session_type, session_id, user_id, user_name,
                            character_key, emotion, llm_ms, tts_ms,
-                           sentence_count, ok=True):
+                           sentence_count, ok=True,
+                           llm_calls=0, tts_calls=0, tool_calls=0):
         try:
             self.execute(
                 "INSERT INTO interactions (ts, session_type, session_id, user_id, user_name,"
-                " character_key, emotion, llm_ms, tts_ms, sentence_count, ok)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                " character_key, emotion, llm_ms, tts_ms, sentence_count, ok,"
+                " llm_calls, tts_calls, tool_calls)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (time.time(), session_type, str(session_id), str(user_id or ""), str(user_name or ""),
                  str(character_key or ""), str(emotion or ""), float(llm_ms or 0),
-                 float(tts_ms or 0), int(sentence_count or 0), 1 if ok else 0)
+                 float(tts_ms or 0), int(sentence_count or 0), 1 if ok else 0,
+                 int(llm_calls or 0), int(tts_calls or 0), int(tool_calls or 0))
             )
         except Exception as e:
             print(f"记录交互统计失败: {e}")

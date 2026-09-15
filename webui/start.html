@@ -47,7 +47,7 @@
         .role-item summary::-webkit-details-marker { display: none; }
         .delete-role-btn { background: #f44336; color: white; border: none; padding: 6px 10px; border-radius: 4px; cursor: pointer; }
         .chat-list-header { display: flex; align-items: center; gap: 15px; margin-bottom: 15px; flex-wrap: wrap; }
-        .chat-list-header select, .chat-list-header button { padding: 8px 12px; border-radius: 4px; border: 1px solid #ccc; background: white; cursor: pointer; }
+        .chat-list-header select, .chat-list-header button { padding: 8px 12px; border-radius: 4px; border: 1px solid #ccc; background: white; color: #333; cursor: pointer; }
         .file-list { display: flex; flex-direction: column; gap: 6px; }
         .file-item { display: flex; align-items: center; background: white; border: 1px solid #ddd; border-radius: 6px; padding: 10px 15px; cursor: pointer; transition: 0.2s; }
         .file-item:hover { border-color: #1e88e5; }
@@ -78,10 +78,14 @@
         .msg-row.selected .msg-bubble { outline: 2px solid #2196F3; }
         .msg-checkbox { margin-right: 8px; display: none; }
         .msg-row.multi-mode .msg-checkbox { display: inline-block; }
-        .log-container { background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 8px; height: 70vh; overflow-y: auto; font-family: monospace; font-size: 13px; white-space: pre-wrap; }
+        .log-container { background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 8px; height: 70vh; overflow-y: auto; font-family: monospace; font-size: 13px; white-space: pre-wrap; user-select: text; cursor: text; }
         .tutorial { background: white; padding: 20px; border-radius: 8px; max-width: 900px; margin: 0 auto; }
         .tutorial h2 { margin-bottom: 15px; color: #333; }
-        .tutorial p { margin-bottom: 10px; line-height: 1.6; }
+        .tutorial h3 { margin: 20px 0 8px; color: #1565c0; font-size: 16px;
+            border-bottom: 1px solid #e3f2fd; padding-bottom: 5px; }
+        .tutorial p { margin-bottom: 10px; line-height: 1.7; }
+        .tutorial strong { color: #263238; }
+        .tutorial em { color: #c62828; font-style: normal; font-weight: bold; }
         .tutorial code { background: #f0f0f0; padding: 2px 5px; border-radius: 3px; }
         /* ===== 通用数据表 ===== */
         .data-table { width: 100%; border-collapse: collapse; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.1); font-size: 13px; }
@@ -136,6 +140,87 @@
         .kv-grid label { font-size: 12px; color: #666; font-weight: bold; }
         .kv-grid input, .kv-grid select, .kv-grid textarea { padding: 7px 9px; border: 1px solid #ccc; border-radius: 4px; font-size: 13px; width: 100%; }
         .muted { color: #999; font-size: 12px; }
+        /* ===== 角色心情列表（可展开） ===== */
+        .mood-list { display: flex; flex-direction: column; gap: 8px; }
+        .mood-row { border: 1px solid #e0e0e0; border-radius: 8px; padding: 10px 12px; background: #fff; }
+        .mood-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+        .mood-name { font-weight: bold; color: #333; min-width: 70px; }
+        .mood-num { font-size: 22px; font-weight: bold; color: #1e88e5; }
+        .mood-toggle { color: #1e88e5; cursor: pointer; font-size: 13px; text-decoration: none; }
+        .mood-records { margin-top: 8px; border-top: 1px dashed #d0d7de; padding-top: 6px; font-size: 12px; color: #555; }
+        .mood-rec-row { display: flex; justify-content: space-between; gap: 10px; padding: 2px 0; }
+        .mood-val-edit { color: #1e88e5; cursor: pointer; text-decoration: underline dashed; font-weight: bold; }
+        /* ===== 工具参数 JSON 编辑区（可自行拉伸） ===== */
+        #tool-params { min-height: 240px; resize: vertical; font-family: Consolas, 'Courier New', monospace; font-size: 12.5px; line-height: 1.5; }
+        /* ===== 工具启用开关：复选框与「已启用/已停用」紧挨在一起 ===== */
+        .tool-toggle { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; white-space: nowrap; user-select: none; }
+        .tool-toggle input[type="checkbox"] { width: 18px; height: 18px; margin: 0; cursor: pointer; }
+        .tool-toggle-text { font-size: 13px; font-weight: bold; }
+        .tool-toggle-text.on { color: #2e7d32; }
+        .tool-toggle-text.off { color: #9e9e9e; }
+        /* 表单里的启用项：整行变成可点击的醒目卡片，避免"看不到启用在哪" */
+        .form-row .checkbox-label { display: flex; align-items: center; gap: 8px; }
+        .enable-card { display: inline-flex; align-items: center; gap: 10px; padding: 8px 16px;
+            border: 2px solid #cfd8dc; border-radius: 8px; background: #fafcff; cursor: pointer;
+            font-size: 14px; font-weight: bold; color: #37474f; }
+        .enable-card:hover { border-color: #1e88e5; background: #f1f8ff; }
+        .enable-card input[type="checkbox"] { width: 20px; height: 20px; margin: 0; cursor: pointer; }
+        .enable-card.checked { border-color: #43a047; background: #f1f9f2; color: #2e7d32; }
+        /* ===== 配置页：左上角锚点导航 ===== */
+        .anchor-nav {
+            position: fixed;
+            top: 20px;
+            left: max(140px, 11%);
+            width: 168px;
+            max-height: calc(100vh - 40px);
+            overflow-y: auto;
+            background: rgba(255, 255, 255, 0.96);
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
+            padding: 8px 0;
+            z-index: 100;
+            display: none;
+        }
+        .anchor-nav.active { display: block; }
+        .anchor-nav::-webkit-scrollbar { width: 6px; }
+        .anchor-nav::-webkit-scrollbar-thumb { background: #cfd8dc; border-radius: 3px; }
+        .anchor-nav .anchor-item {
+            padding: 7px 14px;
+            font-size: 13px;
+            color: #455a64;
+            cursor: pointer;
+            border-left: 3px solid transparent;
+            transition: background 0.15s, color 0.15s;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .anchor-nav .anchor-item:hover {
+            background: #e3f2fd;
+            color: #1565c0;
+            border-left-color: #1e88e5;
+        }
+        /* ===== 配置页：右下角悬浮按钮 ===== */
+        .float-actions {
+            position: fixed;
+            right: 24px;
+            bottom: 24px;
+            display: none;
+            flex-direction: column;
+            gap: 10px;
+            z-index: 100;
+        }
+        .float-actions.active { display: flex; }
+        .float-actions .save-btn,
+        .float-actions .save-btn-restart,
+        .float-actions .btn {
+            margin: 0;
+            width: 160px;
+            padding: 11px 0;
+            font-size: 14px;
+            box-shadow: 0 3px 10px rgba(0, 0, 0, 0.15);
+            text-align: center;
+        }
     </style>
 </head>
 <body>
@@ -155,10 +240,13 @@
             <div class="config-form">
                 <div id="config-message"></div>
                 <div id="config-groups"></div>
+            </div>
+            <div class="anchor-nav" id="anchor-nav"></div>
+            <div class="float-actions" id="float-actions">
                 <button class="save-btn" id="save-only-btn">仅保存</button>
                 <button class="save-btn-restart" id="save-restart-btn">保存并重启TTS</button>
-                <button class="btn btn-gray" id="export-config-btn" style="margin-left:10px;">导出配置</button>
-                <button class="btn btn-gray" id="import-config-btn" style="margin-left:10px;">导入配置</button>
+                <button class="btn btn-gray" id="export-config-btn">导出配置</button>
+                <button class="btn btn-gray" id="import-config-btn">导入配置</button>
                 <input type="file" id="import-config-file" accept=".json" style="display:none;">
             </div>
         </div>
@@ -239,11 +327,23 @@
         </div>
         <div class="panel" id="panel-stats">
             <div class="section-block">
-                <h3>对话统计</h3>
+                <h3>对话统计
+                    <span style="float:right; font-weight:normal;">
+                        <label style="font-size:14px;">时间区间</label>
+                        <select id="stats-range" style="padding:4px 8px; border-radius:6px; border:1px solid #ddd;">
+                            <option value="today">今天</option>
+                            <option value="yesterday">昨天</option>
+                            <option value="7">近 7 天</option>
+                            <option value="14">近 14 天</option>
+                            <option value="30">近 30 天</option>
+                        </select>
+                    </span>
+                </h3>
                 <div class="stats-cards" id="stats-cards"></div>
-                <div class="chart-box"><h4>近 14 天消息量</h4><canvas id="chart-msgs" width="900" height="260"></canvas></div>
-                <div class="chart-box"><h4>情绪分布（近 30 天）</h4><canvas id="chart-emotions" width="900" height="260"></canvas></div>
-                <div class="chart-box"><h4>情绪趋势（近 14 天 · 前 5 种情绪）</h4><canvas id="chart-trend" width="900" height="260"></canvas></div>
+                <div class="chart-box"><h4>角色心情值（可展开查看各会话记录）</h4><div class="mood-list" id="role-moods"></div></div>
+                <div class="chart-box"><h4 id="chart-msgs-title">近 14 天消息量</h4><canvas id="chart-msgs" width="900" height="260"></canvas></div>
+                <div class="chart-box"><h4 id="chart-emotions-title">情绪分布（近 30 天）</h4><canvas id="chart-emotions" width="900" height="260"></canvas></div>
+                <div class="chart-box"><h4 id="chart-trend-title">情绪趋势（近 14 天 · 前 5 种情绪）</h4><canvas id="chart-trend" width="900" height="260"></canvas></div>
                 <div id="stats-tables"></div>
             </div>
             <div class="section-block">
@@ -254,7 +354,7 @@
         <div class="panel" id="panel-advanced">
             <div class="section-block">
                 <h3>表情包</h3>
-                <div class="sub-desc">每个子文件夹是一种情绪分类（可与 LLM 输出的情绪名对应）；「default」为兜底、「any」为任意情绪都可能随机抽取。总开关与触发概率见「配置文件 → 表情包」。</div>
+                <div class="sub-desc">每个子文件夹是一种情绪分类（可与 LLM 输出的情绪名对应）；「default」为兜底、「any」为任意情绪都可能随机抽取。总开关与触发概率见「配置文件 → 表情包」。开启「识图自动收藏表情」后，识图过程中被 LLM 判定为有趣/值得收藏的图片会自动保存到对应情绪分类，并在之后相同情绪的回复里按概率发出。</div>
                 <div class="inline-form">
                     <div class="field"><label>分类名</label><input type="text" id="sticker-category" placeholder="如 happy / gaoxing"></div>
                     <div class="field"><label>选择图片（可多选）</label><input type="file" id="sticker-files" accept="image/*" multiple></div>
@@ -268,8 +368,42 @@
                 </h3>
                 <div class="sub-desc">LLM 可在回复时调用这些工具并把结果融入回答。总开关 tools_enabled 与命令类工具授权在「配置文件 → 工具调用」中。</div>
                 <div id="tool-message" class="muted"></div>
+                <h4 style="margin:14px 0 4px;">联网搜索</h4>
+                <div class="sub-desc">选择 web_search 使用哪个搜索引擎；选项与说明由后端引擎注册表提供，新增引擎后此处自动出现。用户直接发链接时，无论模型是否主动调用，都会先用 web_fetch 抓取一次网页内容。</div>
+                <div class="inline-form" style="margin-top:6px; align-items:flex-end; flex-wrap:wrap;">
+                    <div class="field" style="min-width:220px;">
+                        <label>默认搜索引擎</label>
+                        <select id="search-engine-select"></select>
+                    </div>
+                    <div class="field" style="flex:0;">
+                        <button class="btn btn-green" id="search-engine-save">保存搜索引擎</button>
+                    </div>
+                    <div class="field wide" style="min-width:260px;">
+                        <label>自定义搜索引擎（每行 `名称=地址模板`，模板用 {query} 占位）</label>
+                        <textarea id="search-engine-custom" rows="2" style="resize:vertical; font-family:Consolas,'Courier New',monospace;" placeholder="我的搜索=https://example.com/search?q={query}"></textarea>
+                    </div>
+                    <div class="field wide" style="min-width:200px;">
+                        <label>SearXNG / 自建接口地址（留空用默认）</label>
+                        <input type="text" id="search-engine-url" placeholder="https://你的实例/search">
+                    </div>
+                    <div class="field wide" style="min-width:260px;">
+                        <label>搜索引擎 API key（每行 `环境变量名=值`，有 key 的引擎优先走官方接口）</label>
+                        <textarea id="search-engine-keys" rows="2" style="resize:vertical; font-family:Consolas,'Courier New',monospace;" placeholder="BING_SEARCH_API_KEY=xxxx"></textarea>
+                    </div>
+                </div>
+                <div id="search-engine-desc" class="muted" style="margin-top:4px;"></div>
+                <div id="search-engine-message" class="muted"></div>
                 <div class="editor-form" id="tool-editor"></div>
                 <div id="tools-table-wrap"></div>
+                <div class="inline-form" style="margin-top:12px; align-items:flex-end;">
+                    <div class="field wide">
+                        <label>测试参数 (JSON)</label>
+                        <textarea id="tool-test-args" rows="3" style="resize:vertical; font-family:Consolas,'Courier New',monospace;" placeholder='点击表格中的「测试」会使用这里的内容，例如 {"city": "佛山"}'></textarea>
+                    </div>
+                    <div class="field" style="flex:0;">
+                        <button class="btn btn-orange" id="tool-test-run-btn">使用上方参数测试当前选中工具</button>
+                    </div>
+                </div>
             </div>
             <div class="section-block">
                 <h3>知识库 RAG</h3>
@@ -296,21 +430,135 @@
             </div>
         </div>
         <div class="panel" id="panel-logs">
+            <div style="display:flex;align-items:center;gap:18px;margin-bottom:10px;flex-wrap:wrap;">
+                <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+                    <input type="checkbox" id="log-full-toggle">
+                    显示完整日志
+                </label>
+                <span class="muted" id="log-status" style="font-size:12px;"></span>
+                <span class="muted" style="font-size:12px;">LTVM 控制台日志</span>
+            </div>
             <div class="log-container" id="log-content">加载日志中...</div>
         </div>
         <div class="panel" id="panel-tutorial">
             <div class="tutorial">
                 <h2>使用教程</h2>
-                <p>欢迎使用 LTVM。以下为各功能说明（所有功能均可在对应页面独立开关与配置）：</p>
-                <p><strong>1. 配置文件</strong>：修改所有运行参数；「功能开关」类配置分组可控制流式回复、主动消息、待办、表情包、多角色、工具调用、RAG、用户画像、动态上下文等功能的启停；支持配置的导入与导出。</p>
-                <p><strong>2. 聊天记录</strong>：查看、管理与删除会话；支持单会话导出 / 导入（JSON）以及一键打包导出全部记忆。</p>
-                <p><strong>3. 情绪音频</strong>：可视化上传/试听各情绪的参考音频与 asr.txt，可新建或删除情绪文件夹，保存后自动重扫。</p>
-                <p><strong>4. 定时任务</strong>：自定义定时问候（间隔/每日/每周）、节日与生日自动问候、待办提醒管理。</p>
-                <p><strong>5. 统计面板</strong>：消息量、情绪分布与趋势图表，实时性能监控（LLM/TTS 耗时、服务状态）。</p>
-                <p><strong>6. 高级功能</strong>：表情包管理、工具调用（Function Calling）、知识库 RAG、用户画像。</p>
-                <p><strong>7. 日志输出</strong>：实时查看机器人运行日志。</p>
-                <p><strong>8. 使用教程</strong>：当前页面。</p>
-                <p class="muted">提示：主动消息（长时间未互动自动开口）、待办提取、画像自动提取等功能的详细参数都在「配置文件」对应分组中；每个功能必须开启对应开关后才会生效。</p>
+                <p>以下内容按「先配通、再调优、出问题怎么查」的顺序整理，并写清了每类现象背后的原因与对应设置。
+                   所有功能都必须先打开对应开关才会生效。</p>
+
+                <h3>一、七个页面的作用</h3>
+                <p><strong>1. 配置文件</strong>：所有运行参数与功能总开关。左侧有锚点导航，右上角可导出/导入配置（换机器时用导出文件最省事）。</p>
+                <p><strong>2. 聊天记录</strong>：查看/管理会话与历史，可单会话或整包导出导入。</p>
+                <p><strong>3. 情绪音频</strong>：每个情绪文件夹 = 一套参考音频 + <code>asr.txt</code>；上传后可试听。</p>
+                <p><strong>4. 定时任务</strong>：自定义定时消息、节日/生日问候、待办提醒。</p>
+                <p><strong>5. 统计面板</strong>：消息量、情绪分布、角色心情值与实时性能。</p>
+                <p><strong>6. 高级功能</strong>：表情包、工具调用、知识库 RAG、用户画像。</p>
+                <p><strong>7. 日志输出</strong>：排查问题的第一现场，详见第五节。</p>
+
+                <h3>二、先把它跑通（最小可用配置）</h3>
+                <p><strong>1. LLM 接口</strong>：在「LLM 大模型」里选对<strong>接口类型</strong>。
+                   本地 Ollama 用 <code>ollama</code>；LM Studio、llama.cpp（llama-server，地址要带 <code>/v1</code>）、
+                   vLLM、云端 API 一律用 <code>openai</code>。服务地址、模型名要与你的服务完全一致。</p>
+                <p><strong>2. TTS</strong>：「TTS 服务与模型」里填 GPT-SoVITS 服务地址（默认 <code>http://127.0.0.1:9880</code>）、
+                   模型目录、参考音频根目录；「TTS 参考音频与语言」里的文本语言要与参考音频的实际语言一致。</p>
+                <p><strong>3. 情绪音频目录</strong>：参考音频根目录下的<strong>每个子文件夹就是一个情绪</strong>
+                   （如 <code>pingjing</code>、<code>gaoxing</code>），文件夹里放参考音频和可选的 <code>asr.txt</code>
+                   （没有 <code>asr.txt</code> 时用配置里的「默认参考音频文本」兜底）。
+                   模型/其他杂物目录不会被误识别成情绪。</p>
+                <p><strong>4. 验证</strong>：保存配置后看日志——启动时会打印 LLM 连通性探测结果、扫到的情绪数量、
+                   调度任务注册情况。有 <code>[警告]</code> 就先解决它，再谈调优。</p>
+
+                <h3>三、参数怎么调（按效果分类）</h3>
+                <p><strong>· 回复太长/太慢</strong>：「历史消息条数」控制模型能看到的对话长度（默认 8）；
+                   「回复生成超时」别设太小，本地推理模型首字就要几秒。</p>
+                <p><strong>· 语音与文字对不上、语音少了某个词</strong>：
+                   打开「TTS 详细日志」，日志会分别打印<em>LLM 交过来的完整台词</em>与<em>实际送去合成的文本</em>。
+                   两者内容字不一致时日志会明确写出「清洗前后内容字不一致」。
+                   另外「语气渐变」的合并已修复为不丢音频（旧版本会在每句交界处吃掉一段语音），
+                   「交叉渐变长度」越大过渡越柔和，但不要超过单句时长。</p>
+                <p><strong>· 情绪老是"平静"</strong>：打开「情绪判定规则引导」（默认开）。
+                   关掉它模型更容易把所有句子都判成默认情绪；也可以填「自定义情绪判定补充规则」，
+                   例如"只要主人夸我可爱，就必须用 haixiu"。</p>
+                <p><strong>· 角色漏回消息</strong>：检查「回复审判与心情」——这两个是<strong>独立开关</strong>：
+                   「LLM 判断是否需要回复」会让模型判定"这条不值得回"而真的不回；
+                   「记录角色心情值」只更新心情，<strong>不会</strong>拦任何回复。
+                   想保留心情值又不想漏回消息：只开心情值、关掉回复审判。
+                   相应地，心情值影响回复概率的那几个参数只在两个开关都打开时才出现。</p>
+                <p><strong>· 主动消息/节日问候话题对不上</strong>：
+                   「主动消息/问候携带的历史条数」（默认 6）会把最近几条对话全文发给模型，
+                   更早的内容用摘要压缩（摘要来自「对话上下文自动摘要」，建议同时打开）。
+                   设为 0 就退回"凭空开场"的旧行为。</p>
+                <p><strong>· 主动消息从来不发</strong>：确认「主动消息（闲置唤醒）」已开，
+                   并注意三个限制：闲置阈值、静默时段、单会话每日上限；
+                   若开了「回复前不再主动」，用户没回复之前不会再开口。
+                   启动时日志会打印"已恢复 N 个会话的闲置计时"。</p>
+                <p><strong>· 生成了语音但没声音/半截语音</strong>：日志里出现"分段音频合并已降级为…"说明合并走了兜底路径
+                   （内容不丢，只是过渡更生硬）；出现"TTS 合成失败"则去看 TTS 服务本身。</p>
+
+                <h3>四、工具调用（最容易出问题的地方）</h3>
+                <p><strong>1. 总开关</strong>：「工具调用」分组里的「工具调用 (Function Calling)」；
+                   每个工具还要在「高级功能 → 工具调用」里单独启用（表格里勾一下就会保存）。</p>
+                <p><strong>2. 触发方式怎么选</strong>：
+                   <em>关键词门控</em>最稳，但口语化请求可能漏；
+                   <em>LLM 自主判断</em>会先判断消息是否真的需要客观信息（时间/计算/天气/搜索/链接等），
+                   闲聊类消息直接跳过工具流程，回复更快更自然；
+                   <em>全部放行</em>不做门控，模型容易"什么都去调一遍"，一般不建议。</p>
+                <p><strong>3. 天气</strong>：用户没说地点时，角色<strong>不会</strong>自己猜一个城市
+                   （历史问题：只问"今天天气怎么样"，模型却报了另一个城市的天气）。
+                   想让它在用户没说地点时也能查，请在工具编辑里填「默认城市」。</p>
+                <p><strong>4. 安全搜索</strong>：三档。
+                   <em>无</em>不限制；<em>一般</em>（默认）允许 R16+ 站点但过滤 R18 内容；
+                   <em>严格</em>连低俗、性暗示的站点与内容一并过滤。
+                   除关键词过滤外，还会给支持安全搜索的引擎（SearXNG/Bing/Google News/Brave）带上它们各自的参数。
+                   过滤后结果变少是正常现象，日志里会写明过滤了几条。</p>
+                <p><strong>5. "搜索只出来前几条/像被截断"</strong>：一次搜索给模型的全部结果受
+                   「搜索总字数预算」限制（默认 4000 字）。预算用完后，后面的结果会被<strong>整条</strong>省略
+                   （摘要绝不截半句），并在结果里注明"因长度限制省略 N 条"。
+                   想看到更多条：把「每次搜索返回条数」和「搜索总字数预算」一起调大
+                   （条数 × 每条约 300 字 ≤ 预算），或在「显示完整日志」下查看——完整模式不会被截断
+                   （仅极端情况下有 40 万字符的兜底上限，触发时日志会写明）。</p>
+                <p><strong>6. 工具输出在日志里看不全</strong>：把「工具输出日志字数上限」设为 0（默认）即为完整输出。</p>
+
+                <h3>五、出问题了怎么查（按现象对照）</h3>
+                <p><strong>· 完全没有回复</strong>：先看日志有没有"收到私聊/群聊 …"。
+                   没有 → 检查 NapCat 连接与「群聊需要@才回复」；有 → 看后面是"回复审判决定不回复"还是请求超时。
+                   识图失败会降级为普通文本回复，日志里会写"识图失败，降级为普通文本回复"。</p>
+                <p><strong>· 回复和上一条对不上/像没看到图</strong>：图片若被判定为"无需回复"，系统仍会把画面描述写进历史，
+                   用户随后问"这个怎么样"时会重新调用识图模型；日志里会有
+                   "本条消息指向刚才那张未被真正看过的图片"的提示。</p>
+                <p><strong>· 待办提醒内容很怪（例如提醒"再提醒我"）</strong>：
+                   LLM 提取模式会结合最近对话把"5分钟后再提醒我吧"还原成真正的事项（如"睡觉"）；
+                   正则模式没有上下文可用，这类空指令会被直接丢弃（日志有记录）。
+                   想更准就把「待办提取方式」设为 <code>llm</code>。</p>
+                <p><strong>· 提醒时间不对</strong>：绝对时刻（"23点"）由本地解析成"最近一次到来的该时刻"，
+                   模型不负责算分钟差。日志里会打印解析结果与触发时刻，可直接核对。</p>
+                <p><strong>· 补发问候没有发生</strong>：日志里搜索"问候补发"。
+                   常见原因：程序启动时还没到问候时刻、处于静默时段、事件没有目标会话、
+                   或等待 NapCat 连接超时（可调「补发等待 NapCat 的超时」）。每一种都会打印明确原因。</p>
+                <p><strong>· 日志怎么看</strong>：默认是"精简模式"（只回尾部若干行）；勾选「显示完整日志」看自启动以来的全部输出。
+                   排查时建议打开它，并按关键词搜索：<code>回复审判</code>、<code>工具调用</code>、
+                   <code>搜索预取</code>、<code>待办提取</code>、<code>问候补发</code>、<code>TTS</code>。</p>
+
+                <h3>六、几个容易被忽略的联动关系</h3>
+                <p>· 回复概率门控只在「回复审判」开启时生效；只开心情值时不会影响回复。</p>
+                <p>· 主动消息/问候的历史承接依赖会话里已有记录，全新会话等于没有上下文。</p>
+                <p>· 「识图自动收藏表情」需要同时开启「表情包功能」，且模型没给出明确收藏判定时默认不收藏。</p>
+                <p>· 「分开发送」关闭时，下面的「语音分开发送」「文本分开发送」等选项会自动隐藏（它们只在那条路径上生效）。</p>
+                <p>· 待办提取的「触发关键词」是第一道门槛：消息不含其中任何一个词就不会被提取，
+                   删掉「叫我」会导致"8点半叫我起床"这类消息被直接跳过（日志有提示）。</p>
+                <p class="muted">提示：教程中提到的配置项名称都能在「配置文件」页用浏览器搜索（Ctrl+F）直接定位；
+                   若某项没显示，通常是因为它依赖的上级开关没打开。</p>
+
+                <h3>七、开源协议（AGPL-3.0）</h3>
+                <p>本程序基于 <strong>GNU Affero General Public License v3.0（AGPL-3.0）</strong>发布，
+                   完整协议文本随程序一起分发（安装目录与仓库根目录下的 <code>LICENSE</code>）。</p>
+                <p>· 你可以自由使用、修改、分发本程序（含商用），但<strong>分发修改版时必须同样以 AGPL-3.0 开源</strong>，
+                   并保留版权声明与修改说明。</p>
+                <p>· <strong>第 13 条（远程网络交互）</strong>：如果你修改了本程序，并把它作为网络服务提供给他人使用
+                   （例如自建服务端供他人访问本控制台），<strong>必须向这些使用者提供你修改后的完整源代码</strong>。
+                   这是 AGPL 与 GPL 的关键区别。</p>
+                <p>· 本程序按「现状」提供，不含任何担保（协议第 15、16 条）。
+                   完整的免责条款另见 <code>LICENSE.txt</code>（语音合成内容责任、第三方平台风险、硬件与数据风险等）。</p>
             </div>
         </div>
     </div>
@@ -329,6 +577,28 @@
             <div class="modal-body" id="modal-body"></div>
         </div>
     </div>
+    <div class="modal-overlay" id="auth-modal">
+        <div class="modal-content" style="width:380px; height:auto; padding:24px;">
+            <h3>输入访问密码</h3>
+            <input type="password" id="auth-pass" placeholder="WebUI 访问密码" style="width:100%; margin:12px 0 6px; padding:8px;">
+            <label style="font-size:12px; color:#666;">本次解锁有效时长（分钟，0 = 关闭页面后失效）</label>
+            <input type="number" id="auth-min" min="0" max="43200" step="1" style="width:100%; margin:4px 0 8px; padding:8px;">
+            <div id="auth-msg" class="muted" style="color:red;"></div>
+            <div style="display:flex; gap:10px;">
+                <button class="btn btn-green" id="auth-ok" style="flex:1;">解锁</button>
+            </div>
+        </div>
+    </div>
+    <div class="modal-overlay" id="update-modal">
+        <div class="modal-content" style="width:460px; height:auto; padding:24px;">
+            <h3>发现新版本</h3>
+            <p id="update-info" style="margin:14px 0; line-height:1.6;"></p>
+            <div style="display:flex; gap:10px;">
+                <button class="btn" id="update-later" style="flex:1;">稍后</button>
+                <button class="btn btn-green" id="update-go" style="flex:1;">前往更新</button>
+            </div>
+        </div>
+    </div>
     <script>
         const API_BASE = '';
         let currentConfig = null;
@@ -344,24 +614,42 @@
         let selectedMsgIndices = new Set();
 
         const configGroups = [
+            /* ===== 基础连接 ===== */
             { title: 'NapCat 连接', keys: ['napcat_ws_url', 'napcat_token'] },
-            { title: 'LLM 大模型', keys: ['llm_backend', 'llm_base_url', 'llm_model_name', 'llm_api_key', 'num_ctx', 'history_length', 'enable_think', 'llm_timeout'] },
-            { title: '识图模型', keys: ['image_caption_model_name', 'image_caption_timeout'] },
-            { title: '回复方式', keys: ['tts_reply_enabled', 'streaming_enabled'] },
-            { title: 'TTS 基本配置', keys: ['client_base_url', 'model_dir', 'ref_audio_root', 'timeout_seconds', 'prompt_text', 'prompt_lang', 'text_lang', 'device'] },
-            { title: 'TTS 高级参数', keys: ['top_k', 'top_p', 'temperature', 'text_split_method', 'batch_size', 'batch_threshold', 'split_bucket', 'speed_factor', 'fragment_interval', 'streaming_mode', 'seed', 'parallel_infer', 'repetition_penalty', 'media_type'] },
-            { title: '发送与记忆', keys: ['max_voice_cache', 'isolated_session', 'separate_send', 'send_voice_separately', 'dynamic_sleep', 'text_separate', 'only_private', 'group_need_at'] },
-            { title: '情绪相关', keys: ['llm_judge', 'display_lang', 'default_voice', 'voice_transition', 'breathing_gap_ms', 'crossfade_ms', 'enable_default_emotions', 'llm_emotion_intensity', 'intensity_to_temperature', 'intensity_to_top_k'] },
-            { title: '定时任务与主动消息', keys: ['scheduler_enabled', 'proactive_enabled', 'proactive_idle_minutes', 'proactive_check_seconds', 'proactive_max_per_day', 'proactive_quiet_start', 'proactive_quiet_end', 'proactive_prompt', 'proactive_voice', 'proactive_sticker', 'greeting_events_enabled', 'greeting_check_time', 'birthday_greeting_enabled', 'birthday_greet_template', 'birthday_greet_mode', 'birthday_greet_voice'] },
-            { title: '待办提醒', keys: ['todo_enabled', 'todo_extract_mode', 'todo_voice', 'todo_remind_template', 'todo_keywords', 'todo_regex_patterns', 'todo_extract_prompt'] },
-            { title: '表情包', keys: ['stickers_enabled', 'stickers_dir', 'sticker_probability', 'sticker_max_per_reply', 'sticker_every_sentence'] },
+            { title: 'WebUI 设置', keys: ['webui_enabled', 'webui_host', 'webui_port', 'webui_password', 'webui_auth_ttl_minutes', 'webui_log_buffer_lines', 'webui_log_tail_lines'] },
+
+            /* ===== 模型 ===== */
+            { title: 'LLM 大模型', keys: ['llm_backend', 'llm_base_url', 'llm_model_name', 'llm_api_key', 'num_ctx', 'history_length', 'enable_think', 'llm_timeout', 'llm_auto_unload_old', 'text_clean_blocklist', 'llm_sampling_enabled', 'llm_top_p', 'llm_top_k', 'llm_repeat_penalty', 'llm_extra_body'] },
+            { title: '识图模型', keys: ['image_caption_model_name', 'image_caption_backend', 'image_caption_timeout'] },
+
+            /* ===== TTS 语音 ===== */
+            { title: 'TTS 服务与模型', keys: ['auto_start_tts', 'tts_start_script', 'client_base_url', 'model_dir', 'ref_audio_root', 'timeout_seconds', 'device', 'media_type'] },
+            { title: 'TTS 参考音频与语言', keys: ['prompt_text', 'prompt_lang', 'text_lang', 'tts_auto_lang', 'display_lang'] },
+            { title: 'TTS 推理参数', keys: ['top_k', 'top_p', 'temperature', 'text_split_method', 'batch_size', 'batch_threshold', 'split_bucket', 'speed_factor', 'fragment_interval', 'streaming_mode', 'seed', 'parallel_infer', 'repetition_penalty'] },
+            { title: 'TTS 台词清洗与日志', keys: ['tts_char_map', 'tts_duration_guard', 'tts_min_seconds_per_char', 'tts_debug_log'] },
+            { title: '情绪与语气', keys: ['llm_judge', 'default_voice', 'voice_transition', 'breathing_gap_ms', 'crossfade_ms', 'enable_default_emotions', 'llm_emotion_intensity', 'intensity_to_temperature', 'intensity_to_top_k', 'emotion_guide_enabled', 'emotion_guide_extra', 'image_identity_guard_enabled'] },
+
+            /* ===== 回复与发送 ===== */
+            { title: '回复方式', keys: ['tts_reply_enabled', 'streaming_enabled', 'display_pure_language', 'repeat_guard_rounds'] },
+            { title: '发送与记忆', keys: ['max_voice_cache', 'isolated_session', 'separate_send', 'send_voice_separately', 'separate_force_segment', 'dynamic_sleep', 'text_separate'] },
+            { title: '群聊与私聊', keys: ['only_private', 'group_need_at'] },
+            { title: '回复审判与心情', keys: ['reply_judge_enabled', 'mood_enabled', 'reply_judge_prompt', 'reply_judge_mood_min', 'reply_judge_mood_max', 'reply_judge_mood_initial', 'reply_judge_mood_delta_max', 'reply_judge_mood_low', 'reply_judge_mood_high', 'reply_judge_prob_low', 'reply_judge_prob_high'] },
+
+            /* ===== 对话增强 ===== */
+            { title: '动态上下文与时间', keys: ['enable_time_awareness', 'summary_enabled', 'summary_threshold', 'summary_max_history', 'summary_prompt', 'dynamic_context_enabled', 'topic_summary_every_n', 'topic_summary_prompt'] },
+            { title: '用户画像', keys: ['profiles_enabled', 'profiles_auto_extract', 'profiles_max_chars', 'profiles_extract_prompt', 'profiles_inject_template'] },
             { title: '多角色对话', keys: ['multi_role_enabled', 'multi_role_max_replies', 'multi_role_auto_rounds', 'multi_role_max_total'] },
-            { title: '工具调用', keys: ['tools_enabled', 'tools_allow_commands', 'tools_max_iterations'] },
-            { title: '知识库 RAG', keys: ['rag_enabled', 'rag_embedding_model', 'rag_chunk_size', 'rag_chunk_overlap', 'rag_top_k', 'rag_min_similarity', 'rag_max_context_chars'] },
-            { title: '用户画像', keys: ['profiles_enabled', 'profiles_auto_extract', 'profiles_max_chars', 'profiles_inject_template'] },
-            { title: '动态上下文', keys: ['enable_time_awareness', 'summary_enabled', 'summary_threshold', 'summary_max_history', 'summary_prompt', 'dynamic_context_enabled', 'topic_summary_every_n', 'topic_summary_prompt'] },
-            { title: '自动启动 TTS', keys: ['auto_start_tts', 'tts_start_script'] },
-            { title: 'WebUI 设置', keys: ['webui_enabled', 'webui_host', 'webui_port'] },
+
+            /* ===== 扩展功能 ===== */
+            { title: '定时任务与主动消息', keys: ['scheduler_enabled', 'proactive_enabled', 'proactive_idle_minutes', 'proactive_idle_jitter', 'proactive_check_seconds', 'proactive_max_per_day', 'proactive_wait_reply', 'proactive_quiet_start', 'proactive_quiet_end', 'proactive_prompt', 'proactive_text_max_chars', 'proactive_voice', 'proactive_sticker', 'history_context_recent', 'history_context_summary_chars', 'history_context_max_chars', 'greeting_events_enabled', 'greeting_check_time', 'greeting_catchup_enabled', 'greeting_catchup_deadline_minutes', 'default_events_enabled', 'default_events_to_all', 'birthday_greeting_enabled', 'birthday_greet_template', 'birthday_greet_mode', 'birthday_greet_voice'] },
+            { title: '待办提醒', keys: ['todo_enabled', 'todo_extract_mode', 'todo_voice', 'todo_voice_emotion', 'todo_remind_mode', 'todo_remind_prompt', 'todo_remind_template', 'todo_keywords', 'todo_regex_patterns', 'todo_extract_prompt'] },
+            { title: '表情包', keys: ['stickers_enabled', 'sticker_capture_enabled', 'stickers_dir', 'sticker_probability', 'sticker_max_per_reply', 'sticker_every_sentence', 'sticker_capture_prompt', 'sticker_capture_min_score', 'sticker_capture_min_interval', 'sticker_capture_max_per_day', 'sticker_capture_any_pool', 'sticker_capture_require_verdict', 'sticker_capture_min_reason_chars', 'sticker_capture_skip_if_unfit', 'sticker_capture_preserve_formats', 'sticker_capture_max_side'] },
+            { title: '工具调用', keys: ['tools_enabled', 'tools_trigger_mode', 'tools_skip_pure_chatter', 'tools_allow_commands', 'tools_max_iterations', 'tools_guard_enabled', 'tools_guard_keywords', 'tool_notes_max_entries', 'tool_notes_max_chars', 'tool_log_output_chars', 'tool_uncertain_fallback', 'search_prefetch_enabled', 'search_query_llm_extract', 'search_links_auto_append', 'search_links_max', 'web_search_safe', 'web_search_max_results', 'web_search_result_chars', 'web_search_max_chars'] },
+            { title: '知识库 RAG', keys: ['rag_enabled', 'rag_embedding_backend', 'rag_embedding_model', 'llm_embedding_model', 'llm_embedding_url', 'rag_chunk_size', 'rag_chunk_overlap', 'rag_top_k', 'rag_min_similarity', 'rag_max_context_chars'] },
+
+            /* ===== 系统 ===== */
+            { title: '防刷屏', keys: ['anti_spam_enabled', 'anti_spam_window_seconds', 'anti_spam_max_in_window'] },
+            { title: '软件更新', keys: ['update_check_enabled', 'update_check_interval_hours', 'update_include_prerelease'] },
             { title: '其他', keys: ['active_character', 'hide_gsv_options'] }
         ];
 
@@ -370,25 +658,38 @@
             'napcat_ws_url': { label: 'NapCat WebSocket 地址', description: 'NapCat 服务的 WebSocket 连接地址', hint: '默认为 ws://127.0.0.1:3001', required: true, type: 'string' },
             'napcat_token': { label: 'NapCat Token', description: 'NapCat 服务的访问令牌', hint: '如果 NapCat 设置了 Token，请填写；否则留空', required: false, type: 'string' },
             'hide_gsv_options': { label: '隐藏高级 GSV 参数', description: '【配好参数后可选】隐藏高级 GSV 参数', hint: '开启后，将隐藏大部分 GPT-SoVITS 推理细节参数，简化配置界面。', required: false, type: 'boolean', default: false },
-            'llm_backend': { label: 'LLM 接口类型', description: '选择 LLM 后端接口类型', hint: 'ollama：Ollama 原生接口；openai：OpenAI 兼容接口（LM Studio / vLLM / 各类云 API 等）。', required: false, type: 'string', options: ['ollama', 'openai'], default: 'ollama' },
-            'llm_api_key': { label: 'LLM API Key', description: 'OpenAI 兼容接口的密钥', hint: '仅 openai 接口类型需要；本地服务可留空。', required: false, type: 'string' },
-            'llm_model_name': { label: '大语言模型 (LLM) 名称', description: '【必填】大语言模型 (LLM) 名称', hint: '请填写本地 Ollama 中已部署的模型名称（可通过命令行 ollama list 查看）。', required: true, type: 'string' },
-            'image_caption_model_name': { label: '识图模型名称', description: '【可选】识图模型名称', hint: '用于处理图片，接收图片并输出JSON。留空则遇到图片时直接跳过。', required: false, type: 'string' },
-            'llm_base_url': { label: 'LLM 服务地址', description: 'LLM服务地址', hint: 'Ollama 默认为 http://127.0.0.1:11434。', required: true, type: 'string', options: ['http://127.0.0.1:11434', 'http://127.0.0.1:1234/v1', 'http://127.0.0.1:8000/v1'], default: 'http://127.0.0.1:11434' },
+            'llm_backend': { label: 'LLM 接口类型', description: '选择 LLM 后端接口类型', hint: 'ollama：Ollama 原生接口；openai：OpenAI 兼容接口——llama.cpp（llama-server）、LM Studio、vLLM 等都用这一档（llama.cpp 的工具调用需启动时加 --jinja）。', required: false, type: 'string', options: ['ollama', 'openai'], default: 'ollama' },
+            'llm_api_key': { label: 'LLM API Key', description: 'OpenAI 兼容接口的密钥', hint: '仅 openai 接口类型需要；本地服务可留空。保存后只显示头尾各4位和长度，密钥本体加密存储在 config.json 中。', required: false, type: 'string' },
+            'llm_embedding_url': { label: 'Embedding 端点', description: '【可选】手动指定 Embedding API 完整路径', hint: '留空则自动拼接 llm_base_url + /embeddings', required: false, type: 'string' },
+            'llm_embedding_model': { label: 'Embedding 模型名', description: '【可选】外部 API 的 Embedding 模型名', hint: '使用云端 API 时需填写，如 text-embedding-v3。本地 Ollama 留空则使用 rag_embedding_model。', required: false, type: 'string' },
+            'llm_model_name': { label: '大语言模型 (LLM) 名称', description: '【必填】大语言模型 (LLM) 名称', hint: '可手动填写模型 ID，或点「选文件夹」扫描本地模型 /「服务列表」从 LLM 服务获取。LM Studio 注意：填模型 ID（如 qwen/qwen3.5-9b），不是仓库名。', required: true, type: 'model_select' },
+            'llm_auto_unload_old': { label: '换模型后自动卸载旧模型', description: '修改模型保存后，等新模型首次调用成功时自动卸载不再使用的旧模型（LM Studio）', hint: '默认开启。显存有限时旧模型常驻会挤爆显存或拖慢速度；需要 LM Studio 自带的 lms 命令行。', required: false, type: 'boolean', default: true },
+            'text_clean_blocklist': { label: '文本清洗屏蔽词', description: 'LLM 回复中出现这些字符/词时会被剔除后再发送（语音和文字都生效）', hint: '每行一个字符或词，也可用逗号分隔，例如剔除不想出现的口癖词、符号。留空不启用。', required: false, type: 'text' },
+            'image_caption_model_name': { label: '识图模型名称', description: '【可选】识图模型名称', hint: '用于处理图片，接收图片并输出JSON。可手动填写或点「选文件夹」/「服务列表」选择。留空则遇到图片时直接跳过。', required: false, type: 'model_select' },
+            'image_caption_backend': { label: '识图模型接口', description: '识图模型后端接口类型', hint: '留空则跟随 LLM 接口类型。ollama：本地 Ollama；openai：云端 OpenAI 兼容接口。', required: false, type: 'string', options: ['', 'ollama', 'openai'], default: '' },
+            'llm_base_url': { label: 'LLM 服务地址', description: 'LLM服务地址', hint: 'Ollama 默认 http://127.0.0.1:11434；llama.cpp（llama-server）填 http://127.0.0.1:8080/v1（必须带 /v1，接口类型选 openai）；DeepSeek 等云 API 请填 https://api.deepseek.com（需将接口类型改为 openai）。', required: true, type: 'string', allowCustom: true, options: ['http://127.0.0.1:11434', 'http://127.0.0.1:8080/v1', 'http://127.0.0.1:1234/v1', 'http://127.0.0.1:8000/v1', 'https://api.deepseek.com', 'https://api.deepseek.com/v1'], default: 'http://127.0.0.1:11434' },
             'num_ctx': { label: '上下文长度 (num_ctx)', description: '大模型上下文长度', hint: '默认8192，决定模型能记住的对话历史长度（Token数）。', required: false, type: 'int', default: 8192 },
             'history_length': { label: '历史消息条数', description: '模型可读上下文条数', hint: '模型直接读取的最近对话条数，默认 8 条。', required: false, type: 'int', default: 8 },
             'enable_think': { label: '启用深度思考', description: '开启深度思考', hint: '开启后，模型会在回答前先内部推理。注意：会让响应变慢。', required: false, type: 'boolean', default: false },
             'llm_timeout': { label: 'LLM 请求超时（秒）', description: '大模型请求超时时间', hint: '单位秒。默认120秒。', required: false, type: 'int', default: 120 },
+            'llm_sampling_enabled': { label: '启用 LLM 采样参数', description: '把下面的采样参数随每次 LLM 请求发送给大模型', hint: '默认开启，默认值取 Ollama 官方默认（top_k=40 / top_p=0.9 / 重复惩罚=1.1）。关闭后请求只带温度、上下文长度等基本参数。注意：top_k 与重复惩罚仅 Ollama 后端发送（openai 兼容后端只发 top_p）。', required: false, type: 'boolean', default: true },
+            'llm_top_p': { label: 'Top-P（核采样）', description: '只从累计概率前 top_p 的候选词中采样', hint: '默认 0.9，范围 0~1。Ollama 与支持该参数的 OpenAI 兼容接口生效；调小输出更稳定，调大更多样。', required: false, type: 'float', condition: { llm_sampling_enabled: true }, default: 0.9 },
+            'llm_top_k': { label: 'Top-K', description: '每步只从概率最高的 k 个候选词中采样', hint: '默认 40。仅 Ollama 后端生效（OpenAI 兼容接口不接受该字段，发送会被严格服务拒绝）。', required: false, type: 'int', condition: { llm_sampling_enabled: true, llm_backend: 'ollama' }, default: 40 },
+            'llm_repeat_penalty': { label: '重复惩罚', description: '对已出现过的内容施加惩罚，抑制复读', hint: '默认 1.1；大于 1 抑制重复，1 = 不惩罚。仅 Ollama 后端生效（OpenAI 兼容接口用 frequency_penalty/presence_penalty，字段名不同，故此处隐藏）。', required: false, type: 'float', condition: { llm_sampling_enabled: true, llm_backend: 'ollama' }, default: 1.1 },
+            'llm_extra_body': { label: '自定义请求体字段（JSON）', description: '随请求合并进 OpenAI 兼容接口请求体的额外字段', hint: 'JSON 对象，留空不发送。llama.cpp 示例：{"chat_template_kwargs": {"enable_thinking": false}} 关闭思考模式——思考模型经 llama-server --jinja 启动时默认开思考，不关会导致回复正文为空。解析失败时忽略；LM Studio 目前版本中有bug导致这个选项无效，请前往该软件自行关闭 Enable Thinking', required: false, type: 'string', condition: { llm_backend: 'openai' }, default: '' },
             'image_caption_timeout': { label: '识图模型请求超时（秒）', description: '识图模型请求超时时间（秒）', hint: '单位秒。识图模型推理较慢，建议 60 秒以上。', required: false, type: 'int', default: 90 },
             'tts_reply_enabled': { label: '回复附带语音', description: '关闭后所有回复只发文字不发语音', hint: 'TTS 故障排查或纯文字场景可关闭。', required: false, type: 'boolean', default: true },
+            'display_pure_language': { label: '展示文本只保留展示语言', description: '剔除聊天文本里混入的口语语言片段（模型把日文台词连同中文翻译塞进同一句时）', hint: '默认开启。日文片段按假名识别并整段剔除；纯日文的句子不再发文本、语音照常合成。仅对"中文展示 + 日文口语"的组合生效。', required: false, type: 'boolean', default: true },
+            'repeat_guard_rounds': { label: '防复读参照轮数', description: '把最近几轮角色自己的台词一起作为「禁止重复」的参照，并对这几轮做重合度检查', hint: '默认 3 轮。默认 1 轮时，模型可能隔一轮又开始重复更早说过的话；调大可覆盖更长的重复周期，代价是提示词占用的上下文变多。', required: false, type: 'int', default: 3 },
             'streaming_enabled': { label: '实时流式回复', description: '边生成边逐句合成并发送，大幅降低等待时间', hint: '开启后每句话生成完毕立即合成发送，无需等整段回复完成。需要模型支持流式输出（Ollama / OpenAI 均支持）。', required: false, type: 'boolean', default: false },
             'client_base_url': { label: 'GPT-SoVITS 服务地址', description: 'GPT-SoVITS 服务地址', hint: '默认为 http://127.0.0.1:9880', required: true, type: 'string', condition: { hide_gsv_options: false }, default: 'http://127.0.0.1:9880' },
-            'model_dir': { label: '模型文件夹路径', description: '【必填】模型文件夹所在路径', hint: '存放 .ckpt 和 .pth 的文件夹路径', required: true, type: 'string', condition: { hide_gsv_options: false } },
-            'ref_audio_root': { label: '参考音频根目录', description: '【必填】参考音频根目录', hint: '填有所有语气的文件夹路径即可。', required: true, type: 'string', condition: { hide_gsv_options: false } },
+            'model_dir': { label: '模型文件夹路径', description: '【必填】模型文件夹所在路径', hint: '存放 .ckpt 和 .pth 的文件夹路径，可点「浏览」直接选择', required: true, type: 'path', condition: { hide_gsv_options: false } },
+            'ref_audio_root': { label: '参考音频根目录', description: '【必填】参考音频根目录', hint: '填有所有语气的文件夹路径即可，可点「浏览」直接选择。', required: true, type: 'path', condition: { hide_gsv_options: false } },
             'timeout_seconds': { label: 'TTS 超时时间（秒）', description: 'TTS 超时时间', hint: '单位秒。防止超时导致插件一直等待。', required: false, type: 'int', default: 120 },
             'prompt_text': { label: '默认参考音频文本', description: '默认参考音频文本', hint: '仅当情绪文件夹内没有 asr.txt 时作为兜底使用。', required: false, type: 'string', condition: { hide_gsv_options: false }, default: 'ふむ、おぬしが我輩のご主人か?' },
             'prompt_lang': { label: '参考音频文本语言', description: '参考音频文本语言', hint: '请填写参考音频所念文本的语言代码（如 ja 或 zh）。', required: false, type: 'string', condition: { hide_gsv_options: false }, default: 'ja' },
-            'text_lang': { label: '文本语言', description: '文本语言', hint: '生成的台词语言代码（如 ja 或 zh）。', required: false, type: 'string', condition: { hide_gsv_options: false }, default: 'ja' },
+            'text_lang': { label: '文本语言', description: '文本语言', hint: '生成的台词语言代码（如 ja 或 zh）。开启下一项「按台词文字自动判定语言」后，这里只作为判定不出时的兜底。', required: false, type: 'string', condition: { hide_gsv_options: false }, default: 'ja' },
+            'tts_auto_lang': { label: '按台词文字自动判定合成语言', description: '按每句台词实际使用的文字（假名/汉字/谚文/拉丁）选择送进 TTS 的语言代码', hint: '默认开启，只作为兜底：台词字段本该是「文本语言」（如 ja），系统会先把填成展示语言（如中文）的台词重译过去再合成，保证语音仍是角色语言；只有重译失败时才按台词文字判定语言，避免用错误语言念成乱码。关掉则永远使用上一项的「文本语言」。', required: false, type: 'boolean', condition: { hide_gsv_options: false }, default: true },
             'top_k': { label: 'Top K', description: '核采样的阈值 (top_k)', hint: '数值越大语气变化越丰富。', required: false, type: 'int', condition: { hide_gsv_options: false }, default: 20 },
             'top_p': { label: 'Top P', description: '核采样的阈值 (top_p)', hint: '数值越高越随机。', required: false, type: 'float', condition: { hide_gsv_options: false }, default: 1 },
             'temperature': { label: 'Temperature', description: '随机性 (温度)', hint: '控制语音合成的爆发力和大模型的稳定性。', required: false, type: 'float', condition: { hide_gsv_options: false }, default: 1 },
@@ -402,21 +703,28 @@
             'seed': { label: '随机种子', description: '随机种子', hint: '设置固定种子可复现结果，-1 为完全随机。', required: false, type: 'int', condition: { hide_gsv_options: false }, default: -1 },
             'parallel_infer': { label: '并行推理', description: '并行执行推理', hint: '建议开启以加速合成。', required: false, type: 'boolean', condition: { hide_gsv_options: false }, default: true },
             'repetition_penalty': { label: '重复惩罚', description: '重复惩罚因子', hint: '数值越大越不容易重复字词。', required: false, type: 'float', condition: { hide_gsv_options: false }, default: 1.35 },
+            'tts_duration_guard': { label: '合成音频时长校验', description: '合成结果明显短于台词应有长度时，换一种切分方式重试，避免只发出一声语气的短语音', hint: '默认开启。判定标准由下一项「每秒最少字符数」决定；重试仍偏短时返回其中最长的一段，不会整句语音缺失。', required: false, type: 'boolean', condition: { hide_gsv_options: false }, default: true },
+            'tts_min_seconds_per_char': { label: '每秒最少字符数（时长下限）', description: '按台词可朗读字数估算音频最短时长：字符数 × 该值', hint: '默认 0.05 秒/字。正常人声远慢于此，所以不会误判正常语音；调大更严格，调小更宽松。', required: false, type: 'float', condition: { hide_gsv_options: false, tts_duration_guard: true }, default: 0.05 },
             'media_type': { label: '输出媒体类型', description: '输出媒体的类型', hint: '建议保持 wav 以获得最优音质。', required: false, type: 'string', condition: { hide_gsv_options: false }, default: 'wav' },
             'max_voice_cache': { label: '最大语音缓存数', description: '最大语音缓存数量', hint: '最多保留的临时/合并音频文件数。', required: false, type: 'int', default: 20 },
             'isolated_session': { label: '隔离会话', description: '隔离会话', hint: '启用后，群成员的上下文独立。', required: false, type: 'boolean', default: false },
             'separate_send': { label: '分开发送', description: '分开发送', hint: '开启后，显示语音分开发送和文本分开发送选项。', required: false, type: 'boolean', default: false },
-            'send_voice_separately': { label: '语音分开发送', description: '语音分开发送', hint: '开启后，每句话将单独作为一条语音消息发送。（QQ官方平台受限，建议关闭）', required: false, type: 'boolean', condition: { separate_send: true }, default: false },
+            'send_voice_separately': { label: '语音分开发送', description: '语音分开发送', hint: '开启后，每句话将单独作为一条语音消息发送。（QQ官方机器人平台受限，建议关闭；NapCat可开启）', required: false, type: 'boolean', condition: { separate_send: true }, default: false },
             'dynamic_sleep': { label: '动态等待', description: '根据语音时长动态等待', hint: '开启后，分开发送时会根据音频实际时长动态等待。', required: false, type: 'boolean', condition: { send_voice_separately: true }, default: true },
             'text_separate': { label: '文本分开发送', description: '文本分开发送', hint: '开启后，在语音合并发送的前提下，文本将按句逐条发送。', required: false, type: 'boolean', condition: { separate_send: true }, default: false },
             'only_private': { label: '仅响应私聊', description: '仅响应私聊', hint: '开启后，群聊仅在被@时响应。', required: false, type: 'boolean', default: false },
-            'group_need_at': { label: '群聊需要@才回复', description: '群聊中仅当消息@机器人时才触发回复', hint: '开启后，群聊里没有@机器人的消息会被忽略（引用机器人消息视同@）。关闭则恢复旧的「群聊全部回复」行为。', required: false, type: 'boolean', default: true },
+            'group_need_at': { label: '群聊需要@才回复', description: '群聊中仅当消息@机器人时才触发回复', hint: '开启后，群聊里没有@机器人的消息会被忽略（引用机器人消息视同@）。关闭则恢复旧的「群聊全部回复」行为。', required: false, type: 'boolean', condition: { only_private: false }, default: true },
             'auto_start_tts': { label: '自动启动 TTS 服务', description: '【推荐开启】一键启动本地 TTS 服务', hint: '开启后，插件会自动检测后台服务是否在线并自动启动。', required: false, type: 'boolean', default: true },
-            'tts_start_script': { label: 'TTS 启动脚本路径', description: '【必填】TTS 后端启动命令', hint: '填写 api_v2.py 当前所在的文件夹路径即可。', required: true, type: 'string', condition: { auto_start_tts: true } },
+            'tts_start_script': { label: 'TTS 启动脚本路径', description: '【必填】TTS 后端启动命令', hint: '填写 api_v2.py 当前所在的文件夹路径即可（即含有 __pycache__ 和 GPT-Sovits 文件夹的路径）。', required: true, type: 'path', condition: { auto_start_tts: true } },
             'device': { label: 'TTS 合成设备', description: 'TTS 合成设备', hint: '选择 CUDA 使用显卡（GPU），选择 CPU 使用处理器。', required: false, type: 'string', options: ['cuda', 'cpu'], condition: { auto_start_tts: true }, default: 'cuda' },
             'llm_judge': { label: 'LLM 自动判别情绪', description: '是否使用 LLM 自动判别情绪', hint: '开启后，大模型会根据语境自动从文件夹中挑一个情绪；关闭则固定使用默认情绪。', required: false, type: 'boolean', default: true },
             'display_lang': { label: '显示文本语言', description: '显示文本语言', hint: '选择发送消息时文字的语言，可选：中文（zh）、日语（ja）、英语（en）、韩语（ko）或跟随语音（auto）。', required: false, type: 'string', options: ['zh', 'ja', 'en', 'ko', 'auto'], condition: { llm_judge: true }, default: 'zh' },
             'default_voice': { label: '默认情绪', description: '默认情绪', hint: 'LLM 未开启或判别失败时使用，必须与文件夹名一致（例如 pingjing）。', required: false, type: 'string', condition: { llm_judge: false }, default: 'pingjing' },
+            'tts_debug_log': { label: 'TTS 详细日志', description: '每次合成打印完整台词与合成参数', hint: '排查"语音少词"时打开：日志会打印 LLM 传来的完整内容、实际送去合成的文本、参考音频与切分方式。', required: false, type: 'boolean', default: false },
+            'tts_char_map': { label: 'TTS 字符替换表', description: '【可选】每行一条，格式：原字符=替换内容', hint: '默认已内置常见符号（—— → ～、♪ → 空 等）。想按自己的 TTS 服务调整时在这里覆盖，例如 ——=、 或 ♪=～。留空使用内置默认。', required: false, type: 'text' },
+            'image_identity_guard_enabled': { label: '图片身份规则', description: '告诉模型用户发的图/表情包不是角色自己', hint: '建议开启：避免模型把用户的表情包当成"这是我""我的照片"。', required: false, type: 'boolean', default: true },
+            'emotion_guide_enabled': { label: '情绪判定规则引导', description: '在系统提示词里写明每个情绪的使用时机，避免模型一律填默认情绪', hint: '强烈建议开启：关闭后模型会更容易把所有句子都判成默认情绪（例如 pingjing）。开启后，亲密/成人语境会强制优先使用害羞（haixiu）。', required: false, type: 'boolean', default: true },
+            'emotion_guide_extra': { label: '自定义情绪判定补充规则', description: '【可选】追加到情绪判定规则后的自定义说明', hint: '例如：只要主人夸我可爱，就必须用 haixiu。留空则不追加。', required: false, type: 'text' },
             'voice_transition': { label: '语气渐变', description: '语气渐变', hint: '开启后，不同情绪句子之间将平滑过渡。', required: false, type: 'boolean', default: true },
             'breathing_gap_ms': { label: '呼吸间隙（毫秒）', description: '呼吸间隙（毫秒）', hint: '前一句说完后的停顿时间，默认 100。', required: false, type: 'int', condition: { voice_transition: true }, default: 100 },
             'crossfade_ms': { label: '交叉渐变长度（毫秒）', description: '交叉渐变长度（毫秒）', hint: '两句话重叠过渡的时长，默认 300。', required: false, type: 'int', condition: { voice_transition: true }, default: 300 },
@@ -424,19 +732,41 @@
             'llm_emotion_intensity': { label: '允许 LLM 自动判断情绪强度', description: '开启后，AI 会为每句话评估一个 0~1 的情绪强烈程度，插件会自动调整语音的随机性和音色丰富度。', hint: '关闭则所有句子使用相同的语音变化幅度。', required: false, type: 'boolean', default: true },
             'intensity_to_temperature': { label: '情绪强度对语音变化幅度的影响', description: '当 LLM 判断某句话情绪越强烈时，语音的随机性会适当增加。', hint: '建议保持默认 0.3，如感觉语音过于平淡可略微调高。', required: false, type: 'float', condition: { llm_emotion_intensity: true }, default: 0.3 },
             'intensity_to_top_k': { label: '情绪强度对语音音色丰富度的影响', description: '情绪越强烈，语音合成时会从更多的候选音色中挑选，使语气变化更丰富。', hint: '建议保持默认 10，如感觉声音不稳定可适当调低。', required: false, type: 'float', condition: { llm_emotion_intensity: true }, default: 10.0 },
+            /* ===== 回复审判与心情 ===== */
+            'reply_judge_enabled': { label: 'LLM 判断是否需要回复（回复审判）', description: '收到消息后先用 LLM 判断这一条要不要开口回复；判定"不需要"时本轮就不回复', hint: '与下面的「心情值」是**两个独立开关**：只想让角色有心情、不想让它漏回消息，就只开心情值、关掉这一项。开启后每次回复前会多一次 LLM 调用，延迟略有增加。', required: false, type: 'boolean', default: false },
+            'mood_enabled': { label: '记录角色心情值', description: '每次收到消息时用 LLM 评估该消息让角色心情变化多少，并持久化保存', hint: '与「回复审判」独立：关闭回复审判、只开这一项时，心情照常涨落，但**任何消息都会被回复**（不会再出现"角色觉得这条不值得回"而漏回）。统计面板里的「角色心情值」用的就是这份数据。', required: false, type: 'boolean', default: true },
+            'reply_judge_prompt': { label: '回复审判提示词', description: '告知 LLM 如何判定是否回复、心情如何增减的指令（自动附加角色人格提示词）', hint: '要求只输出JSON：should_reply / mood_delta / mood_reason。只开心情值、关闭回复审判时，系统会自动追加"本次只需判断是否回复"的说明，不评估心情。', required: false, type: 'text', condition: { reply_judge_enabled: true } },
+            'reply_judge_mood_min': { label: '心情值下限', description: '心情值的下限', hint: '默认 0。', required: false, type: 'int', condition: { mood_enabled: true }, default: 0 },
+            'reply_judge_mood_max': { label: '心情值上限', description: '心情值的上限', hint: '默认 100。', required: false, type: 'int', condition: { mood_enabled: true }, default: 100 },
+            'reply_judge_mood_initial': { label: '初始心情值', description: '新会话的初始心情值', hint: '默认 60。', required: false, type: 'int', condition: { mood_enabled: true }, default: 60 },
+            'reply_judge_mood_delta_max': { label: '单次心情变化上限', description: '每次审判允许的心情增减绝对值上限', hint: 'LLM 给出的 mood_delta 会限制在此范围内，默认 10。', required: false, type: 'int', condition: { mood_enabled: true }, default: 10 },
+            'reply_judge_mood_low': { label: '心情低迷下限', description: '心情值不高于该值时，回复概率固定为「心情最低回复概率」', hint: '默认 30。仅当同时开启「回复审判」时才会用概率门控影响回复。', required: false, type: 'int', condition: { mood_enabled: true, reply_judge_enabled: true }, default: 30 },
+            'reply_judge_mood_high': { label: '心情低迷上限', description: '心情值不低于该值时，回复概率恢复为「心情恢复回复概率」', hint: '默认 60（与初始心情值相同）。心情介于上下限之间时概率线性过渡。', required: false, type: 'int', condition: { mood_enabled: true, reply_judge_enabled: true }, default: 60 },
+            'reply_judge_prob_low': { label: '心情最低回复概率', description: '心情值处于最低谷时仍开口回复的概率', hint: '0~1，默认 0.2。', required: false, type: 'float', condition: { mood_enabled: true, reply_judge_enabled: true }, default: 0.2 },
+            'reply_judge_prob_high': { label: '心情恢复回复概率', description: '心情值恢复正常后开口回复的概率', hint: '0~1，默认 1.0（完全由 LLM 的 should_reply 决定）。', required: false, type: 'float', condition: { mood_enabled: true, reply_judge_enabled: true }, default: 1.0 },
             /* ===== 定时任务与主动消息 ===== */
             'scheduler_enabled': { label: '定时任务总开关', description: '开启后自定义定时任务与问候检查才会运行', hint: '任务列表在「定时任务」页面管理。', required: false, type: 'boolean', default: true },
-            'proactive_enabled': { label: '主动消息（闲置唤醒）', description: '长时间未互动时主动开口找话题', hint: '仅对程序运行期间活跃过的会话生效。', required: false, type: 'boolean', default: false },
+            'proactive_enabled': { label: '主动消息（闲置唤醒）', description: '长时间未互动时主动开口找话题', hint: '对聊天记录里存在过的所有会话生效：程序启动时会按每个会话最后一次用户发言时间恢复闲置计时，重启后依然会主动开口。', required: false, type: 'boolean', default: false },
             'proactive_idle_minutes': { label: '闲置阈值（分钟）', description: '超过该时长未互动即视为闲置', hint: '默认 30 分钟。', required: false, type: 'int', default: 30 },
+            'proactive_idle_jitter': { label: '主动消息时间抖动（分钟/区间）', description: '在闲置时间基础上再随机延迟一段时间再发送，单位：分钟', hint: '支持单个数字（如 10 = 0~10 分钟）或区间（如 5~15 / 5,15 / 5 15 / 5，15），分隔符支持 ~ ～ 空格 , ， 、。默认 5~15。', required: false, type: 'string', default: '5~15' },
             'proactive_check_seconds': { label: '检查间隔（秒）', description: '每隔多少秒检查一次闲置会话', hint: '默认 300 秒。', required: false, type: 'int', default: 300 },
             'proactive_max_per_day': { label: '单会话每日上限', description: '每个会话每天最多主动消息次数', hint: '默认 2 次，防止打扰。', required: false, type: 'int', default: 2 },
+            'proactive_wait_reply': { label: '回复前不再主动', description: '主动消息发出后，用户回复之前不再发送新的主动消息', hint: '默认开启。用户在会话里发出任意消息后即恢复主动开口资格（标记跨重启保留）；关闭后维持原行为——闲置时间一到就可能再次主动。', required: false, type: 'boolean', condition: { proactive_enabled: true }, default: true },
             'proactive_quiet_start': { label: '静默时段开始', description: '该时段内不发送主动消息', hint: '格式 HH:MM，默认 23:00。', required: false, type: 'string', default: '23:00' },
             'proactive_quiet_end': { label: '静默时段结束', description: '静默时段结束时间', hint: '格式 HH:MM，默认 08:00（支持跨零点）。', required: false, type: 'string', default: '08:00' },
             'proactive_prompt': { label: '主动开场白指令', description: '让 LLM 生成开场白时的指令', hint: '告诉模型在什么情境下说什么。', required: false, type: 'text' },
+            'proactive_text_max_chars': { label: '主动消息/提醒话术字数上限', description: '生成的文本超过该字数就直接丢弃，不会发送', hint: '默认 120。防止推理模型的思考内容或超长文本被合成成一分钟以上的语音；想让主动消息更长可以调大（如 200）。', required: false, type: 'int', default: 120 },
             'proactive_voice': { label: '主动消息附带语音', description: '主动消息是否合成语音', hint: '需要 TTS 服务在线。', required: false, type: 'boolean', default: false },
             'proactive_sticker': { label: '主动消息附带表情包', description: '发送主动消息时随机附带一张表情', hint: '需开启表情包功能并有可用图片。', required: false, type: 'boolean', default: false },
+            'history_context_recent': { label: '主动消息/问候携带的历史条数', description: '主动消息与节日问候生成时，把最近几条对话**全文**发给模型', hint: '默认 6 条。设为 0 则不携带历史（回到"凭空开场"的旧行为）。历史越长越能承接话题，但模型请求也会慢一些。', required: false, type: 'int', condition: { proactive_enabled: true }, default: 6 },
+            'history_context_summary_chars': { label: '更早历史的摘要字数', description: '比"最近几条"更早的对话用摘要压缩描述的字数上限', hint: '默认 400 字。摘要来自「对话上下文自动摘要」（summary_enabled）；没开摘要时会退化成"最早几条各截一小段"。', required: false, type: 'int', condition: { proactive_enabled: true }, default: 400 },
+            'history_context_max_chars': { label: '历史提示块总字数上限', description: '整段历史提示最多占多少字符', hint: '默认 1600 字。调大会拖慢模型并挤占上下文，建议不超过 3000。', required: false, type: 'int', condition: { proactive_enabled: true }, default: 1600 },
             'greeting_events_enabled': { label: '节日/纪念日问候', description: '按日期自动发送节日问候', hint: '事件列表在「定时任务」页面管理。', required: false, type: 'boolean', default: true },
             'greeting_check_time': { label: '问候检查时刻', description: '每天几点检查节日与生日', hint: '格式 HH:MM，默认 08:00。', required: false, type: 'string', default: '08:00' },
+            'greeting_catchup_enabled': { label: '错过问候时间后补发', description: '程序在问候时间之后才启动时，立即补发当天漏掉的节日/生日问候', hint: '默认开启。启动后会等待 NapCat 连接（见下一项的超时时间），连上即补发；静默时段内启动不补发（避免深夜打扰）。已发过的问候按日志去重，不会重复发送。每次跳过都会在日志里写明原因。', required: false, type: 'boolean', condition: { greeting_events_enabled: true }, default: true },
+            'greeting_catchup_deadline_minutes': { label: '补发等待 NapCat 的超时（分钟）', description: '启动补发最多等多久 NapCat 连上，超时才放弃本次补发', hint: '默认 30 分钟。以前写死 5 分钟：先开程序、后开 NapCat 的用户经常等不到连接，补发就静默失败了（日志里只看到等待、没有实际发送）。', required: false, type: 'int', condition: { greeting_events_enabled: true, greeting_catchup_enabled: true }, default: 30 },
+            'default_events_enabled': { label: '内置默认节日问候', description: '注入元旦、情人节、劳动节、国庆节、圣诞节等默认节日，由 LLM 生成问候语', hint: '默认关闭。开启后自动合并进「定时任务」页的事件列表（不会覆盖你已有的事件）；仅含公历固定节日，春节、中秋等农历节日请按当年公历日期自行添加。每个节日可在事件列表里单独停用。', required: false, type: 'boolean', condition: { greeting_events_enabled: true }, default: false },
+            'default_events_to_all': { label: '默认节日发给全部会话', description: '默认节日事件未指定发送目标时，发给所有已知会话', hint: '关闭后，未设置目标的默认节日不会发送，需要在「定时任务」页为事件手动指定目标。', required: false, type: 'boolean', condition: { greeting_events_enabled: true, default_events_enabled: true }, default: true },
             'birthday_greeting_enabled': { label: '用户生日自动祝福', description: '根据用户画像中的生日自动送上祝福', hint: '生日在「高级功能 → 用户画像」中维护。', required: false, type: 'boolean', default: true },
             'birthday_greet_template': { label: '生日祝福话术', description: '生日祝福模板，支持 {nickname} 占位符', hint: '模式为 llm 时作为生成指令使用。', required: false, type: 'text' },
             'birthday_greet_mode': { label: '生日祝福模式', description: 'template=直接发送话术；llm=由角色生成', hint: 'llm 模式下话术作为生成指令。', required: false, type: 'string', options: ['template', 'llm'], default: 'template' },
@@ -445,16 +775,30 @@
             'todo_enabled': { label: '待办提醒功能', description: '从聊天中提取提醒事项并到点发送提醒', hint: '提取方式见下一项。', required: false, type: 'boolean', default: false },
             'todo_extract_mode': { label: '待办提取方式', description: 'regex=正则匹配（快）；llm=大模型提取（准）；off=仅手动添加', hint: 'llm 模式仅在消息包含关键词时触发。', required: false, type: 'string', options: ['regex', 'llm', 'off'], default: 'regex' },
             'todo_voice': { label: '提醒附带语音', description: '提醒消息是否合成语音', hint: '需要 TTS 服务在线。', required: false, type: 'boolean', default: false },
-            'todo_remind_template': { label: '提醒话术模板', description: '到点发送的提醒内容模板，{content} 为事项', hint: '默认：⏰ 提醒时间到啦：{content}', required: false, type: 'string' },
-            'todo_keywords': { label: '触发关键词（每行一个）', description: '消息包含任一关键词才尝试提取待办', hint: '留空则对所有消息尝试提取（不推荐）。', required: false, type: 'text' },
-            'todo_regex_patterns': { label: '待办正则（每行一个）', description: '每个正则需包含两个捕获组：第1组=时间表达式，第2组=事项内容', hint: '支持 “X分钟后 / X小时后 / HH:MM / 明天HH点MM分” 等写法。', required: false, type: 'text' },
-            'todo_extract_prompt': { label: 'LLM 提取提示词', description: 'llm 提取方式使用的提示词', hint: '要求模型输出 JSON：has_todo/content/delay_minutes/time。', required: false, type: 'text' },
+            'todo_voice_emotion': { label: '提醒语音使用的情绪', description: '提醒语音用哪套参考音色', hint: '填情绪文件夹名（如 pingjing / haixiu），留空或填错会回退角色默认情绪。', required: false, type: 'string', default: 'pingjing' },
+            'todo_remind_mode': { label: '提醒话术生成方式', description: 'llm=让角色用自己的人设现场说一句提醒；preset=固定模板', hint: 'llm 模式会多一次模型请求；若模型失败或生成内容没包含提醒事项，会自动回退到下面的预设模板，不会漏提醒。', required: false, type: 'string', options: ['llm', 'preset'], default: 'llm' },
+            'todo_remind_prompt': { label: '提醒话术提示词（LLM 模式）', description: '【可选】自定义提醒话术的风格要求', hint: '留空使用内置规则（角色语气、一句话、必须说出事项内容）。', required: false, type: 'text' },
+            'todo_remind_template': { label: '提醒话术模板（预设模式）', description: '到点发送的提醒内容模板，{content} 为事项', hint: '默认：⏰ 提醒时间到啦：{content}', required: false, type: 'string' },
+            'todo_keywords': { label: '触发关键词（每行一个）', description: '消息包含任一关键词才尝试提取待办', hint: '这是待办提取的第一道门槛：消息必须包含这里任意一个词才会进入提取流程。默认包含「提醒 / 待办 / 别忘了 / 记得 / 叫我」。如果你把「叫我」删掉，「8点半叫我起床」这类消息会被直接跳过（日志里会提示"看起来是提醒请求但未命中触发关键词"）。留空则对所有消息尝试提取（不推荐）。', required: false, type: 'text' },
+            'todo_regex_patterns': { label: '待办正则（每行一个）', description: '每个正则需包含两个捕获组：第1组=时间表达式，第2组=事项内容', hint: '支持 “X分钟后 / X小时后 / HH:MM / 明天HH点MM分 / 8点半可以叫我起床” 等写法。留空使用内置默认正则（已覆盖"时间+可以+叫我+事项"这类语序）。', required: false, type: 'text' },
+            'todo_extract_prompt': { label: 'LLM 提取提示词', description: 'llm 提取方式使用的提示词', hint: '要求模型输出 JSON：has_todo/content/time/delay_minutes。注意：无论这里填什么，系统都会在这段提示词后面**强制追加**一段硬性约束（content 不许是时间短语；用户说了钟点就必须用 time、不许自己算分钟差；用户没说过相对时长就不许编造 delay_minutes）。留空则使用内置默认提示词。', required: false, type: 'text' },
             /* ===== 表情包 ===== */
             'stickers_enabled': { label: '表情包功能', description: '按情绪随机附带表情图片', hint: '图片在「高级功能 → 表情包」中上传管理。', required: false, type: 'boolean', default: false },
-            'stickers_dir': { label: '表情包目录', description: '表情图片根目录', hint: '留空使用 data/stickers；每个子文件夹为一种情绪分类。', required: false, type: 'string' },
+            'stickers_dir': { label: '表情包目录', description: '表情图片根目录', hint: '留空使用 data/stickers；每个子文件夹为一种情绪分类。可点「浏览」直接选择。', required: false, type: 'path' },
             'sticker_probability': { label: '表情包触发概率', description: '0~1，每次回复附带表情的概率', hint: '默认 1.0（每次都带）。', required: false, type: 'float', default: 1.0 },
             'sticker_max_per_reply': { label: '单次回复最多表情数', description: '限制一次回复附带表情的数量', hint: '当前每回复最多 1 张，默认即 1。', required: false, type: 'int', default: 1 },
             'sticker_every_sentence': { label: '逐句附带表情', description: '语音逐句发送时每句都可能带表情', hint: '仅在「语音分开发送」模式下生效。', required: false, type: 'boolean', default: false },
+            'sticker_capture_enabled': { label: '识图自动收藏表情', description: '识图时若 LLM 判定图片有趣/值得收藏，自动存入表情包对应分类', hint: '需同时开启「表情包功能」。收藏判定搭车在同一次识图调用内完成，不额外增加模型请求。', required: false, type: 'boolean', condition: { stickers_enabled: true }, default: false },
+            'sticker_capture_prompt': { label: '收藏判定指令', description: '附加给识图模型的判定指令，要求其可选的额外输出收藏JSON', hint: '默认：值得收藏时才输出 {"sticker_capture": true, "category": ..., "reason": ...}。', required: false, type: 'text', condition: { sticker_capture_enabled: true } },
+            'sticker_capture_min_score': { label: '收藏最低有趣度', description: 'LLM 输出的收藏价值评分(score 0~1)需不低于该值才保存', hint: '默认 0.7；调高可更严格（减少“什么都保存”）。', required: false, type: 'float', condition: { sticker_capture_enabled: true }, default: 0.7 },
+            'sticker_capture_min_interval': { label: '收藏最小间隔（秒）', description: '两次自动收藏之间的最短时间间隔', hint: '防止短时间内重复收藏，默认 300 秒。', required: false, type: 'int', condition: { sticker_capture_enabled: true }, default: 300 },
+            'sticker_capture_max_per_day': { label: '每日收藏上限', description: '每天最多自动收藏的表情数量', hint: '默认 20，0 表示不限。', required: false, type: 'int', condition: { sticker_capture_enabled: true }, default: 20 },
+            'sticker_capture_any_pool': { label: '收藏时同时放入 any 通用池', description: '收藏的图片除存进情绪分类目录外，再存一份到 any 目录', hint: '建议开启：any 池是所有情绪都可抽到的通用池，关闭后新收藏的图只有对应情绪才会发出。', required: false, type: 'boolean', condition: { sticker_capture_enabled: true }, default: true },
+            'sticker_capture_require_verdict': { label: '必须给出明确收藏判定', description: '模型没明确说要收藏时，一律不收藏', hint: '建议开启：关闭后模型"没表态"的图片也会被收藏，容易出现无意义/无文字图片被误收。', required: false, type: 'boolean', condition: { sticker_capture_enabled: true }, default: true },
+            'sticker_capture_min_reason_chars': { label: '收藏理由最少字数', description: '收藏理由太笼统（如只写"好看""有趣"）就视为无效判定', hint: '默认 6 字。判定理由必须说清使用场景才允许收藏。', required: false, type: 'int', condition: { sticker_capture_enabled: true }, default: 6 },
+            'sticker_capture_skip_if_unfit': { label: '不适合当表情包就不收藏', description: '分类判定为"不适合"（纯风景/阴森/无互动用途）时直接跳过，不落盘', hint: '建议开启：关闭后这类图会被塞进兜底分类，污染表情库。', required: false, type: 'boolean', condition: { sticker_capture_enabled: true }, default: true },
+            'sticker_capture_preserve_formats': { label: '保留原格式的图片类型', description: '这些格式收藏时不重编码，避免动图被压成单帧静态图', hint: '默认 gif,webp。逗号分隔；清空则所有图片都重编码（动图会丢帧）。', required: false, type: 'string', condition: { sticker_capture_enabled: true }, default: 'gif,webp' },
+            'sticker_capture_max_side': { label: '表情包最大边长（像素）', description: '超过该边长的静态图会被等比缩小', hint: '默认 400；设为 0 表示不缩放。动图（上面的保留格式）不受影响。', required: false, type: 'int', condition: { sticker_capture_enabled: true }, default: 400 },
             /* ===== 多角色 ===== */
             'multi_role_enabled': { label: '多角色对话', description: '群聊中 @ 或提及角色名时由对应角色回复', hint: '每个角色使用独立的人设与语音配置（在多角色配置中维护）。', required: false, type: 'boolean', default: false },
             'multi_role_max_replies': { label: '单条消息最多角色回复数', description: '一次@多个角色时最多几个角色依次回复', hint: '默认 2。', required: false, type: 'int', default: 2 },
@@ -462,11 +806,30 @@
             'multi_role_max_total': { label: '单条消息总回复上限', description: '含角色互动在内一次消息最多产生的回复总数', hint: '默认 6，防止刷屏。', required: false, type: 'int', default: 6 },
             /* ===== 工具调用 ===== */
             'tools_enabled': { label: '工具调用 (Function Calling)', description: '允许 LLM 调用外部工具并将结果融入回复', hint: '工具列表在「高级功能 → 工具调用」中管理，每个工具可单独启用与授权。', required: false, type: 'boolean', default: false },
-            'tools_allow_commands': { label: '允许命令类工具', description: '是否允许执行自定义命令行工具（高风险）', hint: '仅在你完全理解工具定义内容时开启。', required: false, type: 'boolean', default: false },
-            'tools_max_iterations': { label: '工具调用最大轮数', description: '单次回复中 LLM 最多连续调用工具的轮数', hint: '默认 3 轮。', required: false, type: 'int', default: 3 },
+            
+            'tools_trigger_mode': { label: '工具触发方式', description: '控制 LLM 在什么条件下允许调用工具', hint: '关键词门控：消息命中触发词才进工具流程，省一次判断、最稳（推荐）；LLM 自主判断：先由系统判断这条消息是否真的需要客观信息（时间/计算/天气/搜索/链接…），需要才让模型自己决定调哪个工具，闲聊不会进工具流程；全部放行：不做任何门控，模型可能什么都去调，慎用。', required: false, type: 'string', options: ['keyword', 'llm', 'always'], condition: { tools_enabled: true }, default: 'keyword' },
+            'tools_skip_pure_chatter': { label: '纯寒暄/纯情绪不调用工具', description: '「在吗」「今天好累」这类没有客观信息需求的消息，不进入工具调用流程', hint: '默认开启，仅「LLM 自主判断」模式生效。开启后角色不会被工具拖慢回复节奏；关闭则每条消息都让模型自己决定要不要用工具。', required: false, type: 'boolean', condition: { tools_enabled: true, tools_trigger_mode: 'llm' }, default: true },
+            'tools_allow_commands': { label: '允许命令类工具', description: '是否允许执行自定义命令行工具（高风险）', hint: '仅在你完全理解工具定义内容时开启。', required: false, type: 'boolean', condition: { tools_enabled: true }, default: false },
+            'tools_max_iterations': { label: '工具调用最大轮数', description: '单次回复中 LLM 最多连续调用工具的轮数', hint: '默认 3 轮。', required: false, type: 'int', condition: { tools_enabled: true }, default: 3 },
+            'tool_notes_max_entries': { label: '工具结果备查条数', description: '每轮回复随历史保存的工具结果最大条数', hint: '默认 4 条。备查会随历史回放进上下文，供"你唱一段我听听"这类追问直接引用，避免同一内容反复搜索。', required: false, type: 'int', condition: { tools_enabled: true }, default: 4 },
+            'tool_notes_max_chars': { label: '工具结果备查单条字数', description: '每条工具结果存入备查的最大字符数', hint: '默认 500 字。回放进上下文的总量约为 条数×单条字数，调太大容易挤占模型上下文。', required: false, type: 'int', condition: { tools_enabled: true }, default: 500 },
+            'tool_log_output_chars': { label: '工具输出日志字数上限', description: '[工具调用] 日志每条最多打印的字符数', hint: '0 = 完整输出（默认，推荐）。设为正数可压缩日志体积。', required: false, type: 'int', condition: { tools_enabled: true }, default: 0 },
+            'tool_uncertain_fallback': { label: '自称不知道时强制补搜', description: '模型没调用工具、回答却说"不知道/没听说过"且用户在问具体事物时，系统替它搜索一轮再重新作答', hint: '默认开启。支持中文与日文（角色说日语时同样识别）。搜索词自动从问句提取。', required: false, type: 'boolean', condition: { tools_enabled: true }, default: true },
+            'search_prefetch_enabled': { label: '搜索请求直接预取', description: '用户消息明确表达搜索请求（搜/查一下/帮我搜…）时，系统直接执行搜索并把结果交给模型，不依赖模型自己发起工具调用', hint: '默认开启。量化模型/无审查模型经常不输出工具调用（有的 GGUF 模板不支持工具），这个开关保证"明确要搜就一定搜"。日志中以 [搜索预取] 标记。', required: false, type: 'boolean', condition: { tools_enabled: true }, default: true },
+            'search_query_llm_extract': { label: '搜索关键词由 LLM 提取', description: '预取搜索前先让模型从用户消息里提取搜索关键词（剔除口语与无关字符），失败或超时自动回退规则提取', hint: '默认开启。注意：推理型模型思考较慢，提取会多花几秒到几十秒；配合关闭模型 Thinking 效果最佳。', required: false, type: 'boolean', condition: { tools_enabled: true }, default: true },
+            'search_links_auto_append': { label: '网页搜索自动返回链接', description: '回复里没写链接时，把本轮搜索结果中"模型确实提到过"的链接补进消息；回复没提到任何结果就不补', hint: '默认开启。只补与回复内容对应的链接（按结果标题/域名比对），不会把无关链接塞给用户；用户明确索要链接时会放宽一档，按相关度取前几条。此前已经发过的链接不会重复发送。', required: false, type: 'boolean', condition: { tools_enabled: true }, default: true },
+            'search_links_max': { label: '自动返回链接条数上限', description: '一次回复最多补几条链接', hint: '默认 3 条。', required: false, type: 'int', condition: { tools_enabled: true, search_links_auto_append: true }, default: 3 },
+            'tools_guard_enabled': { label: '工具调用需求门控', description: '消息不含任何工具触发词时不让 LLM 使用工具，避免误调', hint: '触发词见下一项；留空关键词 = 关闭门控。', required: false, type: 'boolean', condition: { tools_enabled: true, tools_trigger_mode: 'keyword' }, default: true },
+            'tools_guard_keywords': { label: '工具触发词（每行一个）', description: '消息包含任一触发词才进入工具调用流程', hint: '如 几点/计算/天气/搜索/网址 等；包含 http 链接也会放行。', required: false, type: 'text', condition: { tools_enabled: true, tools_trigger_mode: 'keyword', tools_guard_enabled: true } },
+            /* ===== 联网搜索：安全搜索与结果条数 ===== */
+            'web_search_safe': { label: '安全搜索', description: '搜索结果的安全过滤强度', hint: '无：不限制任何搜索；一般（默认）：允许搜到 R16+ 的站点，但不允许 R18（成人向）内容；严格：连低俗、性暗示的站点与内容一并过滤。除关键词过滤外，还会按档位给支持安全搜索的引擎（SearXNG/Bing/Google News/Brave 等）带上它们各自的安全搜索参数。', required: false, type: 'string', options: ['off', 'normal', 'strict'], condition: { tools_enabled: true }, default: 'normal' },
+            'web_search_max_results': { label: '每次搜索返回条数', description: '单次搜索最多把多少条结果交给模型', hint: '默认 10。调大可拿到更多候选，但会和下一项的字数预算一起竞争。', required: false, type: 'int', condition: { tools_enabled: true }, default: 10 },
+            'web_search_result_chars': { label: '单条结果摘要字数', description: '每条结果保留多少字的摘要', hint: '默认 240 字。摘要不会被拦腰截断，超预算时整条省略并说明省了几条。', required: false, type: 'int', condition: { tools_enabled: true }, default: 240 },
+            'web_search_max_chars': { label: '搜索总字数预算', description: '一次搜索交给模型的全部结果最多占多少字符', hint: '默认 4000。预算用完时后面几条会被整条省略（摘要绝不截半句），模型会看到"因长度限制省略 N 条"。条数与字数要一起调：条数×每条约 300 字，预算要比它略大才能全部给出。', required: false, type: 'int', condition: { tools_enabled: true }, default: 4000 },
             /* ===== RAG ===== */
             'rag_enabled': { label: '知识库 RAG', description: '回答前自动检索本地知识库并注入相关内容', hint: '文档在「高级功能 → 知识库 RAG」中上传。', required: false, type: 'boolean', default: false },
-            'rag_embedding_model': { label: '嵌入模型名称', description: '用于向量化的模型', hint: 'Ollama 可先执行 ollama pull nomic-embed-text。', required: false, type: 'string', default: 'nomic-embed-text' },
+            'rag_embedding_backend': { label: 'RAG 嵌入后端', description: 'Embedding 接口类型', hint: '留空则跟随 LLM 接口类型。ollama：本地 Ollama；openai：云端 OpenAI 兼容接口。', required: false, type: 'string', options: ['', 'ollama', 'openai'], default: '' },
+            'rag_embedding_model': { label: '嵌入模型名称', description: '用于向量化的模型', hint: 'Ollama 留空默认使用 nomic-embed-text；云端 API 请使用 llm_embedding_model。', required: false, type: 'string', default: '' },
             'rag_chunk_size': { label: '分块大小（字符）', description: '文档切分的块大小', hint: '默认 500 字符。', required: false, type: 'int', default: 500 },
             'rag_chunk_overlap': { label: '分块重叠（字符）', description: '相邻块重叠字符数', hint: '默认 80。', required: false, type: 'int', default: 80 },
             'rag_top_k': { label: '检索条数', description: '每次检索返回的最相关片段数', hint: '默认 3。', required: false, type: 'int', default: 3 },
@@ -476,6 +839,7 @@
             'profiles_enabled': { label: '用户画像', description: '按用户记录偏好并在对话中注入', hint: '数据在「高级功能 → 用户画像」中查看编辑。', required: false, type: 'boolean', default: false },
             'profiles_auto_extract': { label: '画像自动提取', description: '对话后由 LLM 自动提取用户信息', hint: '每次回复后会额外进行一次轻量 LLM 调用。', required: false, type: 'boolean', default: false },
             'profiles_max_chars': { label: '画像注入最大长度', description: '注入提示词的画像文本最大字符数', hint: '默认 300。', required: false, type: 'int', default: 300 },
+            'profiles_extract_prompt': { label: '画像自动提取提示词', description: 'LLM 自动提取用户画像时使用的指令（要求只输出JSON）', hint: '默认提示词已包含铁律：只收录用户本人的称呼/喜好/厌恶，禁止把角色信息误当成用户画像。', required: false, type: 'text' },
             'profiles_inject_template': { label: '画像注入模板', description: '注入系统提示词的模板，{profile} 为画像内容', hint: '默认：【用户画像】关于当前用户的已知信息：{profile}', required: false, type: 'text' },
             /* ===== 动态上下文 ===== */
             'enable_time_awareness': { label: '现实时间感知', description: '开启后，会将当前时间告知 LLM 模型，使其了解现实时间。', hint: '(时间使用运行本程序的计算机本地时间，时区由系统决定。)', required: false, type: 'boolean', default: false },
@@ -488,12 +852,63 @@
             'topic_summary_prompt': { label: '话题检测提示词', description: '生成当前话题总结使用的指令', hint: '要求输出一句话话题。', required: false, type: 'text' },
             'webui_enabled': { label: '启用 WebUI', description: '是否启用 WebUI 管理界面', hint: '开启后可通过浏览器访问管理界面。', required: false, type: 'boolean', default: true },
             'webui_host': { label: 'WebUI 主机地址', description: 'WebUI 监听地址', hint: '默认 127.0.0.1 仅本机可访问。', required: false, type: 'string', condition: { webui_enabled: true }, default: '127.0.0.1' },
-            'webui_port': { label: 'WebUI 端口', description: 'WebUI 端口号', hint: '默认 11500，请确保端口未被占用。', required: false, type: 'int', condition: { webui_enabled: true }, default: 11500 }
+            'webui_port': { label: 'WebUI 端口', description: 'WebUI 端口号', hint: '默认 11500，请确保端口未被占用。', required: false, type: 'int', condition: { webui_enabled: true }, default: 11500 },
+            'webui_password': { label: 'WebUI 访问密码', description: '设置后所有聊天记录等数据需输入密码才能查看', hint: '留空 = 不启用密码保护。设置后保存并刷新页面生效。', required: false, type: 'password' },
+            'webui_auth_ttl_minutes': { label: '解锁默认有效时长（分钟）', description: '登录框的默认“不再弹出”时长', hint: '0 = 仅当前标签页会话内有效（关闭页面后重新输入）。解锁时也可临时修改。', required: false, type: 'int', condition: { webui_password: true }, default: 30 },
+            'webui_log_buffer_lines': { label: '日志缓冲行数', description: '内存中保留的最大日志行数', hint: '默认 5000 行。日志页的"显示完整日志"读取的就是这份缓冲；调小可省内存，调大可回看更早的输出。', required: false, type: 'int', default: 5000 },
+            'webui_log_tail_lines': { label: '精简日志返回行数', description: '日志页默认（精简）模式每次返回的尾部行数', hint: '默认 500 行；勾选日志页的"显示完整日志"后返回全部缓冲。', required: false, type: 'int', default: 500 },
+            'separate_force_segment': { label: '分开发送时强制分段', description: 'LLM 返回一整段未分句时，按 。？！.!? 自动切分后再逐段合成与发送', hint: '仅影响“分开发送/语音分开发送/文本分开发送”模式，默认开启。', required: false, type: 'boolean', default: true },
+            'anti_spam_enabled': { label: '防刷屏（高频消息忽略）', description: '短时间内同一会话消息超过阈值时忽略多余消息，避免重复占用 LLM', hint: '默认关闭；开启后请按需调窗口与上限。', required: false, type: 'boolean', default: false },
+            'anti_spam_window_seconds': { label: '防刷屏统计窗口（秒）', description: '在多少秒内统计消息条数', hint: '默认 10 秒。', required: false, type: 'int', condition: { anti_spam_enabled: true }, default: 10 },
+            'anti_spam_max_in_window': { label: '窗口内最大消息数', description: '窗口内超过该条数后忽略后续消息', hint: '默认 5 条。', required: false, type: 'int', condition: { anti_spam_enabled: true }, default: 5 },
+            'update_check_enabled': { label: '检查更新', description: '启动后按间隔向 GitHub 检查新版本，发现更新时弹窗提醒', hint: '需要在应用内查看弹窗；纯浏览器访问同样会提示。', required: false, type: 'boolean', default: true },
+            'update_check_interval_hours': { label: '更新检查间隔（小时）', description: '两次检查之间的最小间隔', hint: '默认 24 小时。', required: false, type: 'int', condition: { update_check_enabled: true }, default: 24 },
+            'update_include_prerelease': { label: '提醒测试版更新', description: '检查更新时一并考虑预发布版本，发现更新的 beta/rc 也弹窗提醒', hint: '默认关闭：只提醒正式版。', required: false, type: 'boolean', condition: { update_check_enabled: true }, default: false }
         };
 
+        function showLoginOverlay() {
+            const m = document.getElementById('auth-modal');
+            if (m) {
+                m.classList.add('active');
+                const inp = document.getElementById('auth-pass');
+                if (inp) setTimeout(() => inp.focus(), 50);
+            }
+            const min = document.getElementById('auth-min');
+            if (min && !min.value) min.value = localStorage.getItem('ltvm_auth_min') || '30';
+        }
+        function showAuthMsg(t) {
+            const el = document.getElementById('auth-msg');
+            if (el) el.textContent = t;
+        }
+        document.getElementById('auth-ok').addEventListener('click', async () => {
+            const inp = document.getElementById('auth-pass');
+            const min = document.getElementById('auth-min');
+            showAuthMsg('');
+            try {
+                const minutes = Math.max(0, Math.min(parseInt(min && min.value, 10) || 30, 43200));
+                if (min) localStorage.setItem('ltvm_auth_min', String(minutes));
+                const resp = await fetch(`${API_BASE}/api/auth/login`, {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({password: inp.value, remember_minutes: minutes})
+                });
+                if (resp.ok) location.reload();
+                else showAuthMsg('密码错误');
+            } catch (e) { showAuthMsg('登录失败: ' + e.message); }
+        });
+        document.getElementById('auth-pass').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') document.getElementById('auth-ok').click();
+        });
+        function authOrThrow(resp) {
+            if (resp.status === 401) { showLoginOverlay(); throw new Error('需要密码'); }
+        }
         async function apiGet(path) {
             const resp = await fetch(`${API_BASE}/${path}`);
-            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            authOrThrow(resp);
+            if (!resp.ok) {
+                let msg = `HTTP ${resp.status}`;
+                try { const p = await resp.json(); if (p && p.error) msg = p.error; } catch (e) {}
+                throw new Error(msg);
+            }
             return await resp.json();
         }
         async function apiPost(path, data) {
@@ -502,13 +917,128 @@
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify(data)
             });
-            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            authOrThrow(resp);
+            if (!resp.ok) {
+                let msg = `HTTP ${resp.status}`;
+                try { const p = await resp.json(); if (p && p.error) msg = p.error; } catch (e) {}
+                throw new Error(msg);
+            }
             return await resp.json();
         }
         async function apiPostForm(path, formData) {
             const resp = await fetch(`${API_BASE}/${path}`, { method: 'POST', body: formData });
+            authOrThrow(resp);
             if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
             return await resp.json();
+        }
+        // 失败不抛异常，返回 {ok:false, error}——给文件夹选择/模型列表这类可恢复操作用
+        async function apiPostSoft(path, data) {
+            const resp = await fetch(`${API_BASE}/${path}`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(data)
+            });
+            authOrThrow(resp);
+            let payload = {};
+            try { payload = await resp.json(); } catch (e) {}
+            if (!resp.ok) return { ok: false, error: payload.error || `HTTP ${resp.status}` };
+            return payload;
+        }
+        // 路径字段 / 模型选择的「浏览」按钮：弹出系统文件夹选择对话框
+        function makeBrowseButton(input, mode) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.textContent = mode === 'model_select' ? '📁 选文件夹' : '📁 浏览';
+            btn.style.cssText = 'flex:0 0 auto;padding:6px 10px;border:1px solid #ccc;'
+                + 'border-radius:4px;background:#f7f7f7;cursor:pointer;font-size:13px;';
+            btn.addEventListener('click', async () => {
+                if (btn.disabled) return;
+                btn.disabled = true;
+                try {
+                    const picked = await apiPostSoft('api/dialog/pick_folder', {});
+                    if (!picked.ok) { alert(picked.error || '文件夹选择不可用'); return; }
+                    if (mode === 'model_select') {
+                        await chooseModelFromFolder(input, picked.path);
+                    } else {
+                        input.value = picked.path;
+                        input.dispatchEvent(new Event('change'));
+                    }
+                } catch (e) {
+                    alert('操作失败: ' + e);
+                } finally {
+                    btn.disabled = false;
+                }
+            });
+            return btn;
+        }
+        // 模型多选一时在输入框旁弹出一个下拉列表，选中即填入
+        function showModelChoice(input, keys, sourceLabel) {
+            if (!keys.length) { alert(sourceLabel + '没有找到可用模型'); return; }
+            if (keys.length === 1) {
+                input.value = keys[0];
+                input.dispatchEvent(new Event('change'));
+                return;
+            }
+            const old = input.parentElement.querySelector('.model-choice-select');
+            if (old) old.remove();
+            const sel = document.createElement('select');
+            sel.className = 'model-choice-select';
+            sel.style.cssText = 'flex:1 1 200px;min-width:200px;padding:6px 8px;'
+                + 'border:1px solid #ccc;border-radius:4px;font-size:13px;';
+            sel.appendChild(new Option(`（${sourceLabel}找到 ${keys.length} 个模型，点此选择）`, ''));
+            keys.forEach(k => sel.appendChild(new Option(k, k)));
+            sel.addEventListener('change', () => {
+                if (!sel.value) return;
+                input.value = sel.value;
+                input.dispatchEvent(new Event('change'));
+                sel.remove();
+            });
+            input.parentElement.appendChild(sel);
+        }
+        async function chooseModelFromFolder(input, folder) {
+            const scanned = await apiPostSoft('api/llm/scan_models', { folder });
+            if (!scanned.ok) { alert(scanned.error || '扫描失败'); return; }
+            const keys = [];
+            (scanned.models || []).forEach(m => (m.keys || []).forEach(k => {
+                if (!keys.includes(k)) keys.push(k);
+            }));
+            showModelChoice(input, keys, '该文件夹里');
+        }
+        async function chooseModelFromService(input) {
+            const baseInput = document.querySelector('[data-key="llm_base_url"]');
+            const backendSel = document.querySelector('[data-key="llm_backend"]');
+            const res = await apiPostSoft('api/llm/list_remote_models', {
+                base_url: baseInput ? baseInput.value : '',
+                backend: backendSel ? backendSel.value : 'ollama'
+            });
+            if (!res.ok) { alert(res.error || '获取模型列表失败'); return; }
+            showModelChoice(input, res.models || [], '服务上');
+        }
+        function showUpdateModal(info) {
+            const m = document.getElementById('update-modal');
+            if (!m) return;
+            document.getElementById('update-info').textContent =
+                `当前版本 ${info.current || '未知'}，发现新版本 ${info.latest || '未知'}`
+                + (info.prerelease ? '（测试版）' : '')
+                + `。是否前往下载更新？`;
+            m.classList.add('active');
+        }
+        document.getElementById('update-later').addEventListener('click', () => {
+            document.getElementById('update-modal').classList.remove('active');
+        });
+        document.getElementById('update-go').addEventListener('click', () => {
+            const info = window._ltvmUpdate || {};
+            if (info.url) window.open(info.url, '_blank');
+            document.getElementById('update-modal').classList.remove('active');
+        });
+        async function maybeCheckUpdate() {
+            try {
+                const r = await apiGet('api/update/status');
+                if (r && r.enabled && r.has_update) {
+                    window._ltvmUpdate = r;
+                    showUpdateModal(r);
+                }
+            } catch (e) { /* 401 已由弹窗处理；其它错误静默 */ }
         }
         function fmtTs(ts) {
             if (!ts) return '-';
@@ -528,6 +1058,8 @@
                 document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
                 document.getElementById(`panel-${panelId}`).classList.add('active');
                 if (panelId === 'config') loadConfig();
+                document.getElementById('anchor-nav').classList.toggle('active', panelId === 'config');
+                document.getElementById('float-actions').classList.toggle('active', panelId === 'config');
                 if (panelId === 'chat') loadChatList();
                 if (panelId === 'audio') loadAudioPage();
                 if (panelId === 'tasks') loadTasksPage();
@@ -539,7 +1071,24 @@
             });
         });
 
-        function renderConfigForm(config) {
+        function applyFieldValue(key, value) {
+            const control = document.querySelector(`[data-key="${key}"]`);
+            if (!control) return;
+            if (control.type === 'checkbox') {
+                control.checked = !!value;
+                const label = control.closest('.checkbox-label');
+                const span = label && label.querySelector('span');
+                if (span) span.textContent = control.checked ? '✔ 已开启' : '✘ 已关闭';
+                if (label && label.classList.contains('enable-card')) {
+                    label.classList.toggle('checked', control.checked);
+                }
+            } else {
+                control.value = value;
+            }
+            control.dispatchEvent(new Event('change', {bubbles: true}));
+        }
+
+        function renderConfigForm(config, defaults = {}) {
             const container = document.getElementById('config-groups');
             container.innerHTML = '';
             configGroups.forEach(group => {
@@ -577,39 +1126,90 @@
                         desc.textContent = meta.description;
                         wrapper.appendChild(desc);
                     }
+                    const controlRow = document.createElement('div');
+                    controlRow.style.cssText = 'display:flex;align-items:center;gap:6px;flex-wrap:wrap;';
                     if (meta.type === 'boolean') {
-                        const checkboxWrapper = document.createElement('div');
-                        checkboxWrapper.className = 'checkbox-label';
+                        const checkboxWrapper = document.createElement('label');
+                        checkboxWrapper.className = 'checkbox-label enable-card'
+                            + (value ? ' checked' : '');
                         const input = document.createElement('input');
                         input.type = 'checkbox';
                         input.checked = value;
                         input.dataset.key = key;
                         const span = document.createElement('span');
-                        span.textContent = value ? '开启' : '关闭';
+                        span.textContent = value ? '✔ 已开启' : '✘ 已关闭';
                         input.addEventListener('change', () => {
-                            span.textContent = input.checked ? '开启' : '关闭';
+                            span.textContent = input.checked ? '✔ 已开启' : '✘ 已关闭';
+                            checkboxWrapper.classList.toggle('checked', input.checked);
                             updateConditionalVisibility();
                         });
                         checkboxWrapper.appendChild(input);
                         checkboxWrapper.appendChild(span);
-                        wrapper.appendChild(checkboxWrapper);
+                        controlRow.appendChild(checkboxWrapper);
                     } else if (meta.options && meta.options.length > 0) {
-                        const select = document.createElement('select');
-                        select.dataset.key = key;
-                        meta.options.forEach(opt => {
-                            const option = document.createElement('option');
-                            option.value = opt;
-                            option.textContent = opt;
-                            if (String(value) === String(opt)) option.selected = true;
-                            select.appendChild(option);
-                        });
-                        select.addEventListener('change', updateConditionalVisibility);
-                        wrapper.appendChild(select);
+                        if (meta.allowCustom) {
+                            const input = document.createElement('input');
+                            input.type = 'text';
+                            input.value = value;
+                            input.dataset.key = key;
+                            input.setAttribute('list', `datalist-${key}`);
+                            input.addEventListener('change', updateConditionalVisibility);
+                            const datalist = document.createElement('datalist');
+                            datalist.id = `datalist-${key}`;
+                            meta.options.forEach(opt => {
+                                const option = document.createElement('option');
+                                option.value = opt;
+                                datalist.appendChild(option);
+                            });
+                            controlRow.appendChild(input);
+                            wrapper.appendChild(datalist);
+                        } else {
+                            const select = document.createElement('select');
+                            select.dataset.key = key;
+                            meta.options.forEach(opt => {
+                                const option = document.createElement('option');
+                                option.value = opt;
+                                option.textContent = opt;
+                                if (String(value) === String(opt)) option.selected = true;
+                                select.appendChild(option);
+                            });
+                            select.addEventListener('change', updateConditionalVisibility);
+                            controlRow.appendChild(select);
+                        }
+                    } else if (meta.type === 'path' || meta.type === 'model_select') {
+                        const input = document.createElement('input');
+                        input.type = 'text';
+                        input.value = value;
+                        input.dataset.key = key;
+                        input.style.cssText = 'flex:1 1 auto;width:auto;min-width:220px;';
+                        input.addEventListener('change', updateConditionalVisibility);
+                        controlRow.appendChild(input);
+                        controlRow.appendChild(makeBrowseButton(input, meta.type));
+                        if (meta.type === 'model_select') {
+                            const svcBtn = document.createElement('button');
+                            svcBtn.type = 'button';
+                            svcBtn.textContent = '🌐 服务列表';
+                            svcBtn.title = '从 llm_base_url 指向的服务获取可用模型 ID 列表（最准确）';
+                            svcBtn.style.cssText = 'flex:0 0 auto;padding:6px 10px;border:1px solid #ccc;'
+                                + 'border-radius:4px;background:#f7f7f7;cursor:pointer;font-size:13px;';
+                            svcBtn.addEventListener('click', async () => {
+                                if (svcBtn.disabled) return;
+                                svcBtn.disabled = true;
+                                try {
+                                    await chooseModelFromService(input);
+                                } catch (e) {
+                                    alert('操作失败: ' + e);
+                                } finally {
+                                    svcBtn.disabled = false;
+                                }
+                            });
+                            controlRow.appendChild(svcBtn);
+                        }
                     } else if (meta.type === 'text') {
                         const textarea = document.createElement('textarea');
                         textarea.dataset.key = key;
                         textarea.value = value;
-                        wrapper.appendChild(textarea);
+                        controlRow.appendChild(textarea);
                     } else {
                         const input = document.createElement('input');
                         if (meta.type === 'int' || meta.type === 'float') {
@@ -623,8 +1223,20 @@
                         input.value = value;
                         input.dataset.key = key;
                         input.addEventListener('change', updateConditionalVisibility);
-                        wrapper.appendChild(input);
+                        controlRow.appendChild(input);
                     }
+                    if (defaults && key in defaults && String(defaults[key]) !== String(value)) {
+                        const resetBtn = document.createElement('button');
+                        resetBtn.type = 'button';
+                        resetBtn.textContent = '↺';
+                        resetBtn.title = '恢复默认值：' + defaults[key];
+                        resetBtn.style.cssText = 'width:20px;height:20px;min-width:20px;flex:0 0 auto;'
+                            + 'font-size:13px;line-height:1;padding:0;margin-left:auto;cursor:pointer;'
+                            + 'border-radius:50%;border:1px solid #888;background:transparent;color:#888;';
+                        resetBtn.addEventListener('click', () => applyFieldValue(key, defaults[key]));
+                        controlRow.appendChild(resetBtn);
+                    }
+                    wrapper.appendChild(controlRow);
                     if (meta.hint) {
                         const hint = document.createElement('div');
                         hint.className = 'field-hint';
@@ -642,7 +1254,7 @@
             const container = document.createElement('div');
             container.className = 'config-group';
             container.innerHTML = `
-                <h3>多角色配置 <button id="addRoleBtn" class="btn" style="float:right;">+ 添加条目</button></h3>
+                <h3>多角色配置 <button id="addRoleBtn" class="btn" style="float:right;">+ 添加条目</button><button id="insertDefaultRoleBtn" class="btn" style="float:right;margin-right:8px;">插入丛雨默认提示词</button></h3>
                 <div class="sub-desc" style="font-size:12px;color:#888;margin-bottom:8px;">每个角色可配置独立的人设、提示词、语音目录与默认情绪；开启「多角色对话」后群聊中提及角色名即可由对应角色回复。</div>
                 <div id="roles-container"></div>
             `;
@@ -699,6 +1311,30 @@
                 bindDeleteRole(roleEl);
             });
 
+            document.getElementById('insertDefaultRoleBtn').addEventListener('click', () => {
+                const defaults = config.defaults || {};
+                const defaultRoles = Array.isArray(defaults.roles) ? defaults.roles : [];
+                if (!defaultRoles.length) {
+                    showConfigMessage('未找到默认角色配置', 'error');
+                    return;
+                }
+                defaultRoles.forEach(r => {
+                    const role = {
+                        character_name: r.character_name || '',
+                        character_key: r.character_key || '',
+                        personality_prompt: r.personality_prompt || '',
+                        json_prompt: r.json_prompt || '',
+                        supplement_prompt: r.supplement_prompt || '',
+                        default_voice: r.default_voice || 'pingjing',
+                        ref_audio_root: r.ref_audio_root || '',
+                        text_lang: r.text_lang || 'ja'
+                    };
+                    const roleEl = renderRoleItem(document.querySelectorAll('.role-item').length, role);
+                    document.getElementById('roles-container').appendChild(roleEl);
+                    bindDeleteRole(roleEl);
+                });
+            });
+
             function bindDeleteRole(roleEl) {
                 const delBtn = roleEl.querySelector('.delete-role-btn');
                 if (delBtn) {
@@ -749,20 +1385,55 @@
             try {
                 const config = await apiGet('api/config');
                 currentConfig = config;
-                renderConfigForm(config);
+                renderConfigForm(config, config.defaults || {});
                 renderRolesConfig(config);
                 updateConditionalVisibility();
+                buildAnchorNav();
             } catch (e) {
                 console.error('加载配置失败：', e);
                 showConfigMessage('加载配置失败: ' + e.message, 'error');
             }
         }
 
+        function buildAnchorNav() {
+            const nav = document.getElementById('anchor-nav');
+            if (!nav) return;
+            nav.innerHTML = '';
+            const groups = document.querySelectorAll('#config-groups .config-group');
+            const scroller = document.querySelector('.main-content');
+            groups.forEach((groupEl, i) => {
+                const h3 = groupEl.querySelector('h3');
+                if (!h3) return;
+                const id = `cfg-group-${i}`;
+                groupEl.id = id;
+                const item = document.createElement('div');
+                item.className = 'anchor-item';
+                // h3 里可能含按钮（如「多角色配置」），只取纯文本节点的内容
+                let title = '';
+                h3.childNodes.forEach(n => {
+                    if (n.nodeType === Node.TEXT_NODE) title += n.textContent;
+                });
+                item.textContent = (title || h3.textContent).trim();
+                item.title = item.textContent;
+                item.addEventListener('click', () => {
+                    const groupRect = groupEl.getBoundingClientRect();
+                    const scrollerRect = scroller.getBoundingClientRect();
+                    const top = scroller.scrollTop + (groupRect.top - scrollerRect.top) - 20;
+                    scroller.scrollTo({ top, behavior: 'smooth' });
+                });
+                nav.appendChild(item);
+            });
+        }
+
         function showConfigMessage(text, type) {
             const msgDiv = document.getElementById('config-message');
             msgDiv.className = `message ${type}`;
             msgDiv.textContent = text;
-            setTimeout(() => msgDiv.textContent = '', 5000);
+            clearTimeout(msgDiv._hideTimer);
+            msgDiv._hideTimer = setTimeout(() => {
+                msgDiv.textContent = '';
+                msgDiv.className = '';
+            }, 5000);
         }
 
         async function saveConfig(restart_tts = false) {
@@ -781,7 +1452,11 @@
                 document.querySelectorAll('#config-groups [data-key]').forEach(el => {
                     const key = el.dataset.key;
                     if (el.type === 'checkbox') formData[key] = el.checked;
-                    else if (el.type === 'number') formData[key] = Number(el.value);
+                    else if (el.type === 'number') {
+                        if (String(el.value).trim() === '') return;
+                        const num = Number(el.value);
+                        if (Number.isFinite(num)) formData[key] = num;
+                    }
                     else formData[key] = el.value;
                 });
                 formData['roles'] = roles;
@@ -1337,6 +2012,10 @@
                         </select></div>
                     <div class="field" id="job-time-field"><label>时间 (HH:MM)</label><input id="job-time" value="${esc(t.time || '08:00')}"></div>
                     <div class="field" id="job-seconds-field" style="display:none;"><label>间隔秒数</label><input id="job-seconds" type="number" value="${t.seconds || 3600}"></div>
+                    <div class="field" id="job-jitter-field" style="display:none;">
+                        <label>抖动秒数</label>
+                        <input id="job-jitter" type="number" value="${t.jitter || 0}">
+                    </div>
                     <div class="field" id="job-weekdays-field" style="display:none;"><label>星期几（可多选）</label>
                         <div id="job-weekdays">${[0,1,2,3,4,5,6].map(w =>
                             `<label style="margin-right:8px;font-weight:normal;"><input type="checkbox" value="${w}" ${(t.weekdays || []).includes(w) ? 'checked' : ''}>周${'一二三四五六日'[w]}</label>`).join('')}
@@ -1368,6 +2047,7 @@
                 const type = document.getElementById('job-trigger-type').value;
                 document.getElementById('job-time-field').style.display = type === 'interval' ? 'none' : '';
                 document.getElementById('job-seconds-field').style.display = type === 'interval' ? '' : 'none';
+                document.getElementById('job-jitter-field').style.display = type === 'interval' ? '' : 'none';
                 document.getElementById('job-weekdays-field').style.display = type === 'weekly' ? '' : 'none';
                 const mode = document.getElementById('job-mode').value;
                 document.getElementById('job-template-field').style.display = mode === 'template' ? '' : 'none';
@@ -1382,7 +2062,8 @@
                 const mode = document.getElementById('job-mode').value;
                 const weekdays = Array.from(document.querySelectorAll('#job-weekdays input:checked')).map(i => +i.value);
                 const trigger = type === 'interval'
-                    ? { type, seconds: Math.max(5, +document.getElementById('job-seconds').value || 3600) }
+                    ? { type, seconds: Math.max(5, +document.getElementById('job-seconds').value || 3600),
+                        jitter: Math.max(0, +document.getElementById('job-jitter').value || 0) }
                     : { type: type === 'weekly' ? 'daily' : 'daily', time: document.getElementById('job-time').value || '08:00', weekdays: type === 'weekly' ? weekdays : undefined };
                 const jobNew = {
                     id: job.id || `job_${Date.now()}`,
@@ -1676,33 +2357,104 @@
         }
 
         async function loadStatsPage() {
+            const rangeSel = document.getElementById('stats-range');
+            if (!rangeSel.dataset.bound) {
+                rangeSel.dataset.bound = '1';
+                try {
+                    const saved = localStorage.getItem('ltvm_stats_range');
+                    if (saved) rangeSel.value = saved;
+                } catch (e) {}
+                rangeSel.addEventListener('change', loadStatsPage);
+            }
             try {
-                const s = await apiGet('api/stats');
-                // 汇总卡片
+                const range = rangeSel.value || '30';
+                try { localStorage.setItem('ltvm_stats_range', range); } catch (e) {}
+                const s = await apiGet(`api/stats?range=${encodeURIComponent(range)}`);
+                const rangeInfo = s.range || { days: 14, key: range };
+                const rDays = Math.max(1, rangeInfo.days || 14);
+                const rangeLabel = rangeInfo.key === 'today' ? '今天' : rangeInfo.key === 'yesterday'
+                    ? '昨天' : `近 ${rDays} 天`;
+                document.getElementById('chart-msgs-title').textContent = `${rangeLabel}消息量与调用次数`;
+                document.getElementById('chart-emotions-title').textContent = `情绪分布（${rangeLabel}）`;
+                document.getElementById('chart-trend-title').textContent = `情绪趋势（${rangeLabel} · 前 5 种情绪）`;
+                // 汇总卡片：区间内回复数 + LLM/TTS/工具 API 调用次数
                 const totals = s.totals || {};
-                const today = s.today || {};
+                const rt = s.range_totals || {};
                 const perf = s.performance || {};
-                const days = Math.max(1, Math.round((perf.uptime_seconds || 1) / 86400));
                 document.getElementById('stats-cards').innerHTML = `
-                    <div class="stat-card"><div class="num">${totals.n ?? 0}</div><div class="label">累计回复次数</div></div>
-                    <div class="stat-card"><div class="num">${today.n ?? 0}</div><div class="label">今日回复</div></div>
-                    <div class="stat-card"><div class="num">${(totals.avg_llm || 0).toFixed ? totals.avg_llm.toFixed(0) : 0} ms</div><div class="label">平均 LLM 耗时</div></div>
-                    <div class="stat-card"><div class="num">${(totals.avg_tts || 0).toFixed ? totals.avg_tts.toFixed(0) : 0} ms</div><div class="label">平均 TTS 耗时</div></div>
-                    <div class="stat-card"><div class="num">${(s.top_sessions || []).length}</div><div class="label">活跃会话</div></div>
+                    <div class="stat-card"><div class="num">${rt.n ?? 0}</div><div class="label">回复次数（${rangeLabel}）</div></div>
+                    <div class="stat-card"><div class="num">${rt.llm_calls ?? 0}</div><div class="label">LLM API 调用（${rangeLabel}）</div></div>
+                    <div class="stat-card"><div class="num">${rt.tts_calls ?? 0}</div><div class="label">TTS API 调用（${rangeLabel}）</div></div>
+                    <div class="stat-card"><div class="num">${rt.tool_calls ?? 0}</div><div class="label">工具调用（${rangeLabel}）</div></div>
+                    <div class="stat-card"><div class="num">${(rt.avg_llm || 0).toFixed ? rt.avg_llm.toFixed(0) : 0} ms</div><div class="label">平均 LLM 耗时</div></div>
+                    <div class="stat-card"><div class="num">${(rt.avg_tts || 0).toFixed ? rt.avg_tts.toFixed(0) : 0} ms</div><div class="label">平均 TTS 耗时</div></div>
+                    <div class="stat-card"><div class="num">${totals.n ?? 0}</div><div class="label">累计回复（全部）</div></div>
                     <div class="stat-card"><div class="num">${(perf.uptime_seconds ? Math.round(perf.uptime_seconds / 3600) : 0)} 小时</div><div class="label">运行时长</div></div>
                 `;
-                // 近14天消息量
-                const dayMap = {};
-                (s.per_day || []).forEach(r => { dayMap[r.day_idx] = r.n; });
-                const nowDayIdx = Math.floor(Date.now() / 86400000);
-                const labels = [], data = [];
-                for (let i = 13; i >= 0; i--) {
-                    const di = nowDayIdx - i;
-                    const d = new Date(di * 86400000);
-                    labels.push(`${d.getMonth() + 1}/${d.getDate()}`);
-                    data.push(dayMap[di] || 0);
+                // 角色心情值（每个角色可展开查看各会话记录）
+                const moods = s.moods || [];
+                const moodBox = document.getElementById('role-moods');
+                if (!moods.length) {
+                    moodBox.innerHTML = '<div class="muted">暂无心情记录：开启「回复审判与心情」后，消息经 LLM 审判才会更新各角色心情值。</div>';
+                } else {
+                    moodBox.innerHTML = moods.map((m, i) => {
+                        const recs = (m.records || []).map(r => {
+                            const who = r.user_id ? `${r.session_id}（用户 ${r.user_id}）` : (r.session_id || '未知会话');
+                            return `<div class="mood-rec-row"><span>${esc(who)}</span>
+                            <span><a class="mood-val-edit" data-sid="${esc(r.session_id)}" data-uid="${esc(r.user_id)}" data-char="${esc(m.character_key)}" title="点击修改心情值">${r.mood}</a> · ${fmtTs(r.updated)}</span></div>`;
+                        }).join('');
+                        const multi = m.records && m.records.length > 1;
+                        return `<div class="mood-row">
+                            <div class="mood-head">
+                                <span class="mood-name">${esc(m.character_name)}</span>
+                                <span class="mood-num">${m.mood == null ? '-' : m.mood}</span>
+                                <span class="muted">共 ${m.sessions} 条记录 · 最新 ${fmtTs(m.updated)}（点击数值可修改）</span>
+                                ${multi ? `<a class="mood-toggle" data-i="${i}" href="javascript:void(0)">展开全部</a>` : ''}
+                            </div>
+                            <div class="mood-records" id="mood-rec-${i}" ${multi ? 'style="display:none;"' : ''}>${recs}</div>
+                        </div>`;
+                    }).join('');
+                    moodBox.querySelectorAll('.mood-toggle').forEach(a => a.addEventListener('click', () => {
+                        const rec = document.getElementById(`mood-rec-${a.dataset.i}`);
+                        const open = rec.style.display !== 'none';
+                        rec.style.display = open ? 'none' : 'block';
+                        a.textContent = open ? '展开全部' : '收起';
+                    }));
+                    moodBox.querySelectorAll('.mood-val-edit').forEach(a => a.addEventListener('click', async () => {
+                        const val = prompt(`修改「${a.dataset.char}」的心情值（0-100）：`, a.textContent.trim());
+                        if (val === null || String(val).trim() === '') return;
+                        try {
+                            const r = await apiPost('api/mood/set', {
+                                session_id: a.dataset.sid,
+                                user_id: a.dataset.uid,
+                                character_key: a.dataset.char,
+                                mood: Number(val)
+                            });
+                            if (!r.success) throw new Error(r.error || '设置失败');
+                            loadStatsPage();
+                        } catch (e) { alert('修改失败: ' + e.message); }
+                    }));
                 }
-                drawLineChart(document.getElementById('chart-msgs'), labels, [{ label: '消息量', data }]);
+                // 区间内逐日消息量与 API 调用次数
+                const dayMap = {}, llmMap = {}, ttsMap = {};
+                (s.per_day || []).forEach(r => {
+                    dayMap[r.day_idx] = r.n;
+                    llmMap[r.day_idx] = r.llm_calls || 0;
+                    ttsMap[r.day_idx] = r.tts_calls || 0;
+                });
+                const labels = [], msgData = [], llmData = [], ttsData = [];
+                for (let i = rDays - 1; i >= 0; i--) {
+                    const d = new Date(Date.now() - i * 86400000);
+                    labels.push(`${d.getMonth() + 1}/${d.getDate()}`);
+                    msgData.push(dayMap[i] || 0);
+                    llmData.push(llmMap[i] || 0);
+                    ttsData.push(ttsMap[i] || 0);
+                }
+                drawLineChart(document.getElementById('chart-msgs'), labels, [
+                    { label: '消息量', data: msgData },
+                    { label: 'LLM 调用', data: llmData },
+                    { label: 'TTS 调用', data: ttsData },
+                ]);
                 // 情绪分布
                 const emos = s.emotions || [];
                 drawBarChart(document.getElementById('chart-emotions'),
@@ -1716,8 +2468,8 @@
                 const trendDatasets = topEmos.map((emo, i) => ({
                     label: emo, color: CHART_COLORS[i % CHART_COLORS.length],
                     data: labels.map((_, idx) => {
-                        const di = nowDayIdx - (13 - idx);
-                        return (trendMap[emo] || {})[di] || 0;
+                        const i = rDays - 1 - idx;
+                        return (trendMap[emo] || {})[i] || 0;
                     })
                 }));
                 drawLineChart(document.getElementById('chart-trend'), labels, trendDatasets);
@@ -1824,23 +2576,53 @@
         // ---- 工具调用 ----
         let toolsState = [];
         let editingToolIdx = -1;
+        let lastToolForTest = null;
+
+        async function runToolTest(t) {
+            if (!t) { showAdvMsg('tool-message', '请先在列表中选择要测试的工具', true); return; }
+            lastToolForTest = t;
+            const raw = (document.getElementById('tool-test-args').value || '').trim();
+            let args = {};
+            if (raw) {
+                try { args = JSON.parse(raw); }
+                catch (e) {
+                    showAdvMsg('tool-message', '测试参数不是合法 JSON: ' + e.message, true);
+                    return;
+                }
+            }
+            try {
+                const r = await apiPost('api/tools/test', { name: t.name, arguments: args });
+                showAdvMsg('tool-message', `测试 ${t.name}: ${r.success ? '成功' : '失败'} → ${r.output || ''}`);
+            } catch (e) {
+                showAdvMsg('tool-message', '测试失败: ' + e.message, true);
+            }
+        }
+        document.getElementById('tool-test-run-btn').addEventListener('click', () => {
+            runToolTest(lastToolForTest || (toolsState[0] || null));
+        });
         async function loadTools() {
             try {
                 const data = await apiGet('api/tools');
                 toolsState = data.tools || [];
+                loadSearchEngines();
                 const wrap = document.getElementById('tools-table-wrap');
                 if (!toolsState.length) {
                     wrap.innerHTML = '<div class="muted">暂无工具，点击「新建工具」创建。</div>';
                     return;
                 }
-                let html = '<table class="data-table"><tr><th>名称</th><th>类型</th><th>说明</th><th>状态</th><th>授权用户</th><th>操作</th></tr>';
+                let html = '<table class="data-table"><tr><th>名称</th><th>类型</th><th>说明</th><th>启用</th><th>授权用户</th><th>操作</th></tr>';
                 toolsState.forEach((t, idx) => {
                     const desc = (t.description || '').slice(0, 40);
                     html += `<tr>
                         <td>${esc(t.name)}</td>
                         <td><span class="badge">${esc(t.type || 'builtin')}${t.builtin ? '·' + esc(t.builtin) : ''}</span></td>
                         <td>${esc(desc)}</td>
-                        <td><span class="badge ${t.enabled ? 'green' : 'gray'}">${t.enabled ? '启用' : '停用'}</span></td>
+                        <td>
+                            <label class="tool-toggle" title="勾选/取消即可启用或停用该工具（即时保存）">
+                                <input type="checkbox" class="tool-toggle-box" data-idx="${idx}" ${t.enabled ? 'checked' : ''}>
+                                <span class="tool-toggle-text ${t.enabled ? 'on' : 'off'}">${t.enabled ? '已启用' : '已停用'}</span>
+                            </label>
+                        </td>
                         <td>${(t.allowed_users || []).length ? esc(t.allowed_users.join(',')) : '<span class="muted">所有人</span>'}</td>
                         <td>
                             <button class="btn btn-orange tool-test" data-idx="${idx}">测试</button>
@@ -1850,12 +2632,21 @@
                 });
                 html += '</table>';
                 wrap.innerHTML = html;
-                wrap.querySelectorAll('.tool-test').forEach(b => b.addEventListener('click', async () => {
-                    const t = toolsState[+b.dataset.idx];
-                    try {
-                        const r = await apiPost('api/tools/test', { name: t.name, arguments: {} });
-                        showAdvMsg('tool-message', `测试 ${t.name}: ${r.success ? '成功' : '失败'} → ${r.output || ''}`);
-                    } catch (e) { showAdvMsg('tool-message', '测试失败: ' + e.message, true); }
+                wrap.querySelectorAll('.tool-toggle-box').forEach(b => b.addEventListener('change', async () => {
+                    const i = +b.dataset.idx;
+                    toolsState[i].enabled = b.checked;
+                    // 复选框与「已启用/已停用」文字紧挨在一起，勾选后立即保存，
+                    // 不需要再点「编辑」进表单里找那个离文字很远的「启用」框
+                    const label = b.closest('.tool-toggle');
+                    const span = label && label.querySelector('.tool-toggle-text');
+                    if (span) {
+                        span.textContent = b.checked ? '已启用' : '已停用';
+                        span.className = 'tool-toggle-text ' + (b.checked ? 'on' : 'off');
+                    }
+                    await saveTools();
+                }));
+                wrap.querySelectorAll('.tool-test').forEach(b => b.addEventListener('click', () => {
+                    runToolTest(toolsState[+b.dataset.idx]);
                 }));
                 wrap.querySelectorAll('.tool-edit').forEach(b => b.addEventListener('click', () => openToolEditor(+b.dataset.idx)));
                 wrap.querySelectorAll('.tool-del').forEach(b => b.addEventListener('click', async () => {
@@ -1878,6 +2669,66 @@
             }
         }
 
+        /* ===== 搜索引擎下拉框 ===== */
+        let searchEnginesState = { engines: [], current: '' };
+
+        async function loadSearchEngines() {
+            const select = document.getElementById('search-engine-select');
+            if (!select) return;
+            try {
+                const data = await apiGet('api/search/engines');
+                searchEnginesState = { engines: data.engines || [], current: data.current || '' };
+                select.innerHTML = '';
+                searchEnginesState.engines.forEach(eng => {
+                    const option = document.createElement('option');
+                    option.value = eng.key;
+                    option.textContent = eng.label;
+                    if (eng.key === searchEnginesState.current) option.selected = true;
+                    select.appendChild(option);
+                });
+                document.getElementById('search-engine-custom').value = data.custom || '';
+                document.getElementById('search-engine-url').value = data.url_override || '';
+                const keysBox = document.getElementById('search-engine-keys');
+                const envs = data.api_key_envs || [];
+                const set = data.api_keys_set || [];
+                keysBox.value = '';
+                keysBox.placeholder = envs.length
+                    ? `每行 环境变量名=值，可用：${envs.join('、')}` + (set.length ? `（已配置：${set.join('、')}）` : '')
+                    : '当前引擎列表没有需要 key 的引擎';
+                showSearchEngineDesc();
+            } catch (e) {
+                select.innerHTML = '<option value="">加载失败</option>';
+            }
+        }
+
+        function showSearchEngineDesc() {
+            const select = document.getElementById('search-engine-select');
+            const box = document.getElementById('search-engine-desc');
+            if (!select || !box) return;
+            const found = searchEnginesState.engines.find(eng => eng.key === select.value);
+            box.textContent = found && found.description ? found.description : '';
+        }
+
+        async function saveSearchEngine() {
+            const select = document.getElementById('search-engine-select');
+            try {
+                const res = await apiPost('api/search/engine', {
+                    engine: select ? select.value : '',
+                    custom: document.getElementById('search-engine-custom').value,
+                    url_override: document.getElementById('search-engine-url').value,
+                    api_keys: document.getElementById('search-engine-keys').value
+                });
+                if (!res.success) throw new Error(res.error || '保存失败');
+                showAdvMsg('search-engine-message', '已切换默认搜索引擎：' + (select ? select.value : ''));
+                loadSearchEngines();
+            } catch (e) {
+                showAdvMsg('search-engine-message', '保存失败: ' + e.message, true);
+            }
+        }
+
+        document.getElementById('search-engine-select').addEventListener('change', showSearchEngineDesc);
+        document.getElementById('search-engine-save').addEventListener('click', saveSearchEngine);
+
         function openToolEditor(idx = -1) {
             editingToolIdx = idx;
             const t = idx >= 0 ? toolsState[idx] : {};
@@ -1899,7 +2750,10 @@
                             <option value="calculate" ${t.builtin === 'calculate' ? 'selected' : ''}>数学计算</option>
                             <option value="weather" ${t.builtin === 'weather' ? 'selected' : ''}>天气查询</option>
                             <option value="web_fetch" ${t.builtin === 'web_fetch' ? 'selected' : ''}>网页读取</option>
+                            <option value="web_search" ${t.builtin === 'web_search' ? 'selected' : ''}>联网搜索</option>
                         </select></div>
+                    <div class="field" id="tool-engine-field" style="display:none;"><label>指定该工具的搜索引擎（留空跟随全局下拉框）</label>
+                        <select id="tool-engine"><option value="">跟随全局默认</option></select></div>
                     <div class="field wide" id="tool-url-field" style="display:none;"><label>URL 模板（参数用 {名称} 占位）</label>
                         <input id="tool-url" value="${esc(t.url || '')}" placeholder="https://api.example.com/weather?city={city}"></div>
                     <div class="field" id="tool-method-field" style="display:none;"><label>请求方法</label>
@@ -1911,23 +2765,53 @@
                         <textarea id="tool-params">${esc(JSON.stringify(t.parameters || {type: 'object', properties: {}, required: []}, null, 1))}</textarea></div>
                     <div class="field"><label>授权用户（QQ号，逗号分隔，留空=所有人）</label><input id="tool-users" value="${esc((t.allowed_users || []).join(','))}"></div>
                     <div class="field"><label>单次回复调用上限</label><input id="tool-max" type="number" value="${t.max_calls_per_reply ?? 2}"></div>
-                    <div class="field"><label style="font-weight:normal;"><input type="checkbox" id="tool-enabled" ${t.enabled ? 'checked' : ''}> 启用</label></div>
+                    <div class="field wide" id="tool-location-field" style="display:none;"><label>默认城市（可选，仅天气查询用）</label>
+                        <input id="tool-location" value="${esc(t.default_location || '')}" placeholder="留空 = 主人没说地点时角色会反问，绝不自己猜"></div>
                 </div>
+                <label class="enable-card ${t.enabled ? 'checked' : ''}" id="tool-enabled-card" style="margin-top:12px;">
+                    <input type="checkbox" id="tool-enabled" ${t.enabled ? 'checked' : ''}>
+                    <span id="tool-enabled-text">${t.enabled ? '✔ 已启用（保存后生效）' : '✘ 未启用，LLM 不会调用它'}</span>
+                </label>
                 <div style="margin-top:10px;">
                     <button class="btn btn-green" id="tool-save-btn">保存</button>
                     <button class="btn btn-gray" id="tool-cancel-btn">取消</button>
                 </div>
             `;
             const typeSel = document.getElementById('tool-type');
+            const builtinSel = document.getElementById('tool-builtin');
+            const engineSel = document.getElementById('tool-engine');
+            engineSel.innerHTML = '<option value="">跟随全局默认</option>';
+            searchEnginesState.engines.forEach(eng => {
+                const option = document.createElement('option');
+                option.value = eng.key;
+                option.textContent = eng.label;
+                if (eng.key === (t.engine || '')) option.selected = true;
+                engineSel.appendChild(option);
+            });
             const syncFields = () => {
                 const v = typeSel.value;
+                const isWeather = v === 'builtin' && builtinSel.value === 'weather';
                 document.getElementById('tool-builtin-field').style.display = v === 'builtin' ? '' : 'none';
                 document.getElementById('tool-url-field').style.display = v === 'http' ? '' : 'none';
                 document.getElementById('tool-method-field').style.display = v === 'http' ? '' : 'none';
                 document.getElementById('tool-command-field').style.display = v === 'command' ? '' : 'none';
+                document.getElementById('tool-engine-field').style.display =
+                    (v === 'builtin' && builtinSel.value === 'web_search') ? '' : 'none';
+                document.getElementById('tool-location-field').style.display = isWeather ? '' : 'none';
             };
             typeSel.addEventListener('change', syncFields);
+            builtinSel.addEventListener('change', syncFields);
             syncFields();
+            const enableBox = document.getElementById('tool-enabled');
+            const enableCard = document.getElementById('tool-enabled-card');
+            const enableText = document.getElementById('tool-enabled-text');
+            const syncEnable = () => {
+                enableCard.classList.toggle('checked', enableBox.checked);
+                enableText.textContent = enableBox.checked ? '✔ 已启用（保存后生效）'
+                                                           : '✘ 未启用，LLM 不会调用它';
+            };
+            enableBox.addEventListener('change', syncEnable);
+            syncEnable();
             document.getElementById('tool-cancel-btn').addEventListener('click', () => ed.classList.remove('active'));
             document.getElementById('tool-save-btn').addEventListener('click', () => {
                 let params;
@@ -1938,6 +2822,8 @@
                     name: document.getElementById('tool-name').value.trim(),
                     type,
                     builtin: type === 'builtin' ? document.getElementById('tool-builtin').value : undefined,
+                    engine: (type === 'builtin' && document.getElementById('tool-builtin').value === 'web_search')
+                        ? (document.getElementById('tool-engine').value || undefined) : undefined,
                     url: type === 'http' ? document.getElementById('tool-url').value : undefined,
                     method: type === 'http' ? document.getElementById('tool-method').value : undefined,
                     command: type === 'command' ? document.getElementById('tool-command').value : undefined,
@@ -1947,6 +2833,9 @@
                     max_calls_per_reply: +document.getElementById('tool-max').value || 2,
                     enabled: document.getElementById('tool-enabled').checked,
                 };
+                if (toolNew.builtin === 'weather') {
+                    toolNew.default_location = document.getElementById('tool-location').value.trim();
+                }
                 if (!toolNew.name) { showAdvMsg('tool-message', '工具名不能为空', true); return; }
                 if (editingToolIdx >= 0) toolsState[editingToolIdx] = toolNew;
                 else toolsState.push(toolNew);
@@ -2088,14 +2977,43 @@
         document.getElementById('add-profile-btn').addEventListener('click', () => openProfileEditor({}));
 
         /* ==================== 日志 ==================== */
+        let lastLogText = '';
+        function logFullMode() {
+            try { return localStorage.getItem('ltvm_log_full') === '1'; } catch (e) { return false; }
+        }
         function startLogPolling() {
             if (logTimer) clearInterval(logTimer);
+            const toggle = document.getElementById('log-full-toggle');
+            toggle.checked = logFullMode();
+            if (!toggle.dataset.bound) {
+                toggle.dataset.bound = '1';
+                toggle.addEventListener('change', () => {
+                    try { localStorage.setItem('ltvm_log_full', toggle.checked ? '1' : '0'); } catch (e) {}
+                    lastLogText = '';   // 切换模式后强制刷新一次
+                    fetchLogs();
+                });
+            }
             const fetchLogs = async () => {
                 try {
-                    const data = await apiGet('api/logs');
+                    const data = await apiGet('api/logs' + (logFullMode() ? '?full=1' : ''));
                     const logDiv = document.getElementById('log-content');
+                    const status = document.getElementById('log-status');
+                    if (status) {
+                        const mode = logFullMode() ? '完整模式'
+                            : `精简模式（最近 ${data.tail_lines ?? 500} 行）`;
+                        status.textContent = `服务端缓存 ${data.total_lines ?? '?'} 行 · 当前${mode}`
+                            + (data.truncated ? ' · 已按 40 万字符上限截断，可调小「日志缓冲行数」'
+                                              : '');
+                    }
+                    const text = data.logs || '暂无日志';
+                    // 用户正在日志区选择/复制文字时跳过本次刷新：
+                    const sel = window.getSelection();
+                    const selecting = sel && !sel.isCollapsed && sel.rangeCount > 0
+                        && logDiv.contains(sel.anchorNode);
+                    if (selecting || text === lastLogText) return;
+                    lastLogText = text;
                     const isNearBottom = logDiv.scrollHeight - logDiv.scrollTop - logDiv.clientHeight < 50;
-                    logDiv.textContent = data.logs || '暂无日志';
+                    logDiv.textContent = text;
                     if (isNearBottom) {
                         logDiv.scrollTop = logDiv.scrollHeight;
                     }
@@ -2112,8 +3030,17 @@
         }
 
         document.addEventListener('DOMContentLoaded', () => {
-            loadConfig();
-            loadChatList();
+            (async () => {
+                try {
+                    const resp = await fetch(`${API_BASE}/api/auth/status`);
+                    if (resp.ok && resp.status === 200) { /* 自动续期 Cookie */ }
+                } catch (e) { /* 忽略 */ }
+                loadConfig();
+                loadChatList();
+                document.getElementById('anchor-nav').classList.add('active');
+                document.getElementById('float-actions').classList.add('active');
+                setTimeout(maybeCheckUpdate, 3000);
+            })();
         });
     </script>
 </body>

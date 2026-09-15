@@ -51,15 +51,43 @@ class RAGManager:
 
     # ---------------- 嵌入 ----------------
     async def embed_texts(self, texts: List[str]) -> Optional[np.ndarray]:
-        model = self.config.get("rag_embedding_model", "nomic-embed-text")
-        backend = self.config.get("llm_backend", "ollama")
-        base_url = str(self.config.get("llm_base_url", "http://127.0.0.1:11434")).rstrip("/")
+        """分批嵌入：大文档一次性全量请求容易 OOM / 超时，按批请求后按序拼接。"""
+        if not texts:
+            return await self._embed_texts_once(texts)
+        vecs = []
+        for i in range(0, len(texts), 64):
+            part = await self._embed_texts_once(texts[i:i + 64])
+            if part is None:
+                return None
+            vecs.append(part)
+        return np.concatenate(vecs, axis=0)
+
+    async def _embed_texts_once(self, texts: List[str]) -> Optional[np.ndarray]:
+        backend = self.config.get("rag_embedding_backend", "") or self.config.get("llm_backend", "ollama")
+        if backend == "ollama":
+            base_url = "http://127.0.0.1:11434"
+        else:
+            base_url = str(self.config.get("llm_base_url", "http://127.0.0.1:11434")).rstrip("/")
         api_key = self.config.get("llm_api_key", "")
+        embedding_url = self.config.get("llm_embedding_url", "")
+        if backend == "ollama":
+            model = self.config.get("llm_embedding_model", "") or self.config.get("rag_embedding_model", "") or "nomic-embed-text"
+        else:
+            # 与 ollama 分支保持一致的回退顺序：
+            # llm_embedding_model（外部 API 专用）→ rag_embedding_model → llm_model_name。
+            # 历史 bug：只认 llm_embedding_model / llm_model_name，
+            # 用户在 WebUI 只填了「嵌入模型 (rag_embedding_model)」时会被判成"未配置"。
+            model = (self.config.get("llm_embedding_model", "")
+                     or self.config.get("rag_embedding_model", "")
+                     or self.config.get("llm_model_name", ""))
+            if not model:
+                print("RAG 嵌入跳过：llm_backend 非 ollama 且未配置 llm_embedding_model、"
+                      "rag_embedding_model 或 llm_model_name")
+                return None
         try:
             if backend == "ollama":
                 async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
                     errors = []
-                    # 新版 Ollama：批量嵌入接口
                     resp = await client.post(f"{base_url}/api/embed",
                                              json={"model": model, "input": texts})
                     if resp.status_code == 200:
@@ -69,7 +97,6 @@ class RAGManager:
                         errors.append("/api/embed[200]: 响应缺少 embeddings 字段")
                     else:
                         errors.append(f"/api/embed[{resp.status_code}]: {_response_error(resp)}")
-                    # 兼容旧版 Ollama：/api/embeddings 逐条嵌入
                     vecs = []
                     for t in texts:
                         r = await client.post(f"{base_url}/api/embeddings",
@@ -89,11 +116,10 @@ class RAGManager:
                         msg += "（提示：该模型不支持生成嵌入，请在 WebUI 将 rag_embedding_model 换成嵌入模型，如 nomic-embed-text 或 bge-m3）"
                     raise RuntimeError(msg)
             else:
-                if not base_url.endswith("/v1"):
-                    base_url += "/v1"
+                endpoint = embedding_url or f"{base_url}/embeddings"
                 headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
                 async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
-                    resp = await client.post(f"{base_url}/embeddings",
+                    resp = await client.post(endpoint,
                                              json={"model": model, "input": texts},
                                              headers=headers)
                     resp.raise_for_status()
@@ -103,7 +129,12 @@ class RAGManager:
                         return None
                     return np.array(vecs, dtype=np.float32)
         except Exception as e:
-            print(f"RAG 嵌入失败: {type(e).__name__}: {e}")
+            target = (f"{base_url}/api/embed（或 /api/embeddings）" if backend == "ollama"
+                      else f"{base_url}/v1/embeddings")
+            model_hint = ("rag_embedding_model" if backend == "ollama" else "llm_embedding_model")
+            print(f"RAG 嵌入失败: {type(e).__name__}: {e}\n"
+                  f"（目标服务：{target}，嵌入模型：{model}。"
+                  f"请确认 LLM/嵌入服务已启动，且 {model_hint} 配置正确。）")
             return None
 
     # ---------------- 分块 ----------------

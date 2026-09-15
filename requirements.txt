@@ -3,3 +3,5 @@ numpy
 aiohttp
 napcat-sdk
 pywebview
+pystray
+Pillow

@@ -46,28 +46,61 @@ class StatsManager:
             "active_sessions": len(self.active_sessions),
         }
 
-    def get_stats(self) -> dict:
+    def _range_bounds(self, range_key: str):
+        """把前端传来的区间标识换算成 (start, end, days)。
+
+        today/yesterday 以本地 0 点为界；7/14/30 为"含今天的最近 N 天"。
+        """
+        now = time.time()
+        lt = time.localtime(now)
+        today0 = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+        if range_key == "today":
+            return today0, now, 1
+        if range_key == "yesterday":
+            return today0 - 86400, today0, 1
+        try:
+            days = int(range_key)
+        except (TypeError, ValueError):
+            days = 30
+        if days not in (7, 14, 30):
+            days = 30
+        return today0 - (days - 1) * 86400, now, days
+
+    def get_stats(self, range_key: str = "30") -> dict:
         now = time.time()
         day = 86400
-        out = {}
+        start, end, days = self._range_bounds(range_key)
+        out = {"range": {"key": range_key, "start": start, "end": end, "days": days}}
         try:
             out["totals"] = self.db.query_one(
                 "SELECT COUNT(*) AS n, IFNULL(AVG(llm_ms),0) AS avg_llm, IFNULL(AVG(tts_ms),0) AS avg_tts,"
                 " IFNULL(AVG(sentence_count),0) AS avg_sentences FROM interactions") or {}
+            # 区间内汇总：回复数与 LLM/TTS/工具 API 调用次数
+            out["range_totals"] = self.db.query_one(
+                "SELECT COUNT(*) AS n, IFNULL(SUM(llm_calls),0) AS llm_calls,"
+                " IFNULL(SUM(tts_calls),0) AS tts_calls, IFNULL(SUM(tool_calls),0) AS tool_calls,"
+                " IFNULL(AVG(llm_ms),0) AS avg_llm, IFNULL(AVG(tts_ms),0) AS avg_tts"
+                " FROM interactions WHERE ts >= ? AND ts < ?", (start, end)) or {}
+            lt_now = time.localtime(now)
+            today0 = time.mktime((lt_now.tm_year, lt_now.tm_mon, lt_now.tm_mday,
+                                  0, 0, 0, 0, 0, -1))
             out["today"] = self.db.query_one(
-                "SELECT COUNT(*) AS n FROM interactions WHERE ts >= ?", (now - now % day,)) or {}
+                "SELECT COUNT(*) AS n FROM interactions WHERE ts >= ?", (today0,)) or {}
             out["per_day"] = self.db.query_all(
-                "SELECT CAST(ts/? AS INTEGER) AS day_idx, COUNT(*) AS n FROM interactions"
-                " WHERE ts >= ? GROUP BY day_idx ORDER BY day_idx",
-                (day, now - 13 * day))
+                "SELECT CAST((? - ts + 86399)/86400 AS INTEGER) AS day_idx, COUNT(*) AS n,"
+                " IFNULL(SUM(llm_calls),0) AS llm_calls, IFNULL(SUM(tts_calls),0) AS tts_calls,"
+                " IFNULL(SUM(tool_calls),0) AS tool_calls"
+                " FROM interactions WHERE ts >= ? GROUP BY day_idx ORDER BY day_idx",
+                (today0, start))
             out["emotions"] = self.db.query_all(
                 "SELECT emotion, COUNT(*) AS n FROM interactions"
-                " WHERE ts >= ? AND IFNULL(emotion,'') != '' GROUP BY emotion ORDER BY n DESC LIMIT 12",
-                (now - 30 * day,))
+                " WHERE ts >= ? AND ts < ? AND IFNULL(emotion,'') != ''"
+                " GROUP BY emotion ORDER BY n DESC LIMIT 12", (start, end))
             out["emotion_trend"] = self.db.query_all(
-                "SELECT CAST(ts/? AS INTEGER) AS day_idx, emotion, COUNT(*) AS n FROM interactions"
-                " WHERE ts >= ? AND IFNULL(emotion,'') != '' GROUP BY day_idx, emotion ORDER BY day_idx",
-                (day, now - 13 * day))
+                "SELECT CAST((? - ts + 86399)/86400 AS INTEGER) AS day_idx, emotion, COUNT(*) AS n"
+                " FROM interactions WHERE ts >= ? AND ts < ? AND IFNULL(emotion,'') != ''"
+                " GROUP BY day_idx, emotion ORDER BY day_idx",
+                (today0, start, end))
             out["top_sessions"] = self.db.query_all(
                 "SELECT session_id, session_type, COUNT(*) AS n, MAX(ts) AS last_ts FROM interactions"
                 " GROUP BY session_id ORDER BY n DESC LIMIT 10")

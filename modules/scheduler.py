@@ -9,6 +9,7 @@
 所有任务回调异常都会被捕获并记录，不会中断调度循环。
 """
 import asyncio
+import random
 import time
 from typing import Callable, Awaitable, Optional, Dict, List
 
@@ -28,6 +29,7 @@ class Job:
         self.last_run = None
         self.last_error = None
         self.run_count = 0
+        self.busy = False
         self.compute_next_run(time.time())
 
     def compute_next_run(self, now: float):
@@ -35,6 +37,9 @@ class Job:
         ttype = t.get("type", "interval")
         if ttype == "interval":
             seconds = max(5, int(t.get("seconds", 60)))
+            jitter = float(t.get("jitter", 0))
+            if jitter > 0:
+                seconds = max(5, seconds + random.uniform(-jitter, jitter))
             self.next_run = now + seconds
         elif ttype == "daily":
             self.next_run = _next_daily(t.get("time", "08:00"), t.get("weekdays"), now)
@@ -116,12 +121,15 @@ class SchedulerManager:
         return [j.describe() for j in self.jobs.values()]
 
     async def _run_job(self, job: Job):
+        print(f"[调度] 执行任务 [{job.name}]（trigger={job.trigger}）")
         try:
             await job.func(*job.args)
             job.last_error = None
         except Exception as e:
             job.last_error = f"{type(e).__name__}: {e}"
             print(f"调度任务 [{job.name}] 执行异常: {job.last_error}")
+        finally:
+            job.busy = False
         job.run_count += 1
         job.last_run = time.time()
         if job.trigger and job.trigger.get("type") == "oneshot":
@@ -135,11 +143,21 @@ class SchedulerManager:
                 if not job.enabled:
                     continue
                 if job.next_run <= now:
-                    asyncio.create_task(self._run_job(job))
-                    job.compute_next_run(now)
-                    if job.next_run <= now:
-                        # 间隔过短或已过期的一次性任务，强制前进避免死循环
+                    if job.trigger and job.trigger.get("type") == "oneshot":
+                        # 一次性任务先摘除再执行：回调里常有 LLM 生成等慢操作，
+                        # 若执行期间任务仍留在列表里，下一轮循环会再次点火，
+                        # 造成同一条提醒发送两遍（模板话术+LLM话术各来一条）。
+                        self.jobs.pop(job.id, None)
+                    if getattr(job, "busy", False):
+                        # 上一轮还没跑完（LLM/TTS 慢于间隔）：跳过本次点火，防止堆积并发
                         job.next_run = now + 5
+                    else:
+                        job.busy = True
+                        asyncio.create_task(self._run_job(job))
+                        job.compute_next_run(now)
+                        if job.next_run <= now:
+                            # 间隔过短或已过期的一次性任务，强制前进避免死循环
+                            job.next_run = now + 5
                 if job.next_run < next_wake:
                     next_wake = job.next_run
             delay = max(0.5, min(next_wake - time.time(), 30))

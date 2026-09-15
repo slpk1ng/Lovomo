@@ -1,9 +1,14 @@
-中文：
+LTVM 软件开源协议与免责声明（License & Disclaimer）
 
-LTVM 软件免责声明（License & Disclaimer）
+0. 开源协议
+本项目基于 GNU Affero General Public License v3.0（AGPL-3.0）发布，完整协议文本见同目录下的 LICENSE 文件。
+- 您可以自由使用、修改、分发本软件（包括商用），但分发修改版时必须同样以 AGPL-3.0 开源，并保留版权声明与修改说明。
+- AGPL-3.0 第 13 条（远程网络交互）：若您修改本软件并把它作为网络服务提供给他人使用，必须向这些使用者提供您修改后的完整源代码。
+- 本软件按“现状”提供，不含任何担保（见 AGPL-3.0 第 15、16 条）。
+- 本免责声明不替代 AGPL-3.0；两者冲突时，就版权许可事项以 AGPL-3.0 为准。
 
 1. 软件性质与用途
-本软件（全名Local_TTS_Voice_Modulation.exe）及其相关源代码仅供个人学习、技术研究和娱乐交流使用。本软件严禁用于任何商业用途、非法活动及违反中华人民共和国法律法规的行为。使用本软件即表示您同意本声明的全部条款，并愿意自行承担因使用本软件而产生的一切后果。
+本软件（全名Local_TTS_Voice_Modulation.exe）及其相关源代码仅供个人学习、技术研究和娱乐交流使用。本软件严禁用于任何非法活动及违反中华人民共和国法律法规的行为。使用本软件即表示您同意本声明的全部条款，并愿意自行承担因使用本软件而产生的一切后果。
 
 2. 生成语音（音频内容）的责任
 内容责任：由于 AI 大模型（LLM）和 TTS（语音合成）存在无法避免的“幻觉”和随机性，软件生成的语音内容可能不准确、不真实、具有冒犯性或不符合预期。您必须对您通过该软件生成、发送的所有语音内容和文本内容承担全部责任。
@@ -26,13 +31,21 @@ LTVM 软件免责声明（License & Disclaimer）
 本免责声明最终解释权归软件作者所有。如果您不同意本声明的任何条款，请立即停止使用并彻底删除本软件。
 
 
-English:
 
-LTVM Software Disclaimer (License & Disclaimer)
+LTVM Software License & Disclaimer
+
+0. Open Source License
+
+This project is released under the GNU Affero General Public License v3.0 (AGPL-3.0). The full license text is available in the LICENSE file in the same directory.
+
+- You are free to use, modify, and distribute this software (including commercial use), but any modified version you distribute must also be released under AGPL-3.0, with copyright notices and modification notices preserved.
+- AGPL-3.0 Section 13 (Remote Network Interaction): if you modify this software and make it available to others as a network service, you must offer those users the complete Corresponding Source of your modified version.
+- This software is provided "as is," without warranty of any kind (see Sections 15 and 16 of AGPL-3.0).
+- This disclaimer does not replace AGPL-3.0; in case of conflict, AGPL-3.0 governs matters of copyright licensing.
 
 1. Nature and Purpose of the Software
 
-This software (full name: Local_TTS_Voice_Modulation.exe) and its related source code are provided solely for personal learning, technical research, and entertainment communication. The software is strictly prohibited from being used for any commercial purpose, illegal activity, or any conduct that violates the laws and regulations of the People's Republic of China. By using this software, you agree to all terms of this disclaimer and are willing to bear all consequences arising from your use of the software.
+This software (full name: Local_TTS_Voice_Modulation.exe) and its related source code are provided solely for personal learning, technical research, and entertainment communication. The software is strictly prohibited from being used for any illegal activity or any conduct that violates the laws and regulations of the People's Republic of China. By using this software, you agree to all terms of this disclaimer and are willing to bear all consequences arising from your use of the software.
 
 2. Responsibility for Generated Voice (Audio Content)
 
