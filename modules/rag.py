@@ -4,7 +4,9 @@
   index.json             文档索引
   docs/{id}.json         分块文本
   docs/{id}.npy          分块向量矩阵 (float32)
-嵌入模型可配置（默认使用 Ollama 的 nomic-embed-text 或任何已拉取的 embedding 模型）。
+嵌入后端默认跟随 LLM 接口类型，模型默认 nomic-embed-text（Ollama 可换成任何
+已拉取的 embedding 模型；OpenAI 兼容后端则用 llm_embedding_model /
+rag_embedding_model 指定）。
 """
 import json
 import time

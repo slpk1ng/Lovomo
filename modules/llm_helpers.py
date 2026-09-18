@@ -12,10 +12,89 @@ import time
 from pathlib import Path
 from typing import Optional, List, Dict, AsyncGenerator
 
+from urllib.parse import urlsplit
+
 import httpx
 
 from .tts import strip_urls_for_tts
 from .tls import verified_context
+
+# 服务地址补全规则：配置项约定填「服务根地址」（OpenAI SDK 那种，由代码补 /chat/completions），
+# 但实际经常被粘进某个具体接口的完整地址（…/chat/completions、…/models，
+# 或云厂商那种 …/services/xxx/xxx 的完整路径）。已经带了端点后缀就原样使用，
+# 否则会拼出 …/models/v1/models、…/chat/completions/chat/completions 这类永远 4xx 的地址。
+_VERSION_SEG_RE = re.compile(r"/v\d+(?:\.\d+)*$")
+_CHAT_ENDPOINT_SUFFIXES = ("/chat/completions", "/completions", "/api/chat",
+                           "/api/generate")
+_MODEL_LIST_ENDPOINT_SUFFIXES = ("/models", "/api/tags")
+
+
+def _ends_with_any(base: str, suffixes) -> bool:
+    low = base.lower()
+    return any(low.endswith(suffix) for suffix in suffixes)
+
+
+def _strip_endpoint_suffix(base: str, suffixes) -> str:
+    low = base.lower()
+    for suffix in suffixes:
+        if low.endswith(suffix):
+            return base[: -len(suffix)]
+    return base
+
+
+def chat_endpoint(base_url: str, backend: str = "openai") -> str:
+    """补全对话端点；地址里已经带了端点后缀时原样返回。"""
+    base = str(base_url or "").strip().rstrip("/")
+    if not base:
+        return ""
+    if _ends_with_any(base, _CHAT_ENDPOINT_SUFFIXES):
+        return base
+    base = _strip_endpoint_suffix(base, _MODEL_LIST_ENDPOINT_SUFFIXES)
+    return f"{base}/api/chat" if backend == "ollama" else f"{base}/chat/completions"
+
+
+def model_list_endpoints(base_url: str, backend: str = "openai") -> List[str]:
+    """模型列表的候选地址（按优先级返回，逐个尝试）。
+
+    完整端点会先拆回服务根再补全，所以粘 …/v1/chat/completions 也能用。
+    返回多个候选是因为各服务对版本段的处理不一致（DeepSeek 带不带 /v1 都行，
+    llama.cpp 必须带 /v1），逐个试比猜一个稳。
+    """
+    base = str(base_url or "").strip().rstrip("/")
+    if not base:
+        return []
+    if _ends_with_any(base, _MODEL_LIST_ENDPOINT_SUFFIXES):
+        return [base]
+    stripped = _strip_endpoint_suffix(base, _CHAT_ENDPOINT_SUFFIXES)
+    if stripped != base:
+        base = stripped
+    if backend == "ollama":
+        return [f"{base}/api/tags"]
+    if _VERSION_SEG_RE.search(base):
+        return [f"{base}/models"]
+    return [f"{base}/v1/models", f"{base}/models"]
+
+
+def looks_like_full_endpoint(base_url: str) -> bool:
+    """地址是否更像「某个具体接口的完整路径」而不是「服务根地址」。
+
+    服务根地址最多一层版本段（…/v1、…/compatible-mode/v1），
+    粘贴来的完整接口路径会带多层业务路径（…/api/v1/services/xxx/xxx）。
+    这类地址既列不出模型，也没法直接拿来对话，值得在报错时点明。
+    """
+    base = str(base_url or "").strip().rstrip("/")
+    if not base:
+        return False
+    base = _strip_endpoint_suffix(base, _CHAT_ENDPOINT_SUFFIXES
+                                  + _MODEL_LIST_ENDPOINT_SUFFIXES)
+    try:
+        path = urlsplit(base).path
+    except ValueError:
+        return False
+    segments = [seg for seg in path.split("/") if seg]
+    if segments and _VERSION_SEG_RE.search("/" + segments[-1]):
+        segments = segments[:-1]
+    return len(segments) >= 2
 
 
 def conn_fail_hint(endpoint: str, base_url: str, backend: str) -> str:
@@ -382,12 +461,10 @@ async def check_llm_service(ctx) -> tuple:
     backend = ctx.get("llm_backend", "ollama")
     base_url = str(ctx.get("llm_base_url", "http://127.0.0.1:11434")).rstrip("/")
     api_key = ctx.get("llm_api_key", "")
-    if backend == "ollama":
-        endpoint = f"{base_url}/api/tags"
-        headers = {}
-    else:
-        endpoint = f"{base_url}/models"
-        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    endpoints = model_list_endpoints(base_url, backend)
+    endpoint = endpoints[0] if endpoints else str(base_url)
+    headers = {} if backend == "ollama" else (
+        {"Authorization": f"Bearer {api_key}"} if api_key else {})
     try:
         async with httpx.AsyncClient(timeout=6, proxy=None, trust_env=False,
                                      verify=verified_context()) as client:
@@ -1276,7 +1353,7 @@ def _endpoint_and_payload(ctx: RoleContext, messages: list, stream: bool, tools=
     repeat_penalty = float(ctx.get("llm_repeat_penalty", 1.1) or 1.1)
     messages = normalize_messages_for_backend(messages, backend)
     if backend == "ollama":
-        endpoint = f"{base_url}/api/chat"
+        endpoint = chat_endpoint(base_url, "ollama")
         payload = {
             "model": model, "messages": messages, "stream": stream,
             "think": enable_think,
@@ -1301,7 +1378,7 @@ def _endpoint_and_payload(ctx: RoleContext, messages: list, stream: bool, tools=
                 for tool in tools
             ]
         return backend, endpoint, payload, {}, timeout
-    endpoint = f"{base_url}/chat/completions"
+    endpoint = chat_endpoint(base_url, "openai")
     api_key = ctx.get("llm_api_key", "")
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     payload = {"model": model, "messages": messages, "stream": stream,
@@ -2394,6 +2471,23 @@ def last_user_text(messages) -> str:
     return ""
 
 
+def _nearest_tool_call_id(out: list) -> str:
+    """向前找最近一条 assistant 消息声明过的 tool_call id。
+
+    tool 消息缺 id 时要沿用「上一条 assistant 真的声明过的那个 id」：
+    随便补一个字符串（如 "tool"）在 OpenAI 兼容后端会被判为未声明，整轮 400。
+    """
+    for item in reversed(out):
+        if not isinstance(item, dict) or item.get("role") != "assistant":
+            continue
+        for call in reversed(item.get("tool_calls") or []):
+            cid = call.get("id") if isinstance(call, dict) else ""
+            if cid:
+                return str(cid)
+        return ""
+    return ""
+
+
 def normalize_messages_for_backend(messages: list, backend: str) -> list:
     """按后端要求规整整串消息（主要在发送前调用）。"""
     out = []
@@ -2416,7 +2510,8 @@ def normalize_messages_for_backend(messages: list, backend: str) -> list:
                 # Ollama 不接受 tool_call_id 字段
                 msg.pop("tool_call_id", None)
             elif not msg.get("tool_call_id"):
-                msg["tool_call_id"] = msg.get("tool_name") or "tool"
+                msg["tool_call_id"] = (_nearest_tool_call_id(out)
+                                       or msg.get("tool_name") or "tool")
         out.append(msg)
     if has_tool_result:
         for idx, msg in enumerate(out):
@@ -2435,7 +2530,7 @@ def normalize_messages_for_backend(messages: list, backend: str) -> list:
 # ---------------------------------------------------------------------------
 
 async def _prefetch_message_urls(ctx: RoleContext, work: list, tool_registry,
-                                 user_id: str = "") -> list:
+                                 user_id: str = "", call_counts: dict = None) -> list:
     """用户消息里带链接时，先替模型把网页抓回来。
 
     事故背景：用户发一条含链接的消息，门控（_tool_requested）已经放行走工具流程、
@@ -2478,7 +2573,9 @@ async def _prefetch_message_urls(ctx: RoleContext, work: list, tool_registry,
 
     fetched, failed = [], []
     for index, url in enumerate(urls[:limit]):
-        ok, output = await tool_registry.execute("web_fetch", {"url": url}, user_id)
+        # 与模型发起的调用共用同一份计数器，自动抓取才真的占用该工具的额度
+        ok, output = await tool_registry.execute("web_fetch", {"url": url}, user_id,
+                                                 call_counts=call_counts)
         call_id = f"prefetch_{index}"
         if ok:
             fetched.append(url)
@@ -2490,7 +2587,9 @@ async def _prefetch_message_urls(ctx: RoleContext, work: list, tool_registry,
                      "tool_calls": [{"id": call_id, "type": "function",
                                      "function": {"name": "web_fetch",
                                                   "arguments": {"url": url}}}]})
-        work.append({"role": "tool", "content": str(output)})
+        # tool_call_id 必须与上面 assistant 声明的 id 一致：
+        # OpenAI 兼容后端会校验，对不上直接 400 拒绝整轮请求
+        work.append({"role": "tool", "tool_call_id": call_id, "content": str(output)})
 
     if fetched:
         note = ("用户消息里带了链接，其中 " + "、".join(fetched)
@@ -3071,7 +3170,8 @@ async def _prefetch_search(ctx: RoleContext, work: list, tool_registry, user_id:
                          "tool_calls": [{"id": "prefetch_search", "type": "function",
                                          "function": {"name": "web_search",
                                                       "arguments": {"query": query}}}]})
-            work.append({"role": "tool", "content": output})
+            work.append({"role": "tool", "tool_call_id": "prefetch_search",
+                         "content": output})
             work.append({"role": "user", "content":
                          f"用户提到「{query}」，但这是角色扮演/主观互动，"
                          "请直接以角色身份回应，不要搜索、不要引用搜索结果。"})
@@ -3088,7 +3188,7 @@ async def _prefetch_search(ctx: RoleContext, work: list, tool_registry, user_id:
     work.append({"role": "assistant", "content": "",
                  "tool_calls": [{"id": "prefetch_search", "type": "function",
                                  "function": {"name": "web_search", "arguments": {"query": query}}}]})
-    work.append({"role": "tool", "content": str(output)})
+    work.append({"role": "tool", "tool_call_id": "prefetch_search", "content": str(output)})
     if ok and retry_feedback:
         work.append({"role": "user", "content":
                      f"用户反馈上一次搜索结果不对，系统已用新搜索词「{query}」重新检索，"
@@ -3128,7 +3228,8 @@ async def chat_with_tools(ctx: RoleContext, messages: list, tool_registry,
             stats.record_llm(result["ms"])
         return {"content": result.get("content") or "", "tool_trace": [],
                 "ms": result.get("ms", 0.0), "llm_calls": 1}
-    work = await _prefetch_message_urls(ctx, list(messages), tool_registry, user_id)
+    work = await _prefetch_message_urls(ctx, list(messages), tool_registry, user_id,
+                                        call_counts=call_counts)
     # 搜索意图确定性预取：用户明确要求搜索时不赌模型的工具调用能力，直接检索
     trace.extend(await _prefetch_search(ctx, work, tool_registry, user_id,
                                         call_counts=call_counts, session_key=session_key))
@@ -3426,6 +3527,8 @@ async def get_image_reply(ctx: RoleContext, user_text: str, history: list,
         # 与文本对话共用同一份历史（build_merged_history），保证识图与普通回复上下文互通
         history_msgs = build_merged_history(history, ctx)
         images_for_payload = []  # [(source, mime, base64)]
+        # 收藏功能要的是「用户发来的原图」，所以留一份重编码前的原始字节
+        raw_for_capture = None
         seen_sources = set()
         for img_source in image_urls:
             src = str(img_source)
@@ -3457,11 +3560,14 @@ async def get_image_reply(ctx: RoleContext, user_text: str, history: list,
                 # 图床防盗链/过期链接常返回 HTML 错误页，垃圾数据会让识图模型直接 400
                 print(f"跳过非图片内容（链接可能已过期或被拦截）: {src[:120]}")
                 continue
+            original = data
             data, mime = normalize_image_data(data, mime)
             if not data:
                 print(f"图片格式转换失败，已跳过: {src[:120]}")
                 continue
             images_for_payload.append((src, mime, base64_b64(data)))
+            if raw_for_capture is None:
+                raw_for_capture = {"source": src, "data": original}
         if not images_for_payload:
             print("没有有效的图片数据，使用默认回复")
             default_text = "啊嘞，看不清这张图呢。"
@@ -3471,7 +3577,11 @@ async def get_image_reply(ctx: RoleContext, user_text: str, history: list,
             print("未配置识图模型名称，无法处理图片")
             return None
         caption_backend = ctx.get("image_caption_backend", "") or ctx.get("llm_backend", "ollama")
-        base_url = str(ctx.get("llm_base_url", "http://127.0.0.1:11434")).rstrip("/")
+        # 识图模型可独立配置接口地址（部分全模态/向量模型不是 OpenAI 兼容格式，
+        # 需要指向自己的服务）；留空则跟随 LLM 服务地址
+        base_url = str(ctx.get("image_caption_base_url", "") or "").strip() \
+            or str(ctx.get("llm_base_url", "http://127.0.0.1:11434"))
+        base_url = base_url.rstrip("/")
         timeout = ctx.get("image_caption_timeout", 90)
         system_content = build_system_prompt(ctx, emotions, extra_parts)
         if _cfg_bool(ctx, "image_identity_guard_enabled", True):
@@ -3488,7 +3598,7 @@ async def get_image_reply(ctx: RoleContext, user_text: str, history: list,
                 "stream": False, "think": False,
                 "options": {"temperature": float(ctx.get("temperature", 0.7)), "num_predict": 1024}
             }
-            endpoint = f"{base_url}/api/chat"
+            endpoint = chat_endpoint(base_url, "ollama")
             headers = {}
         else:
             content_parts = []
@@ -3503,7 +3613,7 @@ async def get_image_reply(ctx: RoleContext, user_text: str, history: list,
             vision_messages = [{"role": "system", "content": system_content}]
             vision_messages.extend(history_msgs)
             vision_messages.append({"role": "user", "content": content_parts})
-            endpoint = f"{base_url}/chat/completions"
+            endpoint = chat_endpoint(base_url, "openai")
             payload = {
                 "model": model,
                 "messages": vision_messages,
@@ -3564,6 +3674,10 @@ async def get_image_reply(ctx: RoleContext, user_text: str, history: list,
         print(f"【表情收藏-提取结果】{json.dumps(capture, ensure_ascii=False)}")
         if capture is not None:
             result["capture"] = capture
+            if raw_for_capture:
+                # 识图时已经把原图读进来了，收藏直接用这份字节：
+                # 再下载一次的话，QQ 图床直链的 rkey 往往已经过期，收藏会静默失败
+                result["capture_image"] = raw_for_capture
         return result
     except Exception as e:
         print(f"识图模型处理失败: {e}")

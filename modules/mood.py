@@ -1,4 +1,3 @@
-import json
 import random
 import time
 from pathlib import Path
@@ -79,17 +78,22 @@ class MoodManager:
     def __init__(self, data_path):
         self.file = Path(data_path) / "moods.json"
         self.records: dict = {}
+        self._load_failed = False
         self._load()
+
     def _load(self):
-        try:
-            if self.file.exists():
-                data = json.loads(self.file.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    self.records = data
-        except Exception as e:
-            print(f"加载心情存档失败: {e}")
+        from .jsonio import load_json_ex
+        data, readable = load_json_ex(self.file, {})
+        self._load_failed = not readable
+        if not isinstance(data, dict):
+            print("心情存档顶层不是对象，已按空存档处理。")
+            return
+        self.records = data
 
     def _save(self):
+        if self._load_failed:
+            print("心情存档本次未能读取，已跳过保存以免覆盖磁盘上的原有内容。")
+            return
         try:
             from .jsonio import save_json
             save_json(self.file, self.records)

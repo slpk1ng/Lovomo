@@ -59,4 +59,4 @@ def is_cert_error(exc) -> bool:
     """异常是否是证书校验失败（用于决定是否降级重试）。"""
     text = f"{type(exc).__name__}: {exc}".lower()
     return ("certificate_verify_failed" in text or "certificate verify failed" in text
-            or "ssl" in text and "cert" in text)
+            or ("ssl" in text and "cert" in text))

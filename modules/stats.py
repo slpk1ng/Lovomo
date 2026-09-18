@@ -90,8 +90,8 @@ class StatsManager:
                 "SELECT CAST((? - ts + 86399)/86400 AS INTEGER) AS day_idx, COUNT(*) AS n,"
                 " IFNULL(SUM(llm_calls),0) AS llm_calls, IFNULL(SUM(tts_calls),0) AS tts_calls,"
                 " IFNULL(SUM(tool_calls),0) AS tool_calls"
-                " FROM interactions WHERE ts >= ? GROUP BY day_idx ORDER BY day_idx",
-                (today0, start))
+                " FROM interactions WHERE ts >= ? AND ts < ? GROUP BY day_idx ORDER BY day_idx",
+                (today0, start, end))
             out["emotions"] = self.db.query_all(
                 "SELECT emotion, COUNT(*) AS n FROM interactions"
                 " WHERE ts >= ? AND ts < ? AND IFNULL(emotion,'') != ''"
@@ -101,15 +101,19 @@ class StatsManager:
                 " FROM interactions WHERE ts >= ? AND ts < ? AND IFNULL(emotion,'') != ''"
                 " GROUP BY day_idx, emotion ORDER BY day_idx",
                 (today0, start, end))
+            # 三个 TOP 榜同样只在所选区间内统计，之前无 WHERE 会与区间汇总对不上
             out["top_sessions"] = self.db.query_all(
-                "SELECT session_id, session_type, COUNT(*) AS n, MAX(ts) AS last_ts FROM interactions"
-                " GROUP BY session_id ORDER BY n DESC LIMIT 10")
+                "SELECT session_id, MAX(session_type) AS session_type, COUNT(*) AS n,"
+                " MAX(ts) AS last_ts FROM interactions WHERE ts >= ? AND ts < ?"
+                " GROUP BY session_id ORDER BY n DESC LIMIT 10", (start, end))
             out["top_users"] = self.db.query_all(
                 "SELECT user_id, IFNULL(MAX(user_name),'') AS user_name, COUNT(*) AS n FROM interactions"
-                " WHERE IFNULL(user_id,'') != '' GROUP BY user_id ORDER BY n DESC LIMIT 10")
+                " WHERE ts >= ? AND ts < ? AND IFNULL(user_id,'') != ''"
+                " GROUP BY user_id ORDER BY n DESC LIMIT 10", (start, end))
             out["top_characters"] = self.db.query_all(
-                "SELECT character_key, COUNT(*) AS n FROM interactions WHERE IFNULL(character_key,'') != ''"
-                " GROUP BY character_key ORDER BY n DESC LIMIT 10")
+                "SELECT character_key, COUNT(*) AS n FROM interactions"
+                " WHERE ts >= ? AND ts < ? AND IFNULL(character_key,'') != ''"
+                " GROUP BY character_key ORDER BY n DESC LIMIT 10", (start, end))
         except Exception as e:
             out["error"] = str(e)
         out["performance"] = self.get_performance()

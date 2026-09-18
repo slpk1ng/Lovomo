@@ -134,7 +134,8 @@ class UserProfileManager:
                     item = str(item).strip()
                     if item:
                         bucket = [x for x in bucket if x != item]
-                profile[key] = bucket[-50:]
+                # 纯删除不做截断：已存的条目超过上限时，删一条不该顺带丢掉最老的几条
+                profile[key] = bucket
             if data.get("clear_" + key):
                 profile.pop(key, None)
         for key in ("likes", "dislikes", "notes"):

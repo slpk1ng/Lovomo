@@ -91,15 +91,32 @@ def normalize_capture_category(name) -> str:
         return "wuyu"
     return s[:48] if len(s) > 48 else s
 
-def _capture_quota_ok(config, now: float) -> bool:
+def _capture_quota_block(config, now: float) -> str:
+    """返回被节流拦住的原因；可以收藏时返回空串。
+
+    返回原因而不是布尔值：收藏被静默跳过的样子和"功能坏了"完全一样，
+    用户只能看到识图的提取结果，之后什么都没有。
+    """
     st = _capture_state
     today = time.strftime("%Y-%m-%d")
-    if st["date"] != today: st["date"] = today; st["count"] = 0
-    interval = max(0.0, float(config.get("sticker_capture_min_interval", 300) or 0))
-    if interval > 0 and now - st["last"] < interval: return False
-    cap = max(0, int(config.get("sticker_capture_max_per_day", 20) or 0))
-    if cap > 0 and st["count"] >= cap: return False
-    return True
+    if st["date"] != today:
+        st["date"] = today
+        st["count"] = 0
+    try:
+        interval = max(0.0, float(config.get("sticker_capture_min_interval", 300) or 0))
+    except (TypeError, ValueError):
+        interval = 300.0
+    if interval > 0 and now - st["last"] < interval:
+        wait = int(interval - (now - st["last"])) + 1
+        return (f"距上次收藏不足最小间隔（还需 {wait} 秒；"
+                f"sticker_capture_min_interval={interval:.0f}，设为 0 可关闭该限制）。")
+    try:
+        cap = max(0, int(config.get("sticker_capture_max_per_day", 20) or 0))
+    except (TypeError, ValueError):
+        cap = 20
+    if cap > 0 and st["count"] >= cap:
+        return f"今日收藏已达上限（{st['count']}/{cap}，sticker_capture_max_per_day）。"
+    return ""
 
 def _mark_capture(now: float):
     st = _capture_state
@@ -114,9 +131,80 @@ def _ext_for_bytes(data: bytes, hint: str) -> str:
 
 def _index_path(root: Path) -> Path: return root / ".auto_index.json"
 
+_REASON_NAME_MAX = 40
+
+SEND_MODES = ("off", "random", "emotion", "description")
+
+
+def sticker_name_from_reason(reason: str, fallback: str = "") -> str:
+    """把模型给的 reason 洗成可用作文件名的短标题。"""
+    name = re.sub(r'[\\/:*?"<>|\r\n\t]+', " ", str(reason or ""))
+    name = re.sub(r"\s+", " ", name).strip().strip(".")
+    if len(name) > _REASON_NAME_MAX:
+        name = name[:_REASON_NAME_MAX].rstrip()
+    return name or fallback
+
+
+def _unique_path(folder: Path, base: str, ext: str) -> Path:
+    """同一句 reason 被多次命中时加序号，不覆盖已有的表情。"""
+    target = folder / f"{base}{ext}"
+    if not target.exists():
+        return target
+    for i in range(2, 1000):
+        candidate = folder / f"{base}-{i}{ext}"
+        if not candidate.exists():
+            return candidate
+    return folder / f"{base}-{int(time.time() * 1000)}{ext}"
+
+
+def _entry_path(entry) -> str:
+    """索引值兼容两种形态：新版的 {path, reason, category} 与旧版的纯路径字符串。"""
+    if isinstance(entry, dict):
+        return str(entry.get("path") or "")
+    return str(entry or "")
+
+
+def _entry_reason(entry) -> str:
+    return str(entry.get("reason") or "") if isinstance(entry, dict) else ""
+
+
+def sticker_descriptions(root: Path) -> dict:
+    """相对路径 -> 说明文字（模型给的 reason；没有则退回分类说明）。"""
+    index = _load_index(root)
+    by_path = {}
+    for entry in index.values():
+        path = _entry_path(entry)
+        if path:
+            by_path[path] = _entry_reason(entry)
+    out = {}
+    try:
+        folders = [d for d in root.iterdir() if d.is_dir()]
+    except OSError:
+        folders = []
+    for folder in folders:
+        guide = CATEGORY_GUIDE.get(folder.name.lower(), folder.name)
+        for img in sorted(folder.iterdir()):
+            if img.suffix.lower() not in IMAGE_EXTS:
+                continue
+            rel = f"{folder.name}/{img.name}"
+            out[rel] = by_path.get(rel) or f"{guide}（{img.stem}）"
+    return out
+
 # 默认不重编码的格式：这些格式可能带动画（多帧），重编码会丢帧。
 # 可通过 sticker_capture_preserve_formats 配置（逗号/空格/换行分隔）。
 DEFAULT_PRESERVE_FORMATS = (".gif", ".webp")
+
+
+def send_mode(config) -> str:
+    """发送方式：off=关闭 / random=随机 / emotion=按情绪 / description=按描述让模型挑。
+
+    老配置只有 stickers_enabled 没有 sticker_send_mode，这里按开关折算一次，
+    避免升级后表情包被静默关掉。
+    """
+    mode = str(config.get("sticker_send_mode", "") or "").strip().lower()
+    if mode in SEND_MODES:
+        return mode
+    return "emotion" if config.get("stickers_enabled", False) else "off"
 
 
 def _preserve_formats(config) -> set:
@@ -183,33 +271,56 @@ def _save_index(root: Path, index: dict):
 
 def _prune_index(root: Path) -> int:
     index = _load_index(root)
-    stale = [d for d, rel in index.items() if not (root / str(rel)).exists()]
+    stale = [d for d, rel in index.items() if not (root / _entry_path(rel)).exists()]
     if not stale: return 0
     for d in stale: index.pop(d, None)
     _save_index(root, index)
     return len(stale)
 
-async def auto_capture_image(config, sticker_manager, source, category_hint="") -> bool:
-    if sticker_manager is None or not getattr(sticker_manager, "enabled", False): return False
-    if not config.get("sticker_capture_enabled", False): return False
-    src = str(source or "").strip()
-    if not src: return False
-    now = time.time()
-    if not _capture_quota_ok(config, now): return False
+async def auto_capture_image(config, sticker_manager, source, category_hint="",
+                             image_data=None, reason="") -> bool:
+    """把一张图收藏进表情库。
 
-    data = None
-    try:
-        if src.startswith(("http://", "https://")):
-            from .llm_helpers import download_image
-            data = await download_image(src)
-        else:
-            p = Path(src)
-            if not p.exists(): return False
-            data = p.read_bytes()
-    except Exception as e:
-        print(f"表情收藏读取图片失败: {type(e).__name__}: {e}") 
+    每一步跳过都必须写明原因：全部静默 return False 的时候，
+    "设了开关却没收藏"根本无从排查（用户只能看到提取结果，之后什么都没了）。
+    """
+    if sticker_manager is None:
+        print("[表情收藏] 跳过：表情包管理器不可用。")
         return False
-    if not data: return False
+    if not getattr(sticker_manager, "enabled", False):
+        print("[表情收藏] 跳过：表情包功能未开启（stickers_enabled=false）。")
+        return False
+    if not config.get("sticker_capture_enabled", False):
+        print("[表情收藏] 跳过：识图自动收藏未开启（sticker_capture_enabled=false）。")
+        return False
+    src = str(source or "").strip()
+    if not src and not image_data:
+        print("[表情收藏] 跳过：没有可用的图片来源。")
+        return False
+    now = time.time()
+    quota_blocked = _capture_quota_block(config, now)
+    if quota_blocked:
+        print(f"[表情收藏] 跳过：{quota_blocked}")
+        return False
+
+    data = image_data
+    if not data:
+        try:
+            if src.startswith(("http://", "https://")):
+                from .llm_helpers import download_image
+                data = await download_image(src)
+            else:
+                p = Path(src)
+                if not p.exists():
+                    print(f"[表情收藏] 跳过：本地图片文件不存在（{src[:120]}）。")
+                    return False
+                data = p.read_bytes()
+        except Exception as e:
+            print(f"表情收藏读取图片失败: {type(e).__name__}: {e}")
+            return False
+    if not data:
+        print("[表情收藏] 跳过：没有取到图片数据（下载失败或文件为空）。")
+        return False
 
     ext = _ext_for_bytes(data, src)
     if not ext:
@@ -226,7 +337,7 @@ async def auto_capture_image(config, sticker_manager, source, category_hint="") 
     index = _load_index(root)
     existing = index.get(digest)
     if existing:
-        old = root / existing
+        old = root / _entry_path(existing)
         if old.exists():
             print("[表情收藏] 相同图片此前已收藏，跳过重复保存。") 
             return True
@@ -244,6 +355,9 @@ async def auto_capture_image(config, sticker_manager, source, category_hint="") 
     if mapped_cat:
         cat = mapped_cat
         print(f"【表情收藏-映射成功】'{category_hint}' -> '{cat}'")
+    elif cat in STRICT_ALLOWED:
+        # 模型直接给了拼音：本来就合法，别打印成"映射失败"，会被误读成分类被拒
+        print(f"【表情收藏-分类合法】'{cat}' 已是白名单分类，无需映射")
     else:
         print(f"【表情收藏-映射失败】'{category_hint}' 未找到对应拼音，进入白名单校验")
 
@@ -268,13 +382,13 @@ async def auto_capture_image(config, sticker_manager, source, category_hint="") 
     if config.get("sticker_capture_any_pool", True) and cat != "any":
         dirs.append("any")
 
-    base = f"auto_{int(now * 1000)}"
+    base = sticker_name_from_reason(reason, f"auto_{int(now * 1000)}")
     saved, primary = [], None
     try:
         for folder_name in dirs:
             folder = root / folder_name
             folder.mkdir(parents=True, exist_ok=True)
-            target = folder / f"{base}_{random.randint(1000, 9999)}{ext}"
+            target = _unique_path(folder, base, ext)
             target.write_bytes(data)
             saved.append(f"{folder_name}/{target.name}")
             if primary is None: primary = f"{folder_name}/{target.name}"
@@ -283,7 +397,8 @@ async def auto_capture_image(config, sticker_manager, source, category_hint="") 
         return False
 
     if primary is not None:
-        index[digest] = primary
+        index[digest] = {"path": primary, "reason": str(reason or "").strip(),
+                         "category": cat}
         _save_index(root, index)
 
     try: sticker_manager.rescan()
@@ -294,10 +409,10 @@ async def auto_capture_image(config, sticker_manager, source, category_hint="") 
 
 
 class StickerManager:
-    # 这部分原封不动
     def __init__(self, config):
         self.config = config
-        self.enabled = bool(config.get("stickers_enabled", False))
+        self.mode = send_mode(config)
+        self.enabled = self.mode != "off"
         self.dir = Path(config.get("stickers_dir", "") or Path("data/stickers"))
         try:
             self.probability = float(config.get("sticker_probability", 1.0))
@@ -327,25 +442,92 @@ class StickerManager:
         if total: print(f"表情包扫描完成：{len(self.map)} 个情绪分类，共 {total} 张图片（目录：{root}）")
         else: print(f"表情包目录为空（{root}），可在 WebUI「表情包」页上传图片。")
     def rescan(self): self.__init__(self.config)
+    def _candidates_for(self, emotion: str) -> list:
+        key = str(emotion or "").strip().lower()
+        candidates = []
+        if key and key in self.map: candidates = [p for p in self.map[key] if p.exists()]
+        if not candidates and self.any_pool: candidates = [p for p in self.any_pool if p.exists()]
+        if not candidates: candidates = [p for p in self.default_pool if p.exists()]
+        return candidates
+
+    def _all_candidates(self) -> list:
+        items = []
+        for pool in list(self.map.values()) + [self.any_pool, self.default_pool]:
+            items.extend(p for p in pool if p.exists())
+        return items
+
+    def _candidates(self, emotion: str) -> list:
+        if self.mode == "random":
+            return self._all_candidates()
+        return self._candidates_for(emotion)
+
     def pick(self, emotion: str):
         if not self.enabled: return None
         removed = _prune_index(self.dir)
         if removed:
             print(f"[表情收藏] 清理了 {removed} 条已被删除表情包的索引记录。")
         if self.probability < 1.0 and random.random() > self.probability: return None
-        candidates = []
-        key = str(emotion or "").strip().lower()
-        if key and key in self.map: candidates = [p for p in self.map[key] if p.exists()]
-        if not candidates and self.any_pool: candidates = [p for p in self.any_pool if p.exists()]
-        if not candidates: candidates = [p for p in self.default_pool if p.exists()]
+        candidates = self._candidates(emotion)
         if not candidates:
             self._scan()
-            if key and key in self.map: candidates = [p for p in self.map[key] if p.exists()]
-            if not candidates and self.any_pool: candidates = [p for p in self.any_pool if p.exists()]
-            if not candidates: candidates = [p for p in self.default_pool if p.exists()]
+            candidates = self._candidates(emotion)
         if not candidates: return None
         sticker = random.choice(candidates)
         if not sticker.exists():
             _prune_index(self.dir)
             return None
         return sticker
+
+    async def pick_async(self, ctx=None, emotion: str = "", text: str = ""):
+        """按当前发送方式挑一张；description 模式会问一次模型。"""
+        if self.mode == "off":
+            return None
+        if self.mode == "description":
+            picked = await self._pick_by_description(ctx, text, emotion)
+            if picked is not None:
+                return picked
+        return self.pick(emotion)
+
+    async def _pick_by_description(self, ctx, text: str, emotion: str):
+        if ctx is None:
+            return None
+        try:
+            _prune_index(self.dir)
+            items = list(sticker_descriptions(self.dir).items())
+        except Exception as e:
+            print(f"表情包描述读取失败: {type(e).__name__}: {e}")
+            return None
+        if not items:
+            return None
+        try:
+            limit = max(1, int(self.config.get("sticker_desc_max_candidates", 30) or 30))
+        except (TypeError, ValueError):
+            limit = 30
+        if len(items) > limit:
+            items = random.sample(items, limit)
+        listing = "\n".join(f"{i}. {desc}" for i, (_, desc) in enumerate(items))
+        prompt = str(self.config.get("sticker_pick_prompt", "") or "").strip()
+        payload = (f"{prompt}\n\n候选表情包：\n{listing}\n\n"
+                   f"角色要说的话：{str(text or '')[:200]}"
+                   + (f"\n（当前情绪：{emotion}）" if emotion else ""))
+        try:
+            from .llm_helpers import chat_once
+            result = await chat_once(ctx, [{"role": "user", "content": payload}])
+        except Exception as e:
+            print(f"按描述挑表情包失败，回退按情绪选择: {type(e).__name__}: {e}")
+            return None
+        raw = str((result or {}).get("content") or "").strip()
+        match = re.search(r"\{[^{}]*\"index\"\s*:\s*(-?\d+)[^{}]*\}", raw) \
+            or re.search(r"\b(\d+)\b", raw)
+        if not match:
+            print(f"按描述挑表情包：模型未给出有效编号（{raw[:60]!r}），回退按情绪选择。")
+            return None
+        try:
+            index = int(match.group(1))
+        except (TypeError, ValueError):
+            return None
+        if index < 0 or index >= len(items):
+            print(f"按描述挑表情包：编号 {index} 超出候选范围，回退按情绪选择。")
+            return None
+        path = self.dir / items[index][0]
+        return path if path.exists() else None

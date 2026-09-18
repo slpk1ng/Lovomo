@@ -26,6 +26,7 @@ import ast
 import asyncio
 import ipaddress
 import json
+import locale
 import math
 import operator
 import os
@@ -776,6 +777,26 @@ SEARCH_ENGINES: Dict[str, dict] = {
 }
 
 
+def invalid_custom_engines(raw) -> List[str]:
+    """返回地址模板缺少 {query} 的自定义引擎别名。
+
+    这类模板拿不到搜索词，请求会带着空查询去检索、返回一堆无关结果，
+    而且不会有任何提示；必须在保存时就拦下来。
+    """
+    bad = []
+    for line in str(raw or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, _, url = line.partition("=")
+        name, url = name.strip(), url.strip()
+        if not name or "http" not in url.lower():
+            continue
+        if "{query}" not in url:
+            bad.append(name)
+    return bad
+
+
 def _parse_custom_engines(raw) -> Dict[str, dict]:
     """自定义引擎：`别名=地址模板`，每行一个（模板用 {query} / {page}）。"""
     engines: Dict[str, dict] = {}
@@ -786,6 +807,9 @@ def _parse_custom_engines(raw) -> Dict[str, dict]:
         name, _, url = line.partition("=")
         name, url = name.strip(), url.strip()
         if not name or "http" not in url.lower():
+            continue
+        if "{query}" not in url:
+            print(f"自定义搜索引擎「{name}」的地址模板缺少 {{query}} 占位符，已忽略该引擎。")
             continue
         engines[name] = {
             "label": name,
@@ -893,22 +917,62 @@ _ENGINE_SAFE_PARAMS = {
     "google-news": {"off": {}, "normal": {"safe": "active"}, "strict": {"safe": "active"}},
 }
 
-# R18 关键词：命中即整条丢弃（一般档就已经拦下）。
-# 清单刻意偏向"成人站/成人内容"这类明确字眼：裸体/性爱/性交属于客观词，
-# 查医学或艺术资料时也会出现，放进一般档会误伤正常搜索，故归到严格档。
-_R18_TERMS = (
-    "r18", "r-18", "18禁", "十八禁", "成人内容", "成人视频", "成人影片", "成人漫画",
-    "成人小说", "成人游戏", "成人网站", "成人影片", "色情", "情色", "黄色网站",
-    "黄片", "毛片", "av女优", "av番号", "无码", "有码", "里番", "工口", "エロ",
-    "成人向", "hentai", "porn", "porno", "nsfw", "xvideos", "pornhub", "xhamster",
-    "onlyfans", "erotic", "adult video", "adult site",
+# 成人向（一般档就拦）：成人站点、成人品牌、明确的成人内容描述。
+# 刻意不收「成人」「色」「黄」「性」「av」「sm」这类单字/短词——「成人高考」「裸眼视力」
+# 「Java」「smart」「性教育」都会被它们误伤。
+_ADULT_TERMS = (
+    "r18", "r-18", "18禁", "十八禁", "18+", "限制级",
+    "成人内容", "成人向", "成人视频", "成人影片", "成人电影", "成人动画",
+    "成人动漫", "成人漫画", "成人小说", "成人游戏", "成人网站", "成人论坛",
+    "成人社区", "成人图片", "成人套图", "成人自拍", "成人直播", "成人用品",
+    "成人片", "色情", "色情片", "色情网站", "色情视频", "色情图片", "色情小说",
+    "色情游戏", "色情直播", "色情服务", "色情动漫", "情色", "情色片",
+    "黄色网站", "黄色电影", "黄色小说", "黄色图片", "黄片", "毛片", "黄网",
+    "黄站", "三级片", "三级电影", "エロ",
+    "av女优", "av番号", "av在线", "av下载", "av资源", "av网站", "av影片",
+    "av电影", "无码", "有码", "无码流出", "无码破解", "无修正", "无修版",
+    "里番", "工口",
+    "hentai", "hanime", "nhentai", "e-hentai", "exhentai", "porn", "porno",
+    "pornography", "nsfw", "xvideos", "xhamster", "pornhub", "spankbang",
+    "eporner", "missav", "supjav", "jable", "javbus", "javdb", "javlibrary",
+    "avmoo", "avsee", "madou", "onlyfans", "fansly", "chaturbate", "cam4",
+    "stripchat", "bongacams", "livejasmin", "erome", "thisvid", "motherless",
+    "beeg", "brazzers", "realitykings", "fanza", "duga", "erotic",
+    "adult video", "adult site", "adult content","奸淫", 
+    "淫秽", "淫乱", "淫荡", "淫水", "淫叫", "淫妻", "淫娃", "淫魔",
+    "嫖娼", "卖淫", "招妓", "楼凤", "外围女", "站街女",
+    "性服务", "性交易", "性奴", "性虐", "约炮", "约啪", "炮友", "一夜情",
+    "援交", "sex video", "sex toy", "sex chat", "sex cam",
 )
-# 低俗 / 性暗示关键词：只有严格档才拦
+# 成人聚合站 / 黑料站 / 里番站站名（一般档就拦）
+_ADULT_SITES = (
+    "91爆料", "91porn", "91av", "91视频", "91国产", "91制片厂", "51吃瓜",
+    "吃瓜网", "黑料网", "黑料不打烊", "爆料网", "草榴", "1024社区", "t66y",
+    "色花堂", "sehuatang", "麻豆传媒", "麻豆映画", "天美传媒", "精东影业",
+    "蜜桃传媒", "星空传媒", "果冻传媒", "糖心vlog", "糖心传媒", "国产精品",
+    "精品国产", "自拍偷拍", "偷拍自拍", "里番", "里番库", "91传媒"
+)
+# 低俗 / 性暗示 + 露骨但属客观词的词（只有严格档才拦）。
+# 客观词（性交/性爱/自慰/性行为…）放严格档：查医学、性教育资料时一般档还能用。
 _SUGGESTIVE_TERMS = (
-    "性暗示", "大尺度", "露点", "走光", "艳照", "裸照", "裸聊", "约炮", "一夜情",
-    "情色小说", "情欲", "艳情", "床戏", "软色情", "擦边", "福利姬",
-    "女优", "风俗店", "援交", "sugar baby", "escort", "camgirl", "nsfw18",
-    "nude", "naked", "sex video", "sex toy",
+    "性暗示", "大尺度", "露点", "走光", "艳照", "裸照", "裸聊", "裸舞", "裸体",
+    "性感写真", "性感主播", "擦边", "擦边球", "软色情", "情色小说", "情欲",
+    "艳情", "床戏", "香艳",
+    "福利姬", "女优", "风俗店", "sugar baby", "escort", "camgirl",
+    "nsfw18", "nude", "naked",
+    "性交", "性爱", "做爱", "性行为", "自慰", "手淫", "口交", "肛交", "颜射",
+    "巨乳", "爆乳", "痴女", "肉棒", "肉便器", "潮吹", "调教", "制服诱惑", "鸡巴", 
+    "小穴", "骚货", "骚逼", "骚女", "骚穴", "双飞", "群交", "后入式","69式", "舔阴",
+    "舔奶", "舔肛", "足交", "乳交", "打飞机", "破处", "大奶", "大屌", "屄", "户外露出",
+    "野外露出", "野战", "群P", "多人性行为", "多人性交", "多人性爱", "车震", "激情床戏",
+    "摸奶", "摸胸", "操逼", "淫穴"
+)
+# 成人站域名：一般档起拦（只在网址里匹配）
+_ADULT_DOMAINS = (
+    "91porn", "91av", "91zuida", "51chigua", "chigua", "heiliao", "madou",
+    "sehuatang", "t66y", "xvideo", "pornhub", "missav", "javbus", "javdb",
+    "hanime", "nhentai", "rule34", "onlyfans", "chaturbate", "cam4",
+    "spankbang", "eporner", "agedm", "asmr18",
 )
 
 
@@ -939,26 +1003,64 @@ def _safe_search_params(spec: dict, config) -> dict:
 
 
 def _safe_search_terms(level: str) -> tuple:
+    """该档位的内置词表；严格档一定包含一般档的全部内容。"""
     if level == "off":
         return ()
     if level == "strict":
-        return _R18_TERMS + _SUGGESTIVE_TERMS
-    return _R18_TERMS
+        return _ADULT_TERMS + _ADULT_SITES + _SUGGESTIVE_TERMS
+    return _ADULT_TERMS + _ADULT_SITES
+
+
+_WORD_SPLIT_RE = re.compile(r"[\n\r,，、;；]+")
+
+
+def _split_words(raw) -> tuple:
+    """把词表文本切成小写去重的词元（换行 / 逗号 / 顿号 / 分号分隔）。"""
+    out = []
+    for chunk in _WORD_SPLIT_RE.split(str(raw or "")):
+        word = chunk.strip().lower()
+        if word and word not in out:
+            out.append(word)
+    return tuple(out)
+
+
+def extra_block_terms(config) -> tuple:
+    """配置里用户自己加的过滤词，一般档与严格档都拦。"""
+    return _split_words((config or {}).get("web_search_block_words", ""))
+
+
+def extra_allow_terms(config) -> tuple:
+    """配置里用户自己加的白名单词：命中就放行，优先于黑名单与域名判断。"""
+    return _split_words((config or {}).get("web_search_allow_words", ""))
+
+
+def _adult_domain(url: str) -> str:
+    low = str(url or "").lower()
+    return next((d for d in _ADULT_DOMAINS if d in low), "")
 
 
 def filter_unsafe_results(results: list, config, query: str = "") -> list:
-    """按安全搜索档位过滤搜索结果；返回保留下来的结果列表。"""
+    """按安全搜索档位过滤搜索结果；off 档不做任何过滤。"""
     level = safe_search_level(config)
-    terms = _safe_search_terms(level)
-    if not terms or not results:
+    if level == "off" or not results:
         return list(results or [])
+    terms = _safe_search_terms(level) + extra_block_terms(config)
+    allow = extra_allow_terms(config)
     kept, dropped = [], []
     for item in results:
         if not isinstance(item, dict):
             continue
         haystack = " ".join(str(item.get(k, "") or "")
                             for k in ("title", "url", "content", "snippet")).lower()
-        hit = next((t for t in terms if t.lower() in haystack), "")
+        # 白名单优先：命中就放行，不再看黑名单与域名
+        if allow and any(t in haystack for t in allow):
+            kept.append(item)
+            continue
+        domain = _adult_domain(str(item.get("url", "") or ""))
+        if domain:
+            dropped.append((str(item.get("title", ""))[:40], f"域名 {domain}"))
+            continue
+        hit = next((t for t in terms if t in haystack), "")
         if hit:
             dropped.append((str(item.get("title", ""))[:40], hit))
         else:
@@ -1403,6 +1505,29 @@ async def _run_queries(tool_registry, queries: List[str], tool: dict, engine: st
     if failures:
         text += "\n\n（以下子查询未成功：" + "；".join(failures) + "）"
     return True, text
+
+
+def _decode_console_output(raw) -> str:
+    """解码子进程输出。
+
+    中文 Windows 的控制台工具默认按本机代码页（cp936）输出，而多数跨平台
+    命令按 UTF-8 输出；固定按 UTF-8 解码会把前者整段变成替换字符且不报错。
+    依次尝试候选编码，取第一个能完整解码的结果。
+    """
+    if not raw:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    candidates = ["utf-8"]
+    preferred = locale.getpreferredencoding(False) or ""
+    if preferred:
+        candidates.append(preferred)
+    for enc in candidates:
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", "replace")
 
 
 class ToolRegistry:
@@ -2021,17 +2146,18 @@ class ToolRegistry:
         def _run():
             creationflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
             if executable:
-                return subprocess.run(argv, shell=False, capture_output=True, text=True,
-                                      encoding="utf-8", errors="replace",
+                return subprocess.run(argv, shell=False, capture_output=True,
                                       timeout=timeout, creationflags=creationflags)
             quoted = subprocess.list2cmdline(argv)
             return subprocess.run([os.environ["COMSPEC"], "/d", "/s", "/c", quoted],
-                                  shell=False, capture_output=True, text=True,
+                                  shell=False, capture_output=True,
                                   timeout=timeout, creationflags=creationflags)
 
         try:
             proc = await asyncio.to_thread(_run)
         except subprocess.TimeoutExpired:
             return False, f"命令超时({timeout}s)"
-        output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr.strip() else "")
+        stdout = _decode_console_output(proc.stdout)
+        stderr = _decode_console_output(proc.stderr)
+        output = stdout + ("\n" + stderr if stderr.strip() else "")
         return proc.returncode == 0, output.strip()[:max_chars] or "(无输出)"

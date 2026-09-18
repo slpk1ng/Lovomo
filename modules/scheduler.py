@@ -143,15 +143,16 @@ class SchedulerManager:
                 if not job.enabled:
                     continue
                 if job.next_run <= now:
-                    if job.trigger and job.trigger.get("type") == "oneshot":
-                        # 一次性任务先摘除再执行：回调里常有 LLM 生成等慢操作，
-                        # 若执行期间任务仍留在列表里，下一轮循环会再次点火，
-                        # 造成同一条提醒发送两遍（模板话术+LLM话术各来一条）。
-                        self.jobs.pop(job.id, None)
                     if getattr(job, "busy", False):
-                        # 上一轮还没跑完（LLM/TTS 慢于间隔）：跳过本次点火，防止堆积并发
+                        # 上一轮还没跑完（LLM/TTS 慢于间隔）：跳过本次点火，防止堆积并发。
+                        # 判断必须在摘除之前，否则忙时摘掉一次性任务就再也不会点火了
                         job.next_run = now + 5
                     else:
+                        if job.trigger and job.trigger.get("type") == "oneshot":
+                            # 一次性任务先摘除再执行：回调里常有 LLM 生成等慢操作，
+                            # 若执行期间任务仍留在列表里，下一轮循环会再次点火，
+                            # 造成同一条提醒发送两遍（模板话术+LLM话术各来一条）。
+                            self.jobs.pop(job.id, None)
                         job.busy = True
                         asyncio.create_task(self._run_job(job))
                         job.compute_next_run(now)
@@ -179,12 +180,19 @@ class SchedulerManager:
     async def stop(self):
         self._running = False
         self._wakeup.set()
-        if self._task:
+        task, self._task = self._task, None
+        if task is None:
+            return
+        try:
+            await asyncio.wait_for(task, timeout=3)
+        except Exception:
+            # cancel 之后必须等它真正结束：不等会留下 pending 任务
+            # （"Task was destroyed but it is pending"）和在途回调
+            task.cancel()
             try:
-                await asyncio.wait_for(self._task, timeout=3)
-            except Exception:
-                self._task.cancel()
-            self._task = None
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 _scheduler: Optional[SchedulerManager] = None

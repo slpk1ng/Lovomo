@@ -5,3 +5,14 @@ napcat-sdk
 pywebview
 pystray
 Pillow
+requests
+beautifulsoup4
+jinja2
+python-dateutil
+psutil
+pygments
+markdown
+qrcode
+cryptography
+tzdata
+pypdf

@@ -1,0 +1,71 @@
+# 喵喵皮肤・回复追加 —— Lovomo 示例插件清单
+#
+# 元信息（介绍 / 版本 / 作者 / 仓库）全部写在这里。
+# 字段说明见 plugins/README.md；plugin.json 仍然兼容，但新插件请用本文件。
+id: meow-skin
+name: 喵喵皮肤・回复追加
+version: 1.0.0
+author: Lovomo 官方示例
+github: slpk1ng
+homepage: https://github.com/slpk1ng/Lovomo
+repo: slpk1ng/Lovomo
+type: mixed
+entry: main.py
+logo: logo.png
+tags:
+  - 皮肤
+  - 功能
+  - 示例
+  - 教学
+description: 皮肤 + 功能二合一示例：重排侧边栏与卡片，可调背景图、主色、圆角、区块透明度、分隔线颜色与区块底色；另可设置每轮 LLM 回复结束后追加几条「喵～」文字和喵叫语音。装好后在左侧栏「插件」页点卡片进功能页配置。
+skin:
+  background: true
+  layout: true
+  accent: "#7c4dff"
+  label: 喵喵皮肤
+  vars:
+    - name: block-opacity
+      label: 区块透明度
+      type: range
+      min: 0
+      max: 1
+      step: 0.01
+      default: 0.92
+      description: 卡片、区块、面板、表格、弹窗、日志区、输入框、按钮等所有带底色的面，统一按这个透明度降低底色 alpha（文字不受影响）。0 表示完全透明，只留文字和描边。
+    - name: radius
+      label: 圆角
+      type: range
+      min: 0
+      max: 28
+      step: 1
+      default: 14
+      unit: px
+      description: 区块、卡片、按钮、输入框的圆角大小。
+    - name: line-color
+      label: 分隔线颜色
+      type: color
+      default: "#e6e1f5"
+      description: 区块描边、输入框边框、分隔线的颜色。
+    - name: surface-color
+      label: 区块底色
+      type: color
+      default: "#ffffff"
+      description: 卡片、区块、输入框的底色（会和上面的透明度叠加）。
+panel:
+  label: 喵喵皮肤
+  title: 喵喵皮肤 · 外观与追加
+features:
+  - key: meow_reply_enabled
+    label: 喵喵追加
+    type: bool
+    default: false
+    description: 开启后，每轮 LLM 回复发送完成时会再单独发一条「喵～」文字和一条喵叫语音；关闭或卸载插件即恢复原样。
+  - key: meow_reply_times
+    label: 追加次数
+    type: range
+    min: 1
+    max: 5
+    step: 1
+    default: 1
+    unit: 次
+    description: 每轮回复后重复追加几条。次数越多越吵，建议保持 1~2。

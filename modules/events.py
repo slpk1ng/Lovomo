@@ -12,7 +12,6 @@
 只包含公历固定日期的节日——春节、中秋等农历节日日期逐年不同，请按当年公历日期自行添加，
 写错日期的节日问候比没有更糟，所以不做硬编码猜测。
 """
-import json
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -76,16 +75,18 @@ class EventManager:
 
     # ---------------- 持久化 ----------------
     def load_events(self):
-        try:
-            if self.file.exists():
-                self.events = json.loads(self.file.read_text(encoding="utf-8"))
-                if not isinstance(self.events, list):
-                    self.events = []
-        except Exception as e:
-            print(f"加载事件配置失败: {e}")
-            self.events = []
+        from .jsonio import load_json_ex
+        if not self.file.exists():
+            self._load_failed = False
+            return
+        data, readable = load_json_ex(self.file, [])
+        self._load_failed = not readable
+        self.events = data if isinstance(data, list) else []
 
     def save_events(self):
+        if getattr(self, "_load_failed", False):
+            print("事件配置本次未能读取，已跳过保存以免覆盖磁盘上的原有内容。")
+            return
         try:
             from .jsonio import save_json
             save_json(self.file, self.events)
@@ -93,12 +94,9 @@ class EventManager:
             print(f"保存事件配置失败: {e}")
 
     def load_log(self):
-        self._log = {}
-        try:
-            if self.log_file.exists():
-                self._log = json.loads(self.log_file.read_text(encoding="utf-8"))
-        except Exception:
-            self._log = {}
+        from .jsonio import load_json
+        data = load_json(self.log_file, {})
+        self._log = data if isinstance(data, dict) else {}
 
     def _mark_sent(self, key: str):
         today = time.strftime("%Y-%m-%d")
@@ -109,10 +107,11 @@ class EventManager:
         cutoff = time.strftime("%Y-%m-%d", time.localtime(time.time() - 30 * 86400))
         self._log = {k: v for k, v in self._log.items() if k >= cutoff}
         try:
-            self.log_file.write_text(json.dumps(self._log, ensure_ascii=False, indent=2),
-                                     encoding="utf-8")
-        except Exception:
-            pass
+            # 必须原子写：写一半被强杀会让日志损坏，当天问候会被重复发送一遍
+            from .jsonio import save_json
+            save_json(self.log_file, self._log)
+        except Exception as e:
+            print(f"保存问候记录失败（下次检查可能重复发送）: {type(e).__name__}: {e}")
 
     def _sent(self, key: str) -> bool:
         return key in self._log.get(time.strftime("%Y-%m-%d"), [])
@@ -219,9 +218,13 @@ class EventManager:
                         except Exception as e:
                             print(f"[生日祝福] 获取会话历史失败（忽略）: {type(e).__name__}: {e}")
                     text = await generate_proactive_text(ctx, text, history_block=block) or text
-                await sender.speak_and_send("private", user_id, text, emotions, ctx,
-                                            use_voice=bool(self.config.get("birthday_greet_voice", False)),
-                                            sticker=bool(self.config.get("proactive_sticker", False)))
+                ok = await sender.speak_and_send(
+                    "private", user_id, text, emotions, ctx,
+                    use_voice=bool(self.config.get("birthday_greet_voice", False)),
+                    sticker=bool(self.config.get("proactive_sticker", False)))
+                if not ok:
+                    print(f"[生日祝福] {user_id} 发送失败，不标记已发送，下次检查时重试。")
+                    continue
                 self._mark_sent(key)
                 sent_total += 1
         return sent_total
@@ -231,14 +234,18 @@ class EventManager:
         sent_any = False
         for target in targets:
             try:
-                await sender.speak_and_send(
+                ok = await sender.speak_and_send(
                     target.get("session_type", "private"), target.get("session_id", ""),
                     text, emotions, ctx,
                     use_voice=bool(event.get("use_voice", False)),
                     sticker=bool(self.config.get("proactive_sticker", False)))
-                sent_any = True
             except Exception as e:
                 print(f"[节日问候] 发送失败 {target.get('session_id', '')}: {e}")
+                continue
+            if ok:
+                sent_any = True
+            else:
+                print(f"[节日问候] 发送未成功 {target.get('session_id', '')}")
         return sent_any
 
     async def _render_event_text(self, event: dict, ctx: RoleContext,
@@ -265,9 +272,11 @@ class EventManager:
         text = await self._render_event_text(event, ctx)
         if not text:
             return False
+        sent_any = False
         for target in event.get("targets", []):
-            await sender.speak_and_send(target.get("session_type", "private"),
-                                        target.get("session_id", ""), text,
-                                        emotions_provider(), ctx,
-                                        use_voice=bool(event.get("use_voice", False)))
-        return True
+            ok = await sender.speak_and_send(target.get("session_type", "private"),
+                                             target.get("session_id", ""), text,
+                                             emotions_provider(), ctx,
+                                             use_voice=bool(event.get("use_voice", False)))
+            sent_any = sent_any or bool(ok)
+        return sent_any

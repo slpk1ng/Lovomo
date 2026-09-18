@@ -11,10 +11,70 @@ import shutil
 import sys
 import threading
 import time
+import traceback
 import zipfile
 from base64 import b64encode, b64decode
 from pathlib import Path
 from typing import Optional, Dict, Any, List
+from urllib.parse import urlsplit
+
+
+def _harden_stdio():
+    """让 print 在任何终端/无终端环境下都不会把程序带崩。
+
+    console=False 打包时 sys.stdout 是 None（print 直接 AttributeError）；
+    从 GBK 代码页的 cmd 启动时，⚠️ 这类字符编码不了会抛 UnicodeEncodeError。
+    两种都在任何 print 之前处理掉。
+    """
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is None:
+            try:
+                setattr(sys, name, open(os.devnull, "w", encoding="utf-8",
+                                       errors="replace"))
+            except Exception:
+                pass
+            continue
+        try:
+            # 保留终端原本的编码（中文才能正常显示），只把编码不了的字符换成 ?
+            stream.reconfigure(errors="replace")
+        except Exception:
+            pass
+
+
+_harden_stdio()
+
+
+def _probe_writable(directory: Path) -> bool:
+    """目录是否真的能写：os.access 在 Windows 上会误报，实测一次最准。"""
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        probe = directory / f".lovomo_write_{os.getpid()}"
+        probe.write_text("1", encoding="utf-8")
+        probe.unlink()
+        return True
+    except Exception:
+        return False
+
+
+def user_data_dir() -> Path:
+    """程序目录不可写时的兜底目录（装进 Program Files 且没提权就会走到这里）。"""
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    path = Path(base) / "Lovomo"
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return path
+
+
+def runtime_path(filename: str, preferred_dir: Optional[Path] = None) -> Path:
+    """运行时文件（日志等）的落点：程序目录能写就用它，否则落到用户目录。"""
+    directory = (Path(preferred_dir) if preferred_dir else Path.cwd()).resolve()
+    if _probe_writable(directory):
+        return directory / filename
+    return user_data_dir() / filename
+
 
 import httpx
 try:
@@ -47,8 +107,60 @@ from modules.rag import RAGManager, extract_text_from_file
 from modules.todo_manager import TodoManager, DEFAULT_EXTRACT_PROMPT as TODO_EXTRACT_PROMPT
 from modules.jobs import ScheduledJobManager, generate_proactive_text
 from modules.events import EventManager
+from modules.plugin_publisher import (publish_plugin as _publish_to_github,
+                                       verify_token as _verify_github_token,
+                                       PublishError as _PublishError)
 from modules.mood import MoodManager, judge_and_decide
-from modules.sender import MessageSender
+from modules.sender import MessageSender, VoicePacer
+from modules.ghmirror import DEFAULT_MIRRORS
+from modules.plugins import (PluginManager, ALLOWED_EXTS as ALLOWED_ASSET_EXTS,
+                             MAX_ASSET_BYTES as MAX_PLUGIN_ASSET_BYTES,
+                             WEBUI_NAME as PLUGIN_WEBUI_NAME,
+                             safe_asset_name, unique_asset_name)
+
+# 每次刷新最多查几个 Release 的点赞数（GitHub 匿名接口有次数限制）
+MAX_REACTION_LOOKUPS = 12
+
+# 插件自带页面（功能页 / webui.html）注入的桥接脚本：同源 iframe 直接调父窗口上的
+# lovomoHost。必须插在插件自己的脚本之前，否则插件在解析阶段拿不到 window.lovomo。
+PLUGIN_BRIDGE_TEMPLATE = """<script>
+(function () {
+  var info = /*__LOVOMO_INFO__*/ null;
+  var host = (parent !== window && parent.lovomoHost) ? parent.lovomoHost : null;
+  var api = Object.assign({}, info, {
+    asset: function (name) {
+      return '/api/plugins/asset?id=' + encodeURIComponent(info.id)
+           + '&name=' + encodeURIComponent(name || '');
+    },
+    theme: function () {
+      var root = parent.document.documentElement;
+      return {skinOn: root.classList.contains('skin-on'),
+              accent: parent.getComputedStyle(root).getPropertyValue('--skin-accent').trim()};
+    },
+    log: function () {
+      if (host) { host.log(info.id, Array.prototype.slice.call(arguments)); }
+      else { console.log.apply(console, arguments); }
+    },
+    toast: function (text, isErr) { if (host) { host.toast(info.id, text, isErr); } },
+    save: function (patch) {
+      if (!host) { return Promise.resolve(api.settings); }
+      return Promise.resolve(host.save(info.id, patch)).then(function (merged) {
+        if (merged) { api.settings = merged; }
+        return api.settings;
+      });
+    },
+    apply: function () { return host ? host.apply(info.id) : null; },
+    dirty: function () { return host ? host.dirty(info.id) : false; },
+    reload: function () { return api.settings; },
+    close: function () { if (host) { host.close(info.id); } }
+  });
+  window.lovomo = api;
+  document.addEventListener('DOMContentLoaded', function () {
+    window.dispatchEvent(new CustomEvent('lovomo:ready', {detail: api}));
+  });
+})();
+</script>
+"""
 from modules.llm_helpers import (RoleContext, build_chat_messages, chat_once,
                                 chat_with_tools, normalize_sentences,
                                 normalize_single, sentence_obj_has_text,
@@ -61,14 +173,73 @@ from modules.llm_helpers import (RoleContext, build_chat_messages, chat_once,
                                 image_self_claim, image_identity_note,
                                 IMAGE_CLAIM_WARNING, sent_links, record_sent_links,
                                 urls_in_text, is_search_request, is_search_dissatisfied,
-                                lang_text_broken, translate_to_lang)
-from modules.tts import synthesize_sentence, get_audio_duration, resolve_tts_path
+                                lang_text_broken, translate_to_lang,
+                                model_list_endpoints, looks_like_full_endpoint)
+from modules.tts import synthesize_sentence, resolve_tts_path
 from modules.tls import verified_context
 from modules.tts_service import (process_manager, ensure_tts_service,
-                                 auto_start_and_switch_tts)
+                                 auto_start_and_switch_tts, mark_exiting)
 
-logging.basicConfig(filename='app.log', level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+LOG_MAX_SIZE_MB_DEFAULT = 5
+_LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
+# 裁剪时保留的比例：留出余量，否则每写一行都要重写一次整个日志文件
+_LOG_TRIM_KEEP_RATIO = 0.8
+
+
+class _CappedFileHandler(logging.FileHandler):
+    """日志文件超过字节上限时丢弃文件里最早的记录，只保留尾部内容。"""
+
+    def __init__(self, filename, max_bytes: int):
+        super().__init__(filename, mode="a", encoding="utf-8")
+        self.max_bytes = max(1, int(max_bytes))
+
+    def emit(self, record):
+        super().emit(record)
+        try:
+            if self.stream is not None and self.stream.tell() > self.max_bytes:
+                self._trim()
+        except Exception:
+            self.handleError(record)
+
+    def _trim(self):
+        # 处理器以追加模式打开，截断文件后后续写入仍落在文件末尾，
+        # 所以不需要关掉再重开 stream（重开失败会丢日志）。
+        self.stream.flush()
+        path = Path(self.baseFilename)
+        keep = path.read_bytes()[-int(self.max_bytes * _LOG_TRIM_KEEP_RATIO):]
+        head, sep, tail = keep.partition(b"\n")
+        path.write_bytes(tail if sep else keep)
+
+
+def apply_log_max_size(config) -> None:
+    """按配置的 MB 上限重建 app.log 的处理器，配置改完立即生效。
+
+    日志设置失败不该拦住程序启动或配置热重载，所以这里吞掉异常只留提示。
+    """
+    try:
+        try:
+            max_mb = int(config.get("log_max_size_mb", LOG_MAX_SIZE_MB_DEFAULT))
+        except (TypeError, ValueError):
+            max_mb = LOG_MAX_SIZE_MB_DEFAULT
+        log_path = runtime_path("app.log")
+        root = logging.getLogger()
+        for handler in list(root.handlers):
+            if isinstance(handler, logging.FileHandler) and Path(handler.baseFilename) == log_path:
+                root.removeHandler(handler)
+                handler.close()
+        handler = _CappedFileHandler(log_path, max(1, max_mb) * 1024 * 1024)
+        handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+        root.addHandler(handler)
+        root.setLevel(logging.INFO)
+    except Exception as e:
+        print(f"[警告] 日志文件大小上限未生效：{type(e).__name__}: {e}")
+
+
+try:
+    logging.basicConfig(filename=str(runtime_path("app.log")), encoding="utf-8",
+                        level=logging.INFO, format=_LOG_FORMAT)
+except Exception:
+    logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT)
 
 last_proactive_sent: Dict[str, float] = {}
 
@@ -82,22 +253,31 @@ def get_resource_path(relative_path):
 
 def _pid_alive(pid) -> bool:
     """跨平台判断 pid 对应的进程是否仍在运行。"""
-    if not pid or int(pid) <= 0:
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
         return False
-    pid = int(pid)
+    if pid <= 0:
+        return False
     if os.name == "nt":
         try:
             import ctypes
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            kernel32 = ctypes.windll.kernel32
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
             if not h:
-                return False
+                # 只有"权限不足"才说明进程还在；其余错误码（进程不存在）就是已退出
+                ERROR_ACCESS_DENIED = 5
+                return kernel32.GetLastError() == ERROR_ACCESS_DENIED
             try:
                 code = ctypes.c_ulong()
-                ok = ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+                ok = kernel32.GetExitCodeProcess(h, ctypes.byref(code))
                 return bool(ok) and code.value == 259  # STILL_ACTIVE
             finally:
-                ctypes.windll.kernel32.CloseHandle(h)
+                kernel32.CloseHandle(h)
         except Exception:
             return True
     try:
@@ -135,10 +315,805 @@ def _candidate_icon_paths() -> list:
             continue
     return out
 
+
+# ============================================================================
+# 窗口几何记忆（位置/大小/是否最大化）
+# ============================================================================
+# 点任务栏图标或托盘「打开 Lovomo」还原窗口时，本来最大化的窗口
+# 会被还原成一个往右下角偏移的小窗口；另一次是「打开只有一个很小的窗口」。
+# 两个现象同源：坐标被 DPI 二次缩放。
+#
+# 这条链路要绝对小心，pywebview 的 winforms 后端在 DPI 处理上是自相矛盾的：
+#   · create_window(width, height, x, y) 被当成「逻辑像素」，后端会乘 _scale
+#     转成物理像素再交给 WinForms（见 winforms.py:209/217）。
+#   · window.width / height / x / y 读回来的已经是「逻辑像素」，后端把物理
+#     像素除以 _scale（见 winforms.py:1066/1075 的 get_position/get_size）。
+#
+# 所以只要把读到的值原样写回去，就会被再乘一次 _scale —— 125% 缩放下
+# 1721×926 会变成 2151×1157，2560×1440 的屏幕装不下，看起来就是"小窗口
+# 跑到奇怪的位置"，而最大化状态也在往返中丢掉了。
+#
+# 解决方式：本项目在 _screen_rects() 里调了 SetProcessDPIAware()（见下方），
+# 进程已是 DPI 感知的，系统不会替我们虚拟化任何坐标 —— 于是干脆全程统一用
+# **物理像素**：自己读系统 API 拿矩形，自己除/乘缩放系数，写回时再折算成
+# pywebview 需要的逻辑像素。这样无论 DPI 是多少都只缩放一次。
+#
+# 所有落在 _WINDOW_GEOMETRY["normal"] 里的值都是物理像素，
+#       传给 create_window / move / resize 之前必须过 _phys_to_logical()。
+
+_WINDOW_GEOMETRY_FILE = "window_geometry.json"
+# 几何数据的口径版本。老版本把 pywebview 的「逻辑像素」当物理像素存了，
+# 在 125%/150% 缩放下这份数据是坏的（会被再缩放一次，窗口超出屏幕）。
+# 升到 v2 后旧文件一律丢弃，避免用户升级后仍被脏数据坑一次。
+_GEOMETRY_VERSION = 2
+_WINDOW_GEOMETRY = {
+    "geometry_v": _GEOMETRY_VERSION,
+    "maximized": True,
+    "normal": {"x": None, "y": None, "width": 1280, "height": 720},
+}
+_geometry_save_timer = None
+_geometry_lock = threading.Lock()
+
+
+def _geometry_path() -> Path:
+    return runtime_path(_WINDOW_GEOMETRY_FILE, Path(user_data_dir()))
+
+
+# ---------------------------------------------------------------------------
+# 物理像素 <-> pywebview 逻辑像素
+# ---------------------------------------------------------------------------
+
+def _window_scale(window=None) -> float:
+    """当前进程的 DPI 缩放系数（1.0 = 100%，1.25 = 125%）。
+
+    已经 SetProcessDPIAware 的进程里 GetDpiForSystem() 拿到的就是真实值。
+    取不到时返回 1.0，此时物理==逻辑，全部换算退化成恒等，不会出错。
+    """
+    if os.name != "nt":
+        return 1.0
+    try:
+        import ctypes
+        # 优先问窗口自己（多显示器下每个屏可能不同）
+        if window is not None:
+            hwnd = _window_hwnd(window)
+            if hwnd:
+                dpi = int(ctypes.windll.user32.GetDpiForWindow(hwnd))
+                if dpi > 0:
+                    return dpi / 96.0
+        dpi = int(ctypes.windll.user32.GetDpiForSystem())
+        if dpi > 0:
+            return dpi / 96.0
+    except Exception:
+        pass
+    return 1.0
+
+
+def _window_hwnd(window) -> int:
+    """从 pywebview Window 上挖出原生 HWND（挖不到返回 0）。
+
+    正常路径是 window.native.Handle；有些后端/时序下 window.native 还没挂上，
+    那就退回用标题 EnumWindows 找一遍。拿不到不是错误，调用方都有兜底。
+    """
+    if window is None:
+        return 0
+    try:
+        native = getattr(window, "native", None)
+        if native is not None:
+            handle = getattr(native, "Handle", None)
+            if handle is not None:
+                hwnd = int(handle.ToInt32())
+                if hwnd:
+                    return hwnd
+    except Exception:
+        pass
+    return 0
+
+
+def _phys_to_logical(value, scale: float) -> int:
+    """物理像素 -> pywebview 逻辑像素（写回给 pywebview 时用）。"""
+    try:
+        return int(round(float(value) / max(scale, 1e-6)))
+    except (TypeError, ValueError):
+        return int(value)
+
+
+def _logical_to_phys(value, scale: float) -> int:
+    """pywebview 逻辑像素 -> 物理像素（读回 pywebview 属性时用）。"""
+    try:
+        return int(round(float(value) * max(scale, 1e-6)))
+    except (TypeError, ValueError):
+        return int(value)
+
+
+# ---------------------------------------------------------------------------
+# 原生窗口状态 / 几何读取
+# ---------------------------------------------------------------------------
+# 为什么不直接用 pywebview 的 window.state / window.width：
+#   · window.state 返回的是 State(dict)（pywebview 的"状态字典"），
+#     str() 出来是 "{}"，永远不会等于 "maximized" —— 拿它判断最大化必错。
+#   · window.width/height/x/y 是逻辑像素且会 wait(15) 阻塞，不如直接问系统。
+# 所以这里用 GetWindowPlacement + GetWindowRect 直接读，单位统一物理像素。
+
+def _show_state(hwnd: int) -> int:
+    """SW_SHOWNORMAL=1 / SW_SHOWMINIMIZED=2 / SW_SHOWMAXIMIZED=3，失败返回 0。"""
+    if not hwnd or os.name != "nt":
+        return 0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class POINT(ctypes.Structure):
+            _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+        class RECT(ctypes.Structure):
+            _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG),
+                        ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+
+        class WINDOWPLACEMENT(ctypes.Structure):
+            _fields_ = [("length", wintypes.UINT),
+                        ("flags", wintypes.UINT),
+                        ("showCmd", wintypes.UINT),
+                        ("ptMinPosition", POINT),
+                        ("ptMaxPosition", POINT),
+                        ("rcNormalPosition", RECT)]
+
+        wp = WINDOWPLACEMENT()
+        wp.length = ctypes.sizeof(WINDOWPLACEMENT)
+        if ctypes.windll.user32.GetWindowPlacement(hwnd, ctypes.byref(wp)):
+            return int(wp.showCmd)
+    except Exception:
+        pass
+    return 0
+
+
+def _window_state_name(window) -> str:
+    """"maximized" / "minimized" / "normal"（拿不到就返回 ""）。"""
+    cmd = _show_state(_window_hwnd(window))
+    if cmd == 3:
+        return "maximized"
+    if cmd == 2:
+        return "minimized"
+    if cmd == 1:
+        return "normal"
+    return ""
+
+
+def _normal_rect(window) -> dict:
+    """「还原后」该占的矩形（物理像素），即 GetWindowPlacement 的
+    rcNormalPosition —— 最大化/最小化时它仍保留着 Normal 尺寸，正是我们要的。
+
+    这条路径不受最大化动画影响，所以即使还原发生在一瞬间也能拿到正确的值。
+    """
+    hwnd = _window_hwnd(window)
+    if not hwnd or os.name != "nt":
+        return {}
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class POINT(ctypes.Structure):
+            _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+        class RECT(ctypes.Structure):
+            _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG),
+                        ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+
+        class WINDOWPLACEMENT(ctypes.Structure):
+            _fields_ = [("length", wintypes.UINT),
+                        ("flags", wintypes.UINT),
+                        ("showCmd", wintypes.UINT),
+                        ("ptMinPosition", POINT),
+                        ("ptMaxPosition", POINT),
+                        ("rcNormalPosition", RECT)]
+
+        wp = WINDOWPLACEMENT()
+        wp.length = ctypes.sizeof(WINDOWPLACEMENT)
+        if not ctypes.windll.user32.GetWindowPlacement(hwnd, ctypes.byref(wp)):
+            return {}
+        r = wp.rcNormalPosition
+        w = int(r.right - r.left)
+        h = int(r.bottom - r.top)
+        if w >= 200 and h >= 150:
+            return {"x": int(r.left), "y": int(r.top), "width": w, "height": h}
+    except Exception:
+        pass
+    return {}
+
+
+def _window_rect(window) -> dict:
+    """窗口当前实际矩形（物理像素），GetWindowRect 直接用不缩放。"""
+    hwnd = _window_hwnd(window)
+    if not hwnd or os.name != "nt":
+        return {}
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class RECT(ctypes.Structure):
+            _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG),
+                        ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+
+        r = RECT()
+        if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(r)):
+            return {}
+        w = int(r.right - r.left)
+        h = int(r.bottom - r.top)
+        if w >= 200 and h >= 150:
+            return {"x": int(r.left), "y": int(r.top), "width": w, "height": h}
+    except Exception:
+        pass
+    return {}
+
+
+def _default_normal_geometry() -> dict:
+    """没有可用记忆时的默认 Normal 矩形（物理像素）：屏幕的 80%，居中。
+
+    不要硬编码 1920×1080 —— 在 150% 缩放下那是 2880 物理像素，比 2560 的
+    屏幕还宽，窗口一开就超出屏幕被系统重新摆放，看起来就是"小窗口跑偏"。
+    """
+    sw, sh = _primary_screen_size()
+    if sw <= 0 or sh <= 0:
+        return {"x": None, "y": None, "width": 1280, "height": 720}
+    w = int(sw * 0.8)
+    h = int(sh * 0.8)
+    return {"x": (sw - w) // 2, "y": (sh - h) // 2, "width": w, "height": h}
+
+
+def _load_window_geometry() -> dict:
+    """读取上次的窗口几何。任何异常都回落到默认（最大化）。
+
+    口径版本不匹配（老数据是逻辑像素当物理像素存的）时直接丢弃，
+    返回默认最大化 —— 宁可回到「默认最大化」也不要被脏数据带到错误位置。
+    """
+    default_normal = _default_normal_geometry()
+    try:
+        raw = json.loads(_geometry_path().read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("geometry 不是 dict")
+        if int(raw.get("geometry_v") or 1) != _GEOMETRY_VERSION:
+            # v1 数据：逻辑/物理像素口径混乱，不可信
+            print("检测到旧版窗口位置记录（DPI 口径不兼容），本次按默认最大化打开。")
+            raise ValueError("geometry_v mismatch")
+        normal = raw.get("normal") if isinstance(raw.get("normal"), dict) else {}
+        return {
+            "geometry_v": _GEOMETRY_VERSION,
+            "maximized": bool(raw.get("maximized", True)),
+            "normal": {
+                "x": normal.get("x"),
+                "y": normal.get("y"),
+                "width": int(normal.get("width") or default_normal["width"]),
+                "height": int(normal.get("height") or default_normal["height"]),
+            },
+        }
+    except Exception:
+        return {"geometry_v": _GEOMETRY_VERSION,
+                "maximized": True,
+                "normal": dict(default_normal)}
+
+
+def _save_window_geometry() -> None:
+    """落盘当前几何。写失败只是下次还原不准，不该影响运行。"""
+    try:
+        _WINDOW_GEOMETRY["geometry_v"] = _GEOMETRY_VERSION
+        data = json.loads(json.dumps(_WINDOW_GEOMETRY))
+        path = _geometry_path()
+        tmp = Path(str(path) + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(str(tmp), str(path))
+    except Exception as e:
+        print(f"保存窗口位置失败（下次启动按默认最大化打开）：{e}")
+
+
+def _schedule_geometry_save(delay: float = 1.2) -> None:
+    """拖动/缩放窗口会高频触发事件，合并成一次延迟落盘，避免频繁写盘。"""
+    global _geometry_save_timer
+
+    def _run():
+        global _geometry_save_timer
+        with _geometry_lock:
+            _geometry_save_timer = None
+        _save_window_geometry()
+
+    with _geometry_lock:
+        if _geometry_save_timer is not None:
+            try:
+                _geometry_save_timer.cancel()
+            except Exception:
+                pass
+        _geometry_save_timer = threading.Timer(delay, _run)
+        _geometry_save_timer.daemon = True
+        _geometry_save_timer.start()
+
+
+def _finish_geometry_save() -> None:
+    """退出/重启前同步落盘：取消待执行的定时器，立刻写一次。
+
+    退出流程随时可能被 _force_quit 打断，异步定时器不保证跑得到，
+    所以这里必须同步写完再往下走。
+    """
+    global _geometry_save_timer
+    with _geometry_lock:
+        if _geometry_save_timer is not None:
+            try:
+                _geometry_save_timer.cancel()
+            except Exception:
+                pass
+            _geometry_save_timer = None
+    _save_window_geometry()
+
+
+def _is_geometry_valid(geom: dict) -> bool:
+    """校验记忆下来的矩形是否还在当前屏幕范围内。**入参是物理像素。**
+
+    换显示器、改分辨率、拔掉外接屏之后，旧坐标可能落在屏幕外；
+    这种矩形要丢弃，否则窗口会「打开后看不见」。
+    """
+    try:
+        x, y = geom.get("x"), geom.get("y")
+        w = int(geom.get("width") or 0)
+        h = int(geom.get("height") or 0)
+        if w < 400 or h < 300:
+            return False
+        if x is None or y is None:
+            return False
+        x, y = int(x), int(y)
+    except (TypeError, ValueError):
+        return False
+    try:
+        screens = _screen_rects()
+    except Exception:
+        screens = []
+    if not screens:
+        return x > -10000 and y > -10000
+    for (sx, sy, sw, sh) in screens:
+        # 窗口标题栏必须至少有 40px 落在某个屏幕内，否则用户抓不到窗口
+        if x + w > sx + 40 and x < sx + sw - 40 and y + 40 < sy + sh and y + h > sy:
+            return True
+    return False
+
+
+def _rect_is_degenerate(rect: dict) -> bool:
+    """这个矩形小得不正常？小到一定程度就说明读到的是未初始化的窗口。
+
+    pywebview 的默认 min_size 是 (200,100)。我们要防止把这种「最小尺寸」
+    当成用户真实的窗口尺寸存下来 —— 一旦存进去，下次启动窗口就只有
+    200x100，用户看到的就是"打开只有一个很小的窗口"。
+    """
+    try:
+        w = int(rect.get("width") or 0)
+        h = int(rect.get("height") or 0)
+    except (TypeError, ValueError):
+        return True
+    return w < 640 or h < 480
+
+
+def _geom_looks_like_fullscreen(geom: dict) -> bool:
+    """这份 Normal 矩形是不是「铺满整块屏幕」——通常意味着它是最大化时记的。
+
+    遇到这种就说明历史数据被 DPI 缩放污染过（最大化记成了 Normal），
+    留着只会让窗口开成全屏尺寸但状态是 Normal，一眼"没最大化"。丢弃它、
+    回落成默认最大化，比照着它还原更接近用户预期。
+    """
+    try:
+        w = int(geom.get("width") or 0)
+        h = int(geom.get("height") or 0)
+    except (TypeError, ValueError):
+        return False
+    if w < 400 or h < 300:
+        return False
+    sw, sh = _primary_screen_size()
+    if sw <= 0 or sh <= 0:
+        return False
+    # 宽高都到屏幕的 97% 以上就认定是全屏矩形
+    return w >= sw * 0.97 and h >= sh * 0.97
+
+
+def _sanitize_normal_geometry(geom: dict) -> dict:
+    """把明显不合理的 Normal 矩形清成「无坐标、用屏幕相对的默认尺寸」。
+
+    清空坐标后调用方会走「系统居中」，不会出现小窗或幽灵位置。
+    """
+    fallback = _default_normal_geometry()
+    if not isinstance(geom, dict) or not geom:
+        return dict(fallback)
+    try:
+        w = int(geom.get("width") or fallback["width"])
+        h = int(geom.get("height") or fallback["height"])
+    except (TypeError, ValueError):
+        return dict(fallback)
+    cleaned = {"x": geom.get("x"), "y": geom.get("y"),
+               "width": w, "height": h}
+    if (_rect_is_degenerate(cleaned) or _geom_looks_like_fullscreen(cleaned)
+            or not _is_geometry_valid(cleaned)):
+        return {"x": None, "y": None, "width": w, "height": h}
+    return cleaned
+
+
+def _ensure_dpi_aware() -> None:
+    """让本进程成为 DPI 感知，且必须「在 pywebview 创建窗口之前」就生效。
+
+    注意：这里绝不能再调 SetProcessDPIAware()。
+    pywebview 的 winforms 后端靠 GetDpiForWindow 自己算 _scale，再把
+    create_window 的「逻辑像素」参数乘成物理像素。如果本进程没有 DPI 感知，
+    Windows 会把窗口坐标「虚拟化」一遍，和 pywebview 的乘法叠加，最终尺寸
+    被缩放两次。所以这里只声明感知、把缩放职责完整交给 pywebview。
+
+    优先用 Per-Monitor-V2（GetDpiForWindow 才有意义），进程启动早期调用；
+    太晚调用（已创建过任何窗口）会失败，失败就退回 System 级感知。
+    """
+    if os.name != "nt" or globals().get("_DPI_AWARE_DONE"):
+        return
+    globals()["_DPI_AWARE_DONE"] = True
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        try:
+            # -4 = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+            if user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+                return
+        except Exception:
+            pass
+        try:
+            # 1 = PROCESS_SYSTEM_DPI_AWARE（Win8.1+）
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            return
+        except Exception:
+            pass
+        try:
+            user32.SetProcessDPIAware()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _screen_rects() -> list:
+    """枚举各显示器的 (x, y, width, height)，单位：物理像素。
+
+    单位是物理像素这件事很重要 —— 落盘的 _WINDOW_GEOMETRY 全用物理像素，
+    换算成 pywebview 的逻辑像素只发生在喂给 create_window/move/resize 之前。
+    """
+    if os.name != "nt":
+        return []
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        _ensure_dpi_aware()
+        user32 = ctypes.windll.user32
+
+        class RECT(ctypes.Structure):
+            _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG),
+                        ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+
+        monitors = []
+
+        MonitorEnumProc = ctypes.WINFUNCTYPE(
+            ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
+            ctypes.POINTER(RECT), ctypes.c_double)
+
+        def _cb(hmon, hdc, lprc, data):
+            r = lprc.contents
+            monitors.append((r.left, r.top, r.right - r.left, r.bottom - r.top))
+            return 1
+
+        user32.EnumDisplayMonitors(0, 0, MonitorEnumProc(_cb), 0)
+        return monitors
+    except Exception:
+        return []
+
+
+def _primary_screen_size() -> tuple:
+    """主屏的 (width, height)，单位物理像素。取不到返回 (0, 0)。"""
+    try:
+        import ctypes
+        _ensure_dpi_aware()
+        w = int(ctypes.windll.user32.GetSystemMetrics(0))
+        h = int(ctypes.windll.user32.GetSystemMetrics(1))
+        return (w, h) if w > 0 and h > 0 else (0, 0)
+    except Exception:
+        return (0, 0)
+
+
+def _apply_saved_geometry(window) -> None:
+    """把记忆的几何应用到窗口上，替代 pywebview 自身的隐式还原。
+
+    记忆里存的是**物理像素**，pywebview 的 move/resize 收的是**逻辑像素**，
+    所以这里必须过一遍 _phys_to_logical()，否则 125%/150% 缩放下窗口会被
+    放大到超出屏幕（这就是"打开只有一个很小的窗口/跑到右下角"的根源）。
+
+    只在窗口已经「露过面」时才应用：pywebview 的 move/resize 会把隐藏的窗口
+    显示出来，但**不会把它带成前台**（实测 vis=True / fg=False），
+    这种"露出来但压在别的窗口后面"的状态正是"点了托盘没反应"的观感来源。
+    窗口还藏着/最小化时直接交给调用方的 _raise_to_foreground 处理，
+    这里不做几何调整，免得先露出一个没抢到前台的窗口。
+    """
+    if window is None:
+        return
+    hwnd = _window_hwnd(window)
+    if hwnd:
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            if not user32.IsWindowVisible(hwnd) or user32.IsIconic(hwnd):
+                return
+        except Exception:
+            pass
+    geom = _load_window_geometry()
+    try:
+        if geom.get("maximized"):
+            window.maximize()
+            return
+        normal = geom.get("normal") or {}
+        w = int(normal.get("width") or 0)
+        h = int(normal.get("height") or 0)
+        if w >= 400 and h >= 300:
+            scale = _window_scale(window)
+            x, y = normal.get("x"), normal.get("y")
+            lw = _phys_to_logical(w, scale)
+            lh = _phys_to_logical(h, scale)
+            if _is_geometry_valid(normal) and x is not None and y is not None:
+                window.move(_phys_to_logical(x, scale),
+                            _phys_to_logical(y, scale))
+            window.resize(lw, lh)
+    except Exception as e:
+        print(f"恢复窗口位置失败（按默认最大化打开）：{e}")
+        try:
+            window.maximize()
+        except Exception:
+            pass
+
+
+def _raise_to_foreground(window) -> None:
+    """把窗口提到最前台。
+
+    pywebview 的 show() 只做到 Show+Activate（winforms.py:494），
+    Windows 在前台锁（foreground lock）下会直接忽略它 —— 表现就是
+    "最小化/放到后台后，点任务栏图标或托盘『打开 Lovomo』没反应"。
+    这里补上原生调用：先把最小化状态还原，再抢前台。
+
+    实测（150% 缩放、winforms 后端）必须遵守的顺序：
+      · **先判断 IsIconic，再动窗口。** 最小化时 window.show() 会把前台
+        抢过去却把窗口留在最小化状态（fg=True 但 iconic 仍为 True），
+        画面不会有任何变化，用户看到的就是"点了没反应"。
+        所以最小化判定必须发生在 show() 之前。
+      · 最小化一律走 ShowWindow(SW_RESTORE)，其余情况才用 SW_SHOW。
+      · 结束时校验一次 IsWindowVisible + IsIconic，没达标就重试一轮，
+        避免前台锁/动画竞态导致这一次调用被静默吞掉。
+    """
+    if window is None:
+        return
+    try:
+        import ctypes
+        hwnd = _window_hwnd(window)
+        if not hwnd:
+            return
+        user32 = ctypes.windll.user32
+        SW_RESTORE = 9
+        SW_SHOW = 5
+        SW_SHOWNA = 8
+
+        def _was_minimized() -> bool:
+            try:
+                return bool(user32.IsIconic(hwnd))
+            except Exception:
+                return False
+
+        def _grab() -> None:
+            try:
+                user32.BringWindowToTop(hwnd)
+            except Exception:
+                pass
+            # SetForegroundWindow 在前台锁下会失败，先用 AttachThreadInput 把
+            # 当前前台线程的输入队列挂到自己身上，成功率明显更高。
+            try:
+                fg = int(user32.GetForegroundWindow() or 0)
+                cur = int(ctypes.windll.kernel32.GetCurrentThreadId())
+                tgt = int(user32.GetWindowThreadProcessId(hwnd, None) or 0)
+                attached = False
+                if fg and tgt and cur and cur != tgt:
+                    attached = bool(user32.AttachThreadInput(cur, tgt, True))
+                try:
+                    user32.SetForegroundWindow(hwnd)
+                finally:
+                    if attached:
+                        user32.AttachThreadInput(cur, tgt, False)
+            except Exception:
+                pass
+            try:
+                user32.SetActiveWindow(hwnd)
+            except Exception:
+                pass
+
+        def _ok() -> bool:
+            try:
+                return (bool(user32.IsWindowVisible(hwnd))
+                        and not bool(user32.IsIconic(hwnd)))
+            except Exception:
+                return True
+
+        for attempt in range(2):
+            minimized = _was_minimized()
+            # 1) 先让 pywebview 层把窗口弄出来（Show + Activate）
+            try:
+                window.show()
+            except Exception:
+                pass
+            # 2) 原生层还原 + 抢前台
+            try:
+                user32.ShowWindow(hwnd, SW_RESTORE if minimized else SW_SHOW)
+            except Exception:
+                pass
+            _grab()
+            if _ok():
+                return
+            if attempt == 0:
+                # 第一轮没达标：窗口可能卡在最小化或前台锁里，
+                # 直接用原生 SW_RESTORE 再拉一次（不走 pywebview）。
+                try:
+                    user32.ShowWindow(hwnd, SW_RESTORE)
+                except Exception:
+                    pass
+                try:
+                    user32.ShowWindow(hwnd, SW_SHOWNA)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# 任务栏唤醒收敛
+# ---------------------------------------------------------------------------
+# 为什么需要这一段：
+#   Windows 从任务栏还原窗口走的是**系统自己的**路径（用户点任务栏缩略图、
+#   右键任务栏条目选「还原」，或点任务栏图标）。系统会直接调
+#   ShowWindow(SW_RESTORE) 并把 WM_ACTIVATEAPP / WM_ACTIVATE 发给窗口，
+#   整个过程不经过 pywebview，也不经过我们的 open_console()。
+#
+#   问题就在这里：窗口被还原了、也"激活"了，但**没有抢到前台 Z 序**。
+#   WinForms 的 Activate() 只做 SetForegroundWindow，而 Windows 的前台锁
+#   （foreground lock）规定：只有当调用方线程就是当前前台线程、或收到用户
+#   输入时，SetForegroundWindow 才真的生效。从任务栏还原时前台线程是
+#   explorer.exe，我们的调用会被静默忽略 —— 表现就是"点了任务栏，窗口
+#   出来了但还压在别的窗口后面，没显示在最前面"。
+#
+#   解法：子类化窗口过程（SetWindowLongPtr GWLP_WNDPROC），拦下
+#   WM_ACTIVATEAPP / WM_ACTIVATE 这两个"我被激活了"的消息，在消息处理链
+#   里立刻用 _raise_to_foreground 再抢一次前台。因为此时系统已经把我们
+#   标记成正在激活的窗口，SetForegroundWindow 的通过率显著高于事后调用。
+
+_WNDPROC_HOLDER = {"old": None, "hwnd": 0, "callback": None, "active": False}
+
+
+def _install_taskbar_activate_hook(window, on_activate=None) -> bool:
+    """给窗口装一个原生窗口过程钩子，拦截任务栏还原时的激活消息。
+
+    必须在 **窗口所在线程** 调用（WinForms 的窗口线程）。装上后，任何一次
+    WM_ACTIVATEAPP/WM_ACTIVATE 都会触发 on_activate（默认 _raise_to_foreground），
+    从而把窗口真正提到最前面。
+
+    重复调用是幂等的；拿不到 HWND 或非 Windows 时返回 False，调用方忽略即可
+    （退化为没有钩子，行为与改动前一致）。
+
+    ⚠ 这里每一个 ctypes 入口都必须显式声明 argtypes/restype。窗口过程是
+    64 位指针进出的原生回调，任何一处按默认 c_int 传参/返回都会把高 32 位
+    截断 —— 后果不是"钩子失效"这么轻，而是消息链（含 WM_CLOSE）转发失败，
+    表现为任务栏图标单击/右键全无反应、任务栏「关闭窗口」关不掉程序。
+    """
+    if os.name != "nt" or window is None:
+        return False
+    if _WNDPROC_HOLDER.get("active") and _WNDPROC_HOLDER.get("hwnd"):
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        hwnd = _window_hwnd(window)
+        if not hwnd:
+            return False
+        user32 = ctypes.windll.user32
+
+        WM_ACTIVATE = 0x0006
+        WM_ACTIVATEAPP = 0x001C
+        GWLP_WNDPROC = -4
+
+        # LRESULT / LONG_PTR 在 64 位下都是 8 字节；用 c_ssize_t 表达才与
+        # 原生 ABI 一致（写 c_long 在 Windows 上只有 4 字节）。
+        LRESULT = ctypes.c_ssize_t
+
+        WNDPROC = ctypes.WINFUNCTYPE(
+            LRESULT, wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM)
+
+        if ctypes.sizeof(ctypes.c_void_p) == 8:
+            setter = user32.SetWindowLongPtrW
+            setter.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+            setter.restype = ctypes.c_void_p
+        else:
+            setter = user32.SetWindowLongW
+            setter.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.LONG]
+            setter.restype = wintypes.LONG
+
+        call_proc = user32.CallWindowProcW
+        call_proc.argtypes = [ctypes.c_void_p, wintypes.HWND, ctypes.c_uint,
+                              wintypes.WPARAM, wintypes.LPARAM]
+        call_proc.restype = LRESULT
+
+        def _proc(h, msg, wparam, lparam):
+            try:
+                if msg in (WM_ACTIVATE, WM_ACTIVATEAPP):
+                    # WM_ACTIVATE 的 wParam 低字 == WA_ACTIVE(1) / WA_CLICKACTIVE(2)
+                    # 表示窗口拿到了激活；WA_INACTIVE(0) 是失去激活，不管。
+                    # WM_ACTIVATEAPP 的 wParam != 0 表示应用被激活。
+                    activated = (msg == WM_ACTIVATEAPP and wparam) or \
+                                (msg == WM_ACTIVATE and (wparam & 0xFFFF) != 0)
+                    if activated:
+                        cb = on_activate or _raise_to_foreground
+                        # 不能在窗口过程里同步做重活（会重入/卡消息循环），
+                        # 丢一个短延迟线程出去，等消息返回后再抢前台。
+                        def _kick(win=window, fn=cb):
+                            try:
+                                time.sleep(0.02)
+                                fn(win)
+                            except Exception:
+                                pass
+                        threading.Thread(target=_kick, daemon=True).start()
+            except Exception:
+                pass
+            return call_proc(_WNDPROC_HOLDER.get("old") or 0,
+                             h, msg, wparam, lparam)
+
+        cb = WNDPROC(_proc)
+        old = setter(hwnd, GWLP_WNDPROC, ctypes.cast(cb, ctypes.c_void_p))
+        if not old:
+            return False
+        if old == ctypes.cast(cb, ctypes.c_void_p).value:
+            # 理论上不会发生（原过程不可能就是我们的回调），但真出现了
+            # 说明取到的是回调自身，再往下会自递归死循环，直接放弃。
+            return False
+        _WNDPROC_HOLDER["old"] = old
+        _WNDPROC_HOLDER["hwnd"] = hwnd
+        _WNDPROC_HOLDER["setter"] = setter
+        _WNDPROC_HOLDER["callback"] = cb      # 必须持有引用，否则会被 GC 掉
+        _WNDPROC_HOLDER["active"] = True
+        return True
+    except Exception as e:
+        print(f"安装任务栏唤醒钩子失败（不影响其他功能）: {e}")
+        return False
+
+
+def _uninstall_taskbar_activate_hook() -> None:
+    """还原原始窗口过程。退出前调用，避免进程退出时回调悬空。"""
+    if not _WNDPROC_HOLDER.get("active"):
+        return
+    try:
+        import ctypes
+        hwnd = _WNDPROC_HOLDER.get("hwnd") or 0
+        old = _WNDPROC_HOLDER.get("old") or 0
+        setter = _WNDPROC_HOLDER.get("setter")
+        if hwnd and old and setter is not None:
+            setter(hwnd, -4, old)
+        elif hwnd and old:
+            user32 = ctypes.windll.user32
+            if ctypes.sizeof(ctypes.c_void_p) == 8:
+                user32.SetWindowLongPtrW.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                                     ctypes.c_void_p]
+                user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+                user32.SetWindowLongPtrW(hwnd, -4, old)
+            else:
+                user32.SetWindowLongW(hwnd, -4, old)
+    except Exception:
+        pass
+    finally:
+        _WNDPROC_HOLDER.update({"old": None, "hwnd": 0, "setter": None,
+                                "callback": None, "active": False})
+
+
 global_log_buffer = []
 LOG_BUFFER_MAX = 5000     # 日志缓冲行数默认值（config: webui_log_buffer_lines）
 LOG_TAIL_DEFAULT = 500    # 精简模式尾部行数默认值（config: webui_log_tail_lines）
 _LOG_FULL_MAX_CHARS = 400_000   # "显示完整日志"的极端字符上限（仅防响应撑爆）
+_LOG_PENDING_MAX_CHARS = 8192   # 未换行的半行日志最长保留多少字符
 log_lock = threading.Lock()
 
 
@@ -168,6 +1143,7 @@ class StdoutRedirector:
                 original_stream = None
         self.original_stream = original_stream
         self._last_saved_config = None
+        self._pending = ""
 
     def write(self, message):
         if not message:
@@ -180,8 +1156,20 @@ class StdoutRedirector:
                 except Exception:
                     pass  # 无控制台时忽略写入错误
             buffer_cap, _ = _runtime_log_limits()
-            for line in message.splitlines(True):
-                global_log_buffer.append(line.rstrip('\n'))
+            # print() 先写正文、再单独写一个换行：按单次 write 切行会把同一个
+            # 换行切成一条空记录，日志里每行后面就多出一个空行，隐藏掉的行
+            # 更会留下一整片空白。这里把没写完的半行留到下一次，凑够一整行
+            # 才进缓冲，保证「一行输出 = 一条记录」。
+            self._pending += message
+            lines = self._pending.split("\n")
+            self._pending = lines.pop()
+            if len(self._pending) > _LOG_PENDING_MAX_CHARS:
+                lines.append(self._pending)
+                self._pending = ""
+            for line in lines:
+                # 只删行尾换行，别用 strip()：行首缩进是日志的一部分。
+                # \r 也一起去掉，否则 Windows 下每行都留一个裸 \r。
+                global_log_buffer.append(line.rstrip('\r\n'))
                 if len(global_log_buffer) > buffer_cap:
                     del global_log_buffer[:len(global_log_buffer) - buffer_cap]
 
@@ -193,7 +1181,7 @@ class StdoutRedirector:
                 pass
 
 
-_API_KEY_KEYS = ("llm_api_key", "napcat_token", "web_search_api_keys")
+_API_KEY_KEYS = ("llm_api_key", "napcat_token", "web_search_api_keys", "plugin_publish_token")
 
 _ENC_PREFIX = "enc2:"
 _ENC_KEY_CACHE = None
@@ -203,7 +1191,7 @@ def _enc_key() -> bytes:
     """加密密钥绑定本机（Windows MachineGuid 等），config.json 拷到别的机器解不开。"""
     global _ENC_KEY_CACHE
     if _ENC_KEY_CACHE is None:
-        material = b"LTVM-KEYSTORE-v2"
+        material = b"Lovomo-KEYSTORE-v2"
         try:
             if os.name == "nt":
                 import winreg
@@ -215,7 +1203,7 @@ def _enc_key() -> bytes:
         material += os.environ.get("COMPUTERNAME", "").encode("utf-8")
         material += os.environ.get("USERNAME", "").encode("utf-8")
         _ENC_KEY_CACHE = hashlib.pbkdf2_hmac("sha256", material,
-                                             b"LTVM-KEYSTORE-SALT-v2", 100_000)
+                                             b"Lovomo-KEYSTORE-SALT-v2", 100_000)
     return _ENC_KEY_CACHE
 
 
@@ -233,6 +1221,10 @@ def _encrypt_value(value: str) -> str:
     v = str(value or "")
     if not v or v.startswith(_ENC_PREFIX) or v.startswith("enc:"):
         return v
+    # 打码预览（****）不是真实密钥：加密它等于把一行掩码存成密钥，
+    # 下次读出来还会当成真的密钥去请求上游。
+    if _is_masked_value(v):
+        return v
     raw = v.encode("utf-8")
     nonce = os.urandom(16)
     checksum = hashlib.sha256(raw).digest()[:8]
@@ -241,13 +1233,19 @@ def _encrypt_value(value: str) -> str:
     return _ENC_PREFIX + b64encode(nonce + checksum + ct).decode("ascii")
 
 
-def _decrypt_value(value: str) -> str:
+def _decrypt_value(value: str) -> Optional[str]:
+    """解密失败返回 None：调用方必须保留原密文，绝不能把密钥写成空串。
+
+    密文绑定了本机信息，换电脑后解不开是正常的；此时若置空，下一次保存
+    就会把空值加密回磁盘，原密钥不可恢复。
+    """
     v = str(value or "")
     if v.startswith("enc:"):
         try:
             return b64decode(v[4:].encode("ascii")).decode("utf-8")
-        except Exception:
-            return ""
+        except Exception as e:
+            print(f"[加密] API 密钥解密失败，保留原密文：{e}")
+            return None
     if not v.startswith(_ENC_PREFIX):
         return v
     try:
@@ -258,8 +1256,8 @@ def _decrypt_value(value: str) -> str:
             raise ValueError("校验不匹配（密钥绑定本机，可能来自其他电脑）")
         return raw.decode("utf-8")
     except Exception as e:
-        print(f"[加密] API 密钥解密失败，已置空（请重新在 WebUI 填写）：{e}")
-        return ""
+        print(f"[加密] API 密钥解密失败，保留原密文（不再置空，请重新在 WebUI 填写）：{e}")
+        return None
 
 
 def _mask_preview(value: str) -> str:
@@ -287,24 +1285,182 @@ def _encrypt_api_keys(config: dict) -> dict:
     return config
 
 
+def _encrypt_webui_password(config: dict) -> dict:
+    """WebUI 访问密码落盘前加密。
+
+    它不是 API 密钥，所以不在 _API_KEY_KEYS 里、_encrypt_api_keys 不会碰它；
+    但它同样是登录凭据，必须与 API 密钥一样做到「磁盘密文 / 内存明文」。
+    """
+    val = config.get("webui_password")
+    if isinstance(val, str):
+        config["webui_password"] = _encrypt_value(val)
+    return config
+
+
+# 导出/写盘前必须确认「不可能是明文」的字段：除 _API_KEY_KEYS 外，WebUI 访问
+# 密码同样属于登录凭据，绝不能以明文形式随导出文件外流。
+_SECRET_FIELD_KEYS = _API_KEY_KEYS + ("webui_password",)
+
+# 已知的明文密钥前缀：命中即视为真实密钥，必须加密后才允许出现在导出内容里
+_PLAINTEXT_SECRET_PREFIXES = ("sk-", "sk_", "ak-", "ak_", "ghp_", "gho_", "xoxb-",
+                              "AIza", "Bearer ", "eyJhbGciOi")
+
+# 嵌在长文本 / JSON 串里的密钥片段：如 llm_extra_body={"headers":{"k":"sk-xxx"}}
+_EMBEDDED_SECRET_RE = re.compile(
+    r"(?:sk-|sk_|ak-|ak_|ghp_|gho_|xoxb-|AIza)[A-Za-z0-9_\-]{8,}"
+    r"|Bearer\s+[A-Za-z0-9_\-\.]{12,}"
+    r"|eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}")
+
+_SECRET_REDACTION = "********"
+
+
+def _looks_like_plaintext_secret(value) -> bool:
+    """判断字符串是否是「不该出现在导出结果里」的明文密钥。"""
+    v = str(value or "").strip()
+    if not v:
+        return False
+    if v.startswith(_ENC_PREFIX) or v.startswith("enc:"):
+        return False          # 已经是密文，原样保留
+    if _is_masked_value(v):
+        return False          # 打码预览（****），不含真实密钥
+    if any(v.startswith(p) for p in _PLAINTEXT_SECRET_PREFIXES):
+        return True
+    # 密钥埋在长文本/JSON 串里：用正则捞出疑似密钥片段
+    return bool(_EMBEDDED_SECRET_RE.search(v))
+
+
+def _scrub_value(value: str) -> Optional[str]:
+    """把单个字符串里的明文密钥整段替换为对应密文。
+
+    返回 None 表示该串不含任何明文密钥，调用方可原样保留。
+    """
+    v = str(value or "")
+    if not v:
+        return None
+    if v.startswith(_ENC_PREFIX) or v.startswith("enc:"):
+        return None           # 整串已是密文
+    if _is_masked_value(v):
+        return None           # 打码预览，无需处理
+
+    replaced = False
+
+    def _sub(m):
+        nonlocal replaced
+        token = m.group(0)
+        if token.startswith(_ENC_PREFIX) or token.startswith("enc:"):
+            return token
+        if _is_masked_value(token):
+            return token
+        encrypted = _encrypt_value(token)
+        replaced = True
+        if encrypted.startswith(_ENC_PREFIX):
+            return encrypted
+        return _SECRET_REDACTION      # 实在加密不了就整段打码，绝不留下明文
+
+    out = _EMBEDDED_SECRET_RE.sub(_sub, v)
+    return out if replaced else None
+
+
+def _scrub_plaintext_secrets(config: dict) -> dict:
+    """导出兜底：敏感字段里的明文密钥一律加密，残留明文密钥一律打码。
+
+    _encrypt_api_keys 只覆盖 _API_KEY_KEYS 列表里的字段；配置里别的键（嵌套
+    结构、新增的密钥项、webui_password）如果带着明文，就会直接进导出文件。
+    这里做一次与字段名无关的全量扫描：
+
+    - 敏感字段（_SECRET_FIELD_KEYS）：明文一律 _encrypt_value 成 enc2:...，
+      解不开的外来密文原样保留；
+    - 其他字段：按 sk- 等已知前缀识别，命中的密钥片段加密成 enc2:...；连成串
+      嵌在文本/JSON 里的密钥也会被逐段替换，绝不留下明文。
+    """
+    def scrub(node, in_secret_field: bool):
+        if isinstance(node, dict):
+            return {k: scrub(v, in_secret_field or k in _SECRET_FIELD_KEYS)
+                    for k, v in node.items()}
+        if isinstance(node, list):
+            return [scrub(v, in_secret_field) for v in node]
+        if not isinstance(node, str):
+            return node
+        if not node:
+            return node           # 空串：没填密钥，保持原样
+        if node.startswith(_ENC_PREFIX) or node.startswith("enc:"):
+            return node
+        # 打码预览（****）本就不含真实密钥，任何字段里都原样保留
+        if _is_masked_value(node):
+            return node
+        if in_secret_field:
+            # _encrypt_value 对空串/已是密文的值会原样返回，非空明文必然带前缀
+            encrypted = _encrypt_value(node)
+            if encrypted.startswith(_ENC_PREFIX):
+                return encrypted
+            return _SECRET_REDACTION
+        scrubbed = _scrub_value(node)
+        return node if scrubbed is None else scrubbed
+
+    if not isinstance(config, dict):
+        return config
+    return scrub(config, False)
+
+
 def _decrypt_api_keys(config: dict) -> dict:
     for key in _API_KEY_KEYS:
         val = config.get(key)
         if isinstance(val, dict):
-            config[key] = {k: _decrypt_value(v) if isinstance(v, str) else v
-                           for k, v in val.items()}
+            decoded = {}
+            for k, v in val.items():
+                plain = _decrypt_value(v) if isinstance(v, str) else v
+                decoded[k] = v if plain is None else plain
+            config[key] = decoded
         elif isinstance(val, str):
-            config[key] = _decrypt_value(val)
+            plain = _decrypt_value(val)
+            if plain is not None:
+                config[key] = plain
     return config
+
+
+def _decrypt_webui_password(config: dict) -> dict:
+    """WebUI 访问密码读盘后解密，与 _encrypt_webui_password 对称。
+
+    解不开（换过电脑）时保留原密文、不置空——置空会让「导入配置」里
+    webui_password 变成空串，等于把访问密码静默清掉。
+    """
+    val = config.get("webui_password")
+    if isinstance(val, str) and (val.startswith(_ENC_PREFIX) or val.startswith("enc:")):
+        plain = _decrypt_value(val)
+        if plain is not None:
+            config["webui_password"] = plain
+    return config
+
+
+def _migrate_sticker_mode(config: dict) -> None:
+    """老配置只有 stickers_enabled：折算成新的发送方式，避免升级后表情包被静默关掉。"""
+    if "sticker_send_mode" in config:
+        return
+    config["sticker_send_mode"] = "emotion" if config.get("stickers_enabled", False) else "off"
 
 
 class ConfigLoader:
     def __init__(self, config_path: str = "config.json"):
-        self.config_path = Path(config_path)
+        self.config_path = self._resolve_config_path(config_path)
         self.config = self._load_or_init()
         # 多角色配置解析
         self.active_character = self.config.get("active_character", self.config.get("character_key", "murasame"))
         self.roles = self._parse_roles()
+
+    @staticmethod
+    def _resolve_config_path(config_path: str) -> Path:
+        """装进 Program Files 又没提权时，程序目录是只读的：改用用户目录并带上原配置。"""
+        path = Path(config_path)
+        if path.is_absolute() or _probe_writable(path.resolve().parent):
+            return path
+        fallback = user_data_dir() / path.name
+        if path.exists() and not fallback.exists():
+            try:
+                shutil.copy2(path, fallback)
+            except Exception:
+                pass
+        print(f"程序目录不可写（{path.resolve().parent}），配置文件改用：{fallback}")
+        return fallback
 
     def _parse_roles(self) -> dict:
         """解析多角色配置，将旧版单角色配置迁移为角色列表"""
@@ -339,7 +1495,9 @@ class ConfigLoader:
                 "default_voice": role_cfg.get("default_voice", "pingjing"),
                 "ref_audio_root": role_cfg.get("ref_audio_root", ""),
                 "text_lang": role_cfg.get("text_lang", "ja"),
-                "prompt_lang": role_cfg.get("prompt_lang", "")
+                "prompt_lang": role_cfg.get("prompt_lang", ""),
+                "napcat_ws_url": str(role_cfg.get("napcat_ws_url", "") or "").strip(),
+                "napcat_token": str(role_cfg.get("napcat_token", "") or "")
             }
         if self.active_character not in roles:
             self.active_character = list(roles.keys())[0] if roles else "murasame"
@@ -355,14 +1513,8 @@ class ConfigLoader:
             try:
                 with open(self.config_path, "r", encoding="utf-8") as f:
                     config = json.load(f)
-                _decrypt_api_keys(config)
-                if not Path(config.get("ref_audio_root", "")).exists():
-                    print(f"⚠️ 参考音频目录无效：{config.get('ref_audio_root')}")
-                    if can_interact():
-                        return self._interactive_init(config)
-                    else:
-                        return self._auto_save_default(config)
-                return config
+                if not isinstance(config, dict):
+                    raise ValueError("配置顶层不是对象")
             except Exception as e:
                 print(f"⚠️ 读取配置文件失败：{e}，将自动重新生成默认配置。")
                 try:
@@ -374,6 +1526,23 @@ class ConfigLoader:
                     return self._interactive_init(self.default_config())
                 else:
                     return self._auto_save_default(self.default_config())
+            _migrate_sticker_mode(config)
+            # 解密与目录校验都在「文件可读」之后单独处理：
+            # 任何一处异常都不该把整份配置判成损坏并覆写掉
+            _decrypt_api_keys(config)
+            _decrypt_webui_password(config)
+            ref_root = str(config.get("ref_audio_root") or "")
+            try:
+                ref_ok = Path(ref_root).exists() if ref_root else False
+            except (OSError, ValueError):
+                ref_ok = False
+            if not ref_ok:
+                print(f"⚠️ 参考音频目录无效：{ref_root}")
+                if can_interact():
+                    return self._interactive_init(config)
+                else:
+                    return self._auto_save_default(config)
+            return config
         else:
             print("未找到配置文件，正在自动生成默认配置...")
             if can_interact():
@@ -385,6 +1554,11 @@ class ConfigLoader:
         payload = json.loads(json.dumps(data, ensure_ascii=False))
         if encrypt:
             _encrypt_api_keys(payload)
+            # webui_password 不在 _API_KEY_KEYS 里，得单独补上：
+            # 内存配置是解密后的明文，不加密就直接落盘＝磁盘上留一份明文密码，
+            # 而且下次启动 _decrypt_api_keys() 读回来还是明文（不是密文），
+            # 与「磁盘一律密文、内存一律明文」的约定不符、也白留了把柄。
+            _encrypt_webui_password(payload)
         tmp = Path(str(self.config_path) + ".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(str(tmp), str(self.config_path))
@@ -452,11 +1626,17 @@ class ConfigLoader:
     def default_config() -> dict:
         from modules.todo_manager import DEFAULT_TODO_PATTERNS
         # 完整包含所有可配置字段（含各功能模块的开关与参数，全部可在 WebUI 修改）
+        # WebUI 只渲染「后端返回的配置里存在」的键：缺少这一组键时 NapCat 分组会整块消失
         return {
+            "napcat_ws_url": "ws://127.0.0.1:3001",
+            "napcat_token": "",
             "hide_gsv_options": False,
             "llm_model_name": "",
             "image_caption_model_name": "",
             "image_caption_backend": "",
+            # 识图模型独立接口地址：留空则跟随 llm_base_url。
+            # 部分全模态/向量模型不走 OpenAI 兼容格式，需要单独指向自己的服务地址
+            "image_caption_base_url": "",
             "llm_base_url": "http://127.0.0.1:11434",
             "llm_backend": "ollama",
             "llm_api_key": "",
@@ -490,6 +1670,9 @@ class ConfigLoader:
             # 合成音频短得离谱时按备用切分方式重试，避免只有一声语气的短语音
             "tts_duration_guard": True,
             "tts_min_seconds_per_char": 0.05,
+            # 合成时长的上限（秒/字）：自回归 TTS 偶发"同一音节无限重复"的失控，
+            # 一句台词能拖成几十秒，靠时长与字数的量级关系认出来并作废重试。0 = 关闭
+            "tts_max_seconds_per_char": 0.6,
             "top_k": 20,
             "top_p": 1,
             "temperature": 1,
@@ -517,6 +1700,8 @@ class ConfigLoader:
             "dynamic_sleep": True,
             "only_private": False,
             "group_need_at": True,
+            # 会话白名单：每行一个 QQ 号或群号；留空则响应所有会话
+            "whitelist_ids": "",
             "auto_start_tts": True,
             "tts_start_script": "",
             "device": "cuda",
@@ -526,6 +1711,7 @@ class ConfigLoader:
             "voice_transition": True,
             "breathing_gap_ms": 100,
             "crossfade_ms": 300,
+            "enable_default_emotions": True,
             "llm_emotion_intensity": True,
             "intensity_to_temperature": 0.3,
             "intensity_to_top_k": 10.0,
@@ -567,6 +1753,15 @@ class ConfigLoader:
             "mood_enabled": True,
             # 防复读：把最近几轮的自己台词一起作为"禁止重复"的参照
             "repeat_guard_rounds": 3,
+            # 防复读拆成两个维度、各自可单独关闭（默认全开 = 原来的行为）：
+            # 「什么时候查」= streaming / regen，「跟谁比」= compare_self / compare_user
+            "repeat_guard_streaming_check": True,
+            "repeat_guard_regen_check": True,
+            "repeat_guard_compare_self": True,
+            "repeat_guard_compare_user": True,
+            # 判定"重复"的重合度系数：越高越宽容（越不容易被打回重生成）
+            "repeat_guard_self_threshold": 0.85,
+            "repeat_guard_user_threshold": 0.8,
             "reply_judge_prompt": "你是消息应答决策器。请结合角色人设与上方对话历史，判断对话中最后一条用户消息：\n1) should_reply：这条消息是否需要角色开口回应。直接提问、点名召唤、求助、命令、倾诉强烈情绪、分享趣事期待互动、问候道别（早安晚安等），均视为需要回复；纯陈述、自言自语、路过闲聊、与角色无关的消息、敷衍的语气词，可视为不需要回复。\n2) mood_delta：这条消息让角色心情发生的变化，整数，范围 -10 到 +10。体贴、关心、夸奖、撒娇、有趣的互动为正；冷淡、敷衍、无视、责骂、阴阳怪气为负。\n3) mood_reason：一句话理由。\n只输出一个JSON对象：{\"should_reply\": true 或 false, \"mood_delta\": 整数, \"mood_reason\": \"理由\"}，禁止输出任何其它文字、解释或Markdown。",
             "reply_judge_mood_min": 0,
             "reply_judge_mood_max": 100,
@@ -623,6 +1818,11 @@ class ConfigLoader:
             # 表情包
             "stickers_enabled": False,
             "stickers_dir": "",
+            # 发送方式：off=关闭 / random=随机 / emotion=按情绪 / description=按描述让模型选
+            "sticker_send_mode": "off",
+            # 按描述挑选时，一次最多交给模型多少个候选（防止提示词过长）
+            "sticker_desc_max_candidates": 30,
+            "sticker_pick_prompt": "你是表情包挑选助手。下面是候选表情包清单（编号 + 说明）和角色即将说的一段话。\n请选出最适合配合这段话发出去的一张，只输出一个JSON对象：{\"index\": 编号}，不要输出其他任何内容。",
             "sticker_probability": 1.0,
             "sticker_max_per_reply": 1,
             "sticker_every_sentence": False,
@@ -680,6 +1880,11 @@ class ConfigLoader:
             "web_search_language": "zh",
             # 安全搜索：off=不限制；normal=过滤 R18 只留 R16+；strict=连低俗/性暗示一并过滤
             "web_search_safe": "normal",
+            # 搜索过滤词表：用户自己追加的过滤词，每行一个（逗号分隔也行），
+            # 一般档与严格档都会拦（off 档不拦）
+            "web_search_block_words": "",
+            # 搜索白名单词表：命中就放行，优先于过滤词表与成人站域名
+            "web_search_allow_words": "",
             # RAG 知识库
             "rag_enabled": False,
             "rag_embedding_backend": "",
@@ -709,15 +1914,31 @@ class ConfigLoader:
             "webui_auth_ttl_minutes": 30,
             "webui_log_buffer_lines": 5000,
             "webui_log_tail_lines": 500,
+            "log_max_size_mb": LOG_MAX_SIZE_MB_DEFAULT,
+            # 精简模式要藏掉的噪音日志（每行一个片段，命中即隐藏）；完整模式不受影响
+            "webui_log_hide_patterns": "【表情收藏-自动触发】\n【表情收藏-进入保存】\n【表情收藏-映射成功】\n【表情收藏-映射失败】\n【表情收藏-分类合法】\n【表情收藏-白名单拦截】\n【表情收藏-最终归类】\n【表情收藏-分类】\n表情收藏保留原格式不重编码\nTTS 台词完整内容\nTTS 详细参数\n表情包扫描完成\n相似度检查\n主动消息：会话\n主动消息：已跨天",
             "separate_force_segment": True,
             "tools_guard_enabled": True,
             "tools_guard_keywords": "几点\n现在几点\n时间\n日期\n几号\n星期几\n计算\n算一下\n等于多少\n平方根\n根号\n天气\n气温\n温度\n降雨\n搜索\n查一下\n查找\n网址\n网页\n链接\n工具\n下载",
             "anti_spam_enabled": False,
             "anti_spam_window_seconds": 10,
             "anti_spam_max_in_window": 5,
+            "stats_enabled": True,
             "update_check_enabled": True,
             "update_check_interval_hours": 24,
-            "update_include_prerelease": False
+            "update_include_prerelease": False,
+            # 插件市场：名前缀匹配的分支即为插件，index.json 是兜底索引
+            "plugin_market_repo": "slpk1ng/Lovomo",
+            "plugin_market_path": "plugins/index.json",
+            "plugin_market_branch_prefix": "lovomo_plugin",
+            # 第三方市场：每行一个「用户名/仓库名」，与官方市场同一套上架规则
+            "plugin_market_thirdparty": "",
+            # GitHub 加速镜像：每行一个模板（{url} 前缀式 / {repo}@{ref}/{path} 文件式）。
+            # 只用于匿名读请求，带 token 的发布请求永远直连官方。
+            "github_mirrors": "\n".join(DEFAULT_MIRRORS),
+            # 「程序历史版本」页里 Releases 的来源仓库（默认就是程序自己的仓库）
+            "plugin_release_repo": "slpk1ng/Lovomo",
+            "plugins_enabled": True
         }
 
     def get(self, key: str, default=None):
@@ -856,13 +2077,25 @@ class EmotionManager:
         print(f"手动配置情绪已加载，当前情绪总数：{len(self.emotions)}")
 
     def get_emotion(self, name):
-        return self.emotions.get(name, self.emotions.get(self.default_voice))
+        # 情绪目录为空/被改名时兜底也为空：调用方按空 dict 处理，
+        # 不能返回 None 让下游取 ["ref_path"] 时炸掉
+        return self.emotions.get(name) or self.emotions.get(self.default_voice) or {}
+
+
+def _resolve_data_dir(config) -> Path:
+    configured = str(config.get("memory_data_path", "") or "").strip()
+    if configured:
+        return Path(configured).resolve()
+    default_dir = Path("./data").resolve()
+    if _probe_writable(default_dir.parent):
+        return default_dir
+    return user_data_dir() / "data"
 
 
 class MemoryManager:
     def __init__(self, config: ConfigLoader):
         self.config = config
-        self.data_path = Path(config.get("memory_data_path", "./data")).resolve()
+        self.data_path = _resolve_data_dir(config)
         self.data_path.mkdir(parents=True, exist_ok=True)
         self.character_key = config.get("character_key", "murasame")
         self.character_name = config.get("character_name", "丛雨")
@@ -959,7 +2192,7 @@ class MemoryManager:
         if self.data_path.exists():
             for f in self.data_path.glob("*.json"):
                 # 仅匹配角色会话记忆文件，排除 tools.json / scheduled_jobs.json 等功能数据
-                if not re.match(r'^[A-Za-z0-9_\-]+_(private|group)_[A-Za-z0-9_\-]+\.json$', f.name):
+                if not _is_memory_filename(f.name):
                     continue
                 try:
                     role_name = f.name.split("_")[0] if "_" in f.name else "未知"
@@ -998,7 +2231,7 @@ class MemoryManager:
         return memories
 
     def get_history(self, filename: str):
-        if not re.match(r'^[A-Za-z0-9_\-]+\.json$', filename):
+        if not _is_memory_filename(filename):
             return {"success": False, "error": "非法文件名"}
         file_path = (self.data_path / filename).resolve()
         if self.data_path.resolve() not in file_path.parents:
@@ -1013,7 +2246,7 @@ class MemoryManager:
             return {"success": False, "error": str(e)}
 
     def delete_memory_file(self, filename: str):
-        if not re.match(r'^[A-Za-z0-9_\-]+\.json$', filename):
+        if not _is_memory_filename(filename):
             return False
         target = (self.data_path / filename).resolve()
         if self.data_path.resolve() in target.parents and target.exists():
@@ -1025,7 +2258,7 @@ class MemoryManager:
         return False
 
     def delete_messages(self, filename: str, indices: list):
-        if not re.match(r'^[A-Za-z0-9_\-]+\.json$', filename):
+        if not _is_memory_filename(filename):
             return {"success": False, "error": "非法文件名"}
         if not isinstance(indices, list) or not all(isinstance(i, int) for i in indices):
             return {"success": False, "error": "索引必须为整数列表"}
@@ -1071,6 +2304,8 @@ event_mgr: Optional[EventManager] = None
 mood_mgr: Optional[MoodManager] = None
 sender: Optional[MessageSender] = None
 napcat_client = None
+# 角色独占的 NapCat 连接：client 实例 id -> 角色标识符（多账号时用来判断"这条消息是哪个号收到的"）
+ROLE_CONNECTIONS = {}
 scheduler: SchedulerManager = get_scheduler()
 
 last_interaction: Dict[str, float] = {}   # session_id -> 最后交互时间（含机器人主动发送）
@@ -1082,6 +2317,45 @@ _spam_log: Dict[str, list] = {}           # session_id -> [时间戳,...]
 _role_emotions_cache: Dict[str, dict] = {}
 _PROACTIVE_STATE_FILE = "proactive_state.json"
 _proactive_state_date = ""                # 已落盘的日期，跨天时重置计数
+
+# 会话记忆文件名：<角色>_<private|group>_<会话号>.json。
+# data 目录下同时存放 webui_auth.json / user_profiles.json 等功能数据文件，
+# 凡是"按目录批量读写"的地方都必须用它过滤，不能把功能数据一起卷进来。
+_MEMORY_FILE_RE = re.compile(r'^[A-Za-z0-9_\-]+_(private|group)_[A-Za-z0-9_\-]+\.json$')
+
+
+def _is_memory_filename(name) -> bool:
+    return bool(_MEMORY_FILE_RE.match(str(name or "")))
+
+
+def list_known_sessions() -> list:
+    """列出所有留下过聊天记录的会话（定时任务/事件/待办选发送目标用）。
+
+    会话记忆文件名是 <角色>_<private|group>_<号码>.json，一个会话可能有多个
+    角色的记忆文件，所以按号码去重。返回的 session_id 是纯数字号码。
+    """
+    sessions = []
+    if memory_manager is None:
+        return sessions
+    for f in sorted(memory_manager.data_path.glob("*.json")):
+        m = _MEMORY_FILE_RE.match(f.name)
+        if not m:
+            continue
+        stype = m.group(1)
+        rest = f.name.rsplit(".json", 1)[0].split(f"{stype}_", 1)[-1]
+        if stype == "group":
+            rest = rest.split("_")[0]
+        if not rest:
+            continue
+        item = {"session_type": stype, "session_id": rest}
+        if not any(s["session_id"] == rest and s["session_type"] == stype
+                   for s in sessions):
+            sessions.append(item)
+    return sessions
+
+
+# 待办状态取值（与 TodoManager 使用的一致，供 WebUI 更新接口做白名单校验）
+TODO_STATUSES = ("pending", "done", "cancelled", "missed")
 
 
 def _proactive_state_path() -> Path:
@@ -1144,19 +2418,20 @@ def save_proactive_state():
     if memory_manager is None:
         return
     try:
+        # 实际生效的日期必须先取出来：日期为空时 startswith("") 恒真，
+        # 会把往日的计数一并算到当天头上
+        today = _proactive_state_date or time.strftime("%Y-%m-%d")
         payload = {
-            "date": _proactive_state_date or time.strftime("%Y-%m-%d"),
+            "date": today,
             "counts": {k: v for k, v in proactive_counts.items()
-                       if k.startswith(_proactive_state_date)},
+                       if str(k).startswith(today)},
             "user_activity": last_user_activity,
             "awaiting": sorted(proactive_awaiting),
             "pending": {k: v for k, v in proactive_pending.items()
                         if isinstance(v, (int, float))},
         }
-        path = _proactive_state_path()
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(path)
+        from modules.jsonio import save_json
+        save_json(_proactive_state_path(), payload)
     except Exception as e:
         print(f"保存主动消息状态失败: {type(e).__name__}: {e}")
 
@@ -1210,6 +2485,76 @@ def seed_proactive_sessions():
         idle_min = global_config.get("proactive_idle_minutes", 30) if global_config else 30
         print(f"已恢复 {seeded} 个会话的闲置计时（超过 {idle_min} 分钟未互动即纳入主动消息候选）。")
     save_proactive_state()
+
+
+def session_memory_exists(session_id: str) -> bool:
+    """该会话的记忆文件是否还在。
+
+    会话被删除后，闲置计时与主动消息计数仍留在内存里，到点就会继续往
+    已删除的对话发主动消息；发送前必须确认会话本身还存在。
+    记忆实现没有 get_memory_file 接口时无法判定，按存在处理。
+    """
+    if memory_manager is None:
+        return False
+    getter = getattr(memory_manager, "get_memory_file", None)
+    if getter is None:
+        return True
+    try:
+        return Path(getter(session_id)).exists()
+    except Exception as e:
+        print(f"检查会话 {session_id} 记忆文件失败（按存在处理）: {type(e).__name__}: {e}")
+        return True
+
+
+def forget_proactive_session(session_id: str):
+    """会话被删除时一并清掉它的主动消息状态，避免删完还继续被搭话。"""
+    forgotten = (session_id in last_user_activity or session_id in last_proactive_sent
+                 or session_id in proactive_pending or session_id in proactive_awaiting)
+    last_user_activity.pop(session_id, None)
+    last_proactive_sent.pop(session_id, None)
+    last_interaction.pop(session_id, None)
+    proactive_pending.pop(session_id, None)
+    proactive_awaiting.discard(session_id)
+    for key in [k for k in proactive_counts if str(k).endswith(f"|{session_id}")]:
+        proactive_counts.pop(key, None)
+    if forgotten:
+        print(f"会话 {session_id} 已删除，主动消息状态一并清除。")
+        save_proactive_state()
+
+
+def _log_hide_patterns() -> list:
+    if global_config is None:
+        return []
+    raw = str(global_config.get("webui_log_hide_patterns", "") or "")
+    return [line.strip() for line in raw.splitlines() if line.strip()]
+
+
+def _log_hidden(line: str, patterns: Optional[list] = None) -> bool:
+    for pattern in (patterns if patterns is not None else _log_hide_patterns()):
+        if pattern in line:
+            return True
+    return False
+
+
+def whitelist_ids() -> set:
+    raw = str(global_config.get("whitelist_ids", "") or "") if global_config else ""
+    return {item.strip() for item in re.split(r"[\s,，;；]+", raw) if item.strip()}
+
+
+def _session_whitelisted(target_id) -> bool:
+    allowed = whitelist_ids()
+    if not allowed:
+        return True
+    s = str(target_id)
+    if s in allowed:
+        return True
+    for prefix in ("private_", "group_"):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            break
+    if "_" in s:
+        s = s.split("_", 1)[0]
+    return s in allowed
 
 
 def _allow_message(session_id: str) -> bool:
@@ -1354,25 +2699,43 @@ class SentenceSink:
         self.blocked = False
         self._first_checked = False
         self.pending_sticker_emotion = None
+        self.pending_sticker_text = ""
         self.sticker_sent = False
+        # 构造时就把防复读开关定下来：流式发送过程中配置不会变，
+        # 逐句重读既要保证一致，也省得每次都走一遍配置读取
+        self.guard = repeat_guard_flags(ctx)
+        self.thresholds = repeat_thresholds(ctx)
+        self.pacer = VoicePacer(bool(global_config.get("dynamic_sleep", True)))
 
-    def _looks_repeat(self, sentence: dict) -> bool:
+    def _looks_repeat(self, sentence: dict, flags: dict = None) -> bool:
         zh = str(sentence.get("zh") or "").strip()
         if not zh:
             return False
-        if any(_repeat_ratio(ref, zh) >= _SELF_REPEAT_THRESHOLD
-               for ref in self.last_replies):
-            return True
+        flags = flags or self.guard
+        self_threshold, user_threshold = getattr(self, "thresholds", None) \
+            or repeat_thresholds()
+        if flags.get("compare_self", True):
+            if any(_repeat_ratio(ref, zh) >= self_threshold
+                   for ref in self.last_replies):
+                return True
+        if not flags.get("compare_user", True):
+            return False
         u = str(self.user_text or "")
         if u and "[图片]" not in u and len(_norm_text(u)) >= _USER_ECHO_MIN_CHARS \
-                and _repeat_ratio(u, zh) >= _USER_ECHO_THRESHOLD:
+                and _repeat_ratio(u, zh) >= user_threshold:
             return True
         return False
 
     async def on_sentence(self, sentence: dict):
         if not self._first_checked:
             self._first_checked = True
-            if self._looks_repeat(sentence):
+            flags = self.guard
+            if not flags.get("streaming", True):
+                print("防复读：流式首句检查已关闭（repeat_guard_streaming_check=false），"
+                      "首句不再拦截。")
+            elif not repeat_guard_active(flags):
+                print("防复读：比对对象全部关闭，流式首句检查无内容可比，跳过。")
+            elif self._looks_repeat(sentence, flags):
                 self.blocked = True
                 print("流式首句疑似复读，已暂停发送，改为整段重新生成。")
                 return
@@ -1429,6 +2792,8 @@ class SentenceSink:
     async def _send_one(self, sentence: dict):
         if sticker_mgr and self.sent == 0 and self.pending_sticker_emotion is None:
             self.pending_sticker_emotion = sentence.get("emotion", "")
+            self.pending_sticker_text = str(sentence.get("display")
+                                            or sentence.get("zh") or "")
         wav = None
         if await self._tts_available():
             start = time.time()
@@ -1442,16 +2807,19 @@ class SentenceSink:
             self.tts_ms += (time.time() - start) * 1000
             if wav:
                 self.tts_calls += 1
+        shown = str(sentence.get("display") or sentence.get("zh") or "")
         if wav:
-            await sender.send_text(self.session_type, self.target_id, sentence["display"])
-            await sender.send_voice(self.session_type, self.target_id, wav)
-            if global_config.get("dynamic_sleep", True):
-                await asyncio.sleep(get_audio_duration(str(wav)) + 0.5)
-            else:
-                await asyncio.sleep(0.2)
-            wav.unlink(missing_ok=True)
+            try:
+                # 节奏器只在"还有下一条语音要发"时才真正等：最后一句发完立刻返回，
+                # 否则这一段播放等待会一直占着会话锁，拖住排队的下一条消息
+                await self.pacer.wait()
+                await sender.send_text(self.session_type, self.target_id, shown)
+                await sender.send_voice(self.session_type, self.target_id, wav)
+                await self.pacer.hold_voice(wav)
+            finally:
+                Path(wav).unlink(missing_ok=True)
         else:
-            await sender.send_text(self.session_type, self.target_id, sentence["display"])
+            await sender.send_text(self.session_type, self.target_id, shown)
         self.sent += 1
         self.sent_sentences.append(sentence)
 
@@ -1459,7 +2827,8 @@ class SentenceSink:
         if self.sticker_sent or not self.pending_sticker_emotion or sticker_mgr is None:
             return
         self.sticker_sent = True
-        sticker = sticker_mgr.pick(self.pending_sticker_emotion)
+        sticker = await sticker_mgr.pick_async(self.ctx, self.pending_sticker_emotion,
+                                               getattr(self, "pending_sticker_text", ""))
         if sticker:
             await sender.send_text(self.session_type, self.target_id, "", sticker=sticker)
 
@@ -1475,6 +2844,26 @@ class SentenceSink:
             await self._send_pending_sticker()
         except Exception as e:
             print(f"流式表情包发送异常: {type(e).__name__}: {e}")
+
+    async def abort(self):
+        """放弃本轮流式发送：停掉工作器并丢弃未发送的句子。
+
+        生成超时/异常时若只是 return，工作器会永远阻塞在 queue.get() 上，
+        引用链（sender/ctx/emotions）不释放，每失败一次泄漏一个后台任务。
+        """
+        task, self.worker = self.worker, None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        while not self.queue.empty():
+            try:
+                self.queue.get_nowait()
+                self.queue.task_done()
+            except Exception:
+                break
 
 
 def _tool_notes_from_trace(tool_trace) -> str:
@@ -1739,6 +3128,8 @@ async def generate_reply(ctx: RoleContext, emotions: dict, user_text: str, histo
                 out["description"] = result["description"]
             if result.get("capture"):
                 out["capture"] = result["capture"]
+            if result.get("capture_image"):
+                out["capture_image"] = result["capture_image"]
             return out
         # 识图失败（模型未配置/服务异常），降级为普通文本回复，避免用户消息石沉大海
         print("识图失败，降级为普通文本回复。")
@@ -1824,8 +3215,46 @@ async def generate_reply_stream(ctx: RoleContext, emotions: dict, user_text: str
             "llm_calls": 1, "tool_calls": 0}
 
 
-def resolve_target_roles(user_text: str, is_private: bool) -> List[dict]:
-    """多角色路由：私聊始终当前角色；群聊按消息中出现的角色名路由。"""
+def role_connection_snapshot(config) -> tuple:
+    """各角色独占连接的快照，用来判断配置保存后是否需要重连。"""
+    out = []
+    for key, role in (getattr(config, "roles", None) or {}).items():
+        role = role or {}
+        out.append((str(key), str(role.get("napcat_ws_url") or ""),
+                    str(role.get("napcat_token") or "")))
+    return tuple(sorted(out))
+
+
+def build_connection_profiles(config) -> List[dict]:
+    """要建立的 NapCat 连接清单：一条默认连接，加上每个配了独立连接的角色。
+
+    角色没填 napcat_ws_url 就共用默认连接；填得和默认地址一样时不重复连接。
+    """
+    ws_url = str(config.get("napcat_ws_url", "") or "ws://127.0.0.1:3001")
+    token = str(config.get("napcat_token", "") or "")
+    out = [{"key": "default", "label": "默认连接",
+            "ws_url": ws_url, "token": token, "role_key": ""}]
+    for key, role in (getattr(config, "roles", None) or {}).items():
+        role = role or {}
+        r_url = str(role.get("napcat_ws_url") or "").strip()
+        if not r_url:
+            continue
+        r_token = str(role.get("napcat_token") or "")
+        if r_url == ws_url and r_token == token:
+            continue
+        out.append({"key": f"role:{key}", "label": f"角色 {key}",
+                    "ws_url": r_url, "token": r_token, "role_key": key})
+    return out
+
+
+def resolve_target_roles(user_text: str, is_private: bool,
+                         source_role_key: str = "") -> List[dict]:
+    """多角色路由：账号绑了角色就用它；否则群聊按消息中出现的角色名路由。"""
+    key = str(source_role_key or "").strip()
+    if key:
+        role = (global_config.roles or {}).get(key)
+        if role:
+            return [role]
     active = get_active_role()
     if not active:
         return []
@@ -1908,29 +3337,85 @@ def _max_repeat_ratio(reply_text: str, references: list) -> tuple:
     return best, target
 
 
-_SELF_REPEAT_THRESHOLD = 0.85
-_USER_ECHO_THRESHOLD = 0.8
 _USER_ECHO_MIN_CHARS = 5
 _RETRY_TEMPERATURE = 1.3
 _RETRY_TEMPERATURE_MAX = 1.4
+
+# 防复读的四个独立开关（默认全开 = 原来的行为）。
+# 「什么时候查」与「跟谁比」是两个维度，各自可单独关闭：
+#   streaming / regen  —— 检查时机
+#   compare_self / compare_user —— 比对对象
+_REPEAT_GUARD_KEYS = {
+    "streaming": "repeat_guard_streaming_check",
+    "regen": "repeat_guard_regen_check",
+    "compare_self": "repeat_guard_compare_self",
+    "compare_user": "repeat_guard_compare_user",
+}
+
+
+def repeat_thresholds(ctx=None) -> tuple:
+    """(自重复系数, 复述用户系数)：重合度达到该值即判定为重复，越大越宽容。"""
+    src = ctx if ctx is not None else global_config
+    values = []
+    for key, fallback in (("repeat_guard_self_threshold", 0.85),
+                          ("repeat_guard_user_threshold", 0.8)):
+        try:
+            value = float(src.get(key, fallback))
+        except (TypeError, ValueError):
+            value = fallback
+        values.append(min(1.0, max(0.0, value)))
+    return values[0], values[1]
+
+
+def repeat_guard_flags(ctx=None) -> dict:
+    """读取四个防复读开关；取不到时按开启处理（保持原行为）。"""
+    src = ctx if ctx is not None else global_config
+    flags = {}
+    for name, key in _REPEAT_GUARD_KEYS.items():
+        try:
+            flags[name] = bool(src.get(key, True))
+        except Exception:
+            flags[name] = True
+    return flags
+
+
+def repeat_guard_summary(flags: dict) -> str:
+    """把关闭的开关写成一行提示；全开时返回空串。"""
+    names = {"streaming": "流式首句检查", "regen": "整段生成后校验",
+             "compare_self": "比对角色历史回复", "compare_user": "比对用户本条消息"}
+    off = [label for name, label in names.items() if not flags.get(name, True)]
+    if not off:
+        return ""
+    return "（已关闭：" + "、".join(off) + "）"
+
+
+def repeat_guard_active(flags: dict) -> bool:
+    """是否还有任何一维在生效：比对对象全关掉时，整套防复读等于没开。"""
+    return bool(flags.get("compare_self", True) or flags.get("compare_user", True))
 
 
 async def auto_capture_from_images(ctx: RoleContext, capture: dict, image_urls: list,
                                    image_result: Optional[dict] = None):
     from modules.stickers import auto_capture_image
-    source = ""
-    for s in image_urls:
-        s = str(s)
-        if s.startswith(("http://", "https://")):
-            source = s
-            break
-        try:
-            if Path(s).exists():
+    # 识图时已经把原图读进内存了，优先用这份字节：QQ 图床直链的 rkey 很短命，
+    # 到这里再下载一次经常已经 403/400，收藏就会在下载这一步悄悄失败。
+    preloaded = (image_result or {}).get("capture_image") or {}
+    image_data = preloaded.get("data")
+    source = str(preloaded.get("source") or "")
+    if not image_data:
+        for s in image_urls:
+            s = str(s)
+            if s.startswith(("http://", "https://")):
                 source = s
                 break
-        except Exception:
-            continue
-    if not source:
+            try:
+                if Path(s).exists():
+                    source = s
+                    break
+            except Exception:
+                continue
+    if not image_data and not source:
+        print("[表情收藏] 跳过：这条消息没有可用的图片来源（既无本地文件也无可下载链接）。")
         return
 
     try:
@@ -1955,9 +3440,11 @@ async def auto_capture_from_images(ctx: RoleContext, capture: dict, image_urls: 
         if not category and bool(ctx.get("sticker_capture_skip_if_unfit", True)):
             print("【表情收藏】这张图未被判定为适合当表情包，跳过收藏。")
             return
-        print(f"【表情收藏-自动触发】图片来源: {source[:50]}... 原始分数: {score}, "
-              f"分类: {category or '(空→兜底分类)'}")
-        await auto_capture_image(ctx, sticker_mgr, source, category)
+        print(f"【表情收藏-自动触发】图片来源: {str(source)[:50]}... 原始分数: {score}, "
+              f"分类: {category or '(空→兜底分类)'}, "
+              f"图片字节: {'复用识图已读入的' if image_data else '需重新下载'}")
+        await auto_capture_image(ctx, sticker_mgr, source, category, image_data=image_data,
+                                 reason=str(capture.get("reason", "") or ""))
     except Exception as e:
         print(f"表情收藏失败: {type(e).__name__}: {e}")
 
@@ -2249,6 +3736,9 @@ def _extract_event_info(event, client) -> Optional[dict]:
         if global_config.get("isolated_session", False):
             session_id = f"group_{group_id}_{sender_id}"
     if not is_private and not at_bot:
+        # 引用消息必须放行到 process_message：只有在那里回查被引用的消息，
+        # 才能知道引用的是不是机器人（是则视同 @）。引用他人消息的做法是在
+        # process_message 里、回查之后再按同一套配置拦下。
         if reply_seg is None and (global_config.get("group_need_at", True)
                                   or global_config.get("only_private", False)):
             return None
@@ -2431,6 +3921,9 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
             return
     if not user_text and not has_image:
         return
+    if not _session_whitelisted(target_id):
+        print(f"白名单：会话 {session_id}（{target_id}）不在白名单内，已忽略。")
+        return
     if not _allow_message(session_id):
         print(f"防刷屏：会话 {session_id} 短时间内消息过多，本条已忽略（可在配置中调整 anti_spam_*）。")
         return
@@ -2449,6 +3942,19 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
     data = memory_manager.load_session_data(session_id)
     history = data.get("history", [])
     meta = data.get("meta", {})
+
+    # ---- 插件指令：命中就由插件直接回复，不进 LLM 管线 ----
+    # 插件通过 ctx.register_command 注册具名指令。这里刻意放在"消息已通过
+    # 白名单/防刷屏/唤醒校验、历史已加载"之后、"写入用户消息"之前：
+    # 指令是控制面操作，不该污染对话历史、也不该触发识图与待办提取。
+    handled, plugin_reply = _dispatch_plugin_command(user_text, session_type, target_id,
+                                                     session_id, sender_id,
+                                                     sender_name, event)
+    if handled:
+        if plugin_reply:
+            await sender.send_text(session_type, target_id, str(plugin_reply))
+        return
+    # ------------------------------------------------------
     meta["user_msg_count"] = int(meta.get("user_msg_count", 0)) + 1
     meta["last_user_text"] = user_text[:200]
     data["meta"] = meta
@@ -2511,295 +4017,358 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                                             session_id, sender_id,
                                             recent_context=recent_lines))
 
-    target_roles = resolve_target_roles(user_text, is_private)
+    source_role_key = ROLE_CONNECTIONS.get(id(client), "")
+    target_roles = resolve_target_roles(user_text, is_private, source_role_key)
     max_total = max(1, int(global_config.get("multi_role_max_total", 6)))
     total_replies = 0
     first_reply_done = False
 
-    async def process_role_reply(role: dict, trigger_text: str, gate_reply: bool = False) -> bool:
-        nonlocal total_replies, first_reply_done
-        if total_replies >= max_total:
-            return False
-        ctx = RoleContext(global_config.config, role)
-        emotions = get_role_emotions(role)
-        # 先备好上下文与图片：审判判定"不回复"时也要能补记画面描述（见下）
-        extra_parts = []
-        if not is_private:
-            mention_parts = []
-            for q in at_ids:
-                nm = at_names.get(q)
-                mention_parts.append(f"{nm}(QQ:{q})" if nm else f"QQ:{q}")
-            who = "、".join(mention_parts) if mention_parts else "无（按提及的名字触发）"
-            if at_bot:
-                extra_parts.append(
-                    f"【@对象】本条消息@了：{who}（其中包含你：本机器人/当前角色）。"
-                    "你是被@的机器人，消息里提到的其他人/QQ号都是别的群成员，不是你本人，"
-                    "也不是给你发消息的用户；请区分“发消息的用户”和“被@的其他成员”，只按自己的身份回应。")
-            else:
-                extra_parts.append(
-                    f"【@对象】本条消息@了：{who}（都不是你）。"
-                    "被@的是其他群成员，不是你本人，也不是给你发消息的用户；"
-                    "只有消息明确提到你的名字时才由你回应，不要替其他被@的人作答。")
-        use_history = history
-        if global_config.get("summary_enabled", False) and meta.get("summary"):
-            try:
-                keep = max(1, int(global_config.get("summary_max_history", 5)))
-            except (TypeError, ValueError):
-                keep = 5
-            use_history = history[-keep:]
-            extra_parts.append(f"【早期对话摘要】{meta['summary']}")
-        if global_config.get("dynamic_context_enabled", False) and meta.get("topic"):
-            extra_parts.append(f"【当前话题】{meta['topic']}")
-        if profile_mgr and global_config.get("profiles_enabled", False):
-            p = profile_mgr.build_injection(sender_id)
-            if p:
-                extra_parts.append(p)
-        if rag_mgr and global_config.get("rag_enabled", False):
-            rc = await rag_mgr.build_context(user_text)
-            if rc:
-                extra_parts.append(rc)
+    def _dispatch_reply_done(info: dict) -> None:
+        """通知插件"这一轮 LLM 回复已经发完"。插件系统没启用就什么都不做。"""
+        rt = _plugin_runtime()
+        if rt is None:
+            return
         try:
-            repeat_rounds = max(1, int(global_config.get("repeat_guard_rounds", 3) or 3))
-        except (TypeError, ValueError):
-            repeat_rounds = 3
-        recent_replies = _recent_assistant_replies(history, repeat_rounds)
-        last_reply = recent_replies[0] if recent_replies else ""
-        if recent_replies:
-            block = "\n".join(f"{i + 1}. {r[:200]}" for i, r in enumerate(recent_replies))
-            extra_parts.append(
-                f"【禁止重复】你最近 {len(recent_replies)} 轮已经说过下面这些话：\n{block}\n"
-                "本次回复必须与上面每一句都明显不同：句子结构、用词、切入角度、"
-                "举例与收尾方式都要换新的；严禁把其中任何一句原样或换个说法再说一遍，"
-                "也严禁只是把前面轮次的话重新拼一遍。")
+            rt.dispatch_reply_done(info)
+        except Exception as e:
+            print(f"[插件] 回复完成钩子派发失败: {type(e).__name__}: {e}")
 
-        image_sources = image_urls
-        if has_image:
-            image_sources = await refresh_image_urls(client, image_urls, image_file_ids)
 
-        gen_budget = max(90.0, float(ctx.get("llm_timeout", 120) or 120) + 60.0)
-
-        if gate_reply and (global_config.get("reply_judge_enabled", False)
-                           or global_config.get("mood_enabled", False)) and mood_mgr is not None:
-            mood_user = "" if is_private else str(sender_id)
+    async def process_role_reply(role: dict, trigger_text: str, gate_reply: bool = False) -> bool:
+        with sender.using_client(sender.client_for(role)):
+            nonlocal total_replies, first_reply_done
+            if total_replies >= max_total:
+                return False
+            ctx = RoleContext(global_config.config, role)
+            emotions = get_role_emotions(role)
+            # 先备好上下文与图片：审判判定"不回复"时也要能补记画面描述（见下）
+            extra_parts = []
+            if not is_private:
+                mention_parts = []
+                for q in at_ids:
+                    nm = at_names.get(q)
+                    mention_parts.append(f"{nm}(QQ:{q})" if nm else f"QQ:{q}")
+                who = "、".join(mention_parts) if mention_parts else "无（按提及的名字触发）"
+                if at_bot:
+                    extra_parts.append(
+                        f"【@对象】本条消息@了：{who}（其中包含你：本机器人/当前角色）。"
+                        "你是被@的机器人，消息里提到的其他人/QQ号都是别的群成员，不是你本人，"
+                        "也不是给你发消息的用户；请区分“发消息的用户”和“被@的其他成员”，只按自己的身份回应。")
+                else:
+                    extra_parts.append(
+                        f"【@对象】本条消息@了：{who}（都不是你）。"
+                        "被@的是其他群成员，不是你本人，也不是给你发消息的用户；"
+                        "只有消息明确提到你的名字时才由你回应，不要替其他被@的人作答。")
+            use_history = history
+            if global_config.get("summary_enabled", False) and meta.get("summary"):
+                try:
+                    keep = max(1, int(global_config.get("summary_max_history", 5)))
+                except (TypeError, ValueError):
+                    keep = 5
+                use_history = history[-keep:]
+                extra_parts.append(f"【早期对话摘要】{meta['summary']}")
+            if global_config.get("dynamic_context_enabled", False) and meta.get("topic"):
+                extra_parts.append(f"【当前话题】{meta['topic']}")
+            if profile_mgr and global_config.get("profiles_enabled", False):
+                p = profile_mgr.build_injection(sender_id)
+                if p:
+                    extra_parts.append(p)
+            if rag_mgr and global_config.get("rag_enabled", False):
+                rc = await rag_mgr.build_context(user_text)
+                if rc:
+                    extra_parts.append(rc)
             try:
-                verdict = await asyncio.wait_for(
-                    judge_and_decide(ctx, mood_mgr, session_id, trigger_text,
-                                     history, user_id=mood_user), timeout=30)
+                repeat_rounds = max(1, int(global_config.get("repeat_guard_rounds", 3) or 3))
+            except (TypeError, ValueError):
+                repeat_rounds = 3
+            repeat_flags = repeat_guard_flags(ctx)
+            recent_replies = _recent_assistant_replies(history, repeat_rounds)
+            last_reply = recent_replies[0] if recent_replies else ""
+            if recent_replies and repeat_flags["compare_self"]:
+                block = "\n".join(f"{i + 1}. {r[:200]}" for i, r in enumerate(recent_replies))
+                extra_parts.append(
+                    f"【禁止重复】你最近 {len(recent_replies)} 轮已经说过下面这些话：\n{block}\n"
+                    "本次回复必须与上面每一句都明显不同：句子结构、用词、切入角度、"
+                    "举例与收尾方式都要换新的；严禁把其中任何一句原样或换个说法再说一遍，"
+                    "也严禁只是把前面轮次的话重新拼一遍。")
+
+            image_sources = image_urls
+            if has_image:
+                image_sources = await refresh_image_urls(client, image_urls, image_file_ids)
+
+            gen_budget = max(90.0, float(ctx.get("llm_timeout", 120) or 120) + 60.0)
+
+            if gate_reply and (global_config.get("reply_judge_enabled", False)
+                               or global_config.get("mood_enabled", False)) and mood_mgr is not None:
+                mood_user = "" if is_private else str(sender_id)
+                try:
+                    verdict = await asyncio.wait_for(
+                        judge_and_decide(ctx, mood_mgr, session_id, trigger_text,
+                                         history, user_id=mood_user), timeout=30)
+                except asyncio.TimeoutError:
+                    print("回复审判超时（30s），本轮跳过审判直接回复。")
+                    verdict = None
+                # 只开心情、没开审判时 verdict["should_reply"] 恒为 True，不会被拦下；
+                # 开着审判才会出现真正"决定不回复"的分支。
+                if verdict is not None and not verdict["should_reply"]:
+                    cause = "LLM判定无需回复" if not verdict.get("llm_reply", True) \
+                        else f"概率门控未通过（概率 {verdict.get('probability', 0):.3f} < 1）"
+                    print(f"回复审判：{ctx.character_name or ctx.character_key} 决定不回复"
+                          f"（心情值 {verdict['mood']:.0f}，回复概率 {verdict['probability']:.2f}，{cause}）")
+                    if has_image and image_sources:
+                        # 审判在识图之前就判定"不用回"，但图还是要看：把画面描述写进历史，
+                        # 供用户下一条相关追问使用（统一由收尾逻辑决定是否落盘）。
+                        try:
+                            pending_reply = await asyncio.wait_for(
+                                generate_reply(ctx, emotions, trigger_text, use_history,
+                                               image_sources, list(extra_parts), sender_id,
+                                               session_id=session_id),
+                                timeout=gen_budget)
+                        except Exception as e:
+                            pending_reply = None
+                            print(f"审判未回复时补记画面描述失败（忽略）: {type(e).__name__}: {e}")
+                        desc = str((pending_reply or {}).get("description", "") or "").strip()
+                        if desc:
+                            _backfill_image_description(history, desc)
+                            print(f"审判未回复：画面描述已写入历史，供主人下一条追问使用 → {desc[:60]}")
+                    return False
+
+            sink = None
+            if global_config.get("streaming_enabled", False) and not first_reply_done:
+                sink = SentenceSink(session_type, target_id, emotions, ctx, recent_replies,
+                                    "" if has_image else user_text)
+
+            reply_started = time.time()
+            timed_out = False
+            try:
+                reply = await asyncio.wait_for(
+                    generate_reply(ctx, emotions, trigger_text, use_history,
+                                   image_sources if has_image else None,
+                                   extra_parts, sender_id,
+                                   on_sentence=sink.on_sentence if sink else None,
+                                   session_id=session_id),
+                    timeout=gen_budget)
             except asyncio.TimeoutError:
-                print("回复审判超时（30s），本轮跳过审判直接回复。")
-                verdict = None
-            # 只开心情、没开审判时 verdict["should_reply"] 恒为 True，不会被拦下；
-            # 开着审判才会出现真正"决定不回复"的分支。
-            if verdict is not None and not verdict["should_reply"]:
-                cause = "LLM判定无需回复" if not verdict.get("llm_reply", True) \
-                    else f"概率门控未通过（概率 {verdict.get('probability', 0):.3f} < 1）"
-                print(f"回复审判：{ctx.character_name or ctx.character_key} 决定不回复"
-                      f"（心情值 {verdict['mood']:.0f}，回复概率 {verdict['probability']:.2f}，{cause}）")
-                if has_image and image_sources:
-                    # 审判在识图之前就判定"不用回"，但图还是要看：把画面描述写进历史，
-                    # 供用户下一条相关追问使用（统一由收尾逻辑决定是否落盘）。
-                    try:
-                        pending_reply = await asyncio.wait_for(
-                            generate_reply(ctx, emotions, trigger_text, use_history,
-                                           image_sources, list(extra_parts), sender_id,
-                                           session_id=session_id),
-                            timeout=gen_budget)
-                    except Exception as e:
-                        pending_reply = None
-                        print(f"审判未回复时补记画面描述失败（忽略）: {type(e).__name__}: {e}")
-                    desc = str((pending_reply or {}).get("description", "") or "").strip()
-                    if desc:
-                        _backfill_image_description(history, desc)
-                        print(f"审判未回复：画面描述已写入历史，供主人下一条追问使用 → {desc[:60]}")
+                timed_out = True
+                print(f"回复生成超出预算（{gen_budget:.0f}s），本轮放弃以释放会话锁。")
+            except BaseException:
+                if sink is not None:
+                    await sink.abort()
+                raise
+            if timed_out:
+                if sink is not None:
+                    await sink.abort()
                 return False
 
-        sink = None
-        if global_config.get("streaming_enabled", False) and not first_reply_done:
-            sink = SentenceSink(session_type, target_id, emotions, ctx, recent_replies,
-                                "" if has_image else user_text)
+            # 识图成功就立刻把画面描述回填进历史（哪怕这一轮最终不发消息）：
+            # 这样"要不要回复"的审判、以及下一轮追问，都能看到画面真实内容。
+            if has_image and reply:
+                early_desc = str(reply.get("description", "") or "").strip()
+                if early_desc:
+                    _backfill_image_description(history, early_desc)
 
-        reply_started = time.time()
-        try:
-            reply = await asyncio.wait_for(
-                generate_reply(ctx, emotions, trigger_text, use_history,
-                               image_sources if has_image else None,
-                               extra_parts, sender_id,
-                               on_sentence=sink.on_sentence if sink else None,
-                               session_id=session_id),
-                timeout=gen_budget)
-        except asyncio.TimeoutError:
-            print(f"回复生成超出预算（{gen_budget:.0f}s），本轮放弃以释放会话锁。")
-            return False
+            tts_ms = 0.0
+            if sink is not None:
+                await sink.flush()
+                if (not reply or not reply.get("sentences")) and sink.sent_sentences:
+                    reply = {"sentences": sink.sent_sentences, "llm_ms": 0, "tool_trace": []}
+                tts_ms = sink.tts_ms
+            if not reply or not reply.get("sentences"):
+                return False
 
-        # 识图成功就立刻把画面描述回填进历史（哪怕这一轮最终不发消息）：
-        # 这样"要不要回复"的审判、以及下一轮追问，都能看到画面真实内容。
-        if has_image and reply:
-            early_desc = str(reply.get("description", "") or "").strip()
-            if early_desc:
-                _backfill_image_description(history, early_desc)
+            zh_now = "".join(s.get("zh", "") for s in reply["sentences"]).strip()
+            can_retry = sink is None or sink.sent == 0
+            self_ratio, self_target = (0.0, "")
+            if repeat_flags["compare_self"]:
+                self_ratio, self_target = _max_repeat_ratio(zh_now, recent_replies)
+            user_ratio = 0.0
+            if repeat_flags["compare_user"] and zh_now and user_text and not has_image \
+                    and "[图片]" not in user_text \
+                    and len(_norm_text(user_text)) >= _USER_ECHO_MIN_CHARS:
+                user_ratio = _repeat_ratio(user_text, zh_now)
+            print(f"相似度检查：与最近 {len(recent_replies)} 条回复最高 {self_ratio:.2f}，"
+                  f"与用户本条 {user_ratio:.2f}"
+                  + ("" if can_retry else "（流式内容已发送，无法打回）")
+                  + repeat_guard_summary(repeat_flags))
+            if not repeat_flags["regen"]:
+                print("防复读：整段生成后校验已关闭（repeat_guard_regen_check=false），"
+                      "本次不做相似度重生成。")
+            elif not repeat_guard_active(repeat_flags):
+                print("防复读：比对对象全部关闭，整段校验无内容可比，跳过。")
+            self_threshold, user_threshold = repeat_thresholds(ctx)
+            if repeat_flags["regen"] and repeat_guard_active(repeat_flags) and can_retry \
+                    and (self_ratio >= self_threshold
+                         or user_ratio >= user_threshold):
+                dup_is_user = user_ratio >= user_threshold and self_ratio < self_threshold
+                dup_target = user_text if dup_is_user else (self_target or last_reply)
+                base_ratio = max(self_ratio, user_ratio)
+                dup_label = "复述了用户本条消息的原话" if dup_is_user else "与之前的回复几乎重复"
+                print(f"检测到回复{dup_label}（重合率 {base_ratio:.2f}），重新生成。")
+                retry_hist = use_history
+                if not dup_is_user:
+                    retry_hist = list(use_history)
+                    while retry_hist and retry_hist[-1].get("role") == "assistant":
+                        retry_hist.pop()
+                retry_ctx = RoleContext(global_config.config,
+                                        {**role, "temperature": _RETRY_TEMPERATURE,
+                                         "temperature_max": _RETRY_TEMPERATURE_MAX})
+                for attempt in range(1, 3):
+                    retry_parts = list(extra_parts) + [
+                        f"警告：你刚才的回复{dup_label}——“{dup_target[:120]}”。"
+                        "重新生成时句子、用词、角度必须和这句话明显不同，"
+                        "只回应对方话里的意图，不要照搬其中的词。"
+                        + ("再换一个完全不同的切入角度。" if attempt > 1 else "")]
+                    if time.time() - reply_started > 60:
+                        print("回复生成耗时过长，跳过重生成以免长时间占用会话。")
+                        break
+                    try:
+                        retried = await asyncio.wait_for(
+                            generate_reply(retry_ctx, emotions, trigger_text, retry_hist,
+                                           image_sources if has_image else None,
+                                           retry_parts, sender_id, on_sentence=None,
+                                           session_id=session_id),
+                            timeout=gen_budget)
+                    except asyncio.TimeoutError:
+                        print("重生成超预算，保留原回复。")
+                        break
+                    if not retried or not retried.get("sentences"):
+                        break
+                    new_zh = "".join(s.get("zh", "") for s in retried["sentences"]).strip()
+                    accept_threshold = user_threshold if dup_is_user else self_threshold
+                    # 验收同样只看还有效的那些维度：关掉的维度不该继续左右"重生成是否被接受"
+                    new_self = _max_repeat_ratio(new_zh, recent_replies)[0] \
+                        if repeat_flags["compare_self"] else 0.0
+                    new_user = _repeat_ratio(user_text, new_zh) \
+                        if (repeat_flags["compare_user"] and user_text and new_zh) else 0.0
+                    if dup_is_user:
+                        new_ratio = max(new_self, new_user if new_zh else 1.0)
+                    elif not new_zh:
+                        new_ratio = 1.0
+                    else:
+                        new_ratio = new_self
+                    print(f"重生成第 {attempt} 次，重合率 {new_ratio:.2f}")
+                    if new_ratio < accept_threshold or (attempt == 2 and new_ratio < base_ratio):
+                        reply = retried
+                        break
 
-        tts_ms = 0.0
-        if sink is not None:
-            await sink.flush()
-            if (not reply or not reply.get("sentences")) and sink.sent_sentences:
-                reply = {"sentences": sink.sent_sentences, "llm_ms": 0, "tool_trace": []}
-            tts_ms = sink.tts_ms
-        if not reply or not reply.get("sentences"):
-            return False
+            if has_image and global_config.get("image_identity_guard_enabled", True) \
+                    and image_self_claim("".join(s.get("zh", "") for s in reply["sentences"])):
+                print("图片身份规则：回复把用户发来的图当成了角色自己，重新生成。")
+                fixed = None
+                if can_retry and time.time() - reply_started <= 60:
+                    claim_parts = list(extra_parts) + [IMAGE_CLAIM_WARNING]
+                    try:
+                        retried = await asyncio.wait_for(
+                            generate_reply(ctx, emotions, trigger_text, use_history,
+                                           image_sources if has_image else None,
+                                           claim_parts, sender_id, on_sentence=None,
+                                           session_id=session_id),
+                            timeout=gen_budget)
+                    except asyncio.TimeoutError:
+                        print("图片身份重生成超预算，保留原回复。")
+                        retried = None
+                    if retried and retried.get("sentences") \
+                            and not image_self_claim("".join(s.get("zh", "")
+                                                             for s in retried["sentences"])):
+                        fixed = retried
+                if fixed is not None:
+                    reply = fixed
+                else:
+                    kept = _strip_image_claims(reply["sentences"])
+                    if kept and len(kept) != len(reply["sentences"]):
+                        print("图片身份重生成未消除认领表述，已剔除相关句子。")
+                        reply = {**reply, "sentences": kept}
 
-        zh_now = "".join(s.get("zh", "") for s in reply["sentences"]).strip()
-        can_retry = sink is None or sink.sent == 0
-        self_ratio, self_target = _max_repeat_ratio(zh_now, recent_replies)
-        user_ratio = 0.0
-        if zh_now and user_text and not has_image and "[图片]" not in user_text \
-                and len(_norm_text(user_text)) >= _USER_ECHO_MIN_CHARS:
-            user_ratio = _repeat_ratio(user_text, zh_now)
-        print(f"相似度检查：与最近 {len(recent_replies)} 条回复最高 {self_ratio:.2f}，"
-              f"与用户本条 {user_ratio:.2f}"
-              + ("" if can_retry else "（流式内容已发送，无法打回）"))
-        if can_retry and (self_ratio >= _SELF_REPEAT_THRESHOLD or user_ratio >= _USER_ECHO_THRESHOLD):
-            dup_is_user = user_ratio >= _USER_ECHO_THRESHOLD and self_ratio < _SELF_REPEAT_THRESHOLD
-            dup_target = user_text if dup_is_user else (self_target or last_reply)
-            base_ratio = max(self_ratio, user_ratio)
-            dup_label = "复述了用户本条消息的原话" if dup_is_user else "与之前的回复几乎重复"
-            print(f"检测到回复{dup_label}（重合率 {base_ratio:.2f}），重新生成。")
-            retry_hist = use_history
-            if not dup_is_user:
-                retry_hist = list(use_history)
-                while retry_hist and retry_hist[-1].get("role") == "assistant":
-                    retry_hist.pop()
-            retry_ctx = RoleContext(global_config.config,
-                                    {**role, "temperature": _RETRY_TEMPERATURE,
-                                     "temperature_max": _RETRY_TEMPERATURE_MAX})
-            for attempt in range(1, 3):
-                retry_parts = list(extra_parts) + [
-                    f"警告：你刚才的回复{dup_label}——“{dup_target[:120]}”。"
-                    "重新生成时句子、用词、角度必须和这句话明显不同，"
-                    "只回应对方话里的意图，不要照搬其中的词。"
-                    + ("再换一个完全不同的切入角度。" if attempt > 1 else "")]
-                if time.time() - reply_started > 60:
-                    print("回复生成耗时过长，跳过重生成以免长时间占用会话。")
-                    break
-                try:
-                    retried = await asyncio.wait_for(
-                        generate_reply(retry_ctx, emotions, trigger_text, retry_hist,
-                                       image_sources if has_image else None,
-                                       retry_parts, sender_id, on_sentence=None,
-                                       session_id=session_id),
-                        timeout=gen_budget)
-                except asyncio.TimeoutError:
-                    print("重生成超预算，保留原回复。")
-                    break
-                if not retried or not retried.get("sentences"):
-                    break
-                new_zh = "".join(s.get("zh", "") for s in retried["sentences"]).strip()
-                accept_threshold = _USER_ECHO_THRESHOLD if dup_is_user else _SELF_REPEAT_THRESHOLD
-                new_ratio, _new_target = _max_repeat_ratio(new_zh, recent_replies)
-                if dup_is_user:
-                    new_ratio = max(new_ratio, _repeat_ratio(user_text, new_zh) if new_zh else 1.0)
-                elif not new_zh:
-                    new_ratio = 1.0
-                print(f"重生成第 {attempt} 次，重合率 {new_ratio:.2f}")
-                if new_ratio < accept_threshold or (attempt == 2 and new_ratio < base_ratio):
-                    reply = retried
-                    break
+            if sink is None or sink.sent == 0:
+                await repair_sentence_lang(reply.get("sentences", []), ctx)
 
-        if has_image and global_config.get("image_identity_guard_enabled", True) \
-                and image_self_claim("".join(s.get("zh", "") for s in reply["sentences"])):
-            print("图片身份规则：回复把用户发来的图当成了角色自己，重新生成。")
-            fixed = None
-            if can_retry and time.time() - reply_started <= 60:
-                claim_parts = list(extra_parts) + [IMAGE_CLAIM_WARNING]
-                try:
-                    retried = await asyncio.wait_for(
-                        generate_reply(ctx, emotions, trigger_text, use_history,
-                                       image_sources if has_image else None,
-                                       claim_parts, sender_id, on_sentence=None,
-                                       session_id=session_id),
-                        timeout=gen_budget)
-                except asyncio.TimeoutError:
-                    print("图片身份重生成超预算，保留原回复。")
-                    retried = None
-                if retried and retried.get("sentences") \
-                        and not image_self_claim("".join(s.get("zh", "")
-                                                         for s in retried["sentences"])):
-                    fixed = retried
-            if fixed is not None:
-                reply = fixed
+            # ====== 上下文互通核心逻辑：回填识图模型的画面描述 ======
+            if has_image:
+                img_desc = str(reply.get("description", "") or "").strip()
+                if img_desc:
+                    _backfill_image_description(history, img_desc)
+            # ========================================================
+
+            tts_calls_result = sink.tts_calls if sink is not None else 0
+            if sink is not None:
+                if sink.sent == 0:
+                    send_result = await sender.send_reply(session_type, target_id, reply["sentences"],
+                                                          emotions, ctx,
+                                                          use_voice=global_config.get("tts_reply_enabled", True))
+                    tts_calls_result += send_result.get("tts_calls", 0)
             else:
-                kept = _strip_image_claims(reply["sentences"])
-                if kept and len(kept) != len(reply["sentences"]):
-                    print("图片身份重生成未消除认领表述，已剔除相关句子。")
-                    reply = {**reply, "sentences": kept}
-
-        if sink is None or sink.sent == 0:
-            await repair_sentence_lang(reply.get("sentences", []), ctx)
-
-        # ====== 上下文互通核心逻辑：回填识图模型的画面描述 ======
-        if has_image:
-            img_desc = str(reply.get("description", "") or "").strip()
-            if img_desc:
-                _backfill_image_description(history, img_desc)
-        # ========================================================
-
-        tts_calls_result = sink.tts_calls if sink is not None else 0
-        if sink is not None:
-            if sink.sent == 0:
                 send_result = await sender.send_reply(session_type, target_id, reply["sentences"],
                                                       emotions, ctx,
                                                       use_voice=global_config.get("tts_reply_enabled", True))
-                tts_calls_result += send_result.get("tts_calls", 0)
-        else:
-            send_result = await sender.send_reply(session_type, target_id, reply["sentences"],
-                                                  emotions, ctx,
-                                                  use_voice=global_config.get("tts_reply_enabled", True))
-            tts_ms = send_result.get("tts_ms", 0.0)
-            tts_calls_result = send_result.get("tts_calls", 0)
+                tts_ms = send_result.get("tts_ms", 0.0)
+                tts_calls_result = send_result.get("tts_calls", 0)
 
-        sent_now = urls_in_text("".join(str(s.get("display", "") or "")
-                                        for s in reply["sentences"]))
-        if sent_now:
-            record_sent_links(session_id, sent_now)
+            sent_now = urls_in_text("".join(str(s.get("display", "") or "")
+                                            for s in reply["sentences"]))
+            if sent_now:
+                record_sent_links(session_id, sent_now)
 
-        zh_text = "".join(s["zh"] for s in reply["sentences"])
-        speaker = role.get("character_name", ctx.character_key)
-        entry = {"role": "assistant", "content": zh_text, "timestamp": time.time(),
-                 "speaker": speaker,
-                 "emotion": reply["sentences"][0].get("emotion", "")}
-        tool_notes = _tool_notes_from_trace(reply.get("tool_trace"))
-        if tool_notes:
-            entry["tool_notes"] = tool_notes
-        history.append(entry)
-        data["history"] = history
-        data["meta"] = meta
-        memory_manager.save_session_data(session_id, data)
-        if has_image:
-            # 图片已经被真正看过并回复过了，不必再为后续追问重跑识图
-            _clear_pending_image(session_id)
+            # 插件 on_message：主回复发完后，把插件想追加的文本挨条发出去。
+            # 顺序放在主回复之后，是为了让插件的补充说明不打断角色本身的语气。
+            for extra in _dispatch_plugin_message({
+                    "session_type": session_type, "target_id": target_id,
+                    "session_id": session_id, "sender_id": sender_id,
+                    "sender_name": sender_name, "text": user_text,
+                    "role": role, "emotions": emotions}):
+                try:
+                    await sender.send_text(session_type, target_id, extra)
+                except Exception as e:
+                    print(f"[插件] 追加回复发送失败: {type(e).__name__}: {e}")
 
-        if stats_mgr and global_config.get("stats_enabled", True) and db is not None:
-            db.record_interaction(
-                session_type, session_id, sender_id, sender_name,
-                role.get("character_key", ""), reply["sentences"][0].get("emotion", ""),
-                reply.get("llm_ms", 0), tts_ms, len(reply["sentences"]), ok=True,
-                llm_calls=reply.get("llm_calls", 1),
-                tts_calls=tts_calls_result,
-                tool_calls=reply.get("tool_calls", 0))
-        if stats_mgr:
-            stats_mgr.record_message(session_id)
+            _dispatch_reply_done({
+                "session_type": session_type, "target_id": target_id,
+                "session_id": session_id, "sentences": reply["sentences"],
+                "emotions": emotions, "role": role, "reply": reply,
+                "sender_id": sender_id, "user_text": user_text,
+            })
 
-        if not first_reply_done and has_image and reply.get("capture") \
-                and reply["capture"].get("should") and image_sources and sticker_mgr is not None:
-            _spawn(auto_capture_from_images(
-                ctx, reply["capture"], image_sources,
-                {"description": reply.get("description", ""), "sentences": reply["sentences"]}))
+            # 流式路径补出来的句子可能只有 display 没有 zh，取不到时退回展示文本
+            zh_text = "".join(str(s.get("zh") or s.get("display") or "")
+                              for s in reply["sentences"])
+            speaker = role.get("character_name", ctx.character_key)
+            entry = {"role": "assistant", "content": zh_text, "timestamp": time.time(),
+                     "speaker": speaker,
+                     "emotion": reply["sentences"][0].get("emotion", "")}
+            tool_notes = _tool_notes_from_trace(reply.get("tool_trace"))
+            if tool_notes:
+                entry["tool_notes"] = tool_notes
+            history.append(entry)
+            data["history"] = history
+            data["meta"] = meta
+            memory_manager.save_session_data(session_id, data)
+            if has_image:
+                # 图片已经被真正看过并回复过了，不必再为后续追问重跑识图
+                _clear_pending_image(session_id)
 
-        if profile_mgr and global_config.get("profiles_enabled", False) and \
-                global_config.get("profiles_auto_extract", False) and not first_reply_done:
-            _spawn(profile_mgr.extract_from_dialog(ctx, trigger_text, zh_text, sender_id))
-        first_reply_done = True
-        total_replies += 1
-        return True
+            if stats_mgr and global_config.get("stats_enabled", True) and db is not None:
+                db.record_interaction(
+                    session_type, session_id, sender_id, sender_name,
+                    role.get("character_key", ""), reply["sentences"][0].get("emotion", ""),
+                    reply.get("llm_ms", 0), tts_ms, len(reply["sentences"]), ok=True,
+                    llm_calls=reply.get("llm_calls", 1),
+                    tts_calls=tts_calls_result,
+                    tool_calls=reply.get("tool_calls", 0))
+            if stats_mgr:
+                stats_mgr.record_message(session_id)
+
+            if not first_reply_done and has_image and reply.get("capture") \
+                    and reply["capture"].get("should") and image_sources and sticker_mgr is not None:
+                _spawn(auto_capture_from_images(
+                    ctx, reply["capture"], image_sources,
+                    {"description": reply.get("description", ""), "sentences": reply["sentences"],
+                     "capture_image": reply.get("capture_image")}))
+
+            if profile_mgr and global_config.get("profiles_enabled", False) and \
+                    global_config.get("profiles_auto_extract", False) and not first_reply_done:
+                _spawn(profile_mgr.extract_from_dialog(ctx, trigger_text, zh_text, sender_id))
+            first_reply_done = True
+            total_replies += 1
+            return True
 
     try:
         if not await ensure_tts_service(global_config):
@@ -2828,7 +4397,8 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
     except Exception as e:
         print(f"回复生成失败: {type(e).__name__}: {e}")
 
-    memory_manager.cleanup_voice_cache(global_config.get("max_voice_cache", 20))
+    await asyncio.to_thread(memory_manager.cleanup_voice_cache,
+                            global_config.get("max_voice_cache", 20))
     if total_replies > 0:
         _spawn(post_reply_context_tasks(session_id, get_active_ctx()))
     else:
@@ -2947,6 +4517,11 @@ async def proactive_idle_check():
     for session_id in set(last_user_activity) | set(last_proactive_sent):
         if session_id in proactive_pending:
             continue
+        if not session_memory_exists(session_id):
+            forget_proactive_session(session_id)
+            continue
+        if not _session_whitelisted(session_id):
+            continue
         if wait_reply and session_id in proactive_awaiting:
             # 上一条主动消息用户还没回，不再主动打扰
             continue
@@ -2970,6 +4545,9 @@ async def proactive_idle_check():
         if session_id in newly_scheduled:
             continue
         if now < target:
+            continue
+        if not session_memory_exists(session_id):
+            forget_proactive_session(session_id)
             continue
         if quiet:
             continue
@@ -3009,6 +4587,9 @@ async def proactive_idle_check():
             # 生成期间用户开口了：放弃这条主动消息，避免答非所问地插话
             proactive_pending.pop(session_id, None)
             print(f"主动消息：会话 {session_id} 在生成期间有互动，取消本次发送。")
+            continue
+        if not session_memory_exists(session_id):
+            forget_proactive_session(session_id)
             continue
         try:
             ok = await sender.speak_and_send(
@@ -3270,6 +4851,16 @@ def _json_file_response(data, filename: str):
                         headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
+def _brief_response(resp, limit: int = 200) -> str:
+    """把服务端响应体压成一行短文本，用于把上游报错原因带回给用户。"""
+    try:
+        text = resp.text
+    except Exception:
+        return ""
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
 def _safe_subdir(root: Path, name: str) -> Optional[Path]:
     """校验 name 为 root 的直接子目录名（防路径穿越）。"""
     if not name or not re.match(r'^[\w\u4e00-\u9fff\- ]+$', name):
@@ -3293,7 +4884,7 @@ async def _webui_error_middleware(request, handler):
         print(text)
         print(trace)
         try:
-            with open("webui_error.log", "a", encoding="utf-8") as f:
+            with open(runtime_path("webui_error.log"), "a", encoding="utf-8") as f:
                 f.write(f"{time.ctime()} - {text}\n{trace}\n")
         except Exception:
             pass
@@ -3301,15 +4892,50 @@ async def _webui_error_middleware(request, handler):
             {"success": False, "error": f"{type(e).__name__}: {e}"}, status=500)
 
 
+_CSRF_SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
+
+
+def _same_origin(request) -> bool:
+    """跨站表单/请求能否带着浏览器 Cookie 打过来。
+
+    WebUI 默认不设密码，且写接口多为 multipart 表单，跨站 <form> 可以在
+    没有预检的情况下直接提交到 127.0.0.1。浏览器对跨源请求必定带 Origin，
+    因此「Origin/Referer 的主机与 Host 不一致」即可判定为跨站并拒绝。
+    非浏览器客户端（命令行、测试）不带 Origin，按放行处理。
+    """
+    if request.method in _CSRF_SAFE_METHODS:
+        return True
+    origin = request.headers.get("Origin") or request.headers.get("Referer") or ""
+    if not origin:
+        return True
+    host = request.headers.get("Host", "")
+    if not host:
+        return False
+    try:
+        parsed = urlsplit(origin)
+    except ValueError:
+        return False
+    if not parsed.netloc:
+        return False
+    if parsed.netloc == host:
+        return True
+    default_port = 443 if parsed.scheme == "https" else 80
+    return parsed.port in (None, default_port) and host.split(":")[0] == parsed.hostname
+
+
 def _make_auth_middleware(server: "WebUIServer"):
     @web.middleware
     async def _auth(request, handler):
         path = request.path
+        if not _same_origin(request):
+            print(f"已拒绝跨站请求：{request.method} {path}"
+                  f"（Origin/Referer={request.headers.get('Origin') or request.headers.get('Referer')}）")
+            return web.json_response({"success": False, "error": "跨站请求已被拒绝"}, status=403)
         if path.startswith("/api") and path not in ("/api/auth/login", "/api/auth/status"):
             token = server._auth_token
             if not token:
                 return await handler(request)
-            if request.cookies.get("ltvm_auth") != token:
+            if request.cookies.get("lovomo_auth") != token:
                 return web.json_response({"success": False, "error": "需要密码"}, status=401)
         return await handler(request)
     return _auth
@@ -3317,6 +4943,103 @@ def _make_auth_middleware(server: "WebUIServer"):
 
 # 桌面窗口句柄：pywebview 的"选择文件夹"对话框需要（run_webview_loop 中赋值）
 _WEBVIEW_WINDOW_HOLDER = {"window": None}
+
+# 运行中的 WebUI 服务实例：消息处理链路在别的函数里，靠这个拿到插件运行时
+_WEBUI_SERVER_HOLDER = {"server": None}
+
+
+def _plugin_runtime():
+    """取当前运行的插件运行时；插件系统未启用或尚未就绪时返回 None。"""
+    server = _WEBUI_SERVER_HOLDER.get("server")
+    if server is None:
+        return None
+    return getattr(server, "_plugin_runtime", None)
+
+
+# 指令前缀：#名字 或 /名字，后面跟参数。用 \S+ 取指令名，其余整体当参数，
+# 这样"#喵开关 开"和"#喵开关"两种写法都能命中同一个处理器。
+_COMMAND_RE = re.compile(r"^\s*[#/]\s*(\S+)\s*(.*)$", re.S)
+
+
+def _parse_plugin_command(text: str):
+    """从消息文本里解析插件指令，返回 (名字, 参数) 或 None。
+
+    只认行首的 # / 前缀，正文里出现的 # 不算 —— 否则一句普通聊天里带了
+    井号就会把消息吞掉。名字长度也做个上限，避免把长文本当指令名去查表。
+    """
+    m = _COMMAND_RE.match(str(text or ""))
+    if not m:
+        return None
+    name = m.group(1).strip()
+    if not name or len(name) > 32:
+        return None
+    return name, m.group(2).strip()
+
+
+def _dispatch_plugin_command(user_text, session_type, target_id,
+                             session_id, sender_id, sender_name, event):
+    """把一条可能的插件指令交给插件运行时。
+
+    返回 (是否已被插件处理, 要回复的文本)。没装插件系统、消息不是指令、
+    或没有插件认领这个指令时都返回 (False, None)，调用方继续走正常回复流程。
+    """
+    if not global_config.get("plugins_enabled", True):
+        return False, None
+    parsed = _parse_plugin_command(user_text)
+    if not parsed:
+        return False, None
+    name, args = parsed
+    rt = _plugin_runtime()
+    if rt is None:
+        return False, None
+    if name not in rt.command_names():
+        return False, None
+    payload = {
+        "session_type": session_type, "target_id": target_id,
+        "session_id": session_id, "sender_id": sender_id,
+        "sender_name": sender_name, "text": user_text,
+        "group_id": target_id if session_type == "group" else None,
+        "user_id": sender_id, "raw": event,
+    }
+    print(f"[插件] 指令 #{name} 命中，交由插件处理。")
+    try:
+        out = rt.dispatch_command(name, args, payload)
+    except Exception as e:
+        print(f"[插件] 指令 #{name} 分发失败: {type(e).__name__}: {e}")
+        return True, None
+    if out is None:
+        return True, None
+    return True, str(out)
+
+
+def _dispatch_plugin_message(event_info: dict) -> list:
+    """把消息事件广播给插件的 on_message，返回插件想追加的回复文本列表。
+
+    只在插件启用、且这一轮本来就要回复时才有意义；异常一律由运行时隔离，
+    这里只负责把结果带回去，不让插件的问题影响主链路。
+    """
+    if not global_config.get("plugins_enabled", True):
+        return []
+    rt = _plugin_runtime()
+    if rt is None:
+        return []
+    try:
+        return list(rt.dispatch_message(event_info) or [])
+    except Exception as e:
+        print(f"[插件] on_message 派发失败: {type(e).__name__}: {e}")
+        return []
+
+
+def _plugin_log(text: str) -> None:
+    """插件日志入口：统一并进主日志流，带「插件」前缀便于在日志页里筛。
+
+    只走 print —— 它会经 StdoutRedirector 落进 global_log_buffer，
+    所以「日志输出」页天然就能看到插件的输出，不需要单独一套缓冲。
+    """
+    try:
+        print(f"[插件] {text}")
+    except Exception:
+        pass
 
 
 def _gguf_general_name(path) -> str:
@@ -3370,7 +5093,9 @@ def _gguf_general_name(path) -> str:
 class WebUIServer:
     def __init__(self, config: ConfigLoader, memory_manager: MemoryManager):
         self.config = config
-        self._last_saved_config = None
+        # 必须先用当前配置初始化：为 None 时"首次保存"的 diff 恒为空，
+        # 用户第一次改 TTS 参数保存不会触发重启，第二次才补上
+        self._last_saved_config = dict(config.config or {})
         self.memory_manager = memory_manager
         self.html_path = get_resource_path("webui") / "start.html"
         self.app = web.Application(client_max_size=200 * 1080 * 1080)
@@ -3380,6 +5105,16 @@ class WebUIServer:
         self._auth_file = memory_manager.data_path / "webui_auth.json"
         self._password = ""
         self._auth_token = None
+        # 插件系统：插件目录跟着用户数据目录走（%LOCALAPPDATA%\Lovomo\plugins），
+        # 这样重装/覆盖更新程序不会把用户的插件一起删掉。
+        self._plugins_root = user_data_dir() / "plugins"
+        self.plugin_manager = PluginManager(
+            self._plugins_root,
+            self._plugins_root / "state.json",
+            on_change=self._on_plugins_changed)
+        self._plugin_runtime = None      # 由 run_backend 注入（能发消息时才建）
+        self._plugin_market_cache = {}   # {缓存键: {entries, fetched_at, ...}}
+        self._release_list_cache = {"fetched_at": 0.0, "data": None}
         self._refresh_auth_state()
         self.app.middlewares.append(_webui_error_middleware)
         self.setup_routes()
@@ -3436,15 +5171,22 @@ class WebUIServer:
             pass
 
     async def handle_auth_status(self, request):
+        # 这个接口在页面加载时必被调用一次，版本号搭车返回，
+        # 省得为了左上角那行小字再开一个请求（关掉更新检查时也要能显示）
+        from modules.updater import APP_VERSION
+        version = APP_VERSION
         if not self._password:
-            return web.json_response({"enabled": False, "authed": False})
+            return web.json_response({"enabled": False, "authed": False,
+                                      "version": version})
         remaining = self._auth_remember() - time.time()
         has_valid_cookie = bool(self._auth_token) \
-            and request.cookies.get("ltvm_auth") == self._auth_token
+            and request.cookies.get("lovomo_auth") == self._auth_token
         if remaining > 0 and has_valid_cookie:
             return web.json_response({"enabled": True, "authed": True,
-                                      "expires_at": self._auth_remember()})
-        return web.json_response({"enabled": True, "authed": False})
+                                      "expires_at": self._auth_remember(),
+                                      "version": version})
+        return web.json_response({"enabled": True, "authed": False,
+                                  "version": version})
 
     async def handle_auth_login(self, request):
         try:
@@ -3460,7 +5202,7 @@ class WebUIServer:
                 minutes = max(0, int(self.config.get("webui_auth_ttl_minutes", 30) or 30))
             self._auth_remember_save(minutes)
             resp = web.json_response({"success": True})
-            resp.set_cookie("ltvm_auth", self._auth_token,
+            resp.set_cookie("lovomo_auth", self._auth_token,
                             max_age=minutes * 60 if minutes > 0 else None,
                             samesite="Lax", httponly=True)
             return resp
@@ -3518,35 +5260,68 @@ class WebUIServer:
             return web.json_response({"enabled": False, "has_update": False})
         return web.json_response(await self._update_check_payload())
 
-    async def _fetch_releases(self, api_url: str):
+    def _github_mirrors(self) -> tuple:
+        from modules.ghmirror import parse_mirrors
+        return parse_mirrors(self.config.get("github_mirrors", ""))
+
+    async def _github_fetch(self, url: str, kind: str = "json", *,
+                            timeout: float = 10.0, headers=None):
+        """取一个 GitHub 地址，直连不通时按配置里的镜像重试。
+
+        返回 `(数据, 是否跳过了证书校验)`；kind 决定怎么解析响应
+        （json / text / bytes），解析不了的响应（镜像返回错误页之类）也算失败，
+        换下一个候选。只服务**匿名读**请求 —— 带 token 的写操作一律直连官方。
+        """
+        from modules.ghmirror import candidates, mirror_label, note_success
         from modules.tls import verified_context, unverified_context, is_cert_error
-        headers = {"Accept": "application/vnd.github+json", "User-Agent": "ltvm-update-check"}
-        try:
-            async with httpx.AsyncClient(timeout=10, proxy=None, trust_env=False,
-                                         follow_redirects=True,
-                                         verify=verified_context()) as client:
-                resp = await client.get(api_url, headers=headers)
-                resp.raise_for_status()
-                return resp.json(), False
-        except Exception as e:
-            if not is_cert_error(e):
-                raise
-            print(f"[更新检查] 证书校验失败（{type(e).__name__}），改用不校验证书的方式重试："
+        hdrs = headers or {}
+        last_err = None
+        insecure = False
+        for cand in candidates(url, self._github_mirrors()):
+            for ctx, unverified in ((verified_context(), False),
+                                    (unverified_context(), True)):
+                try:
+                    async with httpx.AsyncClient(timeout=timeout, proxy=None,
+                                                 trust_env=False,
+                                                 follow_redirects=True,
+                                                 verify=ctx) as client:
+                        resp = await client.get(cand, headers=hdrs)
+                        resp.raise_for_status()
+                        if kind == "json":
+                            data = resp.json()
+                        elif kind == "text":
+                            data = resp.text
+                        else:
+                            data = resp.content
+                except Exception as e:
+                    last_err = e
+                    # 证书问题（本机自签根证书/加速器/公司代理）换个不校验的方式再试；
+                    # 其它错误直接换下一个候选地址。
+                    if not unverified and is_cert_error(e):
+                        continue
+                    break
+                insecure = insecure or unverified
+                if note_success(url, cand):
+                    print("[GitHub] " + (f"直连不可用，改用镜像 {mirror_label(cand, url)}"
+                                         if cand != url else "直连已恢复"))
+                return data, insecure
+        raise last_err if last_err else RuntimeError("没有可用的 GitHub 地址")
+
+    async def _fetch_releases(self, api_url: str):
+        headers = {"Accept": "application/vnd.github+json", "User-Agent": "lovomo-update-check"}
+        data, insecure = await self._github_fetch(api_url, "json", headers=headers)
+        if insecure:
+            print("[更新检查] 证书校验失败，已改用不校验证书的方式取回："
                   "常见原因是本机装了自签根证书（安全软件/网络加速器/公司代理），"
                   "系统证书库与 certifi 都没有它")
-            async with httpx.AsyncClient(timeout=10, proxy=None, trust_env=False,
-                                         follow_redirects=True,
-                                         verify=unverified_context()) as client:
-                resp = await client.get(api_url, headers=headers)
-                resp.raise_for_status()
-                return resp.json(), True
+        return data, insecure
 
     async def _update_check_payload(self) -> dict:
         """向 GitHub 查一次最新版本并返回结果（含失败原因），成功时写入缓存。"""
         from modules.updater import APP_VERSION, is_newer, pick_latest_release
         include_pre = bool(self.config.get("update_include_prerelease", False))
         try:
-            repo = "slpk1ng/Local_TTS_Voice_Modulation.exe"
+            repo = "slpk1ng/Lovomo"
             api_url = f"https://api.github.com/repos/{repo}/releases?per_page=30"
             release_home = f"https://github.com/{repo}/releases/latest"
             releases, insecure = await self._fetch_releases(api_url)
@@ -3599,8 +5374,36 @@ class WebUIServer:
         r.add_post("/api/config/save", self.handle_save_config)
         r.add_get("/api/config/export", self.handle_export_config)
         r.add_post("/api/config/import", self.handle_import_config)
+        # 插件系统
+        r.add_get("/api/plugins/list", self.handle_plugins_list)
+        r.add_post("/api/plugins/upload", self.handle_plugins_upload)
+        r.add_post("/api/plugins/inspect", self.handle_plugins_inspect)
+        r.add_post("/api/plugins/toggle", self.handle_plugins_toggle)
+        r.add_post("/api/plugins/pin", self.handle_plugins_pin)
+        r.add_post("/api/github/mirrors/test", self.handle_github_mirror_test)
+        r.add_post("/api/plugins/delete", self.handle_plugins_delete)
+        r.add_get("/api/plugins/theme", self.handle_plugins_theme)
+        r.add_get("/api/plugins/panel", self.handle_plugins_panel)
+        r.add_get("/api/plugins/webui", self.handle_plugins_webui)
+        r.add_get("/api/plugins/icon", self.handle_plugins_icon)
+        r.add_get("/api/plugins/asset", self.handle_plugins_asset)
+        r.add_get("/api/plugins/settings", self.handle_plugins_settings_get)
+        r.add_post("/api/plugins/settings", self.handle_plugins_settings_set)
+        r.add_post("/api/plugins/reload", self.handle_plugins_reload)
+        r.add_post("/api/plugins/open_dir", self.handle_plugins_open_dir)
+        r.add_post("/api/plugins/publish_token", self.handle_plugins_publish_token)
+        r.add_post("/api/plugins/publish_token_clear", self.handle_plugins_publish_token_clear)
+        r.add_get("/api/plugins/publish_status", self.handle_plugins_publish_status)
+        r.add_post("/api/plugins/publish", self.handle_plugins_publish)
+        r.add_get("/api/plugins/market", self.handle_plugins_market)
+        r.add_post("/api/plugins/market_sources", self.handle_plugins_market_sources)
+        r.add_get("/api/plugins/readme", self.handle_plugins_readme)
+        r.add_get("/api/releases", self.handle_releases)
+        r.add_post("/api/releases/download", self.handle_release_download)
+        r.add_post("/api/plugins/install_remote", self.handle_plugins_install_remote)
         # 文件夹选择 / 模型列表
         r.add_post("/api/dialog/pick_folder", self.handle_pick_folder)
+        r.add_post("/api/dialog/pick_file", self.handle_pick_file)
         r.add_post("/api/llm/scan_models", self.handle_scan_models)
         r.add_post("/api/llm/list_remote_models", self.handle_list_remote_models)
         r.add_get("/api/roles", self.handle_get_roles)
@@ -3624,13 +5427,16 @@ class WebUIServer:
         # 定时任务 / 待办 / 事件
         r.add_get("/api/jobs", self.handle_jobs)
         r.add_post("/api/jobs/save", self.handle_jobs_save)
+        r.add_post("/api/jobs/batch", self.handle_jobs_batch)
         r.add_post("/api/jobs/run", self.handle_jobs_run)
         r.add_get("/api/todos", self.handle_todos)
         r.add_post("/api/todos/add", self.handle_todos_add)
         r.add_post("/api/todos/update", self.handle_todos_update)
         r.add_post("/api/todos/delete", self.handle_todos_delete)
+        r.add_post("/api/todos/batch", self.handle_todos_batch)
         r.add_get("/api/events", self.handle_events)
         r.add_post("/api/events/save", self.handle_events_save)
+        r.add_post("/api/events/batch", self.handle_events_batch)
         r.add_post("/api/events/test", self.handle_events_test)
         # 工具调用
         r.add_get("/api/tools", self.handle_tools)
@@ -3652,7 +5458,15 @@ class WebUIServer:
         r.add_post("/api/stickers/upload", self.handle_stickers_upload)
         r.add_post("/api/stickers/delete", self.handle_stickers_delete)
         r.add_get("/api/stickers/file", self.handle_stickers_file)
+        r.add_get("/favicon.ico", self.handle_favicon)
         r.add_get("/", self.handle_index)
+
+    async def handle_favicon(self, request):
+        """浏览器每次打开页面都会自己来要 favicon，没有就报 404 刷控制台。"""
+        paths = _candidate_icon_paths()
+        if not paths:
+            return web.Response(status=404)
+        return web.FileResponse(paths[0], headers={"Cache-Control": "max-age=86400"})
 
     async def handle_index(self, request):
         if self.html_path.exists():
@@ -3674,15 +5488,72 @@ class WebUIServer:
                 masked[key] = _mask_preview(masked[key])
         return web.json_response({**masked, "defaults": self.config.default_config()})
 
-    async def handle_export_config(self, request):
+    def _config_export_payload(self) -> dict:
+        """导出用配置：密钥一律保持 config.json 的 enc:.../enc2:... 密文形态。
+
+        内存里的配置是解密后的明文，直接导出等于把密钥写成明文送出去；这里做
+        两层处理：
+
+        1. 走 _encrypt_api_keys：已是 enc:/enc2: 密文的值原样保留，明文（无论
+           sk- 还是别的形式）全部重新加密；
+        2. 再做一次兜底扫描 _scrub_plaintext_secrets：凡是出现在敏感字段里、
+           或以 sk-/sk_ 之类已知密钥前缀开头的残留明文，一律替换成对应密文，
+           并对无法确认来源的值做打码，避免任何明文密钥出现在导出结果里。
+
+        导出结果里 WebUI 访问密码与 API 密钥只能是密文。
+        """
         payload = json.loads(json.dumps(self.config.config or {}, ensure_ascii=False))
-        for key in _API_KEY_KEYS + ("webui_password",):
-            if isinstance(payload.get(key), dict):
-                payload[key] = {k: _mask_preview(v) if isinstance(v, str) else v
-                                for k, v in payload[key].items()}
-            elif payload.get(key):
-                payload[key] = _mask_preview(payload[key])
-        return _json_file_response(payload, "ltvm_config_export.json")
+        _encrypt_api_keys(payload)
+        return _scrub_plaintext_secrets(payload)
+
+    async def _save_export_via_dialog(self, default_name: str, content: bytes) -> str:
+        """桌面窗口模式下弹系统保存框写盘。
+
+        WebView2 默认禁止页面下载，前端 blob 下载在桌面窗口里是静默无效的；
+        所以桌面模式由服务端落盘，返回 "saved" / "cancelled"；浏览器访问没有
+        保存框可用，返回 "browser"，由前端按普通下载处理。
+        """
+        try:
+            import webview
+        except Exception:
+            return "browser"
+        window = _WEBVIEW_WINDOW_HOLDER.get("window")
+        if window is None:
+            return "browser"
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None, lambda: window.create_file_dialog(webview.SAVE_DIALOG,
+                                                    save_filename=default_name))
+        if not result:
+            return "cancelled"
+        path = result if isinstance(result, str) else str(result[0])
+        Path(path).write_bytes(content)
+        return path
+
+    def _export_status_response(self, mode: str, path: str = ""):
+        """导出结果状态。
+
+        mode 取值：saved（服务端已写盘）/ cancelled（用户取消）/ error（导出出错）
+        / download（前端按浏览器下载处理）。error 时 path 承载错误信息。
+        """
+        return web.json_response({"mode": mode, "path": path})
+
+    async def handle_export_config(self, request):
+        """导出配置。任何异常都必须以 error 状态回给前端，不能静默失败。"""
+        try:
+            payload = self._config_export_payload()
+            content = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+            saved = await self._save_export_via_dialog("lovomo_config_export.json", content)
+            if saved == "browser":
+                return _json_file_response(payload, "lovomo_config_export.json")
+            if saved == "cancelled":
+                return self._export_status_response("cancelled")
+            return self._export_status_response("saved", saved)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"[配置导出] 失败: {type(e).__name__}: {e}")
+            return self._export_status_response("error", f"{type(e).__name__}: {e}")
 
     async def handle_import_config(self, request):
         try:
@@ -3700,7 +5571,7 @@ class WebUIServer:
             if not isinstance(data, dict):
                 return web.json_response({"success": False, "error": "配置文件格式错误"}, status=400)
             stored = self.config.config or {}
-            for key in _API_KEY_KEYS + ("webui_password",):
+            for key in _SECRET_FIELD_KEYS:
                 masked_value = data.get(key)
                 if isinstance(masked_value, dict):
                     stored_keys = stored.get(key) or {}
@@ -3710,14 +5581,18 @@ class WebUIServer:
                                      for k, v in masked_value.items()}
                 elif _is_masked_value(masked_value):
                     data[key] = stored.get(key, "")
-            for key in _API_KEY_KEYS:
+            for key in _SECRET_FIELD_KEYS:
                 val = data.get(key)
+                # 解不开的密文（换过电脑）落到空串：None 会被写进 config.json，
+                # 读取方按字符串用时才炸。webui_password 与 API 密钥一样必须解密——
+                # 内存里的配置约定是明文，漏掉它会让 _password 变成一串 enc2: 密文，
+                # 导入后原密码就再也登不进来（登录校验直接比对内存里的明文）。
                 if isinstance(val, dict):
-                    data[key] = {k: (_decrypt_value(v) if isinstance(v, str) and
+                    data[key] = {k: ((_decrypt_value(v) or "") if isinstance(v, str) and
                                      (v.startswith("enc2:") or v.startswith("enc:")) else v)
                                  for k, v in val.items()}
                 elif isinstance(val, str) and (val.startswith("enc2:") or val.startswith("enc:")):
-                    data[key] = _decrypt_value(val)
+                    data[key] = _decrypt_value(val) or ""
             merged = {**self.config.default_config(), **stored, **data}
             self.config.config = merged
             self.config._atomic_save(merged)
@@ -3726,10 +5601,1031 @@ class WebUIServer:
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
+    # ==================================================================
+    # 插件系统
+    # ==================================================================
+    def attach_plugin_runtime(self, runtime) -> None:
+        """由 run_backend 注入运行时（那时才拿得到 sender / 配置读取器）。"""
+        self._plugin_runtime = runtime
+
+    def _on_plugins_changed(self) -> None:
+        """插件启用/禁用/安装/卸载后的热重载入口。"""
+        rt = self._plugin_runtime
+        if rt is None:
+            return
+        if not self.config.get("plugins_enabled", True):
+            # 总开关关掉时，把已加载的全部卸掉（皮肤也会随之失效）
+            try:
+                rt.unload_all()
+            except Exception as e:
+                print(f"[插件] 停用清理失败: {e}")
+            return
+        try:
+            errors = rt.reload_all()
+            if errors:
+                for pid, err in errors.items():
+                    print(f"[插件] {pid} 重载失败: {err}")
+        except Exception as e:
+            print(f"[插件] 热重载失败: {e}")
+
+    async def handle_plugins_list(self, request):
+        """列出已安装插件及其启用状态。"""
+        try:
+            items = self.plugin_manager.list_plugins()
+            for it in items:
+                # 皮肤设置面板、features 开关、插件自带功能页都要读插件私有设置，
+                # 少任一条件都会让前端拿到空 settings、开关显示错状态。
+                if it.get("skin") or it.get("features") or it.get("panel"):
+                    it["settings"] = self.plugin_manager.plugin_settings(it["id"])
+            return web.json_response({
+                "success": True,
+                "plugins": items,
+                "root": str(self.plugin_manager.root),
+                # 打开了「应用外观」的皮肤插件：前端据此给 html 加 skin-on，
+                # 没开的插件不改程序原本的背景。
+                "active_skins": (self.plugin_manager.active_skin_ids()
+                                 if self.config.get("plugins_enabled", True) else []),
+                "loaded": sorted((self._plugin_runtime.loaded.keys()
+                                  if self._plugin_runtime else [])),
+                "commands": (self._plugin_runtime.command_names()
+                             if self._plugin_runtime else []),
+            })
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_plugins_upload(self, request):
+        """上传 .zip 安装插件。带 force=1 表示用户已确认风险清单。"""
+        try:
+            reader = await request.multipart()
+            data = None
+            force = False
+            file_name = ""
+            async for part in reader:
+                if part.name == "file":
+                    file_name = part.filename or ""
+                    data = await part.read(decode=False)
+                elif part.name == "force":
+                    force = (await part.text()).strip().lower() in ("1", "true", "yes")
+            if not data:
+                return web.json_response({"success": False, "error": "没有收到文件"}, status=400)
+            if file_name and not file_name.lower().endswith(".zip"):
+                return web.json_response(
+                    {"success": False, "error": "插件包必须是 .zip 格式"}, status=400)
+            result = self.plugin_manager.install_zip(data, force=force)
+            if result.get("success"):
+                print(f"[插件] 已安装：{result.get('name')} "
+                      f"(id={result.get('id')}, 覆盖={result.get('replaced')})")
+            return web.json_response(result,
+                                     status=200 if result.get("success") else 400)
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_plugins_inspect(self, request):
+        """只审查不安装：让用户在装之前看到风险清单。"""
+        try:
+            reader = await request.multipart()
+            data = None
+            async for part in reader:
+                if part.name == "file":
+                    data = await part.read(decode=False)
+            if not data:
+                return web.json_response({"success": False, "error": "没有收到文件"}, status=400)
+            report = self.plugin_manager.inspect_zip(data)
+            return web.json_response({"success": bool(report.get("ok")),
+                                      "report": report},
+                                     status=200 if report.get("ok") else 400)
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_plugins_toggle(self, request):
+        """启用 / 禁用某个插件。"""
+        try:
+            payload = await request.json()
+            pid = str(payload.get("id") or "").strip()
+            enabled = bool(payload.get("enabled", True))
+            info = self.plugin_manager.get(pid)
+            if not info:
+                return web.json_response({"success": False, "error": "插件不存在"}, status=404)
+            self.plugin_manager.set_enabled(pid, enabled)
+            return web.json_response({"success": True, "id": pid, "enabled": enabled})
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def _timed_get(self, url: str, timeout: float = 6.0):
+        """取一次地址并计时，返回 (毫秒, 是否成功, 说明)。"""
+        from modules.tls import verified_context
+        t0 = time.monotonic()
+        try:
+            async with httpx.AsyncClient(timeout=timeout, proxy=None, trust_env=False,
+                                         follow_redirects=True,
+                                         verify=verified_context()) as client:
+                resp = await client.get(url, headers={"User-Agent": "lovomo-mirror-test"})
+            ms = int((time.monotonic() - t0) * 1000)
+            if resp.status_code == 200:
+                return ms, True, ""
+            return ms, False, f"HTTP {resp.status_code}"
+        except Exception as e:
+            return int((time.monotonic() - t0) * 1000), False, type(e).__name__
+
+    async def _probe_mirror(self, template: str, repo: str) -> dict:
+        """测一个镜像模板：raw 与 api 各探一次，取最快的一次当它的速度。"""
+        from modules.ghmirror import apply_template, probe_urls, template_host
+        best = None
+        kinds = []
+        note = ""
+        for kind, url in probe_urls(repo):
+            cand = apply_template(str(template), url)
+            if not cand:
+                continue
+            ms, ok, why = await self._timed_get(cand)
+            if ok:
+                kinds.append(kind)
+                best = ms if best is None else min(best, ms)
+            else:
+                note = note or why
+        return {
+            "template": str(template),
+            "host": template_host(str(template)) or str(template),
+            "ms": int(best) if best is not None else 0,
+            "ok": best is not None,
+            "kinds": "+".join(kinds),
+            "note": "" if best is not None else (note or "不可用"),
+        }
+
+    async def handle_github_mirror_test(self, request):
+        """给配置里的每个镜像测一次延迟，按快的在前返回。"""
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        from modules.ghmirror import parse_mirrors
+        raw = payload.get("mirrors")
+        templates = parse_mirrors(raw if raw is not None
+                                  else self.config.get("github_mirrors", ""))
+        if not templates:
+            return web.json_response({"success": False, "error": "没有配置镜像地址"},
+                                     status=400)
+        repo = (str(self.config.get("plugin_market_repo", "") or "").strip()
+                or str(self.config.get("plugin_release_repo", "") or "").strip())
+        if not repo:
+            return web.json_response({"success": False, "error": "没有可用的仓库地址"},
+                                     status=400)
+        items = await asyncio.gather(*[self._probe_mirror(t, repo) for t in templates])
+        items = sorted(items, key=lambda r: (0 if r["ok"] else 1,
+                                             r["ms"] if r["ok"] else 10 ** 6))
+        print("[GitHub] 镜像测速：" + "；".join(
+            f"{r['host']} {r['ms']}ms" if r["ok"] else f"{r['host']} {r['note']}"
+            for r in items))
+        return web.json_response({"success": True, "repo": repo, "mirrors": items})
+
+    async def handle_plugins_pin(self, request):
+        """置顶 / 取消置顶某个插件（只影响「插件」页的排序）。"""
+        try:
+            payload = await request.json()
+            pid = str(payload.get("id") or "").strip()
+            pinned = bool(payload.get("pinned", True))
+            if not self.plugin_manager.get(pid):
+                return web.json_response({"success": False, "error": "插件不存在"}, status=404)
+            self.plugin_manager.set_pinned(pid, pinned)
+            print(f"[插件] {'已置顶' if pinned else '已取消置顶'}：{pid}")
+            return web.json_response({"success": True, "id": pid, "pinned": pinned})
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_plugins_delete(self, request):
+        """卸载插件。keep_settings / keep_data 为真时保留对应的配置与数据。"""
+        try:
+            payload = await request.json()
+            pid = str(payload.get("id") or "").strip()
+            keep_settings = bool(payload.get("keep_settings"))
+            keep_data = bool(payload.get("keep_data"))
+            if not self.plugin_manager.get(pid):
+                return web.json_response({"success": False, "error": "插件不存在"}, status=404)
+            # 先卸载运行时再删目录：Windows 上插件模块还在 sys.modules 里时
+            # 文件句柄没释放，rmtree 会失败（现象是"点卸载没反应"）。
+            ok = self.plugin_manager.uninstall(pid, keep_settings=keep_settings,
+                                               keep_data=keep_data)
+            if ok:
+                kept = [name for name, flag in (("配置", keep_settings),
+                                                ("数据", keep_data)) if flag]
+                print(f"[插件] 已卸载：{pid}"
+                      + (f"（保留{'、'.join(kept)}）" if kept else ""))
+            return web.json_response({"success": ok,
+                                      "error": "" if ok else "删除目录失败"})
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_plugins_theme(self, request):
+        """把所有启用插件的皮肤 CSS 拼起来给前端注入。"""
+        try:
+            if not self.config.get("plugins_enabled", True):
+                return web.Response(text="/* 插件系统已关闭 */",
+                                    content_type="text/css", charset="utf-8")
+            css = self.plugin_manager.theme_css()
+            return web.Response(text=css, content_type="text/css",
+                                charset="utf-8")
+        except Exception as e:
+            return web.Response(text=f"/* 读取皮肤失败: {e} */",
+                                content_type="text/css", charset="utf-8")
+
+    async def handle_plugins_icon(self, request):
+        """返回插件图标，供列表展示。"""
+        try:
+            pid = str(request.query.get("id") or "").strip()
+            f = self.plugin_manager.icon_file(pid)
+            if f is None:
+                return web.json_response({"success": False, "error": "没有图标"},
+                                         status=404)
+            mime = {".png": "image/png", ".jpg": "image/jpeg",
+                    ".svg": "image/svg+xml", ".ico": "image/x-icon"}.get(
+                f.suffix.lower(), "application/octet-stream")
+            return web.Response(body=f.read_bytes(), content_type=mime)
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_plugins_open_dir(self, request):
+        """在资源管理器里打开插件目录，方便用户手动放插件。"""
+        try:
+            root = self.plugin_manager.ensure_root()
+            if os.name == "nt":
+                os.startfile(str(root))  # noqa: S606
+            return web.json_response({"success": True, "path": str(root)})
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_plugins_asset(self, request):
+        """读取插件 data 目录下的静态资源（背景图、样式、字体等）。"""
+        try:
+            pid = str(request.query.get("id") or "").strip()
+            name = str(request.query.get("name") or "").strip()
+            f, mime = self.plugin_manager.asset_file(pid, name)
+            if f is None:
+                return web.Response(status=404, text="not found")
+            return web.Response(body=f.read_bytes(), content_type=mime)
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_plugins_settings_get(self, request):
+        """读取某个插件的私有设置（插件未安装时返回空对象）。"""
+        try:
+            pid = str(request.query.get("id") or "").strip()
+            if not self.plugin_manager.get(pid):
+                return web.json_response({"success": False, "error": "插件不存在"},
+                                         status=404)
+            return web.json_response({"success": True, "id": pid,
+                                      "settings": self.plugin_manager.plugin_settings(pid)})
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_plugins_settings_set(self, request):
+        """保存某个插件的私有设置（只落盘，不立即生效）。
+
+        落盘前按插件声明的字段筛一遍：只有插件在清单里声明过的键会被保留，
+        值也按声明的类型收敛。否则设置文件会变成任意 JSON 的暂存区 ——
+        插件写进去什么，下次读出来就是什么。
+
+        落盘不等于生效：插件运行时与皮肤 CSS 都读磁盘上的这份文件，但要让
+        改动真的作用到已加载的插件上，得由「保存并重载」走 `plugins/reload`
+        重新加载运行时。这样用户一次调好几项也不会中途反复生效。
+        """
+        try:
+            payload = await request.json()
+            pid = str(payload.get("id") or "").strip()
+            if not self.plugin_manager.get(pid):
+                return web.json_response({"success": False, "error": "插件不存在"},
+                                         status=404)
+            settings = payload.get("settings")
+            if not isinstance(settings, dict):
+                return web.json_response({"success": False, "error": "settings 必须是对象"},
+                                         status=400)
+            clean = self.plugin_manager.filter_settings(pid, settings)
+            ok = self.plugin_manager.save_plugin_settings(pid, clean)
+            return web.json_response({"success": ok,
+                                      "draft": clean if ok else {},
+                                      "error": "" if ok else "写入设置失败"})
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_plugins_reload(self, request):
+        """重载插件运行时 + 提交设置草稿 + 刷新皮肤。
+
+        三件事缺一不可：
+          1. `commit_settings()` 把磁盘上的设置草稿提交成生效值 —— 皮肤变量
+             与插件读到的设置都以此为准；
+          2. `_on_plugins_changed()` 重新加载插件运行时（钩子、指令、开关）；
+          3. 回传最新 active_skins，前端重挂 theme 链接与 skin-on 类。
+        """
+        try:
+            pid = ""
+            try:
+                payload = await request.json()
+                pid = str(payload.get("id") or "").strip()
+            except Exception:
+                pid = ""
+            if pid and not self.plugin_manager.get(pid):
+                return web.json_response({"success": False, "error": "插件不存在"},
+                                         status=404)
+            if not self.config.get("plugins_enabled", True):
+                return web.json_response({"success": False,
+                                          "error": "插件系统已在配置里关闭"},
+                                         status=400)
+            self.plugin_manager.commit_settings(pid or None)
+            self._on_plugins_changed()
+            return web.json_response({
+                "success": True,
+                "id": pid,
+                "settings": self.plugin_manager.plugin_settings(pid) if pid else {},
+                "active_skins": self.plugin_manager.active_skin_ids(),
+                "loaded": sorted(self._plugin_runtime.loaded.keys()
+                                 if self._plugin_runtime else []),
+                "commands": (self._plugin_runtime.command_names()
+                             if self._plugin_runtime else []),
+            })
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def _serve_plugin_page_file(self, request, default_name: str):
+        """把插件目录里的界面文件原样回给浏览器（自带功能页 / webui 及其同目录资源）。
+
+        `?id=<插件>&name=<相对路径>`；name 留空时用 default_name。
+        页面本体（name 就是 default_name 的那次请求）会先注入桥接脚本。
+        """
+        try:
+            pid = str(request.query.get("id") or "").strip()
+            info = self.plugin_manager.get(pid)
+            if not info:
+                return web.Response(status=404, text="plugin not found")
+            name = str(request.query.get("name") or "").strip() or default_name
+            if not name:
+                return web.Response(status=404, text="no page file")
+            f, mime = self.plugin_manager.asset_file(pid, name, root_scope=True)
+            if f is None:
+                return web.Response(status=404, text="not found")
+            body = f.read_bytes()
+            if name == default_name and "html" in mime:
+                body = self._inject_plugin_bridge(body, pid, info)
+            return web.Response(body=body, content_type=mime)
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    def _inject_plugin_bridge(self, body: bytes, pid: str, info: dict) -> bytes:
+        """把桥接脚本插到插件页面最前面（插不进就当普通页面返回）。"""
+        try:
+            text = body.decode("utf-8")
+        except UnicodeDecodeError:
+            return body
+        payload = {
+            "id": pid,
+            "name": str(info.get("name") or pid),
+            "version": str(info.get("version") or ""),
+            "enabled": bool(info.get("enabled")),
+            "settings": self.plugin_manager.plugin_settings(pid),
+        }
+        script = PLUGIN_BRIDGE_TEMPLATE.replace(
+            "/*__LOVOMO_INFO__*/ null",
+            json.dumps(payload, ensure_ascii=False).replace("</", "<\\/"))
+        head = text.lower().find("<head>")
+        if head >= 0:
+            at = head + len("<head>")
+            text = text[:at] + script + text[at:]
+        else:
+            text = script + text
+        return text.encode("utf-8")
+
+    async def handle_plugins_panel(self, request):
+        """插件自带的功能页界面（清单里的 panel.html）。"""
+        pid = str(request.query.get("id") or "").strip()
+        info = self.plugin_manager.get(pid) or {}
+        return await self._serve_plugin_page_file(
+            request, str((info.get("panel") or {}).get("html") or "").strip())
+
+    async def handle_plugins_webui(self, request):
+        """插件自带的 webui（插件根目录的 webui.html）。"""
+        return await self._serve_plugin_page_file(request, PLUGIN_WEBUI_NAME)
+
+    async def _market_raw_text(self, url: str):
+        """从 raw.githubusercontent.com 取一段文本，取不到返回 None。"""
+        try:
+            text, _ = await self._github_fetch(
+                url, "text", headers={"User-Agent": "lovomo-plugin-market"})
+            return text
+        except Exception:
+            return None
+
+    async def _market_manifest(self, repo: str, branch: str):
+        """取某条插件分支的清单，返回 (清单字典, 清单文件名)。
+
+        分支根目录放 plugin.yaml 或 plugin.json 都行，yaml 优先 —— 与
+        本地安装走的是同一套优先级（modules.plugins.MANIFEST_NAMES）。
+        """
+        from modules.market import RAW_TMPL
+        from modules.plugins import MANIFEST_NAMES, parse_manifest_text
+        for name in MANIFEST_NAMES:
+            text = await self._market_raw_text(
+                RAW_TMPL.format(repo=repo, branch=branch, path=name))
+            if text is None:
+                continue
+            data = parse_manifest_text(text, name)
+            if data:
+                return data, name
+        return None, ""
+
+    async def _market_commit_time(self, repo: str, sha: str) -> float:
+        """按 SHA 单独查提交时间。
+
+        插件分支是独立根提交，不在默认分支的提交列表里，靠
+        `/commits` 那一次批量查询拿不到它的时间。
+        """
+        from modules.market import parse_iso_time
+        try:
+            data, _ = await self._fetch_releases(
+                f"https://api.github.com/repos/{repo}/git/commits/{sha}")
+        except Exception:
+            return 0.0
+        if not isinstance(data, dict):
+            return 0.0
+        return float(parse_iso_time(str((data.get("committer") or {}).get("date") or "")) or 0.0)
+
+
+    async def _market_branch_entries(self, repo: str, prefix: str) -> dict:
+        """扫插件分支并组装市场条目（branches / commits / releases / raw）。"""
+        from modules.market import (ARCHIVE_TMPL, RAW_TMPL, build_entry,
+                                    count_reactions, matches_branch_prefix,
+                                    plugin_id_from_branch, release_belongs_to,
+                                    parse_iso_time, summarize_releases)
+        warnings = []
+        insecure = False
+        branches, insecure_b = await self._fetch_releases(
+            f"https://api.github.com/repos/{repo}/branches?per_page=100")
+        insecure = insecure or insecure_b
+        picked = [str(b.get("name") or "") for b in (branches or [])
+                  if isinstance(b, dict) and matches_branch_prefix(b.get("name"), prefix)]
+        if not picked:
+            return {"entries": [], "warnings":
+                    [f"{repo} 上没有以「{prefix}」开头的分支"], "insecure": insecure}
+
+        times = {}
+        try:
+            commits, insecure_c = await self._fetch_releases(
+                f"https://api.github.com/repos/{repo}/commits?per_page=100")
+            insecure = insecure or insecure_c
+            for c in (commits if isinstance(commits, list) else []):
+                if not isinstance(c, dict):
+                    continue
+                sha = str(c.get("sha") or "")
+                date = str(((c.get("commit") or {}).get("committer") or {})
+                           .get("date") or "")
+                if sha and date:
+                    times[sha] = parse_iso_time(date)
+        except Exception as e:
+            warnings.append(f"拿不到分支提交时间：{type(e).__name__}")
+
+        releases = []
+        try:
+            data, insecure_r = await self._fetch_releases(
+                f"https://api.github.com/repos/{repo}/releases?per_page=100")
+            insecure = insecure or insecure_r
+            releases = [r for r in (data if isinstance(data, list) else [])
+                        if isinstance(r, dict)]
+        except Exception as e:
+            warnings.append(f"拿不到 Release 信息（下载量/收藏量会显示 0）：{type(e).__name__}")
+
+        branch_meta = {b: {"id": plugin_id_from_branch(b, prefix)} for b in picked}
+        live = [r for r in releases if not r.get("draft")]
+        # 收藏量要按 Release 单独查点赞数（列表接口不给总数），
+        # 只查确实属于这些插件的那些，并且设上限，别把配额烧光。
+        targets = [r for r in live if any(release_belongs_to(r, b, branch_meta[b]["id"])
+                                          for b in picked)]
+        for rel in targets[:MAX_REACTION_LOOKUPS]:
+            rid = rel.get("id")
+            if not rid:
+                continue
+            try:
+                rx, _ = await self._fetch_releases(
+                    f"https://api.github.com/repos/{repo}/releases/{rid}"
+                    "/reactions?per_page=100")
+                rel["_reactions"] = count_reactions(rx)
+            except Exception:
+                rel["_reactions"] = 0
+        stats = summarize_releases(live, branch_meta)
+
+        entries = []
+        for branch in picked:
+            manifest, _manifest_name = await self._market_manifest(repo, branch)
+            if not manifest:
+                from modules.plugins import MANIFEST_NAMES
+                warnings.append(f"{branch}：分支根目录没有 "
+                                + " / ".join(MANIFEST_NAMES) + "，已跳过")
+                continue
+            sha = ""
+            for b in (branches or []):
+                if isinstance(b, dict) and str(b.get("name")) == branch:
+                    sha = str(((b.get("commit") or {}).get("sha")) or "")
+                    break
+            entries.append(build_entry(
+                branch, prefix, manifest,
+                raw_base=RAW_TMPL.format(repo=repo, branch=branch, path="").rstrip("/"),
+                repo=repo, stats=stats.get(branch) or {},
+                commit_at=(float(times.get(sha) or 0.0)
+                           or (await self._market_commit_time(repo, sha) if sha else 0.0))))
+        return {"entries": entries, "warnings": warnings, "insecure": insecure}
+
+    async def _market_index_entries(self, repo: str, market_path: str) -> dict:
+        """读仓库里的 index.json 索引（分支扫描没结果时的兜底）。
+
+        索引条目要带 `source_repo`（或 `repo`）：安装时会拿它校验"插件是不是
+        真从这个仓库来的"。没写就按 `download` 链接的归属推断，再退回归属
+        索引自己所在的仓库。
+        """
+        from modules.plugins import repo_slug
+        url = f"https://raw.githubusercontent.com/{repo}/main/{market_path}"
+        try:
+            data, insecure = await self._fetch_releases(url)
+        except Exception as e:
+            return {"entries": [], "insecure": False,
+                    "warnings": [f"兜底索引 {market_path} 也读不到（{type(e).__name__}）"]}
+        entries = data if isinstance(data, list) else (
+            data.get("plugins") if isinstance(data, dict) else None)
+        out = []
+        for raw in (entries or []):
+            if not isinstance(raw, dict):
+                continue
+            pid = str(raw.get("id") or "").strip()
+            if not pid:
+                continue
+            item = {k: raw.get(k) for k in
+                    ("name", "version", "author", "description", "type",
+                     "download", "homepage", "tags")}
+            item["id"] = pid
+            item["source"] = "index"
+            item.setdefault("branch", "")
+            item["downloads"] = int(raw.get("downloads") or 0)
+            item["favorites"] = int(raw.get("favorites") or 0)
+            item["updated_at"] = 0.0
+            item["released_at"] = 0.0
+            item["logo_url"] = str(raw.get("logo_url") or "")
+            item["icon_url"] = str(raw.get("icon_url") or "")
+            item["github"] = str(raw.get("github") or "")
+            item["source_repo"] = (
+                str(raw.get("source_repo") or raw.get("repo") or "").strip()
+                or repo_slug(item.get("download")) or repo)
+            out.append(item)
+        return {"entries": out, "warnings": [], "insecure": insecure}
+
+
+    async def _market_scan_repos(self, repos, prefix: str) -> dict:
+        """逐个仓库扫插件分支并合并（第三方市场用）。
+
+        单个仓库出错只记一条 warning，不牵连别的仓库 —— 地址是用户自己
+        填的，写错一个不该让整个市场打不开。
+        """
+        entries, warnings, insecure = [], [], False
+        for repo in repos:
+            try:
+                got = await self._market_branch_entries(repo, prefix)
+            except Exception as e:
+                warnings.append(f"{repo}：拉取失败（{type(e).__name__}）")
+                continue
+            entries += got["entries"]
+            warnings += [w if w.startswith(repo) else f"{repo}：{w}"
+                         for w in (got.get("warnings") or [])]
+            insecure = insecure or bool(got.get("insecure"))
+        return {"entries": entries, "warnings": warnings, "insecure": insecure}
+
+
+    async def _plugins_market_payload(self, force: bool = False, sort: str = "latest",
+                                      market: str = "official") -> dict:
+        """插件市场数据：扫分支、按排序键返回（条目缓存 30 分钟）。
+
+        market = official 只看配置里的官方市场仓库；thirdparty 按
+        plugin_market_thirdparty 逐行列出的仓库扫，两者同一套上架规则。
+        """
+        from modules.market import SORT_KEYS, parse_market_repos, sort_entries
+        kind = "thirdparty" if str(market or "").strip().lower() == "thirdparty" \
+            else "official"
+        raw_sources = str(self.config.get("plugin_market_thirdparty", "") or "")
+        repos = parse_market_repos(raw_sources) if kind == "thirdparty" else [
+            str(self.config.get("plugin_market_repo", "") or "").strip()
+            or "slpk1ng/Lovomo"]
+        prefix = str(self.config.get("plugin_market_branch_prefix", "") or "").strip() \
+            or "lovomo_plugin"
+        market_path = str(self.config.get("plugin_market_path", "") or "").strip() \
+            or "plugins/index.json"
+        sort_key = str(sort or "latest").strip().lower()
+        if sort_key not in SORT_KEYS:
+            sort_key = "latest"
+
+        caches = self._plugin_market_cache
+        cache = caches.get(kind + "|" + ",".join(repos)) or {}
+        now = time.time()
+        if (not force and cache.get("entries") is not None
+                and now - float(cache.get("fetched_at") or 0) < 1800):
+            entries = cache["entries"]
+            warnings = list(cache.get("warnings") or [])
+            source = cache.get("source") or "branches"
+            insecure = bool(cache.get("insecure"))
+            error = str(cache.get("error") or "")
+        else:
+            source, warnings, insecure, error = "branches", [], False, ""
+            entries = []
+            if kind == "thirdparty" and not repos:
+                warnings.append("还没有配置第三方市场地址，"
+                                "按每行一个「用户名/仓库名」填好再刷新")
+            elif kind == "thirdparty":
+                got = await self._market_scan_repos(repos, prefix)
+                entries, warnings = got["entries"], got["warnings"]
+                insecure = bool(got.get("insecure"))
+            else:
+                repo = repos[0]
+                try:
+                    got = await self._market_branch_entries(repo, prefix)
+                    entries, warnings = got["entries"], got["warnings"]
+                    insecure = bool(got.get("insecure"))
+                    if not entries:
+                        fallback = await self._market_index_entries(repo, market_path)
+                        warnings = warnings + list(fallback.get("warnings") or [])
+                        if fallback["entries"]:
+                            entries = fallback["entries"]
+                            source = "index"
+                            insecure = insecure or bool(fallback.get("insecure"))
+                            print(f"[插件市场] 分支扫描没有结果，改用索引 {market_path}")
+                except Exception as e:
+                    error = f"拉取市场失败：{type(e).__name__}: {e}"
+                    print(f"[插件市场] {error}")
+            for stale in [k for k, v in caches.items()
+                          if now - float(v.get("fetched_at") or 0) >= 1800]:
+                caches.pop(stale, None)
+            caches[kind + "|" + ",".join(repos)] = {
+                "entries": entries, "fetched_at": now, "source": source,
+                "warnings": warnings, "insecure": insecure, "error": error}
+
+        installed = {p["id"]: p for p in self.plugin_manager.list_plugins()}
+        plugins = []
+        for e in entries:
+            item = dict(e)
+            cur = installed.get(item.get("id") or "")
+            item["installed"] = bool(cur)
+            item["installed_version"] = (cur or {}).get("version", "")
+            item["enabled"] = bool((cur or {}).get("enabled"))
+            plugins.append(item)
+        plugins = sort_entries(plugins, sort_key)
+        if warnings:
+            print("[插件市场] " + "；".join(warnings[:5]))
+        result = {"success": not error, "plugins": plugins, "count": len(plugins),
+                  "sort": sort_key, "source": source, "market": kind,
+                  "market_text": raw_sources, "markets": repos,
+                  "repo": "、".join(repos), "branch_prefix": prefix,
+                  "warnings": warnings, "insecure": insecure, "fetched_at": now,
+                  "url": f"https://github.com/{repos[0]}/branches" if repos else ""}
+        if error:
+            result["error"] = error
+            result["hint"] = ("可以先手动上传插件 zip 安装；"
+                              "GitHub 未登录访问接口有 60 次/小时的限制，"
+                              "过一会儿再刷新即可。")
+        return result
+
+    async def handle_plugins_market(self, request):
+        force = str(request.query.get("refresh") or "") in ("1", "true")
+        sort = str(request.query.get("sort") or "latest")
+        market = str(request.query.get("market") or "official")
+        return web.json_response(
+            await self._plugins_market_payload(force, sort, market))
+
+    async def handle_plugins_market_sources(self, request):
+        """保存第三方市场地址（每行一个「用户名/仓库名」）。"""
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "请求体不是合法 JSON"},
+                                     status=400)
+        from modules.market import parse_market_repos
+        text = str(payload.get("text") or "").strip()
+        markets = parse_market_repos(text)
+        self.config.config["plugin_market_thirdparty"] = text
+        self.config._atomic_save(self.config.config)
+        self._plugin_market_cache.clear()
+        print(f"[插件市场] 第三方市场地址已保存：识别到 {len(markets)} 个"
+              + (f"（{'、'.join(markets)}）" if markets else ""))
+        return web.json_response({"success": True, "markets": markets,
+                                  "count": len(markets), "text": text})
+
+    async def handle_plugins_readme(self, request):
+        """插件包内自带文档的内容（kind = readme / update）。"""
+        pid = str(request.query.get("id") or "").strip()
+        kind = str(request.query.get("kind") or "readme").strip().lower()
+        if kind not in ("readme", "update"):
+            return web.json_response({"success": False, "error": "kind 只能是 readme 或 update"},
+                                     status=400)
+        if not self.plugin_manager.get(pid):
+            return web.json_response({"success": False, "error": "插件不存在"}, status=404)
+        doc = self.plugin_manager.read_doc_text(pid, kind)
+        return web.json_response({"success": True, "id": pid, "kind": kind, **doc})
+
+    async def handle_releases(self, request):
+        """仓库的全部 Releases（含各版本的资源与下载量）。"""
+        repo = str(self.config.get("plugin_release_repo", "") or "").strip() \
+            or "slpk1ng/Lovomo"
+        force = str(request.query.get("refresh") or "") in ("1", "true")
+        cache = self._release_list_cache
+        now = time.time()
+        if (not force and cache.get("data") is not None
+                and now - float(cache.get("fetched_at") or 0) < 1800):
+            return web.json_response(cache["data"])
+        try:
+            data, insecure = await self._fetch_releases(
+                f"https://api.github.com/repos/{repo}/releases?per_page=100")
+            items = data if isinstance(data, list) else []
+            releases = []
+            for rel in items:
+                if not isinstance(rel, dict):
+                    continue
+                assets = []
+                for a in (rel.get("assets") or []):
+                    if not isinstance(a, dict):
+                        continue
+                    assets.append({
+                        "name": str(a.get("name") or "")[:120],
+                        "size": int(a.get("size") or 0),
+                        "downloads": int(a.get("download_count") or 0),
+                        "url": str(a.get("browser_download_url") or ""),
+                    })
+                releases.append({
+                    "tag": str(rel.get("tag_name") or ""),
+                    "name": str(rel.get("name") or rel.get("tag_name") or ""),
+                    "draft": bool(rel.get("draft")),
+                    "prerelease": bool(rel.get("prerelease")),
+                    "published_at": str(rel.get("published_at") or ""),
+                    "created_at": str(rel.get("created_at") or ""),
+                    "body": str(rel.get("body") or "")[:4000],
+                    "url": str(rel.get("html_url") or ""),
+                    "downloads": sum(x["downloads"] for x in assets),
+                    "assets": assets,
+                })
+            result = {"success": True, "repo": repo, "releases": releases,
+                      "count": len(releases), "insecure": insecure,
+                      "fetched_at": now}
+        except Exception as e:
+            result = {"success": False, "repo": repo, "releases": [],
+                      "error": f"拿不到 Releases：{type(e).__name__}: {e}",
+                      "fetched_at": now}
+            print(f"[历史更新] {result['error']}")
+        cache.update({"data": result, "fetched_at": now})
+        return web.json_response(result)
+
+    async def handle_release_download(self, request):
+        """下载 Release 资源并保存到本地（由服务端完成下载）。"""
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "参数错误"}, status=400)
+        url = str(payload.get("url") or "").strip()
+        name = str(payload.get("name") or "").strip() or "download.bin"
+        repo = str(self.config.get("plugin_release_repo", "") or "").strip() \
+            or "slpk1ng/Lovomo"
+        # 只允许下本仓库 Release 的资源
+        head = url.lower()
+        allowed = (
+            head.startswith(f"https://github.com/{repo.lower()}/releases/download/")
+            or head.startswith("https://objects.githubusercontent.com/")
+            or head.startswith("https://github-releases.githubusercontent.com/")
+        )
+        if not allowed:
+            return web.json_response(
+                {"success": False, "error": "只允许下载本仓库 Releases 里的资源"},
+                status=400)
+        try:
+            content, insecure = await self._fetch_bytes(url)
+        except Exception as e:
+            return web.json_response({"success": False,
+                                      "error": f"下载失败：{type(e).__name__}: {e}"},
+                                     status=400)
+        safe = safe_asset_name(name, Path(name).suffix)
+        mode = await self._save_export_via_dialog(safe, content)
+        if mode == "cancelled":
+            return web.json_response({"success": False, "mode": "cancelled"})
+        if mode != "browser":
+            print(f"已保存 Release 资源：{safe} → {mode}")
+            return web.json_response({"success": True, "mode": "saved",
+                                      "path": mode, "name": safe})
+        # 浏览器访问：没有系统保存框，直接回流给浏览器下载
+        from urllib.parse import quote as _quote
+        return web.Response(
+            body=content, content_type="application/octet-stream",
+            headers={"Content-Disposition":
+                     f"attachment; filename*=UTF-8''{_quote(safe)}"})
+
+    async def _fetch_bytes(self, url: str):
+        """下载二进制内容，返回 (bytes, insecure)。"""
+        return await self._github_fetch(url, "bytes", timeout=120,
+                                        headers={"User-Agent": "lovomo-release-download"})
+
+
+
+    @staticmethod
+    def _check_market_source(entry: dict, manifest: dict) -> str:
+        """校验"这个包是不是真来自市场条目记录的仓库"。
+
+        返回空串表示放行，否则返回给用户看的拒绝原因。
+
+        规则：
+        - 包内清单**一个来源都没声明**（github / repo / source_repo /
+          homepage / author 全空）→ 放行。全新插件本来就无从比对，
+          不能因为作者没写就把人挡在门外。
+        - 声明了来源，且能对上市场仓库（仓库名一致，或归属用户名一致）→ 放行。
+        - 声明了来源却对不上 → 拒绝。这正是"把别人的插件换个壳挂到自己
+          仓库上"的特征。
+        """
+        from modules.plugins import manifest_logins, repo_owner, repo_slug
+        want = repo_slug((entry or {}).get("source_repo"))
+        if not want:
+            return ""
+        owners = {v.lower() for v in manifest_logins(manifest)}
+        if not owners:
+            return ""
+        declared = repo_slug(manifest.get("repo") or manifest.get("source_repo"))
+        if declared and declared.lower() == want.lower():
+            return ""
+        if repo_owner(want).lower() in owners:
+            return ""
+        return (f"插件声明的来源（{'、'.join(sorted(owners))}）与市场仓库 {want} "
+                "不一致，已拒绝安装。插件只能从作者本人的仓库安装，"
+                "如果你就是作者，请在清单里写上自己的 github / repo。")
+
+    async def handle_plugins_install_remote(self, request):
+        """从市场索引里下载并安装（同样过一遍安全审查）。"""
+        try:
+            payload = await request.json()
+            pid = str(payload.get("id") or "").strip()
+            force = bool(payload.get("force", False))
+            entry = None
+            for kind in ("official", "thirdparty"):
+                market = await self._plugins_market_payload(market=kind)
+                entry = next((p for p in market.get("plugins", []) if p["id"] == pid), None)
+                if entry:
+                    break
+            if not entry:
+                return web.json_response({"success": False, "error": "市场里没有这个插件"},
+                                         status=404)
+            url = entry.get("download") or ""
+            if not url.startswith(("http://", "https://")):
+                return web.json_response(
+                    {"success": False, "error": "该插件没有提供有效的下载地址"}, status=400)
+            try:
+                content, _ = await self._github_fetch(url, "bytes", timeout=60)
+            except Exception as e:
+                return web.json_response(
+                    {"success": False, "error": f"下载失败：{type(e).__name__}"}, status=400)
+            report = self.plugin_manager.inspect_zip(content)
+            if not report.get("ok"):
+                return web.json_response(
+                    {"success": False, "error": report.get("error") or "包不可用",
+                     "report": report}, status=400)
+            manifest = report.get("manifest") or {}
+            got_id = str(manifest.get("id") or "").strip()
+            if got_id and got_id != pid:
+                return web.json_response(
+                    {"success": False,
+                     "error": f"包内插件 id（{got_id}）与市场条目（{pid}）不一致，已拒绝安装",
+                     "report": report}, status=400)
+            why = self._check_market_source(entry, manifest)
+            if why:
+                print(f"[插件市场] 拒绝安装 {pid}：{why}")
+                return web.json_response({"success": False, "error": why,
+                                          "report": report}, status=400)
+            result = self.plugin_manager.install_zip(content, force=force)
+            if result.get("success"):
+                # 记一笔来源，便于事后追溯插件是从哪条仓库/分支装来的
+                self.plugin_manager.set_source(result["id"],
+                                               entry.get("source_repo") or "",
+                                               entry.get("branch") or "",
+                                               entry.get("source") or "")
+                print(f"[插件市场] 已安装：{result.get('name')} (id={result.get('id')})")
+            return web.json_response(result,
+                                     status=200 if result.get("success") else 400)
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_plugins_publish_token(self, request):
+        """保存 GitHub PAT。配置落地走标准加密落盘流程。"""
+        try:
+            payload = await request.json()
+            token = str(payload.get("token") or "").strip()
+        except Exception:
+            return web.json_response({"success": False, "error": "请求体不是合法 JSON"}, status=400)
+        if not token:
+            return web.json_response({"success": False, "error": "Token 不能为空"}, status=400)
+        try:
+            info = await _verify_github_token(token)
+        except _PublishError as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+        self.config.config["plugin_publish_token"] = token
+        self.config.config["plugin_publish_login"] = info.get("login", "")
+        self.config.config["plugin_publish_name"] = info.get("name", "")
+        self.config._atomic_save(self.config.config)
+        return web.json_response({"success": True, "login": info.get("login", ""),
+                                  "name": info.get("name", "")})
+
+    async def handle_plugins_publish_token_clear(self, request):
+        self.config.config.pop("plugin_publish_token", None)
+        self.config.config.pop("plugin_publish_login", None)
+        self.config.config.pop("plugin_publish_name", None)
+        self.config._atomic_save(self.config.config)
+        return web.json_response({"success": True})
+
+    def _publish_scope(self, login: str):
+        """按 GitHub 登录身份把已装插件分成"能发布"和"被挡下"两拨。
+
+        归属校验必须在服务端做：前端隐藏只是顺手，真正的门禁在这里 ——
+        直接 POST /api/plugins/publish 也绕不过去。登录名为空（还没认证）
+        时全部归入"被挡下"，也就是"未认证就不参与插件制作"。
+        """
+        from modules.plugins import ownership_matches
+        owned, blocked = [], []
+        manager = getattr(self, "plugin_manager", None)
+        plugins = manager.list_plugins() if manager else []
+        for info in plugins:
+            item = {"id": info["id"], "name": info.get("name") or info["id"],
+                    "version": info.get("version") or "",
+                    "owners": list(info.get("owners") or [])}
+            if login and ownership_matches(info, login):
+                owned.append(item)
+            else:
+                blocked.append(item)
+        return owned, blocked
+
+    async def handle_plugins_publish_status(self, request):
+        token = str(self.config.config.get("plugin_publish_token") or "").strip()
+        repo = str(self.config.config.get("plugin_market_repo") or "").strip()
+        login = str(self.config.config.get("plugin_publish_login") or "").strip()
+        owned, blocked = self._publish_scope(login)
+        info = {
+            # 只有「Token 在 + 身份校验过」才算认证完成：缺一个都退回
+            # 让用户重新填 Token，免得出现"显示已登录却什么都发不了"
+            "configured": bool(token and login),
+            "login": login,
+            "name": str(self.config.config.get("plugin_publish_name") or ""),
+            "repo": repo,
+            "branch_prefix": str(self.config.config.get("plugin_market_branch_prefix", "lovomo_plugin")),
+            "publishable": [p["id"] for p in owned],
+            "plugins": owned,
+            "blocked": blocked,
+        }
+        return web.json_response(info)
+
+    async def handle_plugins_publish(self, request):
+        """把 plugins/sources/<id>/ 推到 GitHub 仓库的 lovomo_plugin_<id> 分支。"""
+        try:
+            payload = await request.json()
+            pid = str(payload.get("id") or "").strip()
+            message = str(payload.get("message") or "").strip() or None
+        except Exception:
+            return web.json_response({"success": False, "error": "请求体不是合法 JSON"}, status=400)
+        if not pid:
+            return web.json_response({"success": False, "error": "缺少插件 id"}, status=400)
+        token = str(self.config.config.get("plugin_publish_token") or "").strip()
+        repo = str(self.config.config.get("plugin_market_repo") or "").strip()
+        prefix = str(self.config.config.get("plugin_market_branch_prefix", "lovomo_plugin")).strip()
+        login = str(self.config.config.get("plugin_publish_login") or "").strip()
+        if not token or not login:
+            return web.json_response({"success": False,
+                                      "error": "尚未认证 GitHub 身份，请先在「插件」→「发布到分支」里填写 Personal Access Token"},
+                                     status=400)
+        if not repo:
+            return web.json_response({"success": False,
+                                      "error": "尚未配置插件市场仓库"}, status=400)
+        from modules.plugins import ownership_matches
+        manager = getattr(self, "plugin_manager", None)
+        info = manager.get(pid) if manager else None
+        if info is None:
+            return web.json_response({"success": False, "error": f"插件 {pid} 不存在"},
+                                     status=404)
+        if not ownership_matches(info, login):
+            owners = "、".join(info.get("owners") or []) or "未声明"
+            reason = (f"插件「{info.get('name') or pid}」声明的归属是 {owners}，"
+                      f"与当前登录的 GitHub 账号 {login} 不符，已拒绝发布。"
+                      "要发布请先在插件清单（plugin.yaml）里写上自己的 "
+                      "github / repo / homepage。")
+            print(f"[插件发布] 拒绝发布 {pid}：{reason}")
+            return web.json_response({"success": False, "error": reason}, status=403)
+        sources_dir = (self.plugin_manager.root if self.plugin_manager
+                       else Path(__file__).resolve().parent / "plugins" / "sources")
+        try:
+            result = await _publish_to_github(
+                token=token, repo=repo, plugin_id=pid,
+                sources_dir=sources_dir, message=message,
+                branch_prefix=(prefix + "_") if not prefix.endswith("_") else prefix)
+        except _PublishError as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+        print(f"[插件发布] 发布成功：{pid} → {result.get('branch')}"
+              f"（提交 {str(result.get('commit') or '')[:7]}，"
+              f"{len(result.get('files') or [])} 个文件）")
+        return web.json_response({"success": True, **result})
+
     def _after_config_reload(self):
         """配置变更后的统一热重载。"""
         global global_config, global_emotion_manager, memory_manager
         global_config = self.config
+        apply_log_max_size(self.config)
         self._refresh_auth_state()
         self.config.roles = self.config._parse_roles()
         if not global_config.active_character or global_config.active_character not in self.config.roles:
@@ -3739,30 +6635,94 @@ class WebUIServer:
         memory_manager = MemoryManager(self.config)
         if sender is not None:
             sender.memory_manager = memory_manager
+        # WebUI 侧持有的也是构造时的快照：不同步的话，改了记忆目录/角色之后
+        # 页面上读写的仍是旧目录，只能重启才能自愈
+        self.memory_manager = memory_manager
+        self._update_state_file = memory_manager.data_path / "update_check.json"
+        self._auth_file = memory_manager.data_path / "webui_auth.json"
         hot_reload_managers()
 
     # ---------------- 文件夹选择 / 模型列表 ----------------
-    async def handle_pick_folder(self, request):
-        """弹出系统"选择文件夹"对话框；仅在 LTVM 桌面窗口模式下可用。"""
+    async def _pick_dialog(self, dialog_kind, file_types=None):
+        """弹出系统选择对话框，返回 (ok, path_or_error)。
+
+        对话框是阻塞调用，丢进线程池避免卡住 WebUI 事件循环。
+        """
         try:
             import webview
         except Exception:
-            return web.json_response({"ok": False,
-                                      "error": "pywebview 未安装，无法打开文件夹选择"}, status=400)
+            return False, "pywebview 未安装，无法打开文件选择"
         window = _WEBVIEW_WINDOW_HOLDER.get("window")
         if window is None:
-            return web.json_response({"ok": False,
-                                      "error": "文件夹选择仅在 LTVM 桌面窗口模式下可用（浏览器访问不支持）"},
-                                     status=400)
+            return False, "该功能仅在 Lovomo 桌面窗口模式下可用（浏览器访问不支持）"
+        kind = getattr(webview, dialog_kind)
+        kwargs = {}
+        if file_types:
+            kwargs["file_types"] = tuple(file_types)
         try:
             loop = asyncio.get_running_loop()
-            # 对话框是阻塞调用，丢进线程池避免卡住 WebUI 事件循环
             result = await loop.run_in_executor(
-                None, lambda: window.create_file_dialog(webview.FOLDER_DIALOG))
-            path = str(result[0]) if result else ""
-            return web.json_response({"ok": bool(path), "path": path})
+                None, lambda: window.create_file_dialog(kind, **kwargs))
         except Exception as e:
-            return web.json_response({"ok": False, "error": f"打开文件夹选择失败: {e}"}, status=500)
+            return False, f"打开选择对话框失败: {e}"
+        return True, (str(result[0]) if result else "")
+
+    async def handle_pick_folder(self, request):
+        """弹出系统"选择文件夹"对话框；仅在 Lovomo 桌面窗口模式下可用。"""
+        ok, path = await self._pick_dialog("FOLDER_DIALOG")
+        if not ok:
+            return web.json_response({"ok": False, "error": path}, status=400)
+        return web.json_response({"ok": bool(path), "path": path})
+
+    async def handle_pick_file(self, request):
+        """弹出系统"选择文件"对话框，可选把选中的文件复制到某个插件的数据目录。
+
+        payload:
+            filter    "图片 (*.png;*.jpg)" 这类过滤器描述，可选
+            exts      允许的扩展名列表（不含点），可选
+            plugin_id 给了就把文件复制进该插件 data 目录，返回相对文件名
+        """
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        exts = [str(e).lstrip(".").lower() for e in (payload.get("exts") or []) if str(e).strip()]
+        desc = str(payload.get("filter") or "文件").strip()
+        file_types = (f"{desc} ({';'.join('*.' + e for e in exts)})",)
+        if exts:
+            file_types += ("所有文件 (*.*)",)
+        ok, path = await self._pick_dialog("OPEN_DIALOG", file_types)
+        if not ok:
+            return web.json_response({"ok": False, "error": path}, status=400)
+        if not path:
+            return web.json_response({"ok": False, "path": "", "cancelled": True})
+        src = Path(path)
+        if exts and src.suffix.lower().lstrip(".") not in exts:
+            return web.json_response(
+                {"ok": False, "error": f"只支持这些格式：{', '.join(exts)}"}, status=400)
+        pid = str(payload.get("plugin_id") or "").strip()
+        if not pid:
+            return web.json_response({"ok": True, "path": path, "name": src.name,
+                                      "cancelled": False})
+        data_dir = self.plugin_manager.data_dir(pid)
+        if data_dir is None:
+            return web.json_response({"ok": False, "error": "插件不存在"}, status=404)
+        if src.suffix.lower() not in ALLOWED_ASSET_EXTS:
+            return web.json_response(
+                {"ok": False, "error": f"不支持的文件类型：{src.suffix}"}, status=400)
+        try:
+            if src.stat().st_size > MAX_PLUGIN_ASSET_BYTES:
+                limit_mb = MAX_PLUGIN_ASSET_BYTES // (1024 * 1024)
+                return web.json_response(
+                    {"ok": False, "error": f"文件超过 {limit_mb}MB 上限"}, status=400)
+            # 保留原文件名（只清非法字符），重名自动编号
+            safe = unique_asset_name(data_dir, safe_asset_name(src.name, src.suffix))
+            dst = data_dir / safe
+            shutil.copyfile(src, dst)
+        except Exception as e:
+            return web.json_response({"ok": False, "error": f"复制文件失败: {e}"}, status=500)
+        return web.json_response({"ok": True, "path": str(dst), "name": safe,
+                                  "orig_name": src.name, "cancelled": False})
 
     async def handle_scan_models(self, request):
         """扫描文件夹里的 .gguf 模型，返回可填入 llm_model_name 的候选标识符。
@@ -3815,28 +6775,45 @@ class WebUIServer:
         base = str(payload.get("base_url", "") or "").strip().rstrip("/")
         backend = str(payload.get("backend", "ollama") or "ollama")
         if not base:
-            return web.json_response({"ok": False, "error": "llm_base_url 为空"}, status=400)
-        if backend == "ollama":
-            url = f"{base}/api/tags"
-        else:
-            url = f"{base}/models" if base.endswith("/v1") else f"{base}/v1/models"
-        try:
-            headers = {}
-            api_key = str(self.config.get("llm_api_key", "") or "")
-            if backend != "ollama" and api_key:
-                headers["Authorization"] = f"Bearer {api_key}"
-            async with httpx.AsyncClient(timeout=10, trust_env=False, headers=headers,
-                                         verify=verified_context()) as client:
-                resp = await client.get(url)
-                resp.raise_for_status()
+            return web.json_response({"ok": False, "error": "服务地址为空"}, status=400)
+        headers = {}
+        api_key = str(self.config.get("llm_api_key", "") or "")
+        if backend != "ollama" and api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        tried = []
+        for url in model_list_endpoints(base, backend):
+            try:
+                async with httpx.AsyncClient(timeout=10, trust_env=False, headers=headers,
+                                             verify=verified_context()) as client:
+                    resp = await client.get(url)
+            except Exception as e:
+                tried.append(f"{url} → {type(e).__name__}: {e}")
+                continue
+            # 服务端会在响应体里写明原因（url error / 模型不存在等）；
+            # 只报 raise_for_status 的异常，用户就只看到一个自己从没填过的地址
+            if resp.status_code >= 400:
+                tried.append(f"{url} → HTTP {resp.status_code} {_brief_response(resp)}")
+                continue
+            try:
                 data = resp.json()
+            except Exception:
+                tried.append(f"{url} → 响应不是 JSON {_brief_response(resp)}")
+                continue
             if backend == "ollama":
                 ids = [str(m.get("name") or m.get("model") or "") for m in data.get("models", [])]
             else:
                 ids = [str(m.get("id") or "") for m in data.get("data", [])]
-            return web.json_response({"ok": True, "models": [i for i in ids if i]})
-        except Exception as e:
-            return web.json_response({"ok": False, "error": f"获取模型列表失败: {e}"}, status=500)
+            ids = [i for i in ids if i]
+            if not ids:
+                tried.append(f"{url} → 响应里没有模型列表 {_brief_response(resp)}")
+                continue
+            return web.json_response({"ok": True, "models": ids})
+        error = "获取模型列表失败：\n" + "\n".join(tried)
+        if looks_like_full_endpoint(base):
+            error += ("\n\n当前地址看起来是某个具体接口的完整路径。这里要填「服务根地址」，"
+                      "也就是补上 /v1/models（或 /api/tags）之前的那一段，"
+                      "例如 http://127.0.0.1:8080/v1。")
+        return web.json_response({"ok": False, "error": error, "tried": tried}, status=502)
 
     async def handle_save_config(self, request):
         try:
@@ -3904,7 +6881,8 @@ class WebUIServer:
             napcat_changed = False
             if old_config is not None:
                 if (old_config.get('napcat_ws_url') != new_config.get('napcat_ws_url') or
-                        old_config.get('napcat_token') != new_config.get('napcat_token')):
+                        old_config.get('napcat_token') != new_config.get('napcat_token') or
+                        role_connection_snapshot(old_config) != role_connection_snapshot(new_config)):
                     napcat_changed = True
                 # 换模型：登记旧模型，等新模型首次调用成功后由 llm_helpers 自动卸载
                 if self.config.get("llm_auto_unload_old", True):
@@ -3965,9 +6943,9 @@ class WebUIServer:
     async def handle_get_logs(self, request):
         """WebUI 日志接口。
 
-        精简模式（默认）只回尾部 webui_log_tail_lines 行，轮询负担小；
-        ?full=1（前端"显示完整日志"开关）返回内存中缓存的全部日志（上限
-        webui_log_buffer_lines 行），方便排查问题时翻完整过程。
+        精简模式（默认）先按 webui_log_hide_patterns 剔除噪音行，再回尾部
+        webui_log_tail_lines 行；?full=1（前端"显示完整日志"开关）返回内存里
+        缓存的全部日志（上限 webui_log_buffer_lines 行），一行都不藏。
 
         完整模式另有一道 40 万字符的极端上限（约等于上万行），只为了避免
         极端情况下把整个响应撑爆；触发时会返回 truncated=true 并在日志里写明，
@@ -3980,7 +6958,22 @@ class WebUIServer:
             if full:
                 logs = "\n".join(global_log_buffer)
             else:
-                logs = "\n".join(global_log_buffer[-tail_lines:])
+                patterns = _log_hide_patterns()
+                # 被隐藏的那一行原本占着一行换行，直接丢掉会留下一个空行，
+                # 看起来就是「隐藏内容处莫名其妙空了一片」，所以连同它后面
+                # 紧跟的空白行一起去掉。
+                kept = []
+                blank_after_hidden = False
+                for line in global_log_buffer:
+                    if _log_hidden(line, patterns):
+                        blank_after_hidden = True
+                        continue
+                    if blank_after_hidden and not line.strip():
+                        blank_after_hidden = False
+                        continue
+                    blank_after_hidden = False
+                    kept.append(line)
+                logs = "\n".join(kept[-tail_lines:])
         truncated = False
         if full and len(logs) > _LOG_FULL_MAX_CHARS:
             logs = logs[-_LOG_FULL_MAX_CHARS:]
@@ -4013,9 +7006,11 @@ class WebUIServer:
             for filename in filenames:
                 if self.memory_manager.delete_memory_file(filename):
                     deleted.append(filename)
-            if deleted and mood_mgr is not None:
+            if deleted:
                 for sid in self._session_ids_from_files(deleted):
-                    mood_mgr.delete_session(sid)
+                    if mood_mgr is not None:
+                        mood_mgr.delete_session(sid)
+                    forget_proactive_session(sid)
             return web.json_response({"success": True, "deleted": deleted})
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
@@ -4049,56 +7044,63 @@ class WebUIServer:
         result = self.memory_manager.get_history(filename)
         if not result.get("success"):
             return web.json_response(result, status=404)
-        return _json_file_response({"filename": filename,
-                                    "character_name": result.get("character_name"),
-                                    "history": result.get("history", [])}, filename)
+        payload = {"filename": filename,
+                   "character_name": result.get("character_name"),
+                   "history": result.get("history", [])}
+        content = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        saved = await self._save_export_via_dialog(filename, content)
+        if saved == "browser":
+            return _json_file_response(payload, filename)
+        if saved == "cancelled":
+            return self._export_status_response("cancelled")
+        return self._export_status_response("saved", saved)
 
     async def handle_memory_import(self, request):
         try:
             reader = await request.multipart()
             imported = []
+            skipped = []
             async for part in reader:
-                if part.filename and part.filename.endswith(".json"):
-                    raw = await part.read(decode=False)
-                    data = json.loads(raw.decode("utf-8"))
-                    if not isinstance(data, dict) or "history" not in data:
-                        continue
-                    name = Path(part.filename).name
-                    if not re.match(r'^[A-Za-z0-9_\-]+\.json$', name):
-                        name = re.sub(r'[^A-Za-z0-9_\-]', '_', Path(name).stem) + ".json"
-                    (self.memory_manager.data_path / name).write_text(
-                        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-                    imported.append(name)
-            return web.json_response({"success": True, "imported": imported})
+                if not part.filename or not part.filename.endswith(".json"):
+                    continue
+                raw = await part.read(decode=False)
+                data = json.loads(raw.decode("utf-8"))
+                if not isinstance(data, dict) or "history" not in data:
+                    continue
+                name = Path(part.filename).name
+                # 只允许写入会话记忆文件：data 目录里还躺着 webui_auth.json 等功能数据，
+                # 同一目录下的整份覆盖等于把认证态等数据交给上传者改写
+                if not _is_memory_filename(name):
+                    skipped.append(name)
+                    continue
+                from modules.jsonio import save_json
+                save_json(self.memory_manager.data_path / name, data)
+                imported.append(name)
+            return web.json_response({"success": True, "imported": imported,
+                                      "skipped": skipped})
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
     async def handle_memory_export_all(self, request):
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for f in self.memory_manager.data_path.glob("*.json"):
-                zf.write(f, f.name)
-        buf.seek(0)
-        return web.Response(body=buf.read(), content_type="application/zip",
-                            headers={"Content-Disposition": 'attachment; filename="ltvm_memories.zip"'})
+            # 只打包会话记忆：同一目录下的 webui_auth.json 含 WebUI 令牌与口令散列，
+            # 打包进去等于把登录凭据随导出文件一起送出去
+            for f in sorted(self.memory_manager.data_path.glob("*.json")):
+                if _is_memory_filename(f.name):
+                    zf.write(f, f.name)
+        content = buf.getvalue()
+        saved = await self._save_export_via_dialog("lovomo_memories.zip", content)
+        if saved == "browser":
+            return web.Response(body=content, content_type="application/zip",
+                                headers={"Content-Disposition": 'attachment; filename="lovomo_memories.zip"'})
+        if saved == "cancelled":
+            return self._export_status_response("cancelled")
+        return self._export_status_response("saved", saved)
 
     async def handle_sessions(self, request):
         """返回已知会话列表（供定时任务/事件/待办选择发送目标）。"""
-        sessions = []
-        for f in self.memory_manager.data_path.glob("*.json"):
-            m = re.match(r'^[A-Za-z0-9_\-]+_(private|group)_[A-Za-z0-9_\-]+\.json$', f.name)
-            if not m:
-                continue
-            stype = m.group(1)
-            rest = f.name.split(f"{stype}_", 1)[1].replace(".json", "")
-            if stype == "group":
-                sid = f"group_{rest.split('_')[0]}"
-            else:
-                sid = f"private_{rest}"
-            item = {"session_id": sid, "session_type": stype}
-            if not any(s["session_id"] == sid for s in sessions):
-                sessions.append(item)
-        return web.json_response({"sessions": sessions})
+        return web.json_response({"sessions": list_known_sessions()})
 
     # ---------------- 情绪音频管理 ----------------
     def _role_root(self, role_key: str) -> Path:
@@ -4198,15 +7200,19 @@ class WebUIServer:
         folder = _safe_subdir(root, emotion)
         if folder is None or not file or not re.match(r'^[\w\u4e00-\u9fff\-. ]+$', file):
             return web.Response(status=404, text="not found")
-        target = folder / file
-        if not target.exists():
+        try:
+            target = (folder / file).resolve()
+        except (OSError, ValueError):
+            return web.Response(status=404, text="not found")
+        # 白名单本身允许 "."，file=.. 会解析到目录；必须再确认落在情绪目录内且是文件
+        if folder.resolve() not in target.parents or not target.is_file():
             return web.Response(status=404, text="not found")
         return web.FileResponse(target)
 
     # ---------------- 统计 ----------------
     async def handle_stats(self, request):
         range_key = str(request.query.get("range", "30") or "30")
-        stats = stats_mgr.get_stats(range_key) if stats_mgr else {}
+        stats = (stats_mgr.get_stats(range_key) if stats_mgr else None) or {}
         moods = []
         if mood_mgr is not None:
             by_role = mood_mgr.role_mood_records()
@@ -4280,6 +7286,44 @@ class WebUIServer:
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
+    async def handle_jobs_batch(self, request):
+        """批量修改定时任务的发送目标（会话类型 / 会话 ID）。
+
+        ids 为空表示应用到全部任务；两个字段都留空表示"清空会话 ID"，
+        也就是回到"发给所有聊过的会话"。
+        """
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "请求体不是合法 JSON"}, status=400)
+        ids = payload.get("ids")
+        wanted = {str(i) for i in ids} if isinstance(ids, list) else None
+        has_type = "session_type" in payload
+        session_type = str(payload.get("session_type") or "").strip()
+        if has_type and session_type not in ("private", "group"):
+            return web.json_response({"success": False, "error": "会话类型只能是 private 或 group"},
+                                     status=400)
+        has_id = "session_id" in payload
+        session_id = str(payload.get("session_id") or "").strip()
+        has_voice = "use_voice" in payload
+        use_voice = bool(payload.get("use_voice"))
+        changed = 0
+        for job in job_mgr.jobs:
+            if wanted is not None and str(job.get("id")) not in wanted:
+                continue
+            target = job.setdefault("target", {})
+            if has_type:
+                target["session_type"] = session_type
+            if has_id:
+                target["session_id"] = session_id
+            if has_voice:
+                job.setdefault("action", {})["use_voice"] = use_voice
+            changed += 1
+        job_mgr.save()
+        job_mgr.reload()
+        return web.json_response({"success": True, "changed": changed,
+                                  "jobs": job_mgr.describe()})
+
     async def handle_jobs_run(self, request):
         try:
             payload = await request.json()
@@ -4322,7 +7366,9 @@ class WebUIServer:
             todo = todo_mgr.add_todo(content, remind_ts,
                                      payload.get("session_type", "private"),
                                      payload.get("session_id", ""),
-                                     payload.get("user_id", ""), source="manual")
+                                     payload.get("user_id", ""), source="manual",
+                                     use_voice=(bool(payload["use_voice"])
+                                                if "use_voice" in payload else None))
             return web.json_response({"success": bool(todo), "todo": todo})
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
@@ -4331,14 +7377,18 @@ class WebUIServer:
         try:
             payload = await request.json()
             todo_id = int(payload.get("id", 0))
-            status = payload.get("status", "done")
-            if status in ("done", "cancelled"):
-                if status == "done":
-                    todo_mgr.complete(todo_id)
-                else:
-                    todo_mgr.delete(todo_id)
-                return web.json_response({"success": True})
-            todo_mgr.db.execute("UPDATE todos SET status=? WHERE id=?", (status, todo_id))
+            # status 必填且必须在白名单内：漏传时默认标成"已完成"会静默改错状态，
+            # 任意字符串又会直接落库
+            status = str(payload.get("status", "") or "")
+            if status not in TODO_STATUSES:
+                return web.json_response(
+                    {"success": False, "error": f"状态非法：{status or '(未提供)'}"}, status=400)
+            if status == "done":
+                todo_mgr.complete(todo_id)
+            elif status == "cancelled":
+                todo_mgr.delete(todo_id)
+            else:
+                todo_mgr.db.execute("UPDATE todos SET status=? WHERE id=?", (status, todo_id))
             return web.json_response({"success": True})
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
@@ -4351,6 +7401,49 @@ class WebUIServer:
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
+    async def handle_todos_batch(self, request):
+        """批量修改待办的会话类型 / 会话 ID（与定时任务/节日共用同一套规则）。"""
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "请求体不是合法 JSON"}, status=400)
+        ids = payload.get("ids")
+        wanted = {int(i) for i in ids} if isinstance(ids, list) else None
+        has_type = "session_type" in payload
+        session_type = str(payload.get("session_type") or "").strip()
+        if has_type and session_type not in ("private", "group"):
+            return web.json_response({"success": False, "error": "会话类型只能是 private 或 group"},
+                                     status=400)
+        has_id = "session_id" in payload
+        session_id = str(payload.get("session_id") or "").strip()
+        has_voice = "use_voice" in payload
+        use_voice = 1 if bool(payload.get("use_voice")) else 0
+        changed = 0
+        if todo_mgr is not None:
+            rows = todo_mgr.list_todos()
+            for row in rows:
+                if wanted is not None and int(row.get("id", 0)) not in wanted:
+                    continue
+                sets = []
+                params = []
+                if has_type:
+                    sets.append("session_type=?")
+                    params.append(session_type)
+                if has_id:
+                    sets.append("session_id=?")
+                    params.append(session_id)
+                if has_voice:
+                    sets.append("use_voice=?")
+                    params.append(use_voice)
+                if not sets:
+                    continue
+                params.append(int(row["id"]))
+                todo_mgr.db.execute("UPDATE todos SET " + ", ".join(sets)
+                                    + " WHERE id=?", tuple(params))
+                changed += 1
+        return web.json_response({"success": True, "changed": changed,
+                                  "todos": (todo_mgr.list_todos() if todo_mgr else [])})
+
     # ---------------- 事件问候 ----------------
     async def handle_events(self, request):
         return web.json_response({"events": event_mgr.events if event_mgr else []})
@@ -4359,6 +7452,7 @@ class WebUIServer:
         try:
             payload = await request.json()
             events = payload.get("events", [])
+            known = {str(e.get("id")): e for e in (event_mgr.events if event_mgr else [])}
             cleaned = []
             for ev in events:
                 eid = str(ev.get("id") or f"evt_{int(time.time()*1000)}")
@@ -4371,7 +7465,11 @@ class WebUIServer:
                     "template": str(ev.get("template", "")),
                     "llm_prompt": str(ev.get("llm_prompt", "")),
                     "use_voice": bool(ev.get("use_voice", False)),
-                    "targets": ev.get("targets") or [],
+                    # 内置默认节日标记：请求里没带就沿用原值，丢了它"无目标时发给全部会话"的兜底会失效
+                    "default": bool(ev.get("default", known.get(eid, {}).get("default", False))),
+                    # 会话 ID 留空等于清空目标，存成空目标占位会顶掉默认节日的兜底
+                    "targets": [t for t in (ev.get("targets") or [])
+                                if isinstance(t, dict) and str(t.get("session_id") or "").strip()],
                 })
             event_mgr.events = cleaned
             event_mgr.save_events()
@@ -4379,13 +7477,60 @@ class WebUIServer:
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
+    async def handle_events_batch(self, request):
+        """批量修改节日/纪念日问候的发送目标（会话类型 / 会话 ID）。
+
+        ids 为空表示应用到全部事件；两个字段都留空表示"清空会话 ID"
+        即回到"发给所有聊过的会话"。
+        """
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "请求体不是合法 JSON"}, status=400)
+        ids = payload.get("ids")
+        wanted = {str(i) for i in ids} if isinstance(ids, list) else None
+        has_type = "session_type" in payload
+        session_type = str(payload.get("session_type") or "").strip()
+        if has_type and session_type not in ("private", "group"):
+            return web.json_response({"success": False, "error": "会话类型只能是 private 或 group"},
+                                     status=400)
+        has_id = "session_id" in payload
+        session_id = str(payload.get("session_id") or "").strip()
+        has_voice = "use_voice" in payload
+        use_voice = bool(payload.get("use_voice"))
+        changed = 0
+        for ev in (event_mgr.events if event_mgr else []):
+            if wanted is not None and str(ev.get("id")) not in wanted:
+                continue
+            # 只改语音时别碰发送目标：给本来没有目标的事件补一个空目标，会顶掉
+            # "内置默认节日发给全部会话"的兜底，问候从此永远发不出去。
+            if has_type or has_id:
+                targets = ev.get("targets") or []
+                if not targets:
+                    targets = [{"session_type": "private", "session_id": ""}]
+                tg = targets[0]
+                if has_type:
+                    tg["session_type"] = session_type
+                if has_id:
+                    tg["session_id"] = session_id
+                # 会话 ID 留空 = 清空目标，回到"发给所有聊过的会话"，不能留空目标占位
+                ev["targets"] = targets if str(tg.get("session_id") or "").strip() else []
+            if has_voice:
+                ev["use_voice"] = use_voice
+            changed += 1
+        if event_mgr is not None:
+            event_mgr.save_events()
+        return web.json_response({"success": True, "changed": changed,
+                                  "events": (event_mgr.events if event_mgr else [])})
+
     async def handle_events_test(self, request):
         try:
             payload = await request.json()
             ok = await event_mgr.greet_event_now(str(payload.get("id", "")), sender,
                                                  get_active_ctx, get_active_emotions)
             return web.json_response({"success": bool(ok),
-                                      "message": "已发送测试问候" if ok else "未找到事件或生成内容为空"})
+                                      "message": "已发送测试问候" if ok else
+                                      "该事件没有可发送的目标会话（内置节日会在当天发给全部会话），或问候内容为空"})
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
@@ -4417,10 +7562,16 @@ class WebUIServer:
     async def handle_search_engine_save(self, request):
         """保存默认搜索引擎、自定义引擎、API key（写进 config.json 后热重载）。"""
         try:
-            from modules.tools import available_engines, parse_api_keys
+            from modules.tools import available_engines, parse_api_keys, invalid_custom_engines
             payload = await request.json()
             engine = str(payload.get("engine", "") or "").strip()
             custom = str(payload.get("custom", self.config.get("web_search_custom_engines", "")) or "")
+            bad = invalid_custom_engines(custom)
+            if bad:
+                return web.json_response(
+                    {"success": False,
+                     "error": "自定义引擎地址模板缺少 {query} 占位符，无法带上搜索词："
+                              + "、".join(bad)}, status=400)
             if engine and engine not in available_engines({**self.config.config,
                                                           "web_search_custom_engines": custom}):
                 return web.json_response({"success": False, "error": f"未知搜索引擎: {engine}"}, status=400)
@@ -4563,7 +7714,8 @@ class WebUIServer:
                     if files:
                         categories.append({"name": folder.name, "files": files})
         return web.json_response({"root": str(root), "categories": categories,
-                                  "enabled": bool(self.config.get("stickers_enabled", False))})
+                                  "enabled": bool(sticker_mgr and sticker_mgr.enabled),
+                                  "mode": sticker_mgr.mode if sticker_mgr else "off"})
 
     async def handle_stickers_upload(self, request):
         try:
@@ -4656,7 +7808,7 @@ class WebUIServer:
                 error_msg = f"WebUI 启动失败（端口 {port}）：{type(e).__name__}: {e}"
                 print(error_msg)
                 try:
-                    with open("webui_error.log", "a", encoding="utf-8") as f:
+                    with open(runtime_path("webui_error.log"), "a", encoding="utf-8") as f:
                         f.write(f"{time.ctime()} - {error_msg}\n")
                 except Exception:
                     pass
@@ -4664,12 +7816,25 @@ class WebUIServer:
 
         # 所有端口尝试失败
         print("错误：无法找到可用端口，WebUI 启动失败。")
-        with open("webui_error.log", "a", encoding="utf-8") as f:
-            f.write(f"{time.ctime()} - 所有端口被占用，WebUI 启动失败。\n")
+        try:
+            with open(runtime_path("webui_error.log"), "a", encoding="utf-8") as f:
+                f.write(f"{time.ctime()} - 所有端口被占用，WebUI 启动失败。\n")
+        except Exception:
+            pass
 
     async def shutdown(self):
-        if HAS_AIOHTTP:
-            await self.app.cleanup()
+        if not HAS_AIOHTTP:
+            return
+        runner = getattr(self, "runner", None)
+        if runner is not None:
+            # 只 cleanup app 不会停止 TCPSite 的监听，端口仍被占用；
+            # 热重启/测试流程会因此碰到 "Address already in use"
+            try:
+                await runner.cleanup()
+            except Exception as e:
+                print(f"关闭 WebUI 监听失败: {type(e).__name__}: {e}")
+            self.runner = None
+        await self.app.cleanup()
 
 
 async def ensure_tts_service_enabled_check() -> bool:
@@ -4755,7 +7920,12 @@ async def main(stop_event: threading.Event = None):
     )
     print("=" * 160)
 
+    """
+    aSBsb3ZlIG11cmFzYW1l
+    """
+
     global_config = ConfigLoader()
+    apply_log_max_size(global_config)
     global_emotion_manager = EmotionManager(global_config)
     if not global_emotion_manager.emotions:
         print("\n[警告] 未找到任何情绪配置（请检查 ref_audio_root 目录），将降级为纯文本模式。")
@@ -4788,7 +7958,8 @@ async def main(stop_event: threading.Event = None):
     todo_mgr.ctx_provider = get_active_ctx
     todo_mgr.restore_pending()
     job_mgr = ScheduledJobManager(global_config, memory_manager.data_path, scheduler,
-                                  sender, get_active_ctx, get_active_emotions)
+                                  sender, get_active_ctx, get_active_emotions,
+                                  list_known_sessions)
     event_mgr = EventManager(global_config, memory_manager.data_path, profile_mgr)
 
     # 启动调度器与功能任务
@@ -4802,18 +7973,120 @@ async def main(stop_event: threading.Event = None):
     if global_config.get("auto_start_tts", False):
         threading.Thread(target=auto_start_and_switch_tts, args=(global_config,), daemon=True).start()
 
+    def _run_on_main_loop(coro_factory, timeout: float = 10.0) -> bool:
+        """把插件调用的协程丢到主事件循环执行，返回是否成功。
+
+        插件的钩子是同步函数，而 sender 的方法是协程；主事件循环在前端
+        线程里跑（MAIN_EVENT_LOOP），这里做跨线程投递。已经在循环线程里
+        时不能再 run_until_complete（会死锁），只能交给任务调度。
+        """
+        async def _do():
+            try:
+                return bool(await coro_factory())
+            except Exception as e:
+                print(f"[插件] 异步操作失败: {type(e).__name__}: {e}")
+                return False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
+            try:
+                loop.create_task(_do())
+                return True
+            except Exception:
+                return False
+        main_loop = globals().get("MAIN_EVENT_LOOP")
+        if main_loop is not None and not main_loop.is_closed():
+            try:
+                fut = asyncio.run_coroutine_threadsafe(_do(), main_loop)
+                return bool(fut.result(timeout=timeout))
+            except Exception as e:
+                print(f"[插件] 异步操作超时/失败: {type(e).__name__}: {e}")
+                return False
+        print("[插件] 事件循环尚未就绪，操作未执行")
+        return False
+
+    def plugin_send_text(session_type, target_id, text: str) -> bool:
+        """给插件用的同步发消息桥（支持群聊与私聊）。"""
+        try:
+            tid = int(target_id)
+        except (TypeError, ValueError):
+            return False
+        kind = "private" if str(session_type) == "private" else "group"
+        return _run_on_main_loop(
+            lambda: sender.send_text(kind, tid, str(text)))
+
+    def plugin_send_voice(session_type, target_id, text: str,
+                          emotion: str = "") -> bool:
+        """给插件用的同步发语音桥：复用主程序的 TTS 链路合成后发出。
+
+        情绪名无效时退回角色默认音色（synthesize_sentence 内部已有兜底），
+        合成失败只返回 False，插件自行决定是否降级为纯文本。
+        """
+        try:
+            tid = int(target_id)
+        except (TypeError, ValueError):
+            return False
+        kind = "private" if str(session_type) == "private" else "group"
+        emotions = get_active_emotions()
+        data_path = memory_manager.data_path
+
+        async def _do():
+            if not await ensure_tts_service(global_config):
+                return False
+            wav = await synthesize_sentence(global_config, str(text),
+                                            str(emotion or ""), emotions,
+                                            data_path, stats=stats_mgr)
+            if not wav:
+                return False
+            try:
+                ok = await sender.send_voice(kind, tid, wav)
+            finally:
+                try:
+                    Path(wav).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            return ok
+
+        return _run_on_main_loop(_do, timeout=120.0)
+
+    def plugin_send_message(group_id, text: str) -> bool:
+        """兼容旧签名：早期只有群聊，现在转发到通用桥。"""
+        return plugin_send_text("group", group_id, text)
+
     webui_server = None
     if HAS_AIOHTTP and global_config.get("webui_enabled", True):
         webui_server = WebUIServer(global_config, memory_manager)
+        _WEBUI_SERVER_HOLDER["server"] = webui_server
+        # 注入插件运行时：这时 sender 已就绪，插件才能真的发消息。
+        if global_config.get("plugins_enabled", True):
+            try:
+                from modules.plugin_runtime import PluginRuntime
+                _plugin_rt = PluginRuntime(
+                    webui_server.plugin_manager,
+                    logger=_plugin_log,
+                    config_getter=lambda: (global_config.config or {}),
+                    sender=plugin_send_text,
+                    voice_sender=plugin_send_voice,
+                    emotions_getter=get_active_emotions)
+                webui_server.attach_plugin_runtime(_plugin_rt)
+                _plugin_errors = _plugin_rt.load_all()
+                for _pid, _err in (_plugin_errors or {}).items():
+                    print(f"[插件] {_pid} 加载失败: {_err}")
+            except Exception as e:
+                print(f"[插件] 运行时初始化失败（插件功能不可用，主程序继续）：{e}")
+        else:
+            print("[插件] 插件系统已关闭（config: plugins_enabled=false）")
         try:
             await webui_server.start()
         except Exception as e:
             print(f"WebUI 启动异常，继续运行其他功能：{e}")
 
-    ws_url = global_config.get("napcat_ws_url", "ws://127.0.0.1:3001")
-    token = global_config.get("napcat_token", "")
 
-    print(f"正在连接 NapCat ({ws_url})...")
+    profiles = build_connection_profiles(global_config)
+    print("正在连接 NapCat：" + "；".join(
+        f"{p['label']}→{p['ws_url']}" for p in profiles))
 
     active_clients = []
 
@@ -4839,65 +8112,97 @@ async def main(stop_event: threading.Event = None):
 
     def _consume_task_result(task):
         try:
-            task.exception()
+            err = task.exception()
         except (asyncio.CancelledError, Exception):
-            pass
+            return
+        if err is None:
+            return
+        # 这里吞掉异常等于"机器人没反应"且一行日志都没有，排查时无从下手
+        print(f"[消息处理异常] {type(err).__name__}: {err}")
+        traceback.print_exception(type(err), err, err.__traceback__)
 
-    watcher = asyncio.create_task(_stop_watcher())
-
-    while True:
-        if stop_event is not None and stop_event.is_set():
-            print("收到停止信号，正在退出消息循环...")
-            break
-
-        try:
-            client = NapCatClient(ws_url=ws_url, token=token)
+    async def _run_profile(profile: dict):
+        """一条 NapCat 连接的重连循环。角色独占的连接只服务该角色。"""
+        label = profile["label"]
+        role_key = profile["role_key"]
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                return
+            client = NapCatClient(ws_url=profile["ws_url"], token=profile["token"])
             active_clients.append(client)
-            async with client:
-                sender.client = client  # 注入统一发送器，供消息回复与主动消息使用
-                print(f"已连接！机器人 QQ: {client.self_id}")
-                print("等待消息中...")
-                async for event in client:
-                    if stop_event is not None and stop_event.is_set():
-                        print("收到停止信号，正在退出消息循环...")
-                        break
-                    task = asyncio.create_task(handle_message_event(event, client))
-                    task.add_done_callback(_consume_task_result)
+            try:
+                async with client:
+                    if role_key:
+                        sender.set_role_client(role_key, client)
+                        ROLE_CONNECTIONS[id(client)] = role_key
+                    else:
+                        sender.client = client
+                    print(f"已连接！{label} QQ: {client.self_id}")
+                    print("等待消息中...")
+                    async for event in client:
+                        if stop_event is not None and stop_event.is_set():
+                            return
+                        task = asyncio.create_task(handle_message_event(event, client))
+                        task.add_done_callback(_consume_task_result)
                 # 连接被服务端正常关闭（非异常路径）：稍候重连，避免紧密循环
                 if stop_event is None or not stop_event.is_set():
-                    print("连接已断开，3秒后重连...")
+                    print(f"{label} 连接已断开，3秒后重连...")
                     await asyncio.sleep(3)
+            except Exception as e:
+                print(f"{label} NapCat 连接失败: {e}")
+                print("10秒后尝试重新连接...")
+                await asyncio.sleep(10)
+            finally:
+                if role_key:
+                    sender.set_role_client(role_key, None)
+                    ROLE_CONNECTIONS.pop(id(client), None)
+                elif sender.client is client:
+                    sender.client = None  # 避免主动消息/定时任务使用失效连接
+                try:
+                    active_clients.remove(client)
+                except ValueError:
+                    pass
 
-        except Exception as e:
-            print(f"NapCat 连接失败: {e}")
-            print("10秒后尝试重新连接...")
-            await asyncio.sleep(10)
-            continue
-        finally:
-            sender.client = None  # 连接断开后置空，避免主动消息/定时任务使用失效连接
-            try:
-                active_clients.remove(client)
-            except (ValueError, NameError):
-                pass
-
-    watcher.cancel()
+    watcher = asyncio.create_task(_stop_watcher())
+    tasks = [asyncio.create_task(_run_profile(p)) for p in profiles]
+    try:
+        await asyncio.gather(*tasks)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        watcher.cancel()
     print("正在关闭所有子进程...")
     save_proactive_state()
-    process_manager.shutdown_all()
-    await scheduler.stop()
+    # 关闭顺序按「先关网络服务、再断子进程、最后落盘」：
+    # WebUI 先停能立刻释放端口，用户看到的是窗口立刻消失，而不是等 TTS 收尾。
+    if webui_server:
+        try:
+            await webui_server.shutdown()
+        except Exception as e:
+            print(f"关闭 WebUI 失败（忽略）：{e}")
+        _WEBUI_SERVER_HOLDER["server"] = None
+    try:
+        await scheduler.stop()
+    except Exception as e:
+        print(f"停止调度器失败（忽略）：{e}")
+    # 子进程清理放到最后，且给一个明确预算：超时就交给 _force_quit 兜底，
+    # 不让 taskkill 的等待时间叠加到用户可感知的退出耗时上。
+    process_manager.shutdown_all(budget=3.0)
     if db is not None:
         db.close()
-    if webui_server:
-        await webui_server.shutdown()
 
 
 if __name__ == "__main__":
     import threading
     import time
 
+    # DPI 感知必须在这里声明：pywebview 创建窗口之后再调就无效了，
+    # 而它决定了 create_window 的尺寸会不会被系统二次缩放。
+    _ensure_dpi_aware()
+
     stop_event = threading.Event()
 
-    wait_pid = os.environ.pop("LTVM_WAIT_PID", "")
+    wait_pid = os.environ.pop("LOVOMO_WAIT_PID", "")
     if wait_pid:
         try:
             target_pid = int(wait_pid)
@@ -4911,13 +8216,16 @@ if __name__ == "__main__":
 
     def run_backend():
         try:
-            asyncio.run(main(stop_event))
+            # 记下主事件循环，供插件从同步钩子里回调发消息用
+            globals()["MAIN_EVENT_LOOP"] = asyncio.new_event_loop()
+            asyncio.set_event_loop(globals()["MAIN_EVENT_LOOP"])
+            globals()["MAIN_EVENT_LOOP"].run_until_complete(main(stop_event))
         except Exception as e:
             print(f"后台服务异常: {e}")
             import traceback
             traceback.print_exc()
             try:
-                with open("backend_error.log", "a", encoding="utf-8") as f:
+                with open(runtime_path("backend_error.log"), "a", encoding="utf-8") as f:
                     f.write(f"{time.ctime()} - 异常: {e}\n")
                     traceback.print_exc(file=f)
             except Exception:
@@ -4929,17 +8237,62 @@ if __name__ == "__main__":
     webui_port = int(config.get("webui_port", 11500))
 
     holder = {"window": None}
-    close_state = {"minimized": False}
+    close_state = {"minimized": False, "quitting": False}
     tray_state = {"icon": None}
+    # 唤醒（托盘/任务栏点开）期间暂停几何记录：这段窗口连续做
+    # show/maximize/move/resize，事件回调读到的都是过渡态。
+    _geometry_paused = [0]
+
+    def _wake_geometry_guard(seconds: float = 1.5):
+        """唤醒期间给几何记录加一个静默期，避免把过渡态写进记忆。"""
+        _geometry_paused[0] += 1
+
+        def _release():
+            time.sleep(max(0.0, seconds))
+            _geometry_paused[0] = max(0, _geometry_paused[0] - 1)
+
+        threading.Thread(target=_release, daemon=True).start()
 
     def open_console():
+        """托盘/任务栏「打开 Lovomo」：把窗口唤醒到前台，并保持上次的几何。
+
+        以前这里调 w.restore()，pywebview 会把「最大化时记录的全屏矩形」
+        按 DPI 缩放当成 Normal 矩形还原，窗口就跑到右下角去了。现在改成
+        读自己的几何记忆：该最大化就最大化，否则 move+resize 回原位。
+
+        另外 pywebview 的 show() 只做 Show+Activate，在 Windows 前台锁下会被
+        忽略 —— 表现就是「放到后台后点任务栏/托盘没反应」。
+
+        顺序上刻意把「抢前台」放在最后一步：_apply_saved_geometry 里的
+        maximize/move/resize 都会重新排布窗口并可能把前台交还给系统，
+        只有把它放在几何之后，最后一次抢前台的结果才会被保留下来。
+        """
         w = holder["window"]
-        if w is not None:
+        if w is None:
+            return
+        close_state["minimized"] = False
+        _wake_geometry_guard()
+        _raise_to_foreground(w)
+        try:
+            _apply_saved_geometry(w)
+        except Exception:
             try:
-                w.show()
                 w.restore()
             except Exception:
                 pass
+        # 几何应用后窗口可能被系统重新排列、甚至重新落到后台，
+        # 这里必须再抢一次前台，并以这次的结果为准。
+        _raise_to_foreground(w)
+        # 前台锁在个别时序下会连吞两次调用（例如从托盘还原时焦点还在
+        # 弹出菜单上）。补一次延迟重试，等菜单收起、系统空闲下来再抢一次，
+        # 这样「点开窗口仍压在别的窗口后面」的情况就基本消失了。
+        def _retry(win=w):
+            try:
+                time.sleep(0.12)
+                _raise_to_foreground(win)
+            except Exception:
+                pass
+        threading.Thread(target=_retry, daemon=True).start()
 
     def stop_tray_icon():
         icon = tray_state.get("icon")
@@ -4949,53 +8302,113 @@ if __name__ == "__main__":
             except Exception:
                 pass
 
-    def _force_quit(delay: float = 2.5):
+    def request_quit():
+        """真正的退出入口：任何"关掉程序"的路径都收敛到这里。
+
+        以前 tray 的「退出 Lovomo」直接调 quit_app()，而 quit_app 在销毁窗口时
+        又会触发一次 on_closing，两条路径各做一半清理，容易出现"清理跑了两遍
+        但都没跑完"的观感。现在统一：先立起 quitting 标记（on_closing 见到它
+        就直接放行、不再取消关闭），再走唯一的 quit_app()。
+        """
+        close_state["quitting"] = True
+        quit_app()
+
+    def _force_quit(delay: float = 1.2):
+        """硬退出兜底：到点直接 os._exit，不让任何一处阻塞拖住退出。
+
+        delay 是「留给优雅清理的时间」。清理本身已经改得快了，这里从原来的
+        2.5~3 秒压到 1.2 秒，用户几乎感觉不到等待。
+        """
         def _run():
+            time.sleep(max(0.0, delay))
             try:
-                process_manager.shutdown_all()  # 兜底：确保 TTS 子进程被杀
+                # 先立起"正在退出"：此后任何一处都不许再拉起新的子进程，
+                # 否则会留下"父进程已经没了、子进程还在跑"的独立进程。
+                mark_exiting()
+                process_manager.shutdown_all(budget=1.0)
             except Exception:
                 pass
-            time.sleep(max(0.0, delay))
             os._exit(0)
         threading.Thread(target=_run, daemon=True).start()
 
+    def _spawn_detached(args, env):
+        """无窗口地拉起子进程。
+
+        Windows 上从 GUI 进程 spawn python.exe（控制台版解释器）一定会弹一个
+        黑框；所以这里即使退回到 python.exe，也统一加 CREATE_NO_WINDOW +
+        SW_HIDE 双保险，保证退出/重启时不再闪出 CMD 窗口。
+        """
+        import subprocess
+        kwargs = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = (subprocess.CREATE_NO_WINDOW
+                                       | getattr(subprocess, "DETACHED_PROCESS", 0))
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = 0  # SW_HIDE
+            kwargs["startupinfo"] = si
+        subprocess.Popen(args, env=env, close_fds=True, **kwargs)
+
+    def _resolve_spawn_exe() -> tuple:
+        """挑一个不会弹控制台窗口的解释器来重启。
+
+        优先 pythonw.exe（无控制台子系统）；找不到才退回 python.exe，
+        但那时 _spawn_detached 会补上 CREATE_NO_WINDOW，同样不会闪窗。
+        冻结成 exe 后直接用自身。
+        """
+        if getattr(sys, "frozen", False):
+            return sys.executable, []
+        exe = sys.executable
+        if os.name == "nt":
+            for name in ("pythonw.exe", "pythonw"):
+                cand = Path(exe).with_name(name)
+                if cand.exists():
+                    exe = str(cand)
+                    break
+        args = [exe, str(Path(sys.argv[0]).resolve())]
+        return args[0], args[1:]
+
     def relaunch_console():
+        close_state["quitting"] = True
         stop_tray_icon()
         w = holder["window"]
         if w is not None:
+            _capture_geometry(w)
+            _finalize_geometry(w)
+            _finish_geometry_save()
             try:
                 w.destroy()
             except Exception:
                 pass
         try:
-            import subprocess
-            exe = sys.executable
-            if not getattr(sys, "frozen", False) and os.name == "nt":
-                pyw = str(Path(sys.executable).with_name("pythonw.exe"))
-                if os.path.exists(pyw):
-                    exe = pyw
-            args = [exe]
-            if not getattr(sys, "frozen", False):
-                args.append(str(Path(sys.argv[0]).resolve()))
+            exe, extra = _resolve_spawn_exe()
             env = dict(os.environ)
-            env["LTVM_WAIT_PID"] = str(os.getpid())
-            creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-            subprocess.Popen(args, env=env, close_fds=False,
-                             creationflags=creationflags)
+            env["LOVOMO_WAIT_PID"] = str(os.getpid())
+            _spawn_detached([exe, *extra], env)
             print("已安排重启：新实例将等待本进程完全退出后启动，避免端口占用/重复进程。")
         except Exception as e:
-            print(f"重启 LTVM 控制台失败: {e}")
+            print(f"重启 Lovomo 控制台失败: {e}")
         stop_event.set()
-        _force_quit(3.0)
+        _force_quit(1.5)
 
     def quit_app():
+        # 立起 quitting：此后 on_closing 一律放行，destroy 才能真正关掉窗口。
+        close_state["quitting"] = True
         stop_event.set()
         # 先启动硬退出计时：托盘线程里调用窗口销毁可能阻塞数秒，
         # 计时器必须先跑起来，退出耗时才不受销毁速度影响。
-        _force_quit(2.5)
+        _force_quit(1.2)
         stop_tray_icon()
+        # 先把窗口过程还原再销毁窗口，避免退出过程中回调悬空触发异常
+        try:
+            _uninstall_taskbar_activate_hook()
+        except Exception:
+            pass
         w = holder["window"]
         if w is not None:
+            _capture_geometry(w)
+            _finalize_geometry(w)
+            _finish_geometry_save()
             try:
                 w.destroy()
             except Exception:
@@ -5014,17 +8427,17 @@ if __name__ == "__main__":
                 img = Image.new("RGBA", (64, 64), (30, 136, 229, 255))
                 try:
                     from PIL import ImageDraw
-                    ImageDraw.Draw(img).text((14, 22), "LTVM", fill="white")
+                    ImageDraw.Draw(img).text((8, 22), "Lovomo", fill="white")
                 except Exception:
                     pass
 
             icon = pystray.Icon(
-                "ltvm", img, "LTVM 控制台",
+                "lovomo", img, "Lovomo",
                 menu=pystray.Menu(
-                    pystray.MenuItem("打开 LTVM", lambda i, item: open_console(),
+                    pystray.MenuItem("打开 Lovomo", lambda i, item: open_console(),
                                      default=True),
-                    pystray.MenuItem("重启 LTVM", lambda i, item: relaunch_console()),
-                    pystray.MenuItem("退出 LTVM", lambda i, item: quit_app()),
+                    pystray.MenuItem("重启 Lovomo", lambda i, item: relaunch_console()),
+                    pystray.MenuItem("退出 Lovomo", lambda i, item: request_quit()),
                 ),
             )
             tray_state["icon"] = icon
@@ -5037,14 +8450,36 @@ if __name__ == "__main__":
     tray_ok = try_start_tray()
 
     def on_closing():
+        """窗口关闭事件的唯一入口。
+
+        这里必须能区分「用户主动要关掉程序」和「窗口被别人关了一下」——
+        两种情况在 on_closing 里长得一模一样，只能靠状态区分：
+
+        · 已经在退出流程里（close_state["quitting"]，由 request_quit 立起，
+          或 quit_app/relaunch_console 自己 destroy 窗口触发）：直接返回 None
+          放行，让关闭真的发生。**这里返回 False 是非常危险的** ——
+          pywebview 的 Event.set() 只要收到一个 False 就判定取消关闭，
+          于是"销毁窗口"变成"什么都没发生"，进程卡住不退出。
+        · 用户点右上角 ×：按产品约定不是退出，而是最小化到任务栏。
+          返回 False 取消这次关闭，由我们手工 minimize()。
+
+        为什么必须最小化而不是 pywebview 的 hide()：WinForms 的 Form.Hide()
+        会把窗口从任务栏一并摘掉（ShowInTaskbar 视觉上等于 False），于是
+        "点任务栏图标把窗口叫回来"这条路径根本不存在，用户只能想起来点托盘
+        —— 这是"任务栏点不开窗口"的第一层原因。minimize() 则保留任务栏图标。
+
+        退出本身一律走 request_quit()（托盘菜单）或 quit_app()，它们在
+        destroy 之前会先把 quitting 立起来，所以不会在这里被拦下。
+        """
+        if close_state.get("quitting"):
+            return None
         w = holder["window"]
-        if tray_ok and w is not None:
-            try:
-                w.hide()
-            except Exception:
-                pass
-            return False
+        # 窗口一旦 hide/destroy 就读不到几何了，先抓一次再动手。
+        if w is not None:
+            _capture_geometry(w)
+            _finalize_geometry(w)
         if close_state.get("minimized"):
+            # 已经在最小化了，不要再反复 minimize（会打断还原动画）
             return None
         if w is not None:
             try:
@@ -5052,21 +8487,220 @@ if __name__ == "__main__":
                 close_state["minimized"] = True
             except Exception:
                 pass
+            try:
+                _finish_geometry_save()
+            except Exception:
+                pass
         return False
+
+    def _finalize_geometry(w) -> None:
+        """退出前的最终校准，再落盘。
+
+        只做一件事：把「当前是不是最大化」记准。Normal 矩形一律不在这里读，
+        理由见 _capture_geometry 的注释 —— 最大化退出时 rcNormalPosition 给的
+        是全屏矩形，读它只会污染记忆。
+        """
+        if w is None:
+            return
+        try:
+            cmd = _show_state(_window_hwnd(w))
+            if cmd == 3:
+                _WINDOW_GEOMETRY["maximized"] = True
+            elif cmd == 1:
+                # 真正处于 Normal 状态，此时读到的矩形才是可信的 Normal
+                rect = _window_rect(w)
+                if rect and not _rect_is_degenerate(rect):
+                    _WINDOW_GEOMETRY["maximized"] = False
+                    _WINDOW_GEOMETRY["normal"] = rect
+            # cmd == 2（最小化退出）：什么都不改，保留之前记下的值
+        except Exception:
+            pass
+
+    def _capture_geometry(w, force: bool = False) -> None:
+        """把窗口当前的位置/大小/最大化状态记到内存（落盘由定时器去抖）。
+
+        核心原则：**Normal 矩形只在窗口真的处于 Normal 状态时才记录。**
+        最大化/最小化时一律只更新 maximized 标记，不碰 normal 字段。
+
+        这条原则来之不易，踩过两个坑：
+        · 用 pywebview 的 window.state 判断最大化 —— 它返回 State(dict)，
+          str() 是 "{}"，判断永远为 False，于是最大化被记成了 Normal，
+          存下 2582x1390 这种全屏尺寸（150% 缩放下超出 2560 屏幕宽）。
+        · 改用 GetWindowPlacement 的 rcNormalPosition 想「最大化时也能拿到
+          Normal 矩形」—— 实测发现：窗口以 maximized=True 创建时，
+          Windows 根本没设置 rcNormalPosition，它返回的就是全屏矩形
+          （实测请求 2048x1152 却读到 2586x1466 = 屏幕+边框）。
+          照着记同样会污染。
+
+        所以现在的策略很朴素：只有 Normal 状态下读到的 GetWindowRect 才可信。
+        用户从 Normal 切到最大化时，normal 字段保持上一次 Normal 时的值不变
+        —— 这正是我们想要的行为。
+        """
+        if w is None:
+            return
+        try:
+            state = _window_state_name(w)
+            if not state:
+                # 原生拿不到 HWND（极早期/异常后端）就退回 pywebview 属性
+                return _capture_geometry_fallback(w)
+            if state == "maximized":
+                _WINDOW_GEOMETRY["maximized"] = True
+            elif state == "minimized":
+                # 最小化不动任何几何：GetWindowRect 是 (-32000,-32000)，
+                # rcNormalPosition 又不可靠，保留旧值最安全。
+                pass
+            else:
+                rect = _window_rect(w)
+                if rect and not _rect_is_degenerate(rect):
+                    _WINDOW_GEOMETRY["maximized"] = False
+                    _WINDOW_GEOMETRY["normal"] = rect
+        except Exception:
+            return
+        _schedule_geometry_save(0.4 if force else 1.2)
+
+    def _capture_geometry_fallback(w) -> None:
+        """pywebview 属性兜底路径（拿不到 HWND 时才会走到，例如非 Windows）。
+
+        pywebview 读出来的是逻辑像素，统一乘 scale 转成物理像素再存，
+        保证落盘的口径始终一致。
+
+        这里**不能**用 w.state 判断最大化：pywebview 的 state 是 State(dict)，
+        str() 是 "{}"，永远不等于 "maximized"，会把最大化误判成 Normal、
+        把全屏尺寸存下来。拿不到原生 HWND 时就保守处理：只更新 Normal 矩形，
+        不动 maximized 标记（保留上次的结论），宁可不更新也不写错。
+        """
+        try:
+            scale = _window_scale(w)
+            x = getattr(w, "x", None)
+            y = getattr(w, "y", None)
+            width = getattr(w, "width", None)
+            height = getattr(w, "height", None)
+            if not width or not height:
+                return
+            rect = {
+                "x": _logical_to_phys(x, scale) if x is not None else None,
+                "y": _logical_to_phys(y, scale) if y is not None else None,
+                "width": _logical_to_phys(width, scale),
+                "height": _logical_to_phys(height, scale),
+            }
+            if _rect_is_degenerate(rect):
+                return
+            _WINDOW_GEOMETRY["normal"] = rect
+        except Exception:
+            return
+        _schedule_geometry_save(1.2)
+
+    def _bind_geometry_events(w) -> None:
+        """监听窗口变化，持续更新几何记忆。
+
+        最大化/还原这些事件在 winforms 后端上不一定带尺寸，而且还原动画期间
+        GetWindowRect 读到的是中间态，所以统一延迟一点再读；读的是
+        rcNormalPosition，不受动画影响。
+
+        启动阶段（窗口还没定型）的事件一律忽略：那时候读到的往往是
+        MinimumSize 或者动画中间态，记下来就是把垃圾写进记忆。
+
+        唤醒期间（托盘/任务栏点开）同样忽略：open_console 会连续做
+        show/maximize/move/resize，这些动作触发的事件读到的是过渡态，
+        照记会把"最大化时的全屏矩形"当成 Normal 存下来，下次启动位置就漂了。
+        """
+        # 启动后 5 秒内不记录。窗口初始化 + 最大化动画 + 页面首屏都在这段
+        # 时间里发生，几何值还没稳定。
+        started = time.time()
+        startup_grace = 5.0
+
+        def _later(*_args, **_kwargs):
+            time.sleep(0.2)
+            if time.time() - started < startup_grace:
+                return
+            if _geometry_paused[0] > 0:
+                return
+            _capture_geometry(w)
+
+        for evt_name in ("resized", "moved", "maximized", "restored", "shown"):
+            try:
+                getattr(w.events, evt_name).__iadd__(_later)
+            except Exception:
+                pass
 
     def run_webview_loop():
         import webview
+        geom = _load_window_geometry()
+        normal = _sanitize_normal_geometry(geom.get("normal") or {})
+        scale = _window_scale()
+        to_logical = _phys_to_logical
+        # ---- 尺寸计算全程在「逻辑像素」域里做，最后才交给 create_window ----
+        # 混用物理/逻辑是这个 bug 的老毛病，这里刻意把两个域的边界划清楚：
+        # 屏幕尺寸是物理的，先换算成逻辑上限；候选尺寸也是逻辑的，直接比。
+        _fb = _default_normal_geometry()
+        start_w = to_logical(int(normal.get("width") or _fb["width"]), scale)
+        start_h = to_logical(int(normal.get("height") or _fb["height"]), scale)
+        start_x = normal.get("x")
+        start_y = normal.get("y")
+
+        sw, sh = _primary_screen_size()
+        if sw > 0 and sh > 0:
+            # 窗口再大也不该超过屏幕的 92%（留出标题栏和任务栏的余量）
+            max_w = to_logical(int(sw * 0.92), scale)
+            max_h = to_logical(int(sh * 0.92), scale)
+            start_w = max(400, min(start_w, max_w))
+            start_h = max(300, min(start_h, max_h))
+        else:
+            start_w = max(400, start_w)
+            start_h = max(300, start_h)
+
+        kwargs = {
+            "width": start_w, "height": start_h,
+            "resizable": True, "maximized": bool(geom.get("maximized")),
+        }
+        # 只在记忆的坐标仍落在当前屏幕内时才传给 create_window；
+        # 否则交给系统居中，避免窗口开在屏幕外看不见。
+        if (not geom.get("maximized") and start_x is not None
+                and start_y is not None and _is_geometry_valid(normal)):
+            kwargs["x"] = to_logical(int(start_x), scale)
+            kwargs["y"] = to_logical(int(start_y), scale)
         holder["window"] = webview.create_window(
-            'LTVM 控制台',
+            'Lovomo',
             f'http://127.0.0.1:{webui_port}',
-            width=1920, height=1080,
-            resizable=True, maximized=True)
+            **kwargs)
         w = holder["window"]
         _WEBVIEW_WINDOW_HOLDER["window"] = w
         try:
             w.events.closing += on_closing
         except Exception as e:
             print(f"绑定窗口关闭事件失败，关闭将直接退出: {e}")
+        _bind_geometry_events(w)
+
+        def _install_foreground_hook(*_args, **_kwargs):
+            """窗口首次显示后装任务栏唤醒钩子。
+
+            放在 shown 之后是因为此刻 HWND 才真正有效（create_window 返回时
+            WinForms 窗体可能还没建好原生句柄）。装钩子本身很轻，失败也只是
+            退化成"任务栏还原不抢前台"，不影响程序其余部分。
+            """
+            def _do():
+                time.sleep(0.3)
+                ok = _install_taskbar_activate_hook(
+                    w, on_activate=lambda win: open_console())
+                if ok:
+                    print("[窗口] 已启用任务栏唤醒置顶")
+            threading.Thread(target=_do, daemon=True).start()
+
+        try:
+            w.events.shown += _install_foreground_hook
+        except Exception as e:
+            print(f"绑定窗口显示事件失败（任务栏唤醒钩子未安装）: {e}")
+        # 这里刻意不做启动后再 apply 几何的操作。
+        #
+        # 曾经加过一个 events.loaded + Timer(0.6) 的兜底，想把历史脏几何纠正
+        # 回来，结果制造了更严重的 bug：定时器在窗口还没初始化完成时触发，
+        # 此时 GetWindowRect 拿到的是 MinimumSize(200x100)，_apply_saved_geometry
+        # 就照着 200x100 去 resize，窗口被压成一个 200x100 的小方块，玩家还会
+
+        #
+        # 正确策略：几何只在 create_window 时决定一次（上面已经算好了正确值），
+        # 之后只「观察」不「干预」。历史脏数据由 _load_window_geometry 的版本
+        # 校验和 _sanitize_normal_geometry 负责清理，不需要事后补救。
         webview.start()
         icon = tray_state.get("icon")
         if icon is not None:
@@ -5087,6 +8721,7 @@ if __name__ == "__main__":
     finally:
         print("正在停止后台服务...")
         stop_event.set()
-        backend_thread.join(timeout=3)
-        process_manager.shutdown_all()
+        mark_exiting()
+        backend_thread.join(timeout=1.5)
+        process_manager.shutdown_all(budget=1.5)
         print("程序已完全退出。")

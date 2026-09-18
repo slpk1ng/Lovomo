@@ -1,6 +1,8 @@
 """TTS 合成与音频处理工具（自 main.py 迁出，供主流程与主动消息共用）。"""
 import asyncio
 import re
+import sys
+import threading
 import time
 import wave
 from pathlib import Path
@@ -100,6 +102,24 @@ _TTS_CHAR_MAP = {
 _LEADING_JUNK_RE = re.compile(r'^(?:[\s\u3000。，、,.!?！？…～~；;：:\-—―_*#]+)')
 _TRAILING_WS_RE = re.compile(r'[\s\u3000]+$')
 
+# 3) 语气拖音标记：全角波浪线（含归一化后的 — ― – 〜）与片假名长音符「ー」。
+#    连续 3 个以上一律压到 2 个。模型写「————————」时上面那条映射会把它变成
+#    十几个 ～ 送进合成，引擎会把这一串当成一个超长元音，直接进入
+#    "同一个音节无限重复"的失控状态（表现为一句台词末尾拖着几十秒的「に」「呜」）。
+_TONE_MARK_KEEP = 2
+_TONE_MARK_RUN_RE = re.compile(r'([\uff5e\u301c\u30fc])\1{2,}')
+
+
+def _collapse_tone_marks(text: str, log: bool = True) -> str:
+    """把连续的拖音标记压到 _TONE_MARK_KEEP 个（只缩短，不删内容）。"""
+    collapsed = _TONE_MARK_RUN_RE.sub(
+        lambda m: m.group(1) * _TONE_MARK_KEEP, text)
+    if collapsed != text and log:
+        hit = _TONE_MARK_RUN_RE.search(text)
+        _safe_print(f"TTS 拖音标记压缩: {hit.group(0)!r} → "
+                    f"{hit.group(1) * _TONE_MARK_KEEP!r}（长串拖音会让合成引擎失控拖腔）")
+    return collapsed
+
 
 def _normalize_tts_chars(text: str, extra_map: dict = None) -> str:
     """按映射表归一化字符；extra_map 来自配置，可覆盖/扩展默认映射。"""
@@ -143,7 +163,9 @@ def _safe_print(message: str):
         print(message)
     except UnicodeEncodeError:
         try:
-            print(message.encode("utf-8", "replace").decode("utf-8", "replace"))
+            encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+            data = str(message).encode(encoding, "replace")
+            print(data.decode(encoding, "replace"))
         except Exception:
             pass
     except Exception:
@@ -235,6 +257,7 @@ def _sanitize_tts_text(text: str, emotion: str = "", log: bool = True,
     mapped = _normalize_tts_chars(original, extra_map)
     if mapped != original and log:
         _safe_print(f"TTS 标点归一化: {_mapping_changes(original, extra_map)}")
+    mapped = _collapse_tone_marks(mapped, log=log)
     cleaned = "".join(_TTS_ALLOWED_RE.findall(mapped))
     if cleaned != mapped:
         dropped = "".join(sorted(set(mapped) - set(cleaned)))
@@ -331,6 +354,22 @@ def _min_expected_seconds(text: str, config) -> float:
     return max(0.3, _readable_chars(text) * per_char)
 
 
+# 时长上限的绝对下限：短句（大量停顿标点、结巴式重复）本身字数少，
+# 只按字数算上限会把正常音频误判成失控。
+_MAX_SECONDS_FLOOR = 6.0
+
+
+def _max_expected_seconds(text: str, config) -> float:
+    """这条台词的合成时长上限；0 表示不做上限判断。"""
+    try:
+        per_char = float(config.get("tts_max_seconds_per_char", 0.6) or 0)
+    except (TypeError, ValueError, AttributeError):
+        per_char = 0.6
+    if per_char <= 0:
+        return 0.0
+    return max(_MAX_SECONDS_FLOOR, _readable_chars(text) * per_char)
+
+
 def _wav_duration(path) -> float:
     try:
         with wave.open(str(path), "rb") as wf:
@@ -341,6 +380,42 @@ def _wav_duration(path) -> float:
     except Exception:
         return 0.0
     return 0.0
+
+
+_AUDIO_CONTAINER_MAGIC = (b"RIFF", b"OggS", b"fLaC", b"ID3", b"FORM", b"ADIF")
+
+
+def _looks_like_audio(path) -> bool:
+    """文件头是已知音频容器时才认，避免把服务端报错页当语音发给发送层。"""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(12)
+    except Exception:
+        return False
+    if len(head) < 2:
+        return False
+    if head.startswith(_AUDIO_CONTAINER_MAGIC):
+        return True
+    return head[0] == 0xFF and (head[1] & 0xE0) == 0xE0
+
+
+def _audio_too_long(path, text: str, config) -> bool:
+    """合成时长远超台词本身的合理上限。
+
+    事故背景：自回归 TTS 偶发进入"同一个音节无限重复"的失控状态，
+    一句 30 多字的台词能合成出 27 秒的拖腔（末尾全是「に」「呜」）。
+    音频本身是合法 wav，只能靠时长与台词的量级关系认出来 —— 这种结果
+    必须丢弃并换切分方式重试，绝不能当成功语音发出去。
+    """
+    limit = _max_expected_seconds(text, config)
+    if limit <= 0:
+        return False
+    duration = _wav_duration(path)
+    if duration <= limit:
+        return False
+    _safe_print(f"TTS 合成时长异常偏长（{duration:.1f}s > 上限 {limit:.1f}s，"
+                f"台词 {_readable_chars(text)} 字），疑似拖腔/复读，本段作废")
+    return True
 
 
 def _audio_too_short(path, text: str, config) -> bool:
@@ -366,7 +441,7 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
     模型合成出无法辨认的语音；合成结果过短时按备用切分方式重试，
     仍然拿不到可用音频就返回 None（调用方只发文本），绝不把半截语音发出去。
     """
-    if not isinstance(emotion, str) or isinstance(text, (dict, list)):
+    if isinstance(text, (dict, list)) or isinstance(emotion, (dict, list)):
         _safe_print("TTS arg order looks swapped (text/emotion); auto-corrected.")
         text, emotion = emotion, text
     text = str(text or "")
@@ -470,7 +545,8 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
                 temp_path = data_path / f"temp_{emotion}_{_unique_stamp()}.wav"
                 temp_path.write_bytes(resp.content)
                 duration = _wav_duration(temp_path)
-                if not _audio_too_short(temp_path, clean_text, config):
+                too_long = _audio_too_long(temp_path, clean_text, config)
+                if not too_long and not _audio_too_short(temp_path, clean_text, config):
                     if stats:
                         stats.record_tts((time.time() - start) * 1000)
                     print(f"合成完成: {emotion} | {clean_text[:30]}...")
@@ -484,6 +560,11 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
                     else:
                         temp_path.unlink(missing_ok=True)
                     print("TTS 返回的内容不是可解析的音频，换一种切分方式重试。")
+                elif too_long:
+                    # 偏长的一律不进 best_path：宁可这句不发语音，
+                    # 也不能把几十秒的拖腔当成"最长的一段"挑出来发出去
+                    temp_path.unlink(missing_ok=True)
+                    print("本次合成作废，换一种切分方式重试。")
                 elif duration > best_duration:
                     if best_path is not None:
                         best_path.unlink(missing_ok=True)
@@ -512,15 +593,19 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
             stats.record_tts((time.time() - start) * 1000)
         return best_path
     if raw_path is not None:
-        _safe_print("TTS 返回的内容不是可解析的音频，仍原样交给发送层处理。")
-        if stats:
-            stats.record_tts((time.time() - start) * 1000)
-        return raw_path
+        if _looks_like_audio(raw_path):
+            _safe_print("TTS 返回的不是 wav 容器（如 mp3/ogg），无法按时长校验，原样交给发送层。")
+            if stats:
+                stats.record_tts((time.time() - start) * 1000)
+            return raw_path
+        raw_path.unlink(missing_ok=True)
+        _safe_print("TTS 返回的内容不是音频（多为服务端报错页），已丢弃，本句改为只发文本。")
     print(f"TTS 合成失败: 未能得到可用音频 | 文本={clean_text[:60]}")
     return None
 
 
 _STAMP_SEQ = 0
+_STAMP_LOCK = threading.Lock()
 
 
 def _unique_stamp() -> int:
@@ -528,14 +613,16 @@ def _unique_stamp() -> int:
 
     事故背景：合并与合成都用 `int(time.time()*1000)` 命名，同一毫秒内连续两次
     调用会拿到同样的文件名，后一次直接覆盖前一次 —— 表现为"刚合成的语音内容
-    对不上/被截断"。加一个进程内自增序号即可根治。
+    对不上/被截断"。加一个进程内自增序号即可根治；序号是读-改-写，
+    多线程（合成线程与缓存清理线程）并发时会读到同一个值，因此必须持锁。
     """
     global _STAMP_SEQ
-    now = int(time.time() * 1000)
-    if now <= _STAMP_SEQ:
-        now = _STAMP_SEQ + 1
-    _STAMP_SEQ = now
-    return now
+    with _STAMP_LOCK:
+        now = int(time.time() * 1000)
+        if now <= _STAMP_SEQ:
+            now = _STAMP_SEQ + 1
+        _STAMP_SEQ = now
+        return now
 
 
 def simple_concat_wavs(wav_paths: list, data_path: Path) -> Optional[Path]:
@@ -576,7 +663,8 @@ def _trim_silence(audio, channels: int, lead: bool = False, trail: bool = False,
     """
     if audio is None or len(audio) == 0:
         return audio
-    mono = audio.max(axis=1) if channels > 1 else audio[:, 0] if audio.ndim > 1 else audio
+    mono = np.abs(audio.astype(np.int64)).max(axis=1) if channels > 1 \
+        else audio[:, 0] if audio.ndim > 1 else audio
     loud = np.abs(np.asarray(mono, dtype=np.int64)) > _SILENCE_LEVEL
     loud = np.ravel(loud)
     if not loud.any():
@@ -624,6 +712,9 @@ def merge_wavs(wav_paths: list, config, data_path: Path,
             all_frames = wf.readframes(wf.getnframes())
         if not sample_rate or not n_channels:
             return simple_concat_wavs(wav_paths, data_path)
+        if sampwidth != 2:
+            print(f"音频位深为 {sampwidth * 8} bit，非 16 bit PCM，改用无损直接拼接。")
+            return simple_concat_wavs(wav_paths, data_path)
         try:
             breathing_gap_samples = max(0, int(
                 sample_rate * float(config.get("breathing_gap_ms", 100)) / 1000))
@@ -634,8 +725,9 @@ def merge_wavs(wav_paths: list, config, data_path: Path,
         all_audio = _trim_silence(all_audio, n_channels, trail=True, sample_rate=sample_rate)
         for i in range(1, len(wav_paths)):
             with wave.open(str(wav_paths[i]), 'rb') as wf:
-                if wf.getframerate() != sample_rate or wf.getnchannels() != n_channels:
-                    print("检测到采样率/声道数不一致的音频，已跳过该段以免合并错乱。")
+                if wf.getframerate() != sample_rate or wf.getnchannels() != n_channels \
+                        or wf.getsampwidth() != sampwidth:
+                    print("检测到采样率/声道数/位深不一致的音频，已跳过该段以免合并错乱。")
                     continue
                 frames = wf.readframes(wf.getnframes())
             audio = np.frombuffer(frames, dtype=np.int16).copy().reshape(-1, n_channels)
@@ -648,21 +740,18 @@ def merge_wavs(wav_paths: list, config, data_path: Path,
                     (all_audio,
                      np.zeros((breathing_gap_samples, n_channels), dtype=np.int16)),
                     axis=0)
-            if crossfade_samples > 0:
-                # 只在「末尾静音 + 开头静音」这段重叠区做渐变，
-                # 其余音频原样保留 → 重叠多少都不丢内容
-                head = all_audio[:-2 * crossfade_samples]
-                fade_out = all_audio[-2 * crossfade_samples:]
-            else:
-                head, fade_out = all_audio, all_audio[:0]
-            ov = min(crossfade_samples, len(head), len(fade_out), len(audio))
+            # 等长交叉淡化：重叠区取「上一段尾部 ov」与「下一段头部 ov」等长混合，
+            # 输出长度 = 上段 + 下段 - ov，任何一帧都不会被丢下
+            ov = min(crossfade_samples, len(all_audio), len(audio))
             if getattr(config, "_debug_merge", False):
-                print(f"[merge] i={i} acc={len(all_audio)} head={len(head)} "
-                      f"fo={len(fade_out)} audio={len(audio)} cs={crossfade_samples} ov={ov}")
+                print(f"[merge] i={i} acc={len(all_audio)} audio={len(audio)} "
+                      f"cs={crossfade_samples} ov={ov}")
             if ov <= 0:
                 all_audio = np.concatenate((all_audio, audio), axis=0)
                 continue
-            seg_out = fade_out[-ov:].astype(np.float32)
+            head = all_audio[:-ov]
+            tail = all_audio[-ov:]
+            seg_out = tail.astype(np.float32)
             seg_in = audio[:ov].astype(np.float32)
             gradient = ((1 - np.cos(np.linspace(0, np.pi, ov))) / 2).reshape(-1, 1)
             mixed = (seg_out * (1.0 - gradient) + seg_in * gradient).astype(np.int16)

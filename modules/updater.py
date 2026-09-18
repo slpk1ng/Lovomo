@@ -1,7 +1,7 @@
 import re
 from typing import Tuple
 
-APP_VERSION = "1.2.0.0-beta"
+APP_VERSION = "1.2.0.0"
 
 _VERSION_RE = re.compile(
     r"^[vV]?\s*([0-9]+(?:\.[0-9]+)*)\s*(?:[-_+.\s]+(.*))?$", re.S)

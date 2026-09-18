@@ -576,7 +576,8 @@ class TodoManager:
 
     # ---------------- 增删查 ----------------
     def add_todo(self, content: str, remind_ts: float, session_type: str,
-                 session_id: str, user_id: str = "", source: str = "auto") -> Optional[dict]:
+                 session_id: str, user_id: str = "", source: str = "auto",
+                 use_voice: bool = None) -> Optional[dict]:
         content = str(content or "").strip()
         if todo_content_is_meaningless(content):
             # 最后一道闸：任何来源（正则/LLM/WebUI）都不许把"再提醒我"这类空指令入库，
@@ -586,11 +587,13 @@ class TodoManager:
         try:
             cur = self.db.execute(
                 "INSERT INTO todos (created_at, session_type, session_id, user_id, content,"
-                " remind_time, status, source) VALUES (?,?,?,?,?,?,?,?)",
+                " remind_time, status, source, use_voice) VALUES (?,?,?,?,?,?,?,?,?)",
                 (time.time(), session_type, str(session_id), str(user_id), content,
-                 remind_ts, "pending", source))
+                 remind_ts, "pending", source,
+                 None if use_voice is None else (1 if use_voice else 0)))
             todo_id = cur.lastrowid
-            self._schedule(todo_id, content, remind_ts, session_type, session_id)
+            self._schedule(todo_id, content, remind_ts, session_type, session_id,
+                           use_voice=use_voice)
             print(f"[待办提醒] 已创建 #{todo_id}（来源 {source}）：{content!r} → "
                   f"触发时刻 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(remind_ts))}，"
                   f"会话 {session_type}_{session_id}")
@@ -600,15 +603,17 @@ class TodoManager:
             return None
 
     def _schedule(self, todo_id: int, content: str, remind_ts: float,
-                  session_type: str, session_id: str):
+                  session_type: str, session_id: str, use_voice: bool = None):
         async def _remind(todo_id=todo_id, content=content,
-                          session_type=session_type, session_id=session_id):
-            await self.fire_reminder(todo_id, content, session_type, session_id)
+                          session_type=session_type, session_id=session_id,
+                          use_voice=use_voice):
+            await self.fire_reminder(todo_id, content, session_type, session_id,
+                                     use_voice=use_voice)
         self.scheduler.add_job(f"todo_{todo_id}", f"待办提醒: {content[:16]}",
                                {"type": "oneshot", "at": remind_ts}, _remind)
 
     async def fire_reminder(self, todo_id: int, content: str, session_type: str,
-                            session_id: str, emotion: str = ""):
+                            session_id: str, emotion: str = "", use_voice: bool = None):
         print(f"[待办提醒] 触发 #{todo_id}：{content!r}（提醒模式：{self._remind_mode()}）")
         template = str(self.config.get("todo_remind_template", "") or "⏰ 提醒时间到啦：{content}")
         preset_message = template.replace("{content}", content)
@@ -637,9 +642,11 @@ class TodoManager:
             self.db.execute("UPDATE todos SET status='done' WHERE id=?", (todo_id,))
             return
         emotions = self.emotions_provider() if self.emotions_provider else {}
+        if use_voice is None:
+            use_voice = bool(self.config.get("todo_voice", False))
         try:
             await self.sender.speak_and_send(session_type, session_id, message, emotions, ctx,
-                                             use_voice=bool(self.config.get("todo_voice", False)),
+                                             use_voice=bool(use_voice),
                                              emotion=emotion or str(self.config.get("todo_voice_emotion", "")
                                                                     or "pingjing"))
             self.db.execute("UPDATE todos SET status='done' WHERE id=?", (todo_id,))
@@ -688,7 +695,9 @@ class TodoManager:
                     self.db.execute("UPDATE todos SET status='missed' WHERE id=?", (row["id"],))
                     continue
                 self._schedule(row["id"], row["content"], remind_ts,
-                               row.get("session_type", "private"), row.get("session_id", ""))
+                               row.get("session_type", "private"), row.get("session_id", ""),
+                               use_voice=(None if row.get("use_voice") is None
+                                          else bool(row.get("use_voice"))))
             if rows:
                 print(f"已恢复 {len(rows)} 条待办提醒调度。")
         except Exception as e:

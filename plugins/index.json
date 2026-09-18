@@ -1,0 +1,36 @@
+{
+  "$comment": [
+    "Lovomo 插件市场的**兜底**索引文件。",
+    "官方市场以「分支」为主数据源：仓库里名字以 lovomo_plugin 开头的分支",
+    "会被当成插件列出来（一条分支 = 一个插件，plugin.yaml 放分支根目录）。",
+    "只有当分支扫描一个插件都没扫到时，官方市场才回来读这个文件，",
+    "所以它是给「自建市场」或「还没用分支上架」的人兜底用的；",
+    "第三方市场（plugin_market_thirdparty）只扫分支，不读这份索引。",
+    "把插件包（.zip）上传到本仓库后，把 download 改成它的直链即可上架。",
+    "download 建议用 release 附件或 raw 链接，例如：",
+    "  https://github.com/slpk1ng/Lovomo/raw/main/plugins/packages/<文件名>.zip",
+    "必填：id / name / version / download。",
+    "建议填：source_repo（本插件所在仓库，格式 用户名/仓库名）—— 安装时主程序",
+    "会拿它和插件包内清单声明的归属比对，防止有人把别人的插件挂到自己仓库上。",
+    "可选：author / description / github / homepage / type / tags / logo_url /",
+    "icon_url / downloads / favorites。分支制下 downloads / favorites 来自 Release 的",
+    "资源下载数与点赞数。"
+  ],
+  "version": 2,
+  "updated": "2026-09-18",
+  "plugins": [
+    {
+      "id": "meow-skin",
+      "name": "喵喵皮肤・回复追加",
+      "version": "1.0.0",
+      "author": "Lovomo 官方示例",
+      "github": "slpk1ng",
+      "description": "深度换肤 + 回复追加二合一示例：重排侧边栏与卡片、支持自定义背景图片与主色，并在功能页提供滑块调节圆角、区块透明度、分割线颜色；另可设置每轮 LLM 回复结束后追加几条「喵～」与喵叫语音。装好后在导航栏「插件」里点它进功能页配置。",
+      "type": "mixed",
+      "tags": ["皮肤", "功能", "示例", "教学"],
+      "homepage": "https://github.com/slpk1ng/Lovomo",
+      "source_repo": "slpk1ng/Lovomo",
+      "download": "https://github.com/slpk1ng/Lovomo/raw/main/plugins/packages/meow-skin.zip"
+    }
+  ]
+}

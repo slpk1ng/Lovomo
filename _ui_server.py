@@ -8,6 +8,7 @@ async def run():
     M.global_config.config["webui_port"] = 11599
     M.global_emotion_manager = M.EmotionManager(M.global_config)
     M.memory_manager = M.MemoryManager(M.global_config)
+    M.mood_mgr = M.MoodManager(M.memory_manager.data_path)
     M.db = M.DatabaseManager(M.memory_manager.data_path)
     M.stats_mgr = M.StatsManager(M.db)
     M.sticker_mgr = M.StickerManager(M.global_config)

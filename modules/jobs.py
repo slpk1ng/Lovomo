@@ -7,7 +7,7 @@
     "enabled": true,
     "trigger": {"type": "daily", "time": "08:30"},        # 或 {"type":"interval","seconds":3600}
     "weekdays": [0,1,2,3,4],                              # daily 可选，0=周一
-    "target": {"session_type": "private", "session_id": "10001"},
+    "target": {"session_type": "private", "session_id": "10001"},   # 空 ID = 发给所有聊过的会话
     "action": {"mode": "template", "template": "主人早上好呀～今天是 {date} {weekday}",
                "use_voice": true}
   }
@@ -16,7 +16,6 @@ mode=llm 时使用 action.llm_prompt 生成开场白（可使用 {character_name
 每个任务当天是否已经跑过记在 data/scheduled_jobs_state.json：
 程序在任务时刻之后才启动时，catch_up_missed_daily 会把当天漏掉的每日任务补跑一次。
 """
-import json
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -103,7 +102,8 @@ async def generate_proactive_text(ctx: RoleContext, instruction: str,
 class ScheduledJobManager:
     def __init__(self, config, data_path: Path, scheduler: SchedulerManager,
                  sender=None, ctx_provider: Optional[Callable[[], RoleContext]] = None,
-                 emotions_provider: Optional[Callable[[], dict]] = None):
+                 emotions_provider: Optional[Callable[[], dict]] = None,
+                 sessions_provider: Optional[Callable[[], list]] = None):
         self.config = config
         self.file = Path(data_path) / "scheduled_jobs.json"
         self.state_file = Path(data_path) / "scheduled_jobs_state.json"
@@ -111,6 +111,7 @@ class ScheduledJobManager:
         self.sender = sender
         self.ctx_provider = ctx_provider
         self.emotions_provider = emotions_provider
+        self.sessions_provider = sessions_provider
         self.jobs: list = []
         self.run_state: dict = {}
         self.load()
@@ -118,20 +119,25 @@ class ScheduledJobManager:
 
     # ---------------- 持久化 ----------------
     def load_state(self):
-        try:
-            if self.state_file.exists():
-                data = json.loads(self.state_file.read_text(encoding="utf-8"))
-                self.run_state = data if isinstance(data, dict) else {}
-        except Exception as e:
-            print(f"加载定时任务运行状态失败: {e}")
-            self.run_state = {}
+        from .jsonio import load_json_ex
+        if not self.state_file.exists():
+            self._state_load_failed = False
+            return
+        data, readable = load_json_ex(self.state_file, {})
+        self._state_load_failed = not readable
+        self.run_state = data if isinstance(data, dict) else {}
 
     def save_state(self):
+        if getattr(self, "_state_load_failed", False):
+            print("定时任务运行状态本次未能读取，已跳过保存以免覆盖磁盘上的原有内容。")
+            return
         try:
             from .jsonio import save_json
             cutoff = time.strftime("%Y-%m-%d", time.localtime(time.time() - 14 * 86400))
+            # 非字符串的值（旧格式的浮点时间戳）一律淘汰：既过不了 >= 比较，
+            # 又会永久留在文件里
             self.run_state = {k: v for k, v in self.run_state.items()
-                              if not isinstance(v, str) or v >= cutoff}
+                              if isinstance(v, str) and v >= cutoff}
             save_json(self.state_file, self.run_state)
         except Exception as e:
             print(f"保存定时任务运行状态失败: {e}")
@@ -145,16 +151,18 @@ class ScheduledJobManager:
         return str(self.run_state.get(str(job_id), "")) == day
 
     def load(self):
-        try:
-            if self.file.exists():
-                self.jobs = json.loads(self.file.read_text(encoding="utf-8"))
-                if not isinstance(self.jobs, list):
-                    self.jobs = []
-        except Exception as e:
-            print(f"加载定时任务失败: {e}")
-            self.jobs = []
+        from .jsonio import load_json_ex
+        if not self.file.exists():
+            self._load_failed = False
+            return
+        data, readable = load_json_ex(self.file, [])
+        self._load_failed = not readable
+        self.jobs = data if isinstance(data, list) else []
 
     def save(self):
+        if getattr(self, "_load_failed", False):
+            print("定时任务本次未能读取，已跳过保存以免覆盖磁盘上的原有配置。")
+            return
         try:
             from .jsonio import save_json
             save_json(self.file, self.jobs)
@@ -203,20 +211,64 @@ class ScheduledJobManager:
         for job in self.jobs:
             info = dict(job)
             live = self.scheduler.jobs.get(JOB_PREFIX + str(job.get("id", "")))
-            if live:
-                info["runtime"] = live.describe()
-            else:
-                info["runtime"] = None
+            info["runtime"] = live.describe() if live else None
+            targets = self.resolve_targets(job.get("target") or {})
+            info["resolved"] = {
+                "targets": [{"session_type": t, "session_id": s} for t, s in targets],
+                "broadcast": not str((job.get("target") or {}).get("session_id") or "").strip(),
+            }
             infos.append(info)
         return infos
+
+    # ---------------- 发送目标 ----------------
+    def known_sessions(self) -> list:
+        """所有留下过聊天记录的会话，形如 [("private", "10001"), ...]。"""
+        if self.sessions_provider is None:
+            return []
+        try:
+            items = self.sessions_provider() or []
+        except Exception as e:
+            print(f"读取会话列表失败: {type(e).__name__}: {e}")
+            return []
+        return [(str(s.get("session_type", "private")), str(s.get("session_id", "")).strip())
+                for s in items if str(s.get("session_id", "")).strip()]
+
+    def resolve_targets(self, target: dict) -> list:
+        """把任务里填的目标解析成一到多个 (session_type, session_id)。
+
+        没填会话 ID 时按"发给所有聊过的会话"处理；填了但类型与已知会话不符时
+        （群号被填进私聊），按已知会话的真实类型纠正 —— 否则 NapCat 会拿群号
+        去查用户，返回 retcode 1200「无法获取用户信息」。
+        """
+        session_type = str(target.get("session_type") or "private")
+        session_id = str(target.get("session_id") or "").strip()
+        known = self.known_sessions()
+        if not session_id:
+            return list(known)
+        for prefix, stype in (("private_", "private"), ("group_", "group")):
+            if session_id.startswith(prefix):
+                session_type = stype
+                session_id = session_id[len(prefix):]
+                break
+        if session_type == "group":
+            session_id = session_id.split("_")[0]
+        for stype, sid in known:
+            if sid == session_id and stype != session_type:
+                print(f"[定时任务] 目标类型已纠正：{session_id} 实际是{stype}会话"
+                      f"（任务里填的是{session_type}）")
+                session_type = stype
+                break
+        return [(session_type, session_id)]
 
     # ---------------- 执行 ----------------
     async def _run_job(self, job: dict):
         target = job.get("target") or {}
         action = job.get("action") or {}
-        session_type = target.get("session_type", "private")
-        session_id = target.get("session_id", "")
-        if not session_id or self.sender is None or self.sender.client is None:
+        if self.sender is None or self.sender.client is None:
+            return
+        targets = self.resolve_targets(target)
+        if not targets:
+            print(f"[定时任务] {job.get('name') or job.get('id', '')} 没有可用的发送目标，跳过。")
             return
         ctx = (self.ctx_provider() if self.ctx_provider else None) or RoleContext(self.config)
         emotions = (self.emotions_provider() if self.emotions_provider else None) or {}
@@ -234,9 +286,23 @@ class ScheduledJobManager:
                                    character_name=ctx.character_name)
         if not text:
             return
-        await self.sender.speak_and_send(session_type, session_id, text, emotions, ctx,
-                                         use_voice=bool(action.get("use_voice", False)),
-                                         sticker=bool(self.config.get("proactive_sticker", False)))
+        sent_any = False
+        for session_type, session_id in targets:
+            try:
+                ok = await self.sender.speak_and_send(
+                    session_type, session_id, text, emotions, ctx,
+                    use_voice=bool(action.get("use_voice", False)),
+                    sticker=bool(self.config.get("proactive_sticker", False)))
+            except Exception as e:
+                # 单个目标失败不能中断整轮，更不能冒到调度器变成任务的 last_error
+                print(f"[定时任务] {job.get('name') or job.get('id', '')} 向 "
+                      f"{session_type} {session_id} 发送失败: {type(e).__name__}: {e}")
+                ok = False
+            sent_any = sent_any or bool(ok)
+        if not sent_any:
+            # 发送没成功就不能标记"今天已执行"，否则当天不会再重试
+            print(f"定时任务 {job.get('id', '')} 发送未成功，本次不标记已执行。")
+            return
         self._mark_ran(job.get("id", ""))
 
     def _daily_time_passed_today(self, job: dict) -> Optional[float]:
