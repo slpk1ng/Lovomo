@@ -4,7 +4,7 @@
 # 字段说明见 plugins/README.md；plugin.json 仍然兼容，但新插件请用本文件。
 id: meow-skin
 name: 喵喵皮肤・回复追加
-version: 1.0.0
+version: 1.0.1
 author: Lovomo 官方示例
 github: slpk1ng
 homepage: https://github.com/slpk1ng/Lovomo
@@ -31,7 +31,7 @@ skin:
       max: 1
       step: 0.01
       default: 0.92
-      description: 卡片、区块、面板、表格、弹窗、日志区、输入框、按钮等所有带底色的面，统一按这个透明度降低底色 alpha（文字不受影响）。0 表示完全透明，只留文字和描边。
+      description: 卡片、区块、面板、表格、弹窗、日志区、输入框、按钮、侧边栏等所有带底色的面，统一按这个透明度降低底色 alpha（文字不受影响）。0 表示完全透明，只留文字和描边；侧边栏这类压白字的块最低保留 55%，免得背景图偏浅时字看不清。
     - name: radius
       label: 圆角
       type: range

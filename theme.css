@@ -17,6 +17,10 @@
     --meow-a: calc(var(--meow-alpha) * 100%);
     --meow-a-deep: calc(max(var(--meow-alpha), 0.55) * 100%);
     --meow-radius: var(--skin-radius, 14px);
+    /* 侧边栏渐变的三档色（不透明），渲染时再按 deep 档透明度叠到背景图上 */
+    --meow-nav-top: color-mix(in srgb, var(--skin-accent, #7c4dff) 82%, #000);
+    --meow-nav-mid: var(--skin-accent, #7c4dff);
+    --meow-nav-end: color-mix(in srgb, var(--skin-accent, #7c4dff) 72%, #fff);
 }
 
 /* ---------- 背景层（仅 html.skin-on 下生效） ---------- */
@@ -55,12 +59,13 @@ body > .main-content {
 }
 
 /* ---------- 侧边栏：更宽的留白 + 更大的点击区 ---------- */
-/* 侧边栏：渐变由主色派生，宽度与留白加大 */
+/* 侧边栏：渐变由主色派生，宽度与留白加大；
+ * 底色走 deep 档透明度，背景图能透出来，白字也不会糊在浅色图上。 */
 .sidebar {
     background: linear-gradient(180deg,
-                color-mix(in srgb, var(--skin-accent, #7c4dff) 82%, #000) 0%,
-                var(--skin-accent, #7c4dff) 60%,
-                color-mix(in srgb, var(--skin-accent, #7c4dff) 72%, #fff) 100%) !important;
+                color-mix(in srgb, var(--meow-nav-top) var(--meow-a-deep), transparent) 0%,
+                color-mix(in srgb, var(--meow-nav-mid) var(--meow-a-deep), transparent) 60%,
+                color-mix(in srgb, var(--meow-nav-end) var(--meow-a-deep), transparent) 100%) !important;
     width: 11.5% !important;
     min-width: 168px !important;
     padding: 18px 12px !important;
