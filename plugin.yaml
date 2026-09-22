@@ -1,0 +1,71 @@
+id: device-status
+name: 设备状态
+version: 1.0.0
+author: Lovomo 官方示例
+github: slpk1ng
+homepage: https://github.com/slpk1ng/Lovomo
+repo: slpk1ng/Lovomo
+description: "在 QQ 里发送 /截图（可跟张数，如 /截图 3）或 /截屏，回一张整屏截图和一条本机状态：主机名、系统、架构、CPU 占用率、内存、电源、系统盘占用和当前时间；发送 /录屏 10 则录 10 秒屏幕，最后把视频或动图发回来。"
+type: python
+entry: main.py
+logo: logo.png
+tags:
+  - 工具
+  - 设备信息
+panel:
+  label: 设备状态
+  title: 设备状态 · 截图与录屏
+features:
+  - key: reply_status
+    label: 回复设备状态
+    type: bool
+    default: true
+    description: 关闭后只发截图和录屏，不再回主机名、CPU、内存这些本机状态。
+  - key: keep_shots
+    label: 保留截图数量
+    type: number
+    min: 1
+    max: 200
+    step: 1
+    default: 10
+    unit: 张
+    description: 截图目录里最多留多少张（录屏的每一帧也算一张），超出后自动删掉最早的。
+  - key: capture_interval
+    label: 截图时间间隔
+    type: number
+    min: 0.01
+    max: 60
+    step: 0.01
+    default: 1
+    unit: 秒
+    description: 连拍时两张截图之间等多久。
+  - key: record_fps
+    label: 录屏帧率
+    type: number
+    min: 5
+    max: 30
+    step: 1
+    default: 15
+    unit: 帧/秒
+    description: 录屏每秒抓多少帧，越高越流畅、文件越大。
+  - key: record_audio
+    label: 录制声音
+    type: bool
+    default: true
+    description: 录屏时一起录声音；GIF 动图没有音轨，只对 MP4 生效。
+  - key: record_audio_device
+    label: 录音设备
+    type: select
+    default: ""
+    options_file: data/audio_devices.json
+    description: 录屏时用哪个设备收音；「自动」优先挑能录系统声音的回环设备。
+  - key: record_format
+    label: 录屏格式
+    type: select
+    default: gif
+    options:
+      - value: gif
+        label: GIF 动图
+      - value: mp4
+        label: MP4 视频
+    description: 录屏产物的格式；MP4 是原分辨率，GIF 会缩到宽 1280 以内。两种都需要系统里有 ffmpeg。
