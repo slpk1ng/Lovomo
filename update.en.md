@@ -46,6 +46,8 @@
 
 \- Stickers: automatic collection by the LLM now files images by the naming style of the sticker root folder, so an existing "撒娇" folder no longer gets a second `sajiao` next to it.
 
+\- Stickers: capture now de-duplicates by image content, so an image already in the library is no longer stored twice; leftover empty folders are no longer treated as categories, so captures cannot land in an invisible folder.
+
 \- Sticker page: broken thumbnails, undeletable stickers, 404s on filenames with Chinese punctuation, and broken WebP images.
 
 \- Characters and sessions: a new session was miscounted as the default character, and after switching characters the default character's name leaked into user profiles; a character with no prompts of its own (such as a blank persona created without a name) still received the default character's persona prompts.

@@ -56,13 +56,35 @@ def sticker_root(config) -> Path:
 _NON_CATEGORY_DIRS = {"any", "default"}
 
 
+def _has_images(folder: Path) -> bool:
+    """目录里是否真有一张图片：一张都没有的目录不算分类。"""
+    try:
+        return any(p.suffix.lower() in IMAGE_EXTS for p in folder.iterdir())
+    except OSError:
+        return False
+
+
+def _category_dirs(root) -> dict:
+    """分类目录：小写名 → 真实目录名。只算有图片的目录。
+
+    空目录不算分类：面板不显示它，用户看不见；把它当分类会让模型选中它，
+    收藏落进一个用户看不到的目录。
+    """
+    out = {}
+    try:
+        folders = list(Path(root).iterdir())
+    except OSError:
+        return out
+    for folder in folders:
+        if folder.is_dir() and folder.name.lower() not in _NON_CATEGORY_DIRS \
+                and _has_images(folder):
+            out[folder.name.lower()] = folder.name
+    return out
+
+
 def category_folders(root) -> list:
     """表情库根目录下的分类文件夹名（按名称排序，不含 any/default 池）。"""
-    try:
-        return sorted(d.name for d in Path(root).iterdir()
-                      if d.is_dir() and d.name.lower() not in _NON_CATEGORY_DIRS)
-    except OSError:
-        return []
+    return sorted(_category_dirs(root).values())
 
 
 def category_candidates(config) -> list:
@@ -419,6 +441,36 @@ def _prune_index(root: Path) -> int:
     _save_index(root, index)
     return len(stale)
 
+def _sync_index_digests(root: Path, index: dict) -> int:
+    """把表情库里已有的图片按内容摘要补进索引，返回新增条数。
+
+    索引原本只记「本程序收藏过」的图：用户自己放进目录的图不在其中，
+    同一张图会被当成新图再收藏一次，库里于是出现两份。
+    """
+    known = {_entry_path(entry) for entry in index.values()}
+    added = 0
+    try:
+        folders = [d for d in root.iterdir() if d.is_dir()]
+    except OSError:
+        return 0
+    for folder in folders:
+        try:
+            images = [p for p in folder.iterdir() if p.suffix.lower() in IMAGE_EXTS]
+        except OSError:
+            continue
+        for img in images:
+            rel = f"{folder.name}/{img.name}"
+            if rel in known:
+                continue
+            try:
+                digest = hashlib.sha1(img.read_bytes()).hexdigest()
+            except OSError:
+                continue
+            index.setdefault(digest, {"path": rel, "reason": "", "category": folder.name})
+            added += 1
+    return added
+
+
 async def auto_capture_image(config, sticker_manager, source, category_hint="",
                              image_data=None, reason="") -> bool:
     """把一张图收藏进表情库。
@@ -469,6 +521,7 @@ async def auto_capture_image(config, sticker_manager, source, category_hint="",
         print("表情收藏跳过：无法识别的图片格式。") 
         return False
 
+    raw_digest = hashlib.sha1(data).hexdigest()
     if ext in _preserve_formats(config):
         print(f"表情收藏保留原格式不重编码（{ext}），避免动图被压成单帧静态图。")
     else:
@@ -477,20 +530,23 @@ async def auto_capture_image(config, sticker_manager, source, category_hint="",
     digest = hashlib.sha1(data).hexdigest()
     root = sticker_manager.dir
     index = _load_index(root)
-    existing = index.get(digest)
+    if _sync_index_digests(root, index):
+        _save_index(root, index)
+    # 库里存的是原图（用户自己放的）或本程序重编码后的图，两种摘要都查一次
+    hit = digest if digest in index else raw_digest
+    existing = index.get(hit)
     if existing:
         old = root / _entry_path(existing)
         if old.exists():
             print("[表情收藏] 相同图片此前已收藏，跳过重复保存。") 
             return True
-        index.pop(digest, None)
+        index.pop(hit, None)
 
     # --- 核心分类逻辑 ---
     cat = normalize_capture_category(category_hint)
-    # 文件夹名 → 原名，分类名由用户自己命名（可以是中文），大小写不敏感地匹配。
-    # any/default 是通用池与兜底池，不是分类，不能被模型当成归类目标
-    on_disk = {d.name.lower(): d.name for d in root.iterdir()
-               if d.is_dir() and d.name.lower() not in _NON_CATEGORY_DIRS}
+    # 文件夹名 → 原名，分类名由用户自己命名（可以是中文），大小写不敏感地匹配；
+    # 空目录不算分类，否则模型会选中一个用户看不见的目录
+    on_disk = _category_dirs(root)
     # 内置拼音分类 → 磁盘上的真实目录名：模型给拼音（或中文被翻译成拼音）时
     # 对回用户自己命名的那个文件夹，否则同一种情绪会被拆成两个目录
     pinyin_alias = {}
