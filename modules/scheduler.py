@@ -16,12 +16,37 @@ from typing import Callable, Awaitable, Optional, Dict, List
 WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 
+def _normalize_weekdays(value) -> List[int]:
+    """把 weekdays 收敛成 0-6 的整数列表。
+
+    配置/WebUI 存下来的可能是字符串（"1"），不归一成 int 会让 `wday in weekdays`
+    永远不命中、任务被排到一周之后，describe() 里还会直接抛 TypeError。
+    """
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    days: List[int] = []
+    for item in value:
+        try:
+            day = int(item)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= day <= 6 and day not in days:
+            days.append(day)
+    return days
+
+
 class Job:
     def __init__(self, job_id: str, name: str, trigger: dict,
                  func: Callable[..., Awaitable], args: tuple = (), enabled: bool = True):
         self.id = job_id
         self.name = name
         self.trigger = trigger  # {"type": "interval", "seconds": n} / {"type":"daily","time":"HH:MM","weekdays":[..]} / {"type":"oneshot","at": ts}
+        if isinstance(self.trigger, dict) and "weekdays" in self.trigger:
+            days = _normalize_weekdays(self.trigger.get("weekdays"))
+            if days:
+                self.trigger["weekdays"] = days
+            else:
+                self.trigger.pop("weekdays", None)
         self.func = func
         self.args = args
         self.enabled = enabled

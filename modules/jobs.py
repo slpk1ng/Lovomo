@@ -103,7 +103,8 @@ class ScheduledJobManager:
     def __init__(self, config, data_path: Path, scheduler: SchedulerManager,
                  sender=None, ctx_provider: Optional[Callable[[], RoleContext]] = None,
                  emotions_provider: Optional[Callable[[], dict]] = None,
-                 sessions_provider: Optional[Callable[[], list]] = None):
+                 sessions_provider: Optional[Callable[[], list]] = None,
+                 history_provider: Optional[Callable] = None):
         self.config = config
         self.file = Path(data_path) / "scheduled_jobs.json"
         self.state_file = Path(data_path) / "scheduled_jobs_state.json"
@@ -112,6 +113,7 @@ class ScheduledJobManager:
         self.ctx_provider = ctx_provider
         self.emotions_provider = emotions_provider
         self.sessions_provider = sessions_provider
+        self.history_provider = history_provider
         self.jobs: list = []
         self.run_state: dict = {}
         self.load()
@@ -260,6 +262,16 @@ class ScheduledJobManager:
                 break
         return [(session_type, session_id)]
 
+    def _history_block(self, session_key: str, ctx) -> str:
+        """取该会话最近的对话历史块，让 LLM 模式的话术承接前文。"""
+        if self.history_provider is None:
+            return ""
+        try:
+            return str(self.history_provider(session_key, ctx) or "")
+        except Exception as e:
+            print(f"[定时任务] 读取会话历史失败（忽略）: {type(e).__name__}: {e}")
+            return ""
+
     # ---------------- 执行 ----------------
     async def _run_job(self, job: dict):
         target = job.get("target") or {}
@@ -273,32 +285,51 @@ class ScheduledJobManager:
         ctx = (self.ctx_provider() if self.ctx_provider else None) or RoleContext(self.config)
         emotions = (self.emotions_provider() if self.emotions_provider else None) or {}
         mode = action.get("mode", "template")
-        text = ""
-        if mode == "llm":
-            instruction = render_template(str(action.get("llm_prompt", "") or "主动打个招呼"),
-                                          character_name=ctx.character_name)
-            try:
-                text = await generate_proactive_text(ctx, instruction)
-            except Exception as e:
-                print(f"定时任务 LLM 生成失败: {e}")
-        else:
-            text = render_template(str(action.get("template", "")),
-                                   character_name=ctx.character_name)
-        if not text:
-            return
+        template_text = ""
+        if mode != "llm":
+            template_text = render_template(str(action.get("template", "")),
+                                            character_name=ctx.character_name)
+            if not template_text:
+                return
         sent_any = False
+        composed = 0
         for session_type, session_id in targets:
+            # LLM 模式按目标逐个生成：各会话的上下文不同，共用一句话会让
+            # 每个会话都收到一句对不上话题的开场白
+            if mode == "llm":
+                session_key = f"{session_type}_{session_id}"
+                instruction = render_template(
+                    str(action.get("llm_prompt", "") or "主动打个招呼"),
+                    character_name=ctx.character_name)
+                block = self._history_block(session_key, ctx)
+                if block:
+                    print(f"[定时任务] 已带上会话 {session_key} 的聊天历史"
+                          f"（{len(block)} 字），话术会承接上次话题。")
+                try:
+                    text = await generate_proactive_text(ctx, instruction,
+                                                         history_block=block)
+                except Exception as e:
+                    print(f"定时任务 LLM 生成失败: {e}")
+                    text = ""
+            else:
+                text = template_text
+            if not text:
+                continue
+            composed += 1
             try:
                 ok = await self.sender.speak_and_send(
                     session_type, session_id, text, emotions, ctx,
                     use_voice=bool(action.get("use_voice", False)),
-                    sticker=bool(self.config.get("proactive_sticker", False)))
+                    sticker=bool(self.config.get("proactive_sticker", False)),
+                    session_id=f"{session_type}_{session_id}")
             except Exception as e:
                 # 单个目标失败不能中断整轮，更不能冒到调度器变成任务的 last_error
                 print(f"[定时任务] {job.get('name') or job.get('id', '')} 向 "
                       f"{session_type} {session_id} 发送失败: {type(e).__name__}: {e}")
                 ok = False
             sent_any = sent_any or bool(ok)
+        if not composed:
+            return
         if not sent_any:
             # 发送没成功就不能标记"今天已执行"，否则当天不会再重试
             print(f"定时任务 {job.get('id', '')} 发送未成功，本次不标记已执行。")

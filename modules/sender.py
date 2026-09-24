@@ -7,9 +7,10 @@ from pathlib import Path
 from typing import List, Optional
 
 from .llm_helpers import (RoleContext, segment_for_tts, lang_text_broken,
-                          translate_to_lang)
+                          translate_to_lang, available_mimics)
 from .tts import synthesize_sentence, merge_wavs, get_audio_duration
 from .tts_service import check_tts_service
+from .stickers import resize_for_output
 
 
 # 本次发送使用的 NapCat 连接（多账号时按角色临时切换；未设置则用默认连接）
@@ -155,14 +156,23 @@ class MessageSender:
         # 消息段列表会出现一个空文本段（部分客户端会显示空白气泡）。
         if text and str(text).strip():
             segments.append(Text(text=text))
+        temp_sticker = None
         if sticker is not None:
             try:
-                segments.append(Image(file=str(Path(sticker).resolve())))
+                send_sticker, temp_sticker = resize_for_output(sticker, self.config)
+                segments.append(Image(file=str(Path(send_sticker).resolve())))
             except Exception as e:
+                if temp_sticker is not None:
+                    Path(temp_sticker).unlink(missing_ok=True)
+                    temp_sticker = None
                 print(f"表情包发送失败: {e}")
         if not segments:
             return True
-        return await self.send_segments(session_type, target_id, segments)
+        try:
+            return await self.send_segments(session_type, target_id, segments)
+        finally:
+            if temp_sticker is not None:
+                Path(temp_sticker).unlink(missing_ok=True)
 
     async def send_voice(self, session_type: str, target_id, wav_path) -> bool:
         from napcat import Record
@@ -192,6 +202,7 @@ class MessageSender:
         # 1. 合成语音（全部句子一次性合成，或逐个合成，取决于是否需要分开）
         wavs: List[Optional[Path]] = [None] * len(sentences)
         if use_tts and self._active_client() is not None:
+            synth_started = time.time()
             synth_sem = asyncio.Semaphore(2)
             async def _synthesize(s):
                 async with synth_sem:
@@ -199,9 +210,14 @@ class MessageSender:
                     # 早期版本这里传反了，导致情绪被当成文本、文本被当成情绪，
                     # 情绪永远回退默认音色。synthesize_sentence 内另有兜底纠正。
                     return await synthesize_sentence(ctx, s["lang"], s.get("emotion", ""), emotions,
-                                                     data_path, stats=self.stats)
+                                                     data_path, stats=self.stats,
+                                                     mimic=s.get("mimic", ""),
+                                                     mimics=available_mimics(ctx))
             results = await asyncio.gather(*[_synthesize(s) for s in sentences],
                                            return_exceptions=True)
+            # 这条路径的耗时以前从不赋值，interactions.tts_ms 恒为 0，
+            # 统计页的「平均 TTS 耗时」被系统性低估
+            result["tts_ms"] = (time.time() - synth_started) * 1000
             for idx, item in enumerate(results):
                 if isinstance(item, BaseException):
                     print(f"第 {idx + 1} 句语音合成异常，该句降级为纯文本: "
@@ -329,7 +345,7 @@ class MessageSender:
     async def speak_and_send(self, session_type: str, target_id, text: str,
                              emotions: dict, ctx: Optional[RoleContext] = None,
                              use_voice: bool = None, sticker: bool = False,
-                             emotion: str = "") -> bool:
+                             emotion: str = "", session_id: str = "") -> bool:
         if not text:
             return False
         if self._active_client() is None:
@@ -353,10 +369,33 @@ class MessageSender:
                     await self.send_voice(session_type, target_id, wav)
                     if sticker_path:
                         await self.send_text(session_type, target_id, "", sticker=sticker_path)
+                    if text_ok:
+                        self.record_outgoing_history(session_id, text, ctx)
                     return bool(text_ok)
                 finally:
                     wav.unlink(missing_ok=True)
-        return await self.send_text(session_type, target_id, text, sticker=sticker_path)
+        ok = await self.send_text(session_type, target_id, text, sticker=sticker_path)
+        if ok:
+            self.record_outgoing_history(session_id, text, ctx)
+        return ok
+
+    def record_outgoing_history(self, session_id: str, text: str, ctx=None) -> None:
+        """把主动发出的消息记进会话历史（问候/提醒/主动开口走这条）。
+
+        这些消息不经过回复管线，此前只发不记：用户接着回复时模型看不到自己
+        刚说过什么，WebUI 的聊天记录里也找不到这条主动问候。
+        """
+        if not session_id or self.memory_manager is None or not str(text or "").strip():
+            return
+        try:
+            data = self.memory_manager.load_session_data(session_id)
+            data.setdefault("history", []).append({
+                "role": "assistant", "content": text, "timestamp": time.time(),
+                "speaker": ctx.character_name if ctx is not None else "",
+                "proactive": True})
+            self.memory_manager.save_session_data(session_id, data)
+        except Exception as e:
+            print(f"主动消息写入历史失败: {type(e).__name__}: {e}")
 
     async def _speech_text_for(self, ctx, text: str) -> str:
         """纯文本消息的合成台词：语音要念角色语言，展示文本是别种语言时先译过去。

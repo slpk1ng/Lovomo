@@ -31,21 +31,23 @@ class RAGManager:
         self.index_file = self.root / "index.json"
         self.docs_dir.mkdir(parents=True, exist_ok=True)
         self.index: List[dict] = []
+        self._index_load_failed = False
         self.load_index()
 
     # ---------------- 索引管理 ----------------
     def load_index(self):
-        try:
-            if self.index_file.exists():
-                self.index = json.loads(self.index_file.read_text(encoding="utf-8"))
-        except Exception as e:
-            print(f"加载 RAG 索引失败: {e}")
-            self.index = []
+        from .jsonio import load_json_ex
+        data, readable = load_json_ex(self.index_file, [])
+        self._index_load_failed = not readable
+        self.index = data if isinstance(data, list) else []
 
     def save_index(self):
+        if self._index_load_failed:
+            print("RAG 索引本次未能读取，已跳过保存以免覆盖磁盘上的原有索引。")
+            return
         try:
-            self.index_file.write_text(json.dumps(self.index, ensure_ascii=False, indent=2),
-                                       encoding="utf-8")
+            from .jsonio import save_json
+            save_json(self.index_file, self.index)
         except Exception as e:
             print(f"保存 RAG 索引失败: {e}")
 
@@ -157,8 +159,17 @@ class RAGManager:
                 break
         return chunks or ([text.strip()] if text.strip() else [])
 
+    def _ensure_index_loaded(self) -> bool:
+        """索引读取失败过就重试一次，仍失败才拒绝写入，避免拿空索引覆盖磁盘。"""
+        if not self._index_load_failed:
+            return True
+        self.load_index()
+        return not self._index_load_failed
+
     # ---------------- 文档操作 ----------------
     async def add_document(self, name: str, raw_text: str) -> dict:
+        if not self._ensure_index_loaded():
+            return {"success": False, "error": "RAG 索引读取失败，已中止本次添加以免覆盖原有索引"}
         chunk_size = int(self.config.get("rag_chunk_size", CHUNK_SIZE_DEFAULT))
         overlap = int(self.config.get("rag_chunk_overlap", OVERLAP_DEFAULT))
         chunks = self.chunk_text(raw_text, chunk_size, overlap)
@@ -179,6 +190,8 @@ class RAGManager:
         return {"success": True, "doc": entry}
 
     def delete_document(self, doc_id: str) -> bool:
+        if not self._ensure_index_loaded():
+            return False
         before = len(self.index)
         self.index = [d for d in self.index if d.get("id") != doc_id]
         if len(self.index) == before:
@@ -206,15 +219,20 @@ class RAGManager:
             try:
                 mat = np.load(self.docs_dir / f"{doc['id']}.npy")
                 chunk_data = json.loads((self.docs_dir / f"{doc['id']}.json").read_text(encoding="utf-8"))
+                # 换过嵌入模型后旧文档的向量维度与新查询不一致，矩阵乘法会抛异常；
+                # 与"文档读不出来"同等对待，跳过这一篇即可，不能让整次检索失败。
+                sims = mat @ q
             except Exception as e:
                 print(f"读取 RAG 文档失败 {doc.get('name')}: {e}")
                 continue
-            sims = mat @ q
+            chunks = chunk_data.get("chunks") if isinstance(chunk_data, dict) else None
+            if not isinstance(chunks, list):
+                chunks = []
             order = np.argsort(-sims)[:top_k]
             for idx in order:
                 sim = float(sims[idx])
                 if sim >= min_sim:
-                    text = chunk_data["chunks"][int(idx)] if int(idx) < len(chunk_data["chunks"]) else ""
+                    text = chunks[int(idx)] if int(idx) < len(chunks) else ""
                     hits.append({"doc": doc.get("name", ""), "sim": round(sim, 3), "text": text})
         hits.sort(key=lambda h: -h["sim"])
         return hits[:top_k]

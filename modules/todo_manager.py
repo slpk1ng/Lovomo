@@ -645,13 +645,19 @@ class TodoManager:
         if use_voice is None:
             use_voice = bool(self.config.get("todo_voice", False))
         try:
-            await self.sender.speak_and_send(session_type, session_id, message, emotions, ctx,
-                                             use_voice=bool(use_voice),
-                                             emotion=emotion or str(self.config.get("todo_voice_emotion", "")
-                                                                    or "pingjing"))
-            self.db.execute("UPDATE todos SET status='done' WHERE id=?", (todo_id,))
+            sent = await self.sender.speak_and_send(
+                session_type, session_id, message, emotions, ctx,
+                use_voice=bool(use_voice),
+                emotion=emotion or str(self.config.get("todo_voice_emotion", "") or "pingjing"),
+                session_id=f"{session_type}_{session_id}")
         except Exception as e:
-            print(f"[待办提醒] 发送失败，待办 #{todo_id} 保留为待提醒状态：{type(e).__name__}: {e}")
+            sent = False
+            print(f"[待办提醒] 发送异常：{type(e).__name__}: {e}")
+        if sent:
+            self.db.execute("UPDATE todos SET status='done' WHERE id=?", (todo_id,))
+        else:
+            # 发送方失败时是返回 False 而不是抛异常：不检查就会把没发出的提醒标成已完成
+            print(f"[待办提醒] 未发送成功，待办 #{todo_id} 保留为待提醒状态。")
             self.db.execute("UPDATE todos SET status='pending' WHERE id=?", (todo_id,))
 
     def _remind_mode(self) -> str:

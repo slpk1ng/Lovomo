@@ -355,6 +355,10 @@ def _dump_lines(value, indent: int) -> list:
             elif isinstance(val, list) and val:
                 out.append(f"{pad}{k}:")
                 out.extend(_dump_lines(val, indent))
+            elif isinstance(val, (dict, list)):
+                # 空容器必须写成流式空字面量：走 _scalar_out 会被当成字符串加引号，
+                # 读回来就变成 "[]" / "{}" 这种字符串，类型漂移
+                out.append(f"{pad}{k}: {'{}' if isinstance(val, dict) else '[]'}")
             else:
                 out.append(f"{pad}{k}: {_scalar_out(val)}")
         return out
@@ -368,6 +372,8 @@ def _dump_lines(value, indent: int) -> list:
             elif isinstance(item, list) and item:
                 out.append(f"{pad}-")
                 out.extend(_dump_lines(item, indent + 2))
+            elif isinstance(item, (dict, list)):
+                out.append(f"{pad}- {'{}' if isinstance(item, dict) else '[]'}")
             else:
                 out.append(f"{pad}- {_scalar_out(item)}")
         return out

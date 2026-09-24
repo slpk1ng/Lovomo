@@ -206,6 +206,60 @@ def mood_enabled(ctx) -> bool:
     return _truthy(raw)
 
 
+MOOD_STYLE_COLD = (
+    "【心情影响语气·冷淡】你此刻心情偏低，提不起兴致：语气平淡、话少、略显敷衍，"
+    "不要热情卖萌，也不要主动找话题或长篇大论。回复只允许 1~2 句话。"
+)
+MOOD_STYLE_IRRITATED = (
+    "【心情影响语气·烦躁】你此刻心情很差，正处于不耐烦、烦躁的状态："
+    "语气明显冷淡、没好气、带刺，可以抱怨、怼人、催促或敷衍，"
+    "绝不温柔体贴，也不主动找话题。回复必须极短：只允许 1~2 句话，"
+    "能一句说完就一句，禁止展开、举例、解释或补充说明。"
+)
+
+
+def _mood_style_active(ctx) -> bool:
+    """风格约束是否生效：心情记录与风格映射都开启时才生效。"""
+    if not mood_enabled(ctx):
+        return False
+    try:
+        raw = ctx.get("mood_style_enabled", None)
+    except Exception:
+        return True
+    if raw is None or raw == "":
+        return True
+    return _truthy(raw)
+
+
+def mood_style(ctx, mood) -> tuple:
+    """按心情值给出（档位名, 本轮风格指令）；未生效或心情正常时返回两个空串。
+
+    档位边界直接复用「回复审判」的心情低迷下限/上限，让"心情低"在概率门控
+    与语气表现两处含义一致，不必再单独配一套阈值。
+    """
+    if not _mood_style_active(ctx):
+        return "", ""
+    lo, hi = mood_bounds(ctx)
+    low = clamp(_to_float(ctx.get("reply_judge_mood_low", 30), 30.0), lo, hi)
+    high = clamp(_to_float(ctx.get("reply_judge_mood_high", 60), 60.0), lo, hi)
+    if high < low:
+        high = low
+    value = clamp(_to_float(mood, low), lo, hi)
+    if value <= low:
+        return "烦躁", MOOD_STYLE_IRRITATED
+    if value < high:
+        return "冷淡", MOOD_STYLE_COLD
+    return "", ""
+
+
+def current_mood(ctx, mood_mgr, session_id: str, user_id: str = "") -> float:
+    """读取会话当前心情值；没有记录时用配置的初始心情值。"""
+    lo, hi = mood_bounds(ctx)
+    initial = clamp(_to_float(ctx.get("reply_judge_mood_initial", 60), 60.0), lo, hi)
+    character_key = ctx.character_key or str(ctx.get("character_key", ""))
+    return mood_mgr.get_mood(session_id, character_key, initial, user_id=user_id)
+
+
 MOOD_PROMPT_CUSTOMIZED = "请判断对话记录中最后一条用户消息是否需要角色回复，" \
                          "并评估这条消息会让角色心情变化多少，然后按系统指令只输出JSON。"
 MOOD_PROMPT_OFF = ("请判断对话记录中最后一条用户消息是否需要角色回复，"
@@ -237,12 +291,16 @@ async def _ask_judge(ctx: RoleContext, mood_mgr: MoodManager, session_id: str,
 
 async def judge_and_decide(ctx: RoleContext, mood_mgr: MoodManager, session_id: str,
                            user_text: str, history: list, user_id: str = "") -> dict:
-    """回复审判 +（可选）心情更新。
+    """回复审判 +（可选）心情判定。
 
     两个开关彻底拆开：
       reply_judge_enabled —— 让 LLM 决定"这条要不要回"（本函数返回的 should_reply）；
-      mood_enabled        —— 是否顺带更新心情值。
-    只开心情、不开审判时，心情照常更新，但回复永远交给角色自己（不会被拦）。
+      mood_enabled        —— 是否顺带判定心情变化量。
+    只开心情、不开审判时，心情照常判定，但回复永远交给角色自己（不会被拦）。
+
+    本函数只**判定**变化量（verdict["mood_delta"]），不落盘：
+    变化量要等 LLM 回复生成之后由 commit_mood 落盘，本轮的回复概率与语气
+    都使用更新前的心情值。
     """
     lo, hi = mood_bounds(ctx)
     character_key = ctx.character_key or str(ctx.get("character_key", ""))
@@ -250,9 +308,9 @@ async def judge_and_decide(ctx: RoleContext, mood_mgr: MoodManager, session_id: 
     mood = mood_mgr.get_mood(session_id, character_key, clamp(initial, lo, hi), user_id=user_id)
     want_mood = mood_enabled(ctx)
     want_judge = judge_enabled(ctx)
-    verdict = {"should_reply": True, "mood": mood, "probability": 1.0,
+    verdict = {"should_reply": True, "mood": mood, "mood_delta": None, "probability": 1.0,
                "gated": False, "llm_reply": True, "mood_enabled": want_mood,
-               "judge_enabled": want_judge}
+               "judge_enabled": want_judge, "mood_committed": False}
     if not want_judge and not want_mood:
         return verdict                      # 两个开关都关：完全不调用 LLM
     try:
@@ -265,9 +323,7 @@ async def judge_and_decide(ctx: RoleContext, mood_mgr: MoodManager, session_id: 
         return verdict
     should_reply, delta = parse_judge(obj, ctx)
     if want_mood:
-        mood = clamp(mood + delta, lo, hi)
-        mood_mgr.set_mood(session_id, character_key, mood, user_id=user_id)
-        verdict["mood"] = mood
+        verdict["mood_delta"] = delta
         if not want_judge:
             return verdict                  # 只记心情，不拦回复
     probability = reply_probability(ctx, mood) if want_mood else 1.0
@@ -280,3 +336,22 @@ async def judge_and_decide(ctx: RoleContext, mood_mgr: MoodManager, session_id: 
     verdict.update({"should_reply": decide, "mood": mood, "probability": probability,
                     "gated": bool(should_reply and not decide), "llm_reply": bool(should_reply)})
     return verdict
+
+
+def commit_mood(ctx, mood_mgr, session_id: str, verdict, user_id: str = "") -> Optional[float]:
+    """把本轮审判判定的心情变化量落盘，返回更新后的心情值；无需更新时返回 None。
+
+    一轮只落一次（verdict["mood_committed"] 标记）。调用点在 LLM 回复生成之后：
+    本轮的语气与回复概率都用更新前的心情值判定，否则角色会拿"被这条消息改变之后"
+    的心情去回应这条消息本身。
+    """
+    if not isinstance(verdict, dict) or verdict.get("mood_committed") \
+            or not verdict.get("mood_enabled") or verdict.get("mood_delta") is None:
+        return None
+    verdict["mood_committed"] = True
+    lo, hi = mood_bounds(ctx)
+    character_key = ctx.character_key or str(ctx.get("character_key", ""))
+    delta = _to_float(verdict.get("mood_delta"), 0.0)
+    new_mood = clamp(_to_float(verdict.get("mood"), lo) + delta, lo, hi)
+    mood_mgr.set_mood(session_id, character_key, new_mood, user_id=user_id)
+    return new_mood

@@ -950,7 +950,7 @@ _ADULT_SITES = (
     "吃瓜网", "黑料网", "黑料不打烊", "爆料网", "草榴", "1024社区", "t66y",
     "色花堂", "sehuatang", "麻豆传媒", "麻豆映画", "天美传媒", "精东影业",
     "蜜桃传媒", "星空传媒", "果冻传媒", "糖心vlog", "糖心传媒", "国产精品",
-    "精品国产", "自拍偷拍", "偷拍自拍", "里番", "里番库", "91传媒"
+    "精品国产", "自拍偷拍", "偷拍自拍", "里番库", "91传媒"
 )
 # 低俗 / 性暗示 + 露骨但属客观词的词（只有严格档才拦）。
 # 客观词（性交/性爱/自慰/性行为…）放严格档：查医学、性教育资料时一般档还能用。
@@ -964,7 +964,7 @@ _SUGGESTIVE_TERMS = (
     "巨乳", "爆乳", "痴女", "肉棒", "肉便器", "潮吹", "调教", "制服诱惑", "鸡巴", 
     "小穴", "骚货", "骚逼", "骚女", "骚穴", "双飞", "群交", "后入式","69式", "舔阴",
     "舔奶", "舔肛", "足交", "乳交", "打飞机", "破处", "大奶", "大屌", "屄", "户外露出",
-    "野外露出", "野战", "群P", "多人性行为", "多人性交", "多人性爱", "车震", "激情床戏",
+    "野外露出", "野战", "群p", "多人性行为", "多人性交", "多人性爱", "车震", "激情床戏",
     "摸奶", "摸胸", "操逼", "淫穴"
 )
 # 成人站域名：一般档起拦（只在网址里匹配）
@@ -1538,17 +1538,20 @@ class ToolRegistry:
         self.file = self.data_path / "tools.json"
         self.tools: List[dict] = []
         self._call_counts: Dict[str, int] = {}
+        self._load_failed = False
         self.load()
 
     # ---------------- 持久化 ----------------
     def load(self):
         try:
             if self.file.exists():
-                self.tools = json.loads(self.file.read_text(encoding="utf-8"))
-                if not isinstance(self.tools, list):
-                    self.tools = []
+                from .jsonio import load_json_ex
+                data, readable = load_json_ex(self.file, [])
+                self._load_failed = not readable
+                self.tools = data if isinstance(data, list) else []
             known = {str(t.get("name", "")) for t in self.tools if isinstance(t, dict)}
-            missing = [dict(t) for t in DEFAULT_TOOLS if t.get("name") not in known]
+            missing = [json.loads(json.dumps(t)) for t in DEFAULT_TOOLS
+                       if t.get("name") not in known]
             refreshed = 0
             # 内置工具的说明/参数属于随版本更新的代码资产（写死在 tools.json 里会让
             # 升级后的新说明永远不生效，导致模型分不清 web_search 与 web_fetch）；
@@ -1565,9 +1568,13 @@ class ToolRegistry:
                 if tool.get("description") != shipped.get("description"):
                     tool["description"] = shipped.get("description")
                     refreshed += 1
-                tool["parameters"] = shipped.get("parameters")
+                # 参数也要按发布定义刷新，并计入 refreshed，否则磁盘上的参数永远停留在旧版
+                if tool.get("parameters") != shipped.get("parameters"):
+                    tool["parameters"] = json.loads(json.dumps(shipped.get("parameters")))
+                    refreshed += 1
                 if "engine" not in tool and "engine" in shipped:
                     tool["engine"] = shipped["engine"]
+                    refreshed += 1
             if missing:
                 self.tools.extend(missing)
                 self.save()
@@ -1575,12 +1582,15 @@ class ToolRegistry:
                 self.save()
         except Exception as e:
             print(f"加载工具配置失败: {e}")
-            self.tools = [dict(t) for t in DEFAULT_TOOLS]
+            self.tools = [json.loads(json.dumps(t)) for t in DEFAULT_TOOLS]
 
     def save(self):
+        if self._load_failed:
+            print("工具配置本次未能读取，已跳过保存以免覆盖磁盘上的原有内容。")
+            return
         try:
-            self.file.write_text(json.dumps(self.tools, ensure_ascii=False, indent=2),
-                                 encoding="utf-8")
+            from .jsonio import save_json
+            save_json(self.file, self.tools)
         except Exception as e:
             print(f"保存工具配置失败: {e}")
 

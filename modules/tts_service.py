@@ -2,6 +2,7 @@
 import ctypes
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -188,7 +189,9 @@ def _write_child_record(pid: int, port: int, exe: str) -> None:
     path = _child_record_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
+        # 临时名必须唯一：两个实例共用同一个 .tmp 时，os.replace 可能把
+        # 对方正在写的半截记录提交上去，下次启动就会按错的 PID 去认领进程
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
         tmp.write_text(json.dumps({
             "pid": int(pid),
             "started": process_start_time(int(pid)),
@@ -197,8 +200,9 @@ def _write_child_record(pid: int, port: int, exe: str) -> None:
             "spawned_at": time.time(),
         }, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, path)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[TTS] 记录子进程信息失败（下次启动可能认不到遗留进程）: "
+              f"{type(e).__name__}: {e}")
 
 
 def _read_child_record() -> dict:
@@ -378,6 +382,16 @@ _ensure_fail_until = 0.0  # 启动失败后的冷却截止时间，避免每条�
 _ADOPT_LOCK = threading.Lock()
 _ADOPT_DONE = {"value": False}
 
+# 端口属主必须是 Python 解释器；解释器文件名随发行方式变化
+# （python.exe / pythonw.exe / Windows Store 版 re-exec 出来的 python3.13.exe）
+_PYTHON_IMAGE_RE = re.compile(r"pythonw?[0-9.]*\.exe$", re.I)
+
+
+def _managed_pid(pid: int) -> bool:
+    """该 PID 是否已经是本进程登记在册的子进程。"""
+    return any(getattr(entry.get("proc"), "pid", None) == int(pid)
+               for entry in process_manager.processes)
+
 
 def adopt_existing_tts(config) -> bool:
     """把"上一轮 Lovomo 遗留的 TTS"重新收编成本进程的子进程。
@@ -390,7 +404,7 @@ def adopt_existing_tts(config) -> bool:
 
     只认两种证据，其余一律不动：
       1. 上次启动留下的记录（PID + 创建时间完全吻合）—— 最可靠；
-      2. 没有记录（老版本留下的遗留进程）：端口属主必须是 python/pythonw。
+      2. 没有记录（老版本留下的遗留进程）：端口属主必须是 Python 解释器。
     判据必须严：PID 会被系统复用，只比 PID 有可能认错人、把用户的别的进程
     当成自己的 TTS 杀掉。
     另外只有用户开了「自动启动 TTS 服务」才接管 —— 那表示他把 TTS 的生死
@@ -422,7 +436,7 @@ def adopt_existing_tts(config) -> bool:
         if not candidate or candidate == os.getpid():
             return False
         image = _process_image(candidate)
-        if Path(image).name.lower() not in ("python.exe", "pythonw.exe"):
+        if not _PYTHON_IMAGE_RE.match(Path(image).name):
             # 端口被别的程序占着，那不是我们的 TTS
             return False
         pid = int(candidate)
@@ -432,6 +446,9 @@ def adopt_existing_tts(config) -> bool:
 
     if int(pid) == os.getpid():
         return False
+
+    if _managed_pid(int(pid)):
+        return False                      # 本进程自己启动的 TTS，不是"上一次运行遗留的"
 
     bound = bind_to_job(int(pid))
     process_manager.register(_AdoptedProcess(int(pid)), name="GPT-SoVITS TTS(认领)")
@@ -480,7 +497,9 @@ def auto_start_and_switch_tts(config):
         base_url = config.get("client_base_url", "http://127.0.0.1:9880")
         try:
             resp = httpx.get(f"{base_url}/docs", timeout=2)
-            if resp.status_code < 500:
+            # 判据与 check_tts_service 保持一致：端口被别的服务占用时会回 401/404，
+            # 用 <500 会把别人的服务当成 TTS 已在线，于是既不启动也看不出问题
+            if 200 <= resp.status_code < 400:
                 print("TTS 服务已在线，跳过自动启动。")
                 adopt_existing_tts(config)
                 return
@@ -581,7 +600,7 @@ def auto_start_and_switch_tts(config):
             time.sleep(5)
             try:
                 resp = httpx.get(f"{base_url}/docs", timeout=2)
-                if resp.status_code < 500:
+                if 200 <= resp.status_code < 400:
                     print("TTS 服务已就绪，加载模型中...")
                     break
             except Exception:

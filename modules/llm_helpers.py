@@ -10,7 +10,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Optional, List, Dict, AsyncGenerator
+from typing import Optional, List, Dict, AsyncGenerator, Callable
 
 from urllib.parse import urlsplit
 
@@ -103,6 +103,27 @@ def conn_fail_hint(endpoint: str, base_url: str, backend: str) -> str:
             f"backend={backend}）。请确认：① 对应服务（Ollama / OpenAI 兼容服务）已启动；"
             "② llm_base_url、llm_backend、llm_model_name 与你的服务匹配；"
             "③ 地址可达且未被代理或防火墙拦截。")
+
+
+# 云端服务商的内容审核拦截：命中后整条请求被直接拒绝，正文、翻译、摘要会一起失败，
+# 与本地配置无关，只有换服务或不让这类内容进入上下文才能解决。
+_CONTENT_FILTER_MARKERS = (
+    "data_inspection_failed", "inappropriate content", "content_filter",
+    "content_filtered", "content_policy_violation", "responsibleaipolicyviolation",
+    "moderation_blocked", "内容审核", "内容不合规", "含敏感信息", "敏感内容",
+)
+
+
+def api_error_hint(detail: str) -> str:
+    """把上游 HTTP 错误里值得单独说明的情况翻成一句可操作提示（目前是内容审核拦截）。"""
+    text = str(detail or "")
+    low = text.lower()
+    if not any(marker.lower() in low for marker in _CONTENT_FILTER_MARKERS):
+        return ""
+    return ("；这是模型服务商的内容审核拦截（不是本地配置问题）："
+            "请求里含成人 / 敏感内容时整条请求会被直接拒绝，正文、翻译、上下文摘要都会一起失败。"
+            "改用本地模型或不做审核的接口即可避免；只想保留云端模型的话，"
+            "就得避免让这类内容进入对话上下文。")
 
 
 # ---------------------------------------------------------------------------
@@ -420,21 +441,28 @@ def sticker_capture_allowed(ctx, content: str) -> bool:
     return False
 
 
-def _sticker_capture_instruction(ctx) -> str:
+def _sticker_capture_instruction(ctx, describe_only: bool = False) -> str:
     """生成"是否值得收藏为表情包"的判定指令（力求宁缺毋滥）。
 
     WebUI 的 sticker_capture_prompt 非空时追加为自定义补充规则
     （与 emotion_guide_extra 同一套用法）。
+    describe_only=True 时主 JSON 只有画面描述，措辞要跟着换，否则模型会以为
+    还该输出回复台词。
     """
-    from modules.stickers import STRICT_ALLOWED
-    cats = "、".join(
-        f"{c}({STICKER_USE_HINTS[c]})" if c in STICKER_USE_HINTS else c
-        for c in sorted(STRICT_ALLOWED))
+    from modules.stickers import category_candidates_text
+    # 候选分类来自表情库目录下实际存在的子文件夹，不预设固定的分类名
+    candidates = category_candidates_text(ctx)
     extra = str(ctx.get("sticker_capture_prompt", "") or "").strip()
-    suffix = f"\n【自定义补充规则】{extra}" if extra else ""
+    # 补充规则排在最后，模型会把它当成最高优先；不声明优先级的话，
+    # 用户配置里"拿不准就随便挑一个分类"这类写法会盖掉上面的硬性否决
+    suffix = (f"\n【自定义补充规则】{extra}\n"
+              "以上补充规则与前面的硬性否决（①②⑤）冲突时，以硬性否决为准。") if extra else ""
     return (
-        "\n【表情包收藏判定】在回复 JSON 之后，必须再输出一个独立的 sticker JSON 对象"
-        "（不要放进回复的 sentences/description）："
+        "\n【表情包收藏判定】在" + ("描述 JSON" if describe_only else "回复 JSON")
+        + "之后，必须再输出一个独立的 sticker JSON 对象"
+        + ("（不要放进 description）：" if describe_only
+           else "（不要放进回复的 sentences/description）：")
+        +
         '先判断是否含真人面孔或隐私内容（证件、聊天记录、手机号、地址、二维码等），'
         '含则输出 {"sticker_safe": false}（到此为止）。'
         "\n判定标准（前两条是硬性否决，必须优先执行）："
@@ -446,13 +474,22 @@ def _sticker_capture_instruction(ctx) -> str:
         "画面里有夸张的表情/动作，或带有可用于互动的文字，"
         "或明显用于挑逗、撩拨、嘲讽、炫耀、撒娇、无语等互动用途；"
         "\n④ 判定场景的是【发图一方想表达的语气】，不是画面里角色的此刻心情；"
+        "分类与命名只取决于画面本身，与你此刻的心情、对本条对话的态度无关；"
         "单个神态词（如睁大眼睛、惊喜）不构成收藏理由，"
-        "若整体明显用于调戏/撩拨，应选 weixie 或 sajiao 而不是 jingya；"
+        "若整体明显用于调戏/撩拨，应归入挑逗或撒娇一类的分类，而不是惊讶一类；"
         "\n⑤ 拿不准就输出 {\"sticker_safe\": false}——宁可不收藏，也不要错收藏。"
-        f"\n可以收藏时输出：{{\"sticker_safe\": true, \"category\": \"使用场景拼音\", "
-        f"\"reason\": \"具体说明这张图适合在什么场景、表达什么语气使用\"}}。"
-        f"category 只能从以下拼音中选：{cats}。"
-        "reason 必须具体（一句话说明使用场景），不能只写\"好看\"\"有趣\"\"可爱\"这类空话。"
+        f"\n可以收藏时输出：{{\"sticker_safe\": true, \"category\": \"分类名\", "
+        f"\"reason\": \"这张表情的通用用途名\"}}。"
+        "category 只能从下面这份分类清单里选一个："
+        "清单取自表情库目录下实际存在的分类文件夹，"
+        "先逐个比较各分类的适用范围，再选出最贴合的一个，"
+        "并原样照抄它的名称（不要自己新造，也不要换成拼音或译文）：\n"
+        f"{candidates}\n"
+        "reason 是这张表情以后反复使用时的名字，换角色也必须照样能用："
+        "只写它适合表达的情绪与互动用途，不写画面里是谁、也不写是给谁用的；"
+        "严禁出现任何角色名、人名、作品名（含当前角色自己的名字），"
+        "也不要描述这件具体的事情；简短（6~12 个字），不能写成句子，"
+        "也不能是\"好看\"\"有趣\"\"可爱\"这类空话。"
         + suffix
     )
 
@@ -862,10 +899,17 @@ def maybe_unload_old_models(ctx) -> None:
     threading.Thread(target=_work, daemon=True).start()
 
 
+# 人设提示词：角色条目自己留空就代表「这个角色没有这段提示词」，
+# 不能回退到全局配置——全局那份是内置默认角色的人设文案，会让没填提示词的角色
+# （新建后未设置名称、人设的空白条目）静默变成默认角色。
+_ROLE_PROMPT_KEYS = ("personality_prompt", "json_prompt", "supplement_prompt")
+
+
 class RoleContext:
     """全局配置 + 角色覆盖字段的只读视图。
 
     角色字段中非空的值优先；否则回退到全局配置。
+    _ROLE_PROMPT_KEYS 例外：角色条目存在时只认它自己的值。
     """
 
     def __init__(self, config, role: Optional[dict] = None):
@@ -873,8 +917,11 @@ class RoleContext:
         self.role = role or {}
 
     def get(self, key, default=None):
+        if self.role and key in _ROLE_PROMPT_KEYS:
+            return self.role.get(key) or default
         role_val = self.role.get(key)
-        if role_val is not None and role_val != "":
+        if role_val is not None and role_val != "" and not (
+                isinstance(role_val, (list, dict)) and not role_val):
             return role_val
         try:
             return self.config.get(key, default)
@@ -933,6 +980,14 @@ def build_speaker_labels(history: list) -> Dict:
     return labels
 
 
+_IMAGE_PLACEHOLDER_RE = re.compile(r"\[图片(?::[^\]]*)?\]")
+
+
+def _strip_stale_image_description(content: str) -> str:
+    """把非本轮用户消息里的画面描述降级为 [图片] 占位。"""
+    return _IMAGE_PLACEHOLDER_RE.sub("[图片]", content)
+
+
 def build_merged_history(history: list, ctx: RoleContext) -> List[dict]:
     """将持久化历史转换为对话消息列表（合并同角色相邻消息，附带说话人序号标签）。
 
@@ -940,18 +995,31 @@ def build_merged_history(history: list, ctx: RoleContext) -> List[dict]:
     只在**最近一条**这样的消息后面追加一条备查备注：
     让模型回答"你唱一段我听听"之类的追问时能直接引用此前搜到的内容，
     而不是因为上下文里没有结果又重新搜索一遍。
+
+    用户消息附带的画面描述只在**最近一条用户消息**上保留：画面描述一旦回填就永久
+    留在历史里，之后每一轮都会被当成当前话题的指代对象（用户说"这是什么东西"时，
+    模型会去回答上一条早已聊过的图片）。更早的降级为 [图片] 占位，只保留"这里曾有图"。
     """
     n = max(0, int(ctx.get("history_length", 8) or 0))
-    history_data = history[-n:] if n > 0 else []
+    # 历史里混进非 dict 条目时（损坏的持久化数据）下面直接 .get 会抛 AttributeError，
+    # 整轮回复构建都会失败，所以先过滤
+    history_data = [m for m in (history[-n:] if n > 0 else []) if isinstance(m, dict)]
     labels = build_speaker_labels(history)
     merged = []
     notes_idx = next((i for i in range(len(history_data) - 1, -1, -1)
                       if str(history_data[i].get("tool_notes") or "").strip()), None)
+    last_user_idx = next((i for i in range(len(history_data) - 1, -1, -1)
+                          if history_data[i].get("role", "user") == "user"), None)
+    # 备查备注也是 role="user"，记下它在 merged 里的位置：否则紧随其后的用户真话
+    # 会被合并进这条备注里，模型会把用户的新问题当成备查资料的一部分
+    note_pos = -1
     for idx, msg in enumerate(history_data):
         role = msg.get("role", "user")
         content = str(msg.get("content", ""))
         if role not in ["user", "assistant"] or not content:
             continue
+        if role == "user" and idx != last_user_idx:
+            content = _strip_stale_image_description(content)
         label = ""
         if role == "user":
             label = labels.get(str(msg.get("sender_id") or "").strip(), "")
@@ -959,7 +1027,7 @@ def build_merged_history(history: list, ctx: RoleContext) -> List[dict]:
             label = labels.get(str(msg["speaker"]).strip(), "")
         if label:
             content = f"[{label}] {content}"
-        if merged and merged[-1]["role"] == role:
+        if merged and merged[-1]["role"] == role and len(merged) - 1 != note_pos:
             merged[-1]["content"] += "\n" + content
         else:
             merged.append({"role": role, "content": content})
@@ -971,6 +1039,7 @@ def build_merged_history(history: list, ctx: RoleContext) -> List[dict]:
                 "【此前工具查询结果备查】下面是上一轮通过工具查到的结果记录，"
                 "回答用户追问时直接引用这些内容，严禁就同一内容再次调用搜索/抓取：\n"
                 + str(msg.get("tool_notes"))[:note_chars * max_entries + 200]})
+            note_pos = len(merged) - 1
     return merged
 
 
@@ -1053,6 +1122,10 @@ def build_system_prompt(ctx: RoleContext, emotions: dict, extra_parts: Optional[
     if ctx.get("llm_judge", True) and emotion_keys:
         parts.append(f"【情绪可选列表】{', '.join(emotion_keys)}")
         parts.append(_emotion_guide(ctx, emotions))
+        mimics = available_mimics(ctx)
+        if mimics:
+            parts.append(f"【情绪模仿可选列表】{', '.join(str(k) for k in mimics)}")
+            parts.append(_mimic_guide(mimics))
     if ctx.get("enable_time_awareness", False):
         lt = time.localtime()
         try:
@@ -1082,20 +1155,60 @@ EMOTION_HINTS = {
     "pingjing": "平静、日常陈述、没有明显情绪的普通寒暄",
 }
 
-# 常用中文情绪名 → 拼音目录名
+# 常用中文情绪名 → 拼音情绪名（目录名可以是其中任意一种，见 _EMOTION_SYNONYMS）
 _EMOTION_ALIASES = {
-    "高兴": "gaoxing", "开心": "gaoxing", "生气": "shengqi", "愤怒": "shengqi",
-    "害羞": "haixiu", "羞涩": "haixiu", "无语": "wuyu", "惊讶": "jingya",
-    "撒娇": "sajiao", "威胁": "weixie", "挑逗": "weixie", "着急": "zhaoji",
-    "平静": "pingjing", "默认": "pingjing",
+    "高兴": "gaoxing", "开心": "gaoxing", "快乐": "gaoxing", "兴奋": "gaoxing",
+    "喜悦": "gaoxing", "搞笑": "gaoxing", "沙雕": "gaoxing", "滑稽": "gaoxing",
+    "生气": "shengqi", "愤怒": "shengqi", "恼火": "shengqi", "暴躁": "shengqi",
+    "害羞": "haixiu", "羞涩": "haixiu", "脸红": "haixiu", "娇羞": "haixiu",
+    "无语": "wuyu", "无奈": "wuyu", "翻白眼": "wuyu", "敷衍": "wuyu",
+    "惊讶": "jingya", "吃惊": "jingya", "震惊": "jingya", "错愕": "jingya",
+    "撒娇": "sajiao", "卖萌": "sajiao", "可爱": "sajiao", "调情": "sajiao",
+    "威胁": "weixie", "挑逗": "weixie", "阴阳怪气": "weixie", "坏笑": "weixie",
+    "着急": "zhaoji", "慌张": "zhaoji", "焦虑": "zhaoji", "紧张": "zhaoji",
+    "平静": "pingjing", "淡定": "pingjing", "冷漠": "pingjing", "默认": "pingjing",
+    "伤心": "shangxin", "难过": "shangxin", "悲伤": "shangxin", "哭泣": "shangxin",
+    "委屈": "weiqu", "害怕": "haipa", "恐惧": "haipa", "无聊": "wuliao",
+    "疲惫": "pibei", "犯困": "pibei", "严肃": "yansu",
 }
-# 常见英文情绪名 → 拼音目录名
+# 常见英文情绪名 → 拼音情绪名
 _EMOTION_EN = {
-    "happy": "gaoxing", "joy": "gaoxing", "angry": "shengqi", "shy": "haixiu",
-    "embarrassed": "haixiu", "speechless": "wuyu", "surprised": "jingya",
-    "coy": "sajiao", "threat": "weixie", "tease": "weixie", "anxious": "zhaoji",
+    "happy": "gaoxing", "joy": "gaoxing", "excited": "gaoxing", "funny": "gaoxing",
+    "angry": "shengqi", "furious": "shengqi", "mad": "shengqi",
+    "shy": "haixiu", "embarrassed": "haixiu", "blush": "haixiu",
+    "speechless": "wuyu", "helpless": "wuyu",
+    "surprised": "jingya", "shocked": "jingya",
+    "coy": "sajiao", "cute": "sajiao", "flirty": "sajiao", "teasing": "sajiao",
+    "threat": "weixie", "smirk": "weixie", "sarcastic": "weixie",
+    "anxious": "zhaoji", "nervous": "zhaoji", "worried": "zhaoji",
     "calm": "pingjing", "neutral": "pingjing", "normal": "pingjing",
+    "sad": "shangxin", "cry": "shangxin", "upset": "weiqu",
+    "scared": "haipa", "terrified": "haipa", "bored": "wuliao", "tired": "pibei",
 }
+
+
+def _build_emotion_synonyms() -> dict:
+    """把中文/英文/拼音三种写法汇总成同义组：成员(小写) -> 同组成员（拼音在前，顺序固定）。
+
+    情绪目录名由用户自定（中文、拼音、英文都可能），所以解析必须双向：
+    目录叫「高兴」而模型写 gaoxing/happy，或目录叫 gaoxing 而模型写「高兴」，都要落到同一个情绪。
+    """
+    groups = {}
+    for table in (_EMOTION_ALIASES, _EMOTION_EN):
+        for name, canonical in table.items():
+            members = groups.setdefault(canonical, [canonical])
+            low = str(name).lower()
+            if low not in members:
+                members.append(low)
+    out = {}
+    for members in groups.values():
+        frozen = tuple(members)
+        for member in frozen:
+            out[member] = frozen
+    return out
+
+
+_EMOTION_SYNONYMS = _build_emotion_synonyms()
 
 # 「关键词 → 应优先使用的情绪」硬规则：只在对应情绪可用时生效
 _EMOTION_HOTWORDS = (
@@ -1109,21 +1222,93 @@ _EMOTION_HOTWORDS = (
 )
 
 
-def _resolve_emotion_key(key: str, available) -> str:
+def resolve_emotion_key(key: str, available) -> str:
+    """把模型给的情绪收敛到实际存在的情绪目录名；解析不出返回空串。
+
+    顺序：小写精确 → 同义组（中文/拼音/英文互通）→ 前缀包含兜底（如 haixiu2 → haixiu）。
+    目录名由用户自定，所以一律按小写比对、命中后返回目录原本的名字：
+    目录叫「高兴」而模型写 gaoxing/happy，或目录叫 Yandere 而模型写 yandere，都要能命中。
+    """
     k = str(key or "").strip()
-    if k in available:
-        return k
+    if not k:
+        return ""
+    lookup = {}
+    for item in available or ():
+        name = str(item)
+        lookup.setdefault(name.lower(), name)
+    if not lookup:
+        return ""
     low = k.lower()
-    if low in available:
-        return low
-    for table in (_EMOTION_ALIASES, _EMOTION_EN):
-        mapped = table.get(k) or table.get(low)
-        if mapped and mapped in available:
-            return mapped
-    for avail in available:  # 前缀/包含兜底（如 haixiu2 → haixiu）
-        if avail and (avail in low or low in avail):
-            return avail
+    if low in lookup:
+        return lookup[low]
+    for member in _EMOTION_SYNONYMS.get(low, ()):
+        if member in lookup:
+            return lookup[member]
+    for name, actual in lookup.items():
+        if name and (name in low or low in name):
+            return actual
     return ""
+
+
+def _emotion_hint(key: str) -> str:
+    """按同义组找情绪目录对应的判定说明：目录名是中文/英文也能拿到该情绪的说明。"""
+    low = str(key or "").strip().lower()
+    if not low:
+        return ""
+    hint = EMOTION_HINTS.get(low)
+    if hint:
+        return hint
+    for member in _EMOTION_SYNONYMS.get(low, ()):
+        hint = EMOTION_HINTS.get(member)
+        if hint:
+            return hint
+    return ""
+
+
+# 旧版提示词把情绪锁死在拼音/英文上（"绝对不能输出中文汉字"），情绪目录改成中文时会自相矛盾，
+# 升级时按原样替换成"照抄【情绪可选列表】里的词"。
+LEGACY_EMOTION_RULE_PHRASES = (
+    ("【情绪匹配规则】情绪文件夹可能是拼音（如 gaoxing），也可能是英文（如 happy）。"
+     "你必须严格只输出我在【情绪可选列表】中提供的单词，绝对不能输出中文汉字或拼音简写！",
+     "【情绪匹配规则】emotion 只能从【情绪可选列表】里原样照抄一个词："
+     "列表给的是中文就填中文、是拼音就填拼音、是英文就填英文，不许翻译、改写或自创；"
+     "列表以外的词一律无效！"),
+)
+_PROMPT_TEXT_FIELDS = ("personality_prompt", "json_prompt", "supplement_prompt")
+
+
+def migrate_emotion_rules(config) -> bool:
+    """把提示词里"只能输出拼音/英文"的旧规则换成"照抄【情绪可选列表】"，含每个角色条目。"""
+    targets = [config]
+    roles = config.get("roles")
+    if isinstance(roles, list):
+        targets.extend(r for r in roles if isinstance(r, dict))
+    changed = False
+    for item in targets:
+        for field in _PROMPT_TEXT_FIELDS:
+            raw = str(item.get(field) or "")
+            if not raw:
+                continue
+            new = raw
+            for old, repl in LEGACY_EMOTION_RULE_PHRASES:
+                new = new.replace(old, repl)
+            if new != raw:
+                item[field] = new
+                changed = True
+    return changed
+
+
+_emotion_miss_warned: set = set()
+
+
+def _warn_unknown_emotion(value, fallback, emotions) -> None:
+    """模型给了列表外的情绪时提示一次（同一取值只提示一次，避免逐句刷屏）。"""
+    key = str(value or "").strip().lower()
+    if not key or key in _emotion_miss_warned:
+        return
+    _emotion_miss_warned.add(key)
+    print(f"情绪 {value!r} 不在【情绪可选列表】里，已改用默认情绪 {fallback!r}。"
+          f"当前可用：{', '.join(str(k) for k in (emotions or {}))}")
 
 
 def _emotion_guide(ctx: RoleContext, emotions: dict) -> str:
@@ -1133,18 +1318,13 @@ def _emotion_guide(ctx: RoleContext, emotions: dict) -> str:
         return ""
     available = [str(k) for k in (emotions or {})]
     default_voice = str(ctx.get("default_voice", "") or "")
-    default_key = _resolve_emotion_key(default_voice, available) or (available[0] if available else "")
+    default_key = resolve_emotion_key(default_voice, available) or (available[0] if available else "")
     lines = [
         "【情绪判定规则】emotion 字段决定这句话用哪套参考音色，必须按下面时机判断，"
         "不要凭手感随便填，也不要因为拿不准就一律填平静。"
     ]
     for key in available:
-        hint = EMOTION_HINTS.get(key.lower())
-        if not hint:
-            for alias, mapped in _EMOTION_ALIASES.items():
-                if mapped == key.lower():
-                    hint = EMOTION_HINTS.get(mapped)
-                    break
+        hint = _emotion_hint(key)
         lines.append(f"- {key}：{hint}" if hint else f"- {key}：按字面意思选用")
     if default_key:
         lines.append(
@@ -1165,6 +1345,101 @@ def _emotion_guide(ctx: RoleContext, emotions: dict) -> str:
     extra = str(ctx.get("emotion_guide_extra", "") or "").strip()
     if extra:
         lines.append(extra)
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 情绪模仿（在语气音色之上叠加说话情绪，音色仍由语气目录决定）
+# ---------------------------------------------------------------------------
+
+# 情绪模仿配置要按角色扫描参考音频目录，只有主程序有文件系统上下文，由它注入
+_MIMICS_PROVIDER: Optional[Callable[[dict], dict]] = None
+
+# 模型用这些值表示"这句话不做情绪模仿"
+_MIMIC_NONE_VALUES = {"none", "null", "无", "无情绪", "不模仿", "-"}
+
+MIMIC_HINTS = {
+    # 表现型命名（抽泣、大笑这类说话方式）
+    "chuoqi": "抽泣、哽咽、忍着眼泪说话",
+    "kuqi": "大哭、放声哭",
+    "daxiao": "捧腹大笑、笑到停不下来",
+    "fennu": "愤怒、怒吼、发火",
+    "jingya": "惊讶、震惊、倒吸一口气",
+    "tanxi": "叹息、长叹、无奈",
+    "kongju": "恐惧、害怕、发抖",
+    "weiqu": "委屈、哽咽着抱怨",
+    "lengxiao": "冷笑、嘲讽",
+    "xingfen": "兴奋、激动、喊出来",
+    # 情绪型命名（按情绪词命名目录时用）
+    "gaoxing": "高兴、开心、雀跃",
+    "haixiu": "害羞、脸红、扭捏",
+    "shengqi": "生气、恼怒、赌气",
+    "zhaoji": "着急、慌忙、催促",
+    "nanguo": "难过、失落、想哭",
+    "weixiao": "微笑、轻声笑",
+    "bujie": "不解、困惑、想不通",
+    "ganga": "尴尬、不好意思、讪讪地",
+    "jiaoao": "骄傲、得意、傲娇",
+    "wuyu": "无语、无奈、说不出话",
+    "xiao": "笑、轻笑、憋笑",
+    "xingfu": "幸福、满足、温柔欣慰",
+    "yihuo": "疑惑、纳闷、不确定",
+    "pingjing": "平静、淡然、平铺直叙",
+}
+
+
+def set_mimics_provider(provider) -> None:
+    """注入「按角色取情绪模仿配置」的回调（主程序启动时调用一次）。"""
+    global _MIMICS_PROVIDER
+    _MIMICS_PROVIDER = provider
+
+
+def available_mimics(ctx) -> dict:
+    """当前角色可用的情绪模仿列表；未注入、开关关闭或无配置时返回空 dict。"""
+    if _MIMICS_PROVIDER is None:
+        return {}
+    if not _cfg_bool(ctx, "emotion_mimic_enabled", True):
+        return {}
+    try:
+        return _MIMICS_PROVIDER(getattr(ctx, "role", None) or {}) or {}
+    except Exception:
+        return {}
+
+
+def _resolve_mimic_key(key: str, available) -> str:
+    """把模型给的 mimic 值收敛到实际存在的情绪模仿目录名；解析不出返回空串。"""
+    k = str(key or "").strip()
+    if not k or k.lower() in _MIMIC_NONE_VALUES:
+        return ""
+    if k in available:
+        return k
+    low = k.lower()
+    if low in available:
+        return low
+    for avail in available:
+        name = str(avail).lower()
+        if name and (name == low or name in low or low in name):
+            return avail
+    return ""
+
+
+def _mimic_guide(mimics: dict) -> str:
+    """生成「情绪模仿规则」段落：给出带 mimic 的 JSON 块样式与选择规则。"""
+    lines = [
+        "【情绪模仿规则】每句 JSON 块在 zh / ja / emotion 之外还要再补一个 mimic 字段"
+        "（上面的输出格式说明只列了前三个字段，本条在此基础上追加）："
+        '{"zh": "中文台词", "ja": "日语台词", "emotion": "情绪", "mimic": "情绪模仿"}。'
+        "emotion 决定音色，mimic 决定这句话用什么情绪说话，"
+        "只改变说话的情绪，不改变角色音色。"
+    ]
+    for key in [str(k) for k in mimics]:
+        hint = MIMIC_HINTS.get(key.lower())
+        lines.append(f"- {key}：{hint}" if hint else f"- {key}：按字面意思选用")
+    lines.append("- none：不做情绪模仿，按 emotion 的语气正常说话")
+    lines.append(
+        "【mimic 选择规则】mimic 只能填上面列表里的名字，禁止输出列表以外的任何值。"
+        "每句话都要从列表里挑一个与这句话情绪最贴近的；列表里确实没有合适的"
+        "（例如平铺直叙、纯陈述）才填 none。")
     return "\n".join(lines)
 
 
@@ -1193,6 +1468,24 @@ def _cfg_bool(ctx: RoleContext, key: str, default: bool = True) -> bool:
     if val is None or val == "":
         return default
     return str(val).strip().lower() not in ("false", "0", "no", "off", "否", "关", "关闭")
+
+
+def _cfg_num(ctx: RoleContext, key: str, default: float) -> float:
+    """配置数值容错：空值/非数字回落默认值。
+
+    不能写成 `ctx.get(key, default) or default`：那会把合法的 0（例如
+    temperature=0 的贪婪解码、llm_top_k=0）当成"没配置"而吞掉。
+    """
+    try:
+        val = ctx.get(key, default)
+    except Exception:
+        return default
+    if val is None or val == "":
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
 
 
 def _recent_user_text(history: list, limit: int = 6) -> str:
@@ -1341,16 +1634,16 @@ def _endpoint_and_payload(ctx: RoleContext, messages: list, stream: bool, tools=
     base_url = str(ctx.get("llm_base_url", "http://127.0.0.1:11434")).rstrip("/")
     model = ctx.get("llm_model_name", "")
     timeout = ctx.get("llm_timeout", 120)
-    enable_think = ctx.get("enable_think", False)
-    temp_cap = float(ctx.get("temperature_max", 1.0) or 1.0)
-    temperature = min(temp_cap, float(ctx.get("temperature", 1.0) or 1.0))
+    enable_think = _cfg_bool(ctx, "enable_think", False)
+    temp_cap = _cfg_num(ctx, "temperature_max", 1.0)
+    temperature = min(temp_cap, _cfg_num(ctx, "temperature", 1.0))
     # LLM 采样参数（WebUI 可配，默认开启）：top_p / top_k / 重复惩罚。
     # 默认值取 Ollama 官方默认（top_k=40, top_p=0.9, repeat_penalty=1.1），
     # 关闭 llm_sampling_enabled 后请求只带温度等基本参数。
-    sampling_on = bool(ctx.get("llm_sampling_enabled", True))
-    top_p = float(ctx.get("llm_top_p", 0.9) or 0.9)
-    top_k = int(ctx.get("llm_top_k", 40) or 40)
-    repeat_penalty = float(ctx.get("llm_repeat_penalty", 1.1) or 1.1)
+    sampling_on = _cfg_bool(ctx, "llm_sampling_enabled", True)
+    top_p = _cfg_num(ctx, "llm_top_p", 0.9)
+    top_k = int(_cfg_num(ctx, "llm_top_k", 40))
+    repeat_penalty = _cfg_num(ctx, "llm_repeat_penalty", 1.1)
     messages = normalize_messages_for_backend(messages, backend)
     if backend == "ollama":
         endpoint = chat_endpoint(base_url, "ollama")
@@ -1358,7 +1651,7 @@ def _endpoint_and_payload(ctx: RoleContext, messages: list, stream: bool, tools=
             "model": model, "messages": messages, "stream": stream,
             "think": enable_think,
             "options": {
-                "num_ctx": int(ctx.get("num_ctx", 8192)),
+                "num_ctx": int(_cfg_num(ctx, "num_ctx", 8192)),
                 "temperature": temperature,
             },
         }
@@ -1432,8 +1725,10 @@ async def chat_once(ctx: RoleContext, messages: list, tools=None) -> Dict:
                             print("Ollama 工具 schema 的 required 字段不兼容，已重试兼容格式。")
                             await asyncio.sleep(1.2)
                             continue
-                        raise RuntimeError(f"HTTP {resp.status_code} {endpoint}：{detail}")
-                    raise RuntimeError(f"HTTP {resp.status_code} {endpoint}：{detail}")
+                        raise RuntimeError(f"HTTP {resp.status_code} {endpoint}：{detail}"
+                                       + api_error_hint(detail))
+                    raise RuntimeError(f"HTTP {resp.status_code} {endpoint}：{detail}"
+                                       + api_error_hint(detail))
                 resp.raise_for_status()
                 data = resp.json()
             break
@@ -1449,7 +1744,7 @@ async def chat_once(ctx: RoleContext, messages: list, tools=None) -> Dict:
     maybe_unload_old_models(ctx)
     content = ""
     tool_calls = []
-    enable_think = bool(ctx.get("enable_think", False))
+    enable_think = _cfg_bool(ctx, "enable_think", False)
     if backend == "ollama":
         msg = data.get("message", {}) or {}
         # 只取真正的回答：thinking 字段与 content 内嵌的  thinking 块都会被剥离
@@ -1482,7 +1777,8 @@ async def _stream_chat_inner(ctx: RoleContext, messages: list) -> AsyncGenerator
                     detail = (await resp.aread()).decode("utf-8", errors="ignore")[:400]
                 except Exception:
                     detail = ""
-                raise RuntimeError(f"HTTP {resp.status_code} {endpoint}：{detail}")
+                raise RuntimeError(f"HTTP {resp.status_code} {endpoint}：{detail}"
+                                   + api_error_hint(detail))
             resp.raise_for_status()
             if backend == "ollama":
                 async for line in resp.aiter_lines():
@@ -1519,9 +1815,13 @@ async def _stream_chat_inner(ctx: RoleContext, messages: list) -> AsyncGenerator
                     except Exception:
                         continue
                     delta = ((chunk.get("choices") or [{}])[0].get("delta") or {})
-                    if thinking_fragments(delta):
-                        continue  # OpenAI 兼容服务常把思维链放在 reasoning_content
                     delta_text = delta.get("content", "") or ""
+                    tool_fragments = delta.get("tool_calls") or []
+                    if not delta_text and not tool_fragments:
+                        # 只有既没有正文也没有工具分片时才是纯思考块（OpenAI 兼容
+                        # 服务常把思维链放在 reasoning_content）。按"整块跳过"处理会
+                        # 把同一 chunk 里的正文/工具分片一起丢掉
+                        continue
                     if first_token_ms is None and delta_text:
                         first_token_ms = (time.time() - start) * 1000
                     yield {"delta": delta_text,
@@ -1611,7 +1911,7 @@ def strip_other_language_from_display(display: str, display_lang: str, text_lang
 
 
 def normalize_single(obj, ctx: RoleContext, emotions: dict, user_text: str) -> Dict:
-    """将单个句子对象规整为 {zh, lang, display, emotion}。"""
+    """将单个句子对象规整为 {zh, lang, display, emotion, mimic}。"""
     s = obj if isinstance(obj, dict) else {"zh": str(obj)}
     text_lang = ctx.get("text_lang", "ja")
     display_lang = ctx.get("display_lang", "zh")
@@ -1642,12 +1942,18 @@ def normalize_single(obj, ctx: RoleContext, emotions: dict, user_text: str) -> D
     if not ctx.get("llm_judge", True) or not emo:
         emo = default_voice
     else:
-        emo = _resolve_emotion_key(emo, emotions) or default_voice
+        resolved = resolve_emotion_key(emo, emotions)
+        if not resolved:
+            _warn_unknown_emotion(emo, default_voice, emotions)
+        emo = resolved or default_voice
+    # 情绪模仿名同样要收敛到真实存在的目录，解析不出就当没选（退回纯语气音色）
+    mimic = _resolve_mimic_key(s.get("mimic", ""), available_mimics(ctx)) \
+        if ctx.get("llm_judge", True) else ""
     # 文本清洗：用户配置的屏蔽字符/词不进语音也不进发送文本
     zh = apply_text_clean(zh, ctx)
     lang = apply_text_clean(lang, ctx)
     display = apply_text_clean(display, ctx)
-    return {"zh": zh, "lang": lang, "display": display, "emotion": emo}
+    return {"zh": zh, "lang": lang, "display": display, "emotion": emo, "mimic": mimic}
 
 
 # 提示词约定「一个句号才算一句话」；模型偶尔把多句写进同一个数组元素，
@@ -1734,7 +2040,8 @@ def split_multi_clause_sentences(sentences: List[Dict]) -> List[Dict]:
                      "lang": lang_parts[i] if lang and lang_parts else lang,
                      "display": disp_list[i] if i < len(disp_list)
                      else _display_piece(zh_parts[i], lang_parts[i]),
-                     "emotion": s.get("emotion", "")}
+                     "emotion": s.get("emotion", ""),
+                     "mimic": s.get("mimic", "")}
             out.append(piece)
     return _merge_short_sentences(out)
 
@@ -1959,6 +2266,7 @@ def segment_for_tts(sentences: List[Dict]) -> List[Dict]:
             print(f"分句合成：中文 {len(parts)} 句 / 台词 {len(lang_parts)} 句，"
                   f"已按长度对齐为 {len(zh_groups)} 段（逐段对应、不丢内容）")
         emotion = s.get("emotion", "")
+        mimic = s.get("mimic", "")
         for i, piece in enumerate(zh_groups):
             lang_piece = lang_groups[i]
             if not had_display:
@@ -1972,6 +2280,7 @@ def segment_for_tts(sentences: List[Dict]) -> List[Dict]:
                 "lang": lang_piece,
                 "display": text_piece,
                 "emotion": emotion,
+                "mimic": mimic,
             })
     return result
 
@@ -2565,7 +2874,7 @@ async def _prefetch_message_urls(ctx: RoleContext, work: list, tool_registry,
             urls.append(url)
     if not urls:
         return work
-    limit = max(1, int(ctx.get("web_fetch_precheck_max", 2)))
+    limit = max(1, int(_cfg_num(ctx, "web_fetch_precheck_max", 2)))
     allowed, reason = tool_registry.check_permission(tool, user_id)
     if not allowed:
         print(f"含链接消息预抓取跳过: {reason}")
@@ -3213,7 +3522,7 @@ async def chat_with_tools(ctx: RoleContext, messages: list, tool_registry,
     trace = []
     call_counts = {}
     total_ms = 0.0
-    max_iter = max(1, int(ctx.get("tools_max_iterations", 3)))
+    max_iter = max(1, int(_cfg_num(ctx, "tools_max_iterations", 3)))
     user_text = last_user_text(messages)
     tool_names = [str(t.get("function", {}).get("name", ""))
                   for t in (tools_schema or []) if t.get("function")]
@@ -3484,46 +3793,55 @@ async def generate_json_reply(ctx: RoleContext, system_prompt: str, user_prompt:
     return extract_json(text)
 
 
-STICKER_USE_HINTS = {
-    "gaoxing": "开心大笑、炫耀、起哄",
-    "shengqi": "生气、不满、警告",
-    "haixiu": "害羞、被夸不好意思",
-    "wuyu": "无语、敷衍、怼人",
-    "jingya": "惊讶、震惊",
-    "sajiao": "撒娇、卖萌、撩人",
-    "weixie": "威胁、阴阳怪气、挑逗",
-    "pingjing": "平静、日常寒暄",
-}
-
-
 async def get_image_reply(ctx: RoleContext, user_text: str, history: list,
                           emotions: dict, image_urls: list,
-                          extra_parts=None, stats=None) -> Optional[Dict]:
-    """识图回复：读取本地或下载网络图片，交给识图模型生成句子。"""
+                          extra_parts=None, stats=None,
+                          describe_only: bool = False) -> Optional[Dict]:
+    """识图回复：读取本地或下载网络图片，交给识图模型生成句子。
+
+    describe_only=True 时只取画面描述（与收藏判定），不产出任何台词：用于
+    「回复审判判定不用回、但仍要把图看进历史」的场景 —— 那一轮本来就不发消息，
+    让它生成台词只会留下一段没发出去、又被下一轮接着演的回复。
+    """
     try:
-        prompt_text = (
-            "用户发来了一张图片，请仔细观察图片内容，结合你的角色人设与上方对话历史，"
-            "根据图片内容回复（可以是吐槽、评价、撒娇等）。\n"
-            "回复 JSON 必须包含 sentences（角色台词，至少一条）与 description"
-            "（一句中文客观描述画面实际内容，只陈述事实）；sentences 不能缺失或为空。\n"
-            "图片里的文字要分两种情况看："
-            "写着“小妹妹”“老婆”“笨蛋”这类称呼、且没有明确指向别人时，是在称呼你本人"
-            "（当前角色），绝不要理解成画面里另有一个人、也不要把话题转到第三方身上，"
-            "只有明确写了别人名字时才当作别人；"
-            "而写着“我馋你身子”“让我贴贴”这类第一人称的台词，说话的是画中人或发图的人，"
-            "不是你本人，引用时绝不能说成是你自己说的话。\n"
-            f"用户附加文字：{user_text}"
-        )
+        if describe_only:
+            prompt_text = (
+                "用户发来了一张图片。本轮角色不会回复，你只需要看图。\n"
+                "只输出一个 JSON 对象，字段为 description"
+                "（一句中文客观描述画面实际内容，只陈述事实）；"
+                "不要输出 sentences，不要写任何角色台词。\n"
+                f"用户附加文字：{user_text}"
+            )
+        else:
+            prompt_text = (
+                "用户发来了一张图片，请仔细观察图片内容，结合你的角色人设与上方对话历史，"
+                "根据图片内容回复（可以是吐槽、评价、撒娇等）。\n"
+                "回复 JSON 必须包含 sentences（角色台词，至少一条）与 description"
+                "（一句中文客观描述画面实际内容，只陈述事实）；sentences 不能缺失或为空。\n"
+                "图片里的文字要分两种情况看："
+                "写着“小妹妹”“老婆”“笨蛋”这类称呼、且没有明确指向别人时，是在称呼你本人"
+                "（当前角色），绝不要理解成画面里另有一个人、也不要把话题转到第三方身上，"
+                "只有明确写了别人名字时才当作别人；"
+                "而写着“我馋你身子”“让我贴贴”这类第一人称的台词，说话的是画中人或发图的人，"
+                "不是你本人，引用时绝不能说成是你自己说的话。\n"
+                f"用户附加文字：{user_text}"
+            )
         if ctx.get("sticker_capture_enabled", False):
-            prompt_text += _sticker_capture_instruction(ctx)
-        prompt_text += (
-            "\n要求："
-            "1) sentences 的 zh 要贴合当前这张图的具体内容来写，不要用套话；"
-            "若你刚才回复过相似内容，绝不能重复上一句的句子，要换一种完全不同的说法。"
-            "2) ja 必须是 zh 的地道日文翻译（含义与语气完全一致，不逐字硬译，不夹带中文）。"
-            "3) description 除客观画面内容外，还要写清人物表情神态"
-            "（如脸红、害羞、惊讶、生气、无语等）与整体氛围，不要只写构图和画面文字。"
-        )
+            prompt_text += _sticker_capture_instruction(ctx, describe_only)
+        if describe_only:
+            prompt_text += (
+                "\n要求：description 除客观画面内容外，还要写清人物表情神态"
+                "（如脸红、害羞、惊讶、生气、无语等）与整体氛围，不要只写构图和画面文字。"
+            )
+        else:
+            prompt_text += (
+                "\n要求："
+                "1) sentences 的 zh 要贴合当前这张图的具体内容来写，不要用套话；"
+                "若你刚才回复过相似内容，绝不能重复上一句的句子，要换一种完全不同的说法。"
+                "2) ja 必须是 zh 的地道日文翻译（含义与语气完全一致，不逐字硬译，不夹带中文）。"
+                "3) description 除客观画面内容外，还要写清人物表情神态"
+                "（如脸红、害羞、惊讶、生气、无语等）与整体氛围，不要只写构图和画面文字。"
+            )
         # 与文本对话共用同一份历史（build_merged_history），保证识图与普通回复上下文互通
         history_msgs = build_merged_history(history, ctx)
         images_for_payload = []  # [(source, mime, base64)]
@@ -3570,6 +3888,8 @@ async def get_image_reply(ctx: RoleContext, user_text: str, history: list,
                 raw_for_capture = {"source": src, "data": original}
         if not images_for_payload:
             print("没有有效的图片数据，使用默认回复")
+            if describe_only:
+                return {"sentences": [], "ms": 0, "tool_trace": []}
             default_text = "啊嘞，看不清这张图呢。"
             return {"sentences": normalize_sentences(default_text, ctx, emotions, user_text), "ms": 0, "tool_trace": []}
         model = ctx.get("image_caption_model_name", "")
@@ -3584,7 +3904,7 @@ async def get_image_reply(ctx: RoleContext, user_text: str, history: list,
         base_url = base_url.rstrip("/")
         timeout = ctx.get("image_caption_timeout", 90)
         system_content = build_system_prompt(ctx, emotions, extra_parts)
-        if _cfg_bool(ctx, "image_identity_guard_enabled", True):
+        if not describe_only and _cfg_bool(ctx, "image_identity_guard_enabled", True):
             prompt_text = f"{prompt_text}\n{image_identity_note(ctx)}"
         start = time.time()
         if caption_backend == "ollama":
@@ -3596,7 +3916,7 @@ async def get_image_reply(ctx: RoleContext, user_text: str, history: list,
                 "model": model,
                 "messages": vision_messages,
                 "stream": False, "think": False,
-                "options": {"temperature": float(ctx.get("temperature", 0.7)), "num_predict": 1024}
+                "options": {"temperature": _cfg_num(ctx, "temperature", 0.7), "num_predict": 1024}
             }
             endpoint = chat_endpoint(base_url, "ollama")
             headers = {}
@@ -3618,14 +3938,18 @@ async def get_image_reply(ctx: RoleContext, user_text: str, history: list,
                 "model": model,
                 "messages": vision_messages,
                 "stream": False,
-                "temperature": float(ctx.get("temperature", 0.7)),
+                "temperature": _cfg_num(ctx, "temperature", 0.7),
                 "max_tokens": 1024
             }
             api_key = ctx.get("llm_api_key", "")
             headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         async with httpx.AsyncClient(timeout=timeout, verify=verified_context()) as client:
             resp = await client.post(endpoint, json=payload, headers=headers)
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                detail = resp.text[:400]
+                raise httpx.HTTPStatusError(
+                    f"HTTP {resp.status_code} {endpoint}：{detail}{api_error_hint(detail)}",
+                    request=resp.request, response=resp)
             data = resp.json()
         ms = (time.time() - start) * 1000
         if caption_backend == "ollama":
@@ -3635,9 +3959,11 @@ async def get_image_reply(ctx: RoleContext, user_text: str, history: list,
         content = strip_thinking(content or "")
         if stats:
             stats.record_llm(ms)
-        sentences = normalize_sentences(content, ctx, emotions, user_text or "（图片）")
+        sentences = [] if describe_only else \
+            normalize_sentences(content, ctx, emotions, user_text or "（图片）")
         description = extract_image_description(content or "")
-        if len(sentences) == 1 and "走神了" in str(sentences[0].get("zh", "") or "") and description:
+        if not describe_only and len(sentences) == 1 \
+                and "走神了" in str(sentences[0].get("zh", "") or "") and description:
             try:
                 regen_text = f"{user_text or '（看图）'}\n（用户发来一张图片，画面内容：{description}）"
                 chat = await chat_once(ctx, build_chat_messages(ctx, regen_text, history, emotions, extra_parts))

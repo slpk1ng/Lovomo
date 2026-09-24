@@ -1,11 +1,12 @@
 # 仅供 UI 检查的独立 WebUI 服务（不连 NapCat / 不启动 TTS）
-import asyncio, sys
+import asyncio, os, sys
 sys.stdout.reconfigure(encoding='utf-8')
 import main as M
 
 async def run():
     M.global_config = M.ConfigLoader()
     M.global_config.config["webui_port"] = 11599
+    M.global_config.config["webui_second_password"] = os.environ.get("LOVOMO_UI_SECOND", "")
     M.global_emotion_manager = M.EmotionManager(M.global_config)
     M.memory_manager = M.MemoryManager(M.global_config)
     M.mood_mgr = M.MoodManager(M.memory_manager.data_path)
@@ -14,6 +15,7 @@ async def run():
     M.sticker_mgr = M.StickerManager(M.global_config)
     M.tool_registry = M.ToolRegistry(M.global_config, M.memory_manager.data_path)
     M.profile_mgr = M.UserProfileManager(M.global_config, M.memory_manager.data_path)
+    M.lexicon_mgr = M.LexiconManager(M.global_config, M.memory_manager.data_path)
     M.rag_mgr = M.RAGManager(M.global_config, M.memory_manager.data_path)
     M.sender = M.MessageSender(M.global_config, M.memory_manager, M.sticker_mgr, M.stats_mgr)
     M.todo_mgr = M.TodoManager(M.global_config, M.db, M.scheduler, M.sender,

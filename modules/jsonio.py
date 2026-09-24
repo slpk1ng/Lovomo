@@ -45,8 +45,16 @@ def save_json(path, data):
     # 临时文件名必须唯一：同一文件的两次并发保存（WebUI 线程与 bot 协程）
     # 若共用同一个 .tmp，会互相覆盖，最终提交的内容可能来自另一次写入
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(json.dumps(data, ensure_ascii=False, indent=2))
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(str(tmp), str(path))
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(data, ensure_ascii=False, indent=2))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(str(tmp), str(path))
+    except BaseException:
+        # 写入或提交失败时清掉半成品：临时名带唯一后缀，不清理会永久残留在数据目录
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise

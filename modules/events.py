@@ -51,6 +51,7 @@ class EventManager:
         self.log_file = Path(data_path) / "greeting_log.json"
         self.profiles = profiles
         self.events: list = []
+        self._log_readable = True
         self.load_events()
         self.ensure_default_events()
         self.load_log()
@@ -94,9 +95,13 @@ class EventManager:
             print(f"保存事件配置失败: {e}")
 
     def load_log(self):
-        from .jsonio import load_json
-        data = load_json(self.log_file, {})
-        self._log = data if isinstance(data, dict) else {}
+        from .jsonio import load_json_ex
+        data, readable = load_json_ex(self.log_file, {})
+        self._log_readable = readable
+        # 只认 list 值：值不是 list 时 _mark_sent 会 append 到字符串上抛 AttributeError，
+        # _sent 的 `key in str` 还会变成子串匹配、误判成"今天已发过"
+        self._log = ({k: v for k, v in data.items() if isinstance(v, list)}
+                     if isinstance(data, dict) else {})
 
     def _mark_sent(self, key: str):
         today = time.strftime("%Y-%m-%d")
@@ -106,6 +111,9 @@ class EventManager:
         # 只保留最近 30 天
         cutoff = time.strftime("%Y-%m-%d", time.localtime(time.time() - 30 * 86400))
         self._log = {k: v for k, v in self._log.items() if k >= cutoff}
+        if not self._log_readable:
+            print("问候记录本次未能读取，已跳过保存以免覆盖磁盘上的原有内容。")
+            return
         try:
             # 必须原子写：写一半被强杀会让日志损坏，当天问候会被重复发送一遍
             from .jsonio import save_json
@@ -148,7 +156,10 @@ class EventManager:
             if self._sent(key):
                 print(f"[节日问候] {event.get('name', event.get('id'))} 今天已经发过了，跳过。")
                 continue
-            targets = event.get("targets") or []
+            # 只认填了会话号的条目：WebUI 里点了"添加目标"但没填号码时会留下
+            # session_id 为空的行，这种真值占位会顶掉下面"默认节日发给全部会话"的兜底
+            targets = [t for t in (event.get("targets") or [])
+                       if isinstance(t, dict) and str(t.get("session_id") or "").strip()]
             if not targets and event.get("default") \
                     and self.config.get("default_events_to_all", True) and sessions_provider:
                 try:
@@ -221,7 +232,8 @@ class EventManager:
                 ok = await sender.speak_and_send(
                     "private", user_id, text, emotions, ctx,
                     use_voice=bool(self.config.get("birthday_greet_voice", False)),
-                    sticker=bool(self.config.get("proactive_sticker", False)))
+                    sticker=bool(self.config.get("proactive_sticker", False)),
+                    session_id=f"private_{user_id}")
                 if not ok:
                     print(f"[生日祝福] {user_id} 发送失败，不标记已发送，下次检查时重试。")
                     continue
@@ -233,12 +245,14 @@ class EventManager:
         """把同一段话发给多个目标；返回是否至少成功发送了一个。"""
         sent_any = False
         for target in targets:
+            stype = target.get("session_type", "private")
+            sid = target.get("session_id", "")
             try:
                 ok = await sender.speak_and_send(
-                    target.get("session_type", "private"), target.get("session_id", ""),
-                    text, emotions, ctx,
+                    stype, sid, text, emotions, ctx,
                     use_voice=bool(event.get("use_voice", False)),
-                    sticker=bool(self.config.get("proactive_sticker", False)))
+                    sticker=bool(self.config.get("proactive_sticker", False)),
+                    session_id=f"{stype}_{sid}")
             except Exception as e:
                 print(f"[节日问候] 发送失败 {target.get('session_id', '')}: {e}")
                 continue
@@ -274,9 +288,11 @@ class EventManager:
             return False
         sent_any = False
         for target in event.get("targets", []):
-            ok = await sender.speak_and_send(target.get("session_type", "private"),
-                                             target.get("session_id", ""), text,
+            stype = target.get("session_type", "private")
+            sid = target.get("session_id", "")
+            ok = await sender.speak_and_send(stype, sid, text,
                                              emotions_provider(), ctx,
-                                             use_voice=bool(event.get("use_voice", False)))
+                                             use_voice=bool(event.get("use_voice", False)),
+                                             session_id=f"{stype}_{sid}")
             sent_any = sent_any or bool(ok)
         return sent_any

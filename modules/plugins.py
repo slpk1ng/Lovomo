@@ -471,7 +471,7 @@ def _normalize_field(item: dict, index: int) -> dict:
 
     t = out["type"]
     if t == "bool":
-        out["default"] = bool(default)
+        out["default"] = _as_bool(default)
     elif t in ("range", "number"):
         lo = _as_float(item.get("min"), 0.0)
         hi = _as_float(item.get("max"), 1.0 if t == "range" else 100.0)
@@ -507,9 +507,14 @@ def _normalize_field(item: dict, index: int) -> dict:
             return {}
         if t == "select":
             vals = [o["value"] for o in out["options"]]
-            fallback = vals[0] if vals else ""
-            dv = str(default if default is not None else fallback)
-            out["default"] = dv if dv in vals else fallback
+            if not vals and options_file:
+                # 选项要等运行时读 options_file 才知道，此时不能按"空选项"把
+                # 清单里声明的默认值改掉（_features_with_options 之后会补上选项）
+                out["default"] = str(default if default is not None else "")
+            else:
+                fallback = vals[0] if vals else ""
+                dv = str(default if default is not None else fallback)
+                out["default"] = dv if dv in vals else fallback
         else:
             picked = default if isinstance(default, list) else ([default] if default else [])
             out["default"] = [str(v) for v in picked if str(v) in
@@ -564,6 +569,20 @@ def _as_float(value, fallback: float) -> float:
 
 def _clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
+
+
+def _as_bool(value, fallback: bool = False) -> bool:
+    """布尔值容错：兼容清单/请求里写成字符串的 "false" / "0" / "否"。
+
+    直接 bool("false") 会得到 True，把声明的默认值或用户的选择反向。
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None or value == "":
+        return fallback
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() not in ("false", "0", "no", "off", "否", "关", "关闭")
 
 
 def _normalize_features(raw) -> list:
@@ -809,7 +828,7 @@ def _validate_setting(field: dict, value):
     """
     t = field.get("type") or "bool"
     if t == "bool":
-        return True, bool(value)
+        return True, _as_bool(value)
     if t in ("range", "number"):
         lo = _as_float(field.get("min"), 0.0)
         hi = _as_float(field.get("max"), 1.0)
@@ -939,7 +958,9 @@ class PluginManager:
     def _save_state(self) -> None:
         try:
             self.ensure_root()
-            tmp = Path(str(self.state_file) + ".tmp")
+            # 临时名必须唯一：并发写入共用同一个 .tmp 时，
+            # os.replace 可能把另一次写入的半截内容提交成正式文件
+            tmp = Path(f"{self.state_file}.{os.getpid()}.{time.time_ns()}.tmp")
             tmp.write_text(json.dumps(self._state(), ensure_ascii=False, indent=2),
                            encoding="utf-8")
             os.replace(str(tmp), str(self.state_file))
@@ -1230,8 +1251,13 @@ class PluginManager:
         return result
 
     # ------------------------------------------------------------ 安装
-    def install_zip(self, data: bytes, *, force: bool = False) -> dict:
-        """安装一个 zip 插件包。force=True 表示用户已确认高危风险。"""
+    def install_zip(self, data: bytes, *, force: bool = False,
+                    enable: bool = False) -> dict:
+        """安装一个 zip 插件包。force=True 表示用户已确认高危风险。
+
+        enable 只管新装的插件：默认装完是停用状态，由用户自己去「插件」里
+        启用；覆盖安装一律沿用原有状态，升级不该把用户的开关改掉。
+        """
         report = self.inspect_zip(data)
         if not report.get("ok"):
             return {"success": False, "error": report.get("error") or "包不可用",
@@ -1282,7 +1308,9 @@ class PluginManager:
             os.replace(str(staging), str(target))
             if had_old:
                 _rmtree_retry(backup)
-            self._state()["enabled"].setdefault(pid, True)
+            # 新装的插件默认停用，装完由用户自己去「插件」里启用；
+            # 覆盖安装沿用原有状态（setdefault 只在没有记录时生效）
+            self._state()["enabled"].setdefault(pid, bool(enable))
             self._save_state()
             # 覆盖安装保留了旧的 data/，但设置要重新补种一次：
             # 新版本的清单可能声明了新的键，旧的生效快照不一定对得上。
@@ -1355,8 +1383,9 @@ class PluginManager:
         d = self.plugin_dir(pid)
         if d is None or not d.is_dir():
             return False
-        self._state()["enabled"].pop(pid, None)
-        self._state()["source"].pop(pid, None)
+        saved_enabled = self._state()["enabled"].pop(pid, None)
+        saved_source = self._state()["source"].pop(pid, None)
+        saved_pinned = pid in self._state()["pinned"]
         self._state()["pinned"] = [p for p in self._state()["pinned"] if p != pid]
         self._save_state()
         # 卸掉生效快照：重装同一个 id 时应该重新从磁盘补种，
@@ -1372,13 +1401,37 @@ class PluginManager:
         last_err = None
         ok = _rmtree_retry(d, attempts=3, delay=0.15)
         if not ok:
-            if stash is not None:
-                shutil.rmtree(stash, ignore_errors=True)
+            # 目录没删掉，插件其实还在：把挪走的配置/数据放回原位、状态也恢复回去，
+            # 否则会变成「插件还在、却显示未启用且来源未知」，用户选的保留配置也一起丢了。
+            self._restore_stash(d, stash)
+            if saved_enabled is not None:
+                self._state()["enabled"][pid] = saved_enabled
+            if saved_source is not None:
+                self._state()["source"][pid] = saved_source
+            if saved_pinned:
+                self._state()["pinned"].insert(0, pid)
+            self._save_state()
             last_err = "目录被占用（可能有程序正在读里面的文件）"
             print(f"[插件] 卸载失败: {last_err}")
             return False
         self._restore_kept_data(d, stash)
         return True
+
+    def _restore_stash(self, d: Path, stash) -> None:
+        """卸载失败时把挪走的 data/ 放回插件目录（不打卸载标记，插件仍是插件）。"""
+        if stash is None:
+            return
+        kept = stash / "data"
+        try:
+            if kept.is_dir():
+                d.mkdir(parents=True, exist_ok=True)
+                target = d / "data"
+                if target.exists():
+                    shutil.rmtree(target, ignore_errors=True)
+                shutil.move(str(kept), str(target))
+        except Exception as e:
+            print(f"[插件] 卸载失败后恢复配置/数据失败: {e}")
+        shutil.rmtree(stash, ignore_errors=True)
 
     def _stash_kept_data(self, d: Path, keep_settings: bool, keep_data: bool):
         """把要保留的配置/数据挪到临时目录，返回该目录（没有要留的返回 None）。"""
@@ -1666,7 +1719,7 @@ class PluginManager:
         if f is None or not isinstance(data, dict):
             return False
         try:
-            tmp = Path(str(f) + ".tmp")
+            tmp = Path(f"{f}.{os.getpid()}.{time.time_ns()}.tmp")
             tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
                            encoding="utf-8")
             os.replace(str(tmp), str(f))
@@ -1714,7 +1767,7 @@ class PluginManager:
             if field is None:
                 # 插件无权声明的键：只放行几个主程序认识的内建键
                 if key == "appearance_enabled":
-                    out[key] = bool(value)
+                    out[key] = _as_bool(value)
                 elif key == "background" and isinstance(value, dict):
                     out[key] = value
                 elif key == "accent":

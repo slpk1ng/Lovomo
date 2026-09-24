@@ -15,7 +15,7 @@ DEFAULT_EXTRACT_PROMPT = (
     "只提取关于【对话中用户本人】的长期稳定信息，绝不能把角色信息当成用户信息。\n"
     "铁律：\n"
     "1. nickname 只记录「用户希望被怎么称呼」或「用户自称、角色常称呼用户的昵称」；"
-    "用户对角色说的称呼、给角色起的外号（如角色名、丛雨、主人、AI）以及角色自称（如本座、吾辈）"
+    "用户对角色说的称呼、给角色起的外号（如角色名、{role}、主人、AI）以及角色自称（如本座、吾辈）"
     "都不是用户昵称，禁止收录。\n"
     "2. likes/dislikes 只记录用户本人的喜好与厌恶；角色在回复里提到的角色自己的喜好与厌恶"
     "（如角色喜欢甜食、害怕幽灵）一律忽略，不得写入。\n"
@@ -30,6 +30,58 @@ DEFAULT_EXTRACT_PROMPT = (
     '"likes_remove": ["已过时的旧喜好"], "notes_remove": ["已过时备注"]}，'
     "不需要的字段可省略，禁止输出任何其它文字。"
 )
+
+# 旧版默认提示词里写死了内置默认角色的名字，会被模型照抄进画像，
+# 再随画像注入到其他角色的对话里，所以升级时按原样替换掉这段。
+LEGACY_ROLE_NAME_PHRASES = (
+    ("（如角色名、丛雨、主人、AI）", "（如角色名、{role}、主人、AI）"),
+)
+
+
+def migrate_extract_prompt(config) -> bool:
+    """把旧版默认提示词里写死的默认角色名换成占位符。"""
+    raw = str(config.get("profiles_extract_prompt", "") or "")
+    if not raw:
+        return False
+    new = raw
+    for old, repl in LEGACY_ROLE_NAME_PHRASES:
+        new = new.replace(old, repl)
+    if new == raw:
+        return False
+    config["profiles_extract_prompt"] = new
+    return True
+
+
+def _role_names(ctx) -> set:
+    """所有已知角色的名字与标识符；角色名不是用户的昵称。"""
+    names = {ctx.get("character_name", ""), ctx.get("character_key", "")}
+    roles = ctx.get("roles")
+    if isinstance(roles, list):
+        for role in roles:
+            if isinstance(role, dict):
+                names.add(role.get("character_name", ""))
+                names.add(role.get("character_key", ""))
+    return {str(n or "").strip().lower() for n in names} - {""}
+
+
+def _strip_role_names(data: dict, ctx) -> dict:
+    """把模型写进画像的角色名剔掉：角色名属于角色，不是用户的昵称或事项。"""
+    names = _role_names(ctx)
+    if not names or not isinstance(data, dict):
+        return data
+    out = dict(data)
+    if str(out.get("nickname", "") or "").strip().lower() in names:
+        out.pop("nickname", None)
+    for key in ("likes", "dislikes", "notes"):
+        items = out.get(key)
+        if not isinstance(items, list):
+            continue
+        kept = [i for i in items if str(i).strip().lower() not in names]
+        if kept:
+            out[key] = kept
+        else:
+            out.pop(key, None)
+    return out
 
 
 def _strip_assistant_leak(data: dict, user_text: str, reply_text: str) -> dict:
@@ -79,15 +131,19 @@ class UserProfileManager:
         self.file = self.data_path / "user_profiles.json"
         self.profiles = {}
         self._dirty = False
+        self._load_failed = False
         self.load()
 
     def load(self):
-        from .jsonio import load_json
-        self.profiles = load_json(self.file, {})
-        if not isinstance(self.profiles, dict):
-            self.profiles = {}
+        from .jsonio import load_json_ex
+        data, readable = load_json_ex(self.file, {})
+        self._load_failed = not readable
+        self.profiles = data if isinstance(data, dict) else {}
 
     def save(self):
+        if self._load_failed:
+            print("用户画像本次未能读取，已跳过保存以免覆盖磁盘上的原有内容。")
+            return
         try:
             from .jsonio import save_json
             save_json(self.file, self.profiles)
@@ -167,6 +223,8 @@ class UserProfileManager:
         if not str(user_text or "").strip():
             return
         prompt = str(self.config.get("profiles_extract_prompt", "") or DEFAULT_EXTRACT_PROMPT)
+        role_name = str(ctx.get("character_name", "") or "").strip() or "角色名"
+        prompt = prompt.replace("{role}", role_name)
         system = (
             f"{prompt}\n当前用户ID: {user_id}\n已有画像(供去重参考): "
             f"{json.dumps(self.get(user_id), ensure_ascii=False)}"
@@ -182,7 +240,8 @@ class UserProfileManager:
             return
         if not isinstance(data, dict):
             return
-        self.update(user_id, _strip_assistant_leak(data, user_text, reply_text))
+        self.update(user_id, _strip_role_names(
+            _strip_assistant_leak(data, user_text, reply_text), ctx))
 
     # ---------------- 注入提示词 ----------------
     def build_injection(self, user_id: str) -> str:

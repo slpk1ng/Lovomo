@@ -1,5 +1,6 @@
 """TTS 合成与音频处理工具（自 main.py 迁出，供主流程与主动消息共用）。"""
 import asyncio
+import random
 import re
 import sys
 import threading
@@ -12,6 +13,52 @@ import httpx
 import numpy as np
 
 from .tls import verified_context
+from .audio_level import DEFAULT_MAX_GAIN_DB, DEFAULT_PEAK_DB, DEFAULT_TARGET_DB
+from .audio_level import normalize_file as _normalize_level
+from .audio_level import prepare_reference as _prepare_reference
+
+
+def _level_setting(config, key: str, fallback: float) -> float:
+    try:
+        return float(config.get(key, fallback))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _tts_reference(path, config, data_path: Path) -> str:
+    """送进 TTS 的参考音频先统一电平（单声道 + 裁静音 + 响度归一），结果缓存复用。"""
+    if not bool(config.get("tts_ref_normalize", True)):
+        return str(path)
+    try:
+        prepared = _prepare_reference(
+            path, Path(data_path) / "ref_cache",
+            target_db=_level_setting(config, "tts_loudness_target_db", DEFAULT_TARGET_DB),
+            peak_db=_level_setting(config, "tts_loudness_peak_db", DEFAULT_PEAK_DB),
+            max_gain_db=_level_setting(config, "tts_loudness_max_gain_db", DEFAULT_MAX_GAIN_DB))
+    except Exception as e:
+        _safe_print(f"参考音频预处理失败（按原文件合成）: {type(e).__name__}: {e}")
+        return str(path)
+    if prepared != str(path) and bool(config.get("tts_debug_log", False)):
+        _safe_print(f"参考音频电平统一: {Path(path).name} -> {Path(prepared).name}")
+    return prepared
+
+
+def _normalize_tts_output(path, config) -> None:
+    """把这一段语音的响度对齐到统一目标，避免段与段之间忽大忽小。"""
+    if not bool(config.get("tts_loudness_normalize", True)):
+        return
+    try:
+        result = _normalize_level(
+            path,
+            target_db=_level_setting(config, "tts_loudness_target_db", DEFAULT_TARGET_DB),
+            peak_db=_level_setting(config, "tts_loudness_peak_db", DEFAULT_PEAK_DB),
+            max_gain_db=_level_setting(config, "tts_loudness_max_gain_db", DEFAULT_MAX_GAIN_DB),
+            warn="tts_output")
+    except Exception as e:
+        _safe_print(f"响度统一失败（保持原样）: {type(e).__name__}: {e}")
+        return
+    if result.get("ok") and bool(config.get("tts_debug_log", False)):
+        _safe_print(f"响度统一: {Path(path).name} 调整 {result['gain_db']:+.1f}dB")
 
 
 def get_audio_duration(file_path: str) -> float:
@@ -46,17 +93,6 @@ def resolve_tts_path(input_path: str) -> str:
     except OSError:
         target_dir = "C:/tts"
     return target_dir
-
-
-async def check_tts_service(config) -> bool:
-    base_url = config.get("client_base_url", "http://127.0.0.1:9880")
-    try:
-        async with httpx.AsyncClient(timeout=2, trust_env=False,
-                                     verify=verified_context()) as client:
-            resp = await client.get(f"{base_url}/docs")
-            return resp.status_code < 500
-    except Exception:
-        return False
 
 
 # 送进 TTS 的字符白名单。CJK / 假名 / 谚文 / 全角标点 / 半角可打印字符。
@@ -433,13 +469,17 @@ def _audio_too_short(path, text: str, config) -> bool:
 
 
 async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
-                              data_path: Path, stats=None) -> Optional[Path]:
+                              data_path: Path, stats=None,
+                              mimic: str = "", mimics: dict = None) -> Optional[Path]:
     """合成一句话语音，返回 wav 路径；纯标点/空句子返回 None。
 
     参数顺序：config, text(要念的台词), emotion(情绪名), emotions(情绪表)。
     语言按台词实际使用的文字判定（tts_auto_lang），避免拿中文台词配日文语言
     模型合成出无法辨认的语音；合成结果过短时按备用切分方式重试，
     仍然拿不到可用音频就返回 None（调用方只发文本），绝不把半截语音发出去。
+
+    mimic 命中 mimics 时启用情绪模仿：情绪音频当主参考决定说话情绪，
+    语气音频当辅助参考（按 emotion_mimic_voice_weight 重复加权）决定音色。
     """
     if isinstance(text, (dict, list)) or isinstance(emotion, (dict, list)):
         _safe_print("TTS arg order looks swapped (text/emotion); auto-corrected.")
@@ -466,6 +506,30 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
         return None
     ref_path = emotion_data["ref_path"]
     prompt_text = emotion_data["prompt_text"]
+    tone_ref_path, tone_prompt_text = ref_path, prompt_text
+    mimic_key = ""
+    aux_paths = []
+    mimic_data = (mimics or {}).get(str(mimic or "")) if mimic else None
+    if mimic_data:
+        # 情绪音频当主参考（决定说话情绪），语气音频当辅助参考并重复加权：
+        # GPT-SoVITS 对多参考音频的音色取平均，重复次数决定语气音色的占比
+        try:
+            weight = max(1, int(config.get("emotion_mimic_voice_weight", 4) or 1))
+        except (TypeError, ValueError):
+            weight = 4
+        aux_paths = [ref_path] * weight
+        mimic_key = str(mimic)
+        candidates = [p for p in (mimic_data.get("candidates") or []) if p]
+        # 一个情绪文件夹里可能放了多段情绪音频，每次随机挑一段
+        ref_path = random.choice(candidates) if len(candidates) > 1 else (
+            candidates[0] if candidates else mimic_data["ref_path"])
+        prompt_text = mimic_data["prompt_text"]
+        # 每段音频可以有自己的识别文字，用它才能对上所选音频的语调
+        sidecar = (mimic_data.get("candidate_texts") or {}).get(
+            str(ref_path).replace("\\", "/"))
+        if sidecar:
+            prompt_text = sidecar
+    voice_tag = f"{emotion}+模仿:{mimic_key}" if mimic_key else emotion
     if not re.sub(r'[\s。，！？、,.!?…～~；;：:]+', '', text):
         _safe_print(f"TTS skipped: punctuation-only sentence "
                     f"({text.encode('unicode_escape').decode('ascii')})")
@@ -491,18 +555,23 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
     split_default = str(config.get("text_split_method", "cut1") or "cut1")
     variants = ([split_default] + [v for v in ("cut5", "cut0", "cut2", "cut3")
                                    if v != split_default])[:3]
+    attempts = [(variant, True) for variant in variants]
+    if mimic_key:
+        # 模仿用的参考音频不合规（如时长不在 3~10 秒）时退回纯语气，别让整句丢掉语音
+        attempts.append((split_default, False))
     best_path = None
     best_duration = 0.0
     raw_path = None
     retry_delay = 1.0
     start = time.time()
 
-    def _build_params(variant) -> dict:
-        return {
+    def _build_params(variant, use_mimic) -> dict:
+        params = {
             "text": clean_text,
             "text_lang": lang,
-            "ref_audio_path": ref_path,
-            "prompt_text": prompt_text,
+            "ref_audio_path": _tts_reference(
+                ref_path if use_mimic else tone_ref_path, config, data_path),
+            "prompt_text": prompt_text if use_mimic else tone_prompt_text,
             "prompt_lang": config.get("prompt_lang", "ja"),
             "device": config.get("device", "cuda"),
             "top_k": config.get("top_k", 20),
@@ -520,16 +589,22 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
             "repetition_penalty": config.get("repetition_penalty", 1.35),
             "media_type": config.get("media_type", "wav")
         }
+        if use_mimic and aux_paths:
+            params["aux_ref_audio_paths"] = [
+                _tts_reference(p, config, data_path) for p in aux_paths]
+        return params
 
-    for index, variant in enumerate(variants):
+    for index, (variant, use_mimic) in enumerate(attempts):
         transient_left = 2 if index == 0 else 1
         while True:
             try:
-                print(f"正在合成: 情绪={emotion} | 语言={lang} | 切分={variant} | "
-                      f"文本={clean_text} (第 {index + 1}/{len(variants)} 次)")
+                print(f"正在合成: 情绪={voice_tag if use_mimic else emotion} | "
+                      f"语言={lang} | 切分={variant} | "
+                      f"文本={clean_text} (第 {index + 1}/{len(attempts)} 次)")
                 async with httpx.AsyncClient(timeout=timeout, trust_env=False,
                                              verify=verified_context()) as client:
-                    resp = await client.get(f"{base_url}/tts", params=_build_params(variant))
+                    resp = await client.get(f"{base_url}/tts",
+                                            params=_build_params(variant, use_mimic))
             except Exception as e:
                 if transient_left > 0:
                     transient_left -= 1
@@ -544,12 +619,13 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
             if resp.status_code == 200:
                 temp_path = data_path / f"temp_{emotion}_{_unique_stamp()}.wav"
                 temp_path.write_bytes(resp.content)
+                _normalize_tts_output(temp_path, config)
                 duration = _wav_duration(temp_path)
                 too_long = _audio_too_long(temp_path, clean_text, config)
                 if not too_long and not _audio_too_short(temp_path, clean_text, config):
                     if stats:
                         stats.record_tts((time.time() - start) * 1000)
-                    print(f"合成完成: {emotion} | {clean_text[:30]}...")
+                    print(f"合成完成: {voice_tag} | {clean_text[:30]}...")
                     for extra in (best_path, raw_path):
                         if extra is not None:
                             extra.unlink(missing_ok=True)

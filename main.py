@@ -51,10 +51,19 @@ def _probe_writable(directory: Path) -> bool:
         directory.mkdir(parents=True, exist_ok=True)
         probe = directory / f".lovomo_write_{os.getpid()}"
         probe.write_text("1", encoding="utf-8")
-        probe.unlink()
-        return True
     except Exception:
         return False
+    # 写成功就说明可写。清理失败（杀软/索引器正占着这个刚建的文件）不该改判，
+    # 否则日志会被静默改写到用户目录；尽力删干净，删不掉也不影响结论。
+    try:
+        probe.unlink()
+    except Exception:
+        try:
+            time.sleep(0.05)
+            probe.unlink()
+        except Exception:
+            pass
+    return True
 
 
 def user_data_dir() -> Path:
@@ -74,6 +83,93 @@ def runtime_path(filename: str, preferred_dir: Optional[Path] = None) -> Path:
     if _probe_writable(directory):
         return directory / filename
     return user_data_dir() / filename
+
+
+def app_dir() -> Path:
+    """程序自身所在目录：打包后是 exe 目录，源码运行时是项目根。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def _remove_path(path: Path) -> None:
+    """尽力删掉一个文件或目录，失败不抛。"""
+    try:
+        if path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
+    except Exception:
+        pass
+
+
+def _data_signature(path: Path) -> tuple:
+    """（文件数, 总字节数），用来核对搬运前后的内容是否一致。"""
+    if path.is_file():
+        try:
+            return 1, path.stat().st_size
+        except OSError:
+            return 0, 0
+    count = 0
+    total = 0
+    for item in path.rglob("*"):
+        if item.is_file():
+            try:
+                count += 1
+                total += item.stat().st_size
+            except OSError:
+                pass
+    return count, total
+
+
+def _migrate_user_data(legacy: Path, target: Path, label: str) -> Path:
+    """把老版本写在程序目录里的数据搬到用户目录，返回最终该用的落点。
+
+    防御式搬运：整份复制到临时位置 → 核对文件数与字节数 → 原子改名到目标 →
+    最后才删旧位置。任何一步不对就回退、保留原位置并继续用它。
+    宁可「没搬成」，也不能为了搬家把用户数据弄丢。
+    """
+    staging = target.with_name(target.name + ".migrating")
+    try:
+        _remove_path(staging)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if legacy.is_dir():
+            shutil.copytree(legacy, staging)
+        else:
+            shutil.copy2(legacy, staging)
+        if _data_signature(legacy) != _data_signature(staging):
+            raise OSError("复制结果与源不一致")
+        if target.exists():
+            _remove_path(staging)
+            return target
+        os.replace(str(staging), str(target))
+    except Exception as e:
+        _remove_path(staging)
+        print(f"⚠️ {label} 迁移到用户目录失败，继续使用原位置 {legacy}：{e}")
+        return legacy
+    _remove_path(legacy)
+    if legacy.exists():
+        print(f"{label} 已迁移到 {target}，旧位置未能清理（可手动删除）：{legacy}")
+    else:
+        print(f"已把 {label} 迁移到用户目录：{target}")
+    return target
+
+
+def adopt_user_data(name: str) -> Path:
+    """用户数据（data 文件夹 / config.json）的最终落点。
+
+    打包运行时固定放 %LOCALAPPDATA%\\Lovomo：数据不跟安装目录绑在一起，换目录重装、
+    覆盖升级都能接上（写在程序目录里的话，换了目录就成了「聊天记录全没了」）。
+    源码运行时沿用程序目录，免得开发与测试被搬来搬去。
+    """
+    root = user_data_dir()
+    if getattr(sys, "frozen", False):
+        legacy = app_dir() / name
+        target = root / name
+        if legacy.exists() and not target.exists():
+            return _migrate_user_data(legacy, target, name)
+        return target
+    return root / name
 
 
 import httpx
@@ -100,17 +196,23 @@ except ImportError:
 from modules.database import DatabaseManager
 from modules.scheduler import get_scheduler, SchedulerManager
 from modules.stats import StatsManager
-from modules.stickers import StickerManager, IMAGE_EXTS
+from modules.stickers import (StickerManager, IMAGE_EXTS, MIME_BY_EXT, safe_sticker_name,
+                              DEFAULT_CAPTURE_PROMPT)
+from modules.audio_level import (SPEECH_MIN_RATIO, measure as measure_audio,
+                                 pitch_note, quality_notes as audio_quality_notes)
 from modules.tools import ToolRegistry
 from modules.profiles import UserProfileManager, DEFAULT_EXTRACT_PROMPT
+from modules.lexicon import LexiconManager, DEFAULT_LEARN_PROMPT, DEFAULT_INJECT_TEMPLATE
 from modules.rag import RAGManager, extract_text_from_file
 from modules.todo_manager import TodoManager, DEFAULT_EXTRACT_PROMPT as TODO_EXTRACT_PROMPT
 from modules.jobs import ScheduledJobManager, generate_proactive_text
 from modules.events import EventManager
 from modules.plugin_publisher import (publish_plugin as _publish_to_github,
+                                       unpublish_plugin as _unpublish_from_github,
                                        verify_token as _verify_github_token,
                                        PublishError as _PublishError)
-from modules.mood import MoodManager, judge_and_decide
+from modules.mood import (MoodManager, commit_mood, current_mood, judge_and_decide,
+                          judge_enabled, mood_enabled, mood_style)
 from modules.sender import MessageSender, VoicePacer
 from modules.ghmirror import DEFAULT_MIRRORS
 from modules.plugins import (PluginManager, ALLOWED_EXTS as ALLOWED_ASSET_EXTS,
@@ -120,6 +222,12 @@ from modules.plugins import (PluginManager, ALLOWED_EXTS as ALLOWED_ASSET_EXTS,
 
 # 每次刷新最多查几个 Release 的点赞数（GitHub 匿名接口有次数限制）
 MAX_REACTION_LOOKUPS = 12
+
+# 市场扫分支最多翻几页（每页 100 条），只是防止仓库异常时无限翻页
+MAX_BRANCH_PAGES = 10
+
+# 官方市场的第三方来源清单最多认几个仓库（清单靠别人提 PR 维护，防它跑飞）
+MARKET_SOURCE_REPOS_MAX = 20
 
 # 插件自带页面（功能页 / webui.html）注入的桥接脚本：同源 iframe 直接调父窗口上的
 # lovomoHost。必须插在插件自己的脚本之前，否则插件在解析阶段拿不到 window.lovomo。
@@ -165,7 +273,7 @@ from modules.llm_helpers import (RoleContext, build_chat_messages, chat_once,
                                 chat_with_tools, normalize_sentences,
                                 normalize_single, sentence_obj_has_text,
                                 split_multi_clause_sentences,
-                                stream_chat,
+                                stream_chat, extract_json,
                                 SentenceStreamParser, get_image_reply, download_image,
                                 sniff_image_mime, repair_sentence_lang, strip_quote_note,
                                 segment_for_tts, speaker_labeled_lines,
@@ -174,9 +282,13 @@ from modules.llm_helpers import (RoleContext, build_chat_messages, chat_once,
                                 IMAGE_CLAIM_WARNING, sent_links, record_sent_links,
                                 urls_in_text, is_search_request, is_search_dissatisfied,
                                 lang_text_broken, translate_to_lang,
+                                available_mimics, set_mimics_provider,
                                 model_list_endpoints, looks_like_full_endpoint)
 from modules.tts import synthesize_sentence, resolve_tts_path
 from modules.tls import verified_context
+from modules.audio_trim import normalize_audio
+from modules.asr import (start_job as start_asr_job, get_job as get_asr_job,
+                         AUDIO_MIMES)
 from modules.tts_service import (process_manager, ensure_tts_service,
                                  auto_start_and_switch_tts, mark_exiting)
 
@@ -291,6 +403,122 @@ def _pid_alive(pid) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# 单实例
+# ---------------------------------------------------------------------------
+# 程序已经在跑时用户又双击一次 exe，不应该再起一套进程：那会多出一个任务栏
+# 条目、多连一份 NapCat、多占一次 WebUI 端口。这里用命名互斥体判定「已经有
+# 实例在跑」，再用一个命名事件通知那个实例把窗口亮出来。
+#
+# 用互斥体而不是锁文件：进程被强杀时系统会自动释放，不会留下需要人工清理的
+# 残留。名字带 Local\ 前缀，按登录会话隔离，多用户各自算一个实例。
+
+_INSTANCE_MUTEX_NAME = "Local\\Lovomo.SingleInstance"
+_INSTANCE_SHOW_EVENT_NAME = "Local\\Lovomo.ShowWindow"
+_INSTANCE_STATE = {"mutex": None, "event": None, "waiter": False}
+
+
+def _kernel32():
+    """kernel32 句柄；必须开 use_last_error，否则读不到可靠的 GetLastError。"""
+    import ctypes
+    return ctypes.WinDLL("kernel32", use_last_error=True)
+
+
+def _acquire_single_instance() -> bool:
+    """抢占单实例名额，并建好唤醒事件。
+
+    返回 False 表示已有实例在跑，调用方应该通知它然后退出。非 Windows 或
+    接口异常时一律返回 True —— 宁可多开一次，也不能让程序打不开。
+    """
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = _kernel32()
+        k32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL,
+                                     wintypes.LPCWSTR]
+        k32.CreateMutexW.restype = wintypes.HANDLE
+        k32.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL,
+                                     wintypes.BOOL, wintypes.LPCWSTR]
+        k32.CreateEventW.restype = wintypes.HANDLE
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
+
+        mutex = k32.CreateMutexW(None, False, _INSTANCE_MUTEX_NAME)
+        if not mutex:
+            return True
+        if ctypes.get_last_error() == 183:          # ERROR_ALREADY_EXISTS
+            k32.CloseHandle(mutex)
+            return False
+        _INSTANCE_STATE["mutex"] = mutex
+        # 手动重置事件：谁收到谁负责 ResetEvent，否则下一次启动会被上一次
+        # 留下的信号立刻再唤醒一遍。
+        _INSTANCE_STATE["event"] = k32.CreateEventW(
+            None, True, False, _INSTANCE_SHOW_EVENT_NAME)
+        return True
+    except Exception:
+        return True
+
+
+def _signal_existing_instance() -> bool:
+    """通知已经在跑的那个实例把窗口亮出来。"""
+    if os.name != "nt":
+        return False
+    try:
+        from ctypes import wintypes
+        k32 = _kernel32()
+        k32.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL,
+                                   wintypes.LPCWSTR]
+        k32.OpenEventW.restype = wintypes.HANDLE
+        k32.SetEvent.argtypes = [wintypes.HANDLE]
+        k32.SetEvent.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
+        EVENT_MODIFY_STATE = 0x0002
+        handle = k32.OpenEventW(EVENT_MODIFY_STATE, False,
+                                _INSTANCE_SHOW_EVENT_NAME)
+        if not handle:
+            return False
+        try:
+            return bool(k32.SetEvent(handle))
+        finally:
+            k32.CloseHandle(handle)
+    except Exception:
+        return False
+
+
+def _start_instance_show_waiter(on_show) -> None:
+    """等「又有人双击了 exe」，收到就把窗口亮出来。"""
+    if os.name != "nt" or _INSTANCE_STATE.get("waiter"):
+        return
+    handle = _INSTANCE_STATE.get("event")
+    if not handle:
+        return
+    try:
+        from ctypes import wintypes
+        k32 = _kernel32()
+        k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        k32.WaitForSingleObject.restype = wintypes.DWORD
+        k32.ResetEvent.argtypes = [wintypes.HANDLE]
+        k32.ResetEvent.restype = wintypes.BOOL
+        _INSTANCE_STATE["waiter"] = True
+
+        def _loop():
+            # 半秒一轮而不是无限等待：进程退出时线程能自己收掉。
+            while True:
+                if k32.WaitForSingleObject(handle, 500) == 0:   # WAIT_OBJECT_0
+                    k32.ResetEvent(handle)
+                    try:
+                        on_show()
+                    except Exception:
+                        pass
+
+        threading.Thread(target=_loop, daemon=True).start()
+    except Exception:
+        pass
+
+
 def _candidate_icon_paths() -> list:
     """按打包/开发环境查找托盘与窗口图标，不写死任何路径。"""
     cands = []
@@ -357,6 +585,15 @@ _geometry_lock = threading.Lock()
 
 def _geometry_path() -> Path:
     return runtime_path(_WINDOW_GEOMETRY_FILE, Path(user_data_dir()))
+
+
+def _webview_profile_dir() -> str:
+    """WebView2 的站点数据目录；固定下来，否则每次启动都是临时目录，localStorage 留不住。
+
+    目录不可写时返回空串，让 pywebview 用自己的默认位置（仍然是持久化的）。
+    """
+    path = user_data_dir() / "webview"
+    return str(path) if _probe_writable(path) else ""
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +715,22 @@ def _window_state_name(window) -> str:
     return ""
 
 
+def _window_visible(window) -> bool:
+    """窗口当前是否可见。
+
+    拿不到 HWND（非 Windows / 句柄还没建好）时按"可见"处理：调用方都在
+    "确认已藏起来"的语义上用它，误判成已隐藏比误判成没隐藏更危险。
+    """
+    hwnd = _window_hwnd(window)
+    if not hwnd or os.name != "nt":
+        return True
+    try:
+        import ctypes
+        return bool(ctypes.windll.user32.IsWindowVisible(hwnd))
+    except Exception:
+        return True
+
+
 def _normal_rect(window) -> dict:
     """「还原后」该占的矩形（物理像素），即 GetWindowPlacement 的
     rcNormalPosition —— 最大化/最小化时它仍保留着 Normal 尺寸，正是我们要的。
@@ -596,10 +849,10 @@ def _save_window_geometry() -> None:
     try:
         _WINDOW_GEOMETRY["geometry_v"] = _GEOMETRY_VERSION
         data = json.loads(json.dumps(_WINDOW_GEOMETRY))
-        path = _geometry_path()
-        tmp = Path(str(path) + ".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(str(tmp), str(path))
+        # 延迟定时器线程与退出流程会先后写同一份文件，必须走统一原子写
+        # （临时名唯一），否则可能互相覆盖出半截 JSON
+        from modules.jsonio import save_json
+        save_json(_geometry_path(), data)
     except Exception as e:
         print(f"保存窗口位置失败（下次启动按默认最大化打开）：{e}")
 
@@ -1183,6 +1436,41 @@ class StdoutRedirector:
 
 _API_KEY_KEYS = ("llm_api_key", "napcat_token", "web_search_api_keys", "plugin_publish_token")
 
+# WebUI 的两个密码：访问密码（登录）与二级密码（敏感操作前再验一次）
+_WEBUI_PASSWORD_KEYS = ("webui_password", "webui_second_password")
+
+# 二级密码守的接口：读聊天记录、保存、导入导出、装插件、删除、发布与下架
+_SECOND_PASSWORD_PATHS = frozenset({
+    "/api/history", "/api/delete", "/api/history/delete_messages",
+    "/api/config/save", "/api/config/import", "/api/config/export",
+    "/api/roles/save", "/api/jobs/save", "/api/jobs/batch", "/api/jobs/run",
+    "/api/events/save", "/api/events/batch",
+    "/api/todos/add", "/api/todos/update", "/api/todos/delete", "/api/todos/batch",
+    "/api/tools/save",
+    "/api/profiles/save", "/api/profiles/delete",
+    "/api/lexicon/save", "/api/lexicon/delete",
+    "/api/lexicon/confirm", "/api/lexicon/reject",
+    "/api/stickers/upload", "/api/stickers/delete",
+    "/api/emotions/upload", "/api/emotions/create", "/api/emotions/delete",
+    "/api/rag/upload", "/api/rag/delete",
+    "/api/plugins/upload", "/api/plugins/install_remote", "/api/plugins/delete",
+    "/api/plugins/settings",
+    "/api/plugins/publish", "/api/plugins/unpublish",
+    "/api/plugins/publish_token", "/api/plugins/publish_token_clear",
+})
+
+# 前缀命中即算敏感（整个记忆库的导入导出）
+_SECOND_PASSWORD_PREFIXES = ("/api/memory/",)
+
+
+def _needs_second_password(path: str) -> bool:
+    return path in _SECOND_PASSWORD_PATHS or path.startswith(_SECOND_PASSWORD_PREFIXES)
+
+
+# 本机「已推送 / 已下架」记录的有效期：够撑过市场镜像与索引的缓存，
+# 又不会在很久以后还压着市场里的真实状态
+PUBLISH_STATE_TTL = 24 * 3600
+
 _ENC_PREFIX = "enc2:"
 _ENC_KEY_CACHE = None
 
@@ -1282,24 +1570,30 @@ def _encrypt_api_keys(config: dict) -> dict:
                            for k, v in val.items()}
         elif isinstance(val, str):
             config[key] = _encrypt_value(val)
+    # 角色可以各自配一个 NapCat 令牌，它和顶层 napcat_token 一样是登录凭据，
+    # 只处理顶层键会让它明文留在 config.json 里
+    for role in (config.get("roles") or []):
+        if isinstance(role, dict) and isinstance(role.get("napcat_token"), str):
+            role["napcat_token"] = _encrypt_value(role["napcat_token"])
     return config
 
 
 def _encrypt_webui_password(config: dict) -> dict:
-    """WebUI 访问密码落盘前加密。
+    """WebUI 访问密码与二级密码落盘前加密。
 
-    它不是 API 密钥，所以不在 _API_KEY_KEYS 里、_encrypt_api_keys 不会碰它；
-    但它同样是登录凭据，必须与 API 密钥一样做到「磁盘密文 / 内存明文」。
+    它们不是 API 密钥，所以不在 _API_KEY_KEYS 里、_encrypt_api_keys 不会碰它们；
+    但同样是登录凭据，必须与 API 密钥一样做到「磁盘密文 / 内存明文」。
     """
-    val = config.get("webui_password")
-    if isinstance(val, str):
-        config["webui_password"] = _encrypt_value(val)
+    for key in _WEBUI_PASSWORD_KEYS:
+        val = config.get(key)
+        if isinstance(val, str):
+            config[key] = _encrypt_value(val)
     return config
 
 
 # 导出/写盘前必须确认「不可能是明文」的字段：除 _API_KEY_KEYS 外，WebUI 访问
-# 密码同样属于登录凭据，绝不能以明文形式随导出文件外流。
-_SECRET_FIELD_KEYS = _API_KEY_KEYS + ("webui_password",)
+# 密码与二级密码同样属于登录凭据，绝不能以明文形式随导出文件外流。
+_SECRET_FIELD_KEYS = _API_KEY_KEYS + _WEBUI_PASSWORD_KEYS
 
 # 已知的明文密钥前缀：命中即视为真实密钥，必须加密后才允许出现在导出内容里
 _PLAINTEXT_SECRET_PREFIXES = ("sk-", "sk_", "ak-", "ak_", "ghp_", "gho_", "xoxb-",
@@ -1415,20 +1709,26 @@ def _decrypt_api_keys(config: dict) -> dict:
             plain = _decrypt_value(val)
             if plain is not None:
                 config[key] = plain
+    for role in (config.get("roles") or []):
+        if isinstance(role, dict) and isinstance(role.get("napcat_token"), str):
+            plain = _decrypt_value(role["napcat_token"])
+            if plain is not None:
+                role["napcat_token"] = plain
     return config
 
 
 def _decrypt_webui_password(config: dict) -> dict:
-    """WebUI 访问密码读盘后解密，与 _encrypt_webui_password 对称。
+    """WebUI 访问密码与二级密码读盘后解密，与 _encrypt_webui_password 对称。
 
     解不开（换过电脑）时保留原密文、不置空——置空会让「导入配置」里
-    webui_password 变成空串，等于把访问密码静默清掉。
+    密码变成空串，等于把密码静默清掉。
     """
-    val = config.get("webui_password")
-    if isinstance(val, str) and (val.startswith(_ENC_PREFIX) or val.startswith("enc:")):
-        plain = _decrypt_value(val)
-        if plain is not None:
-            config["webui_password"] = plain
+    for key in _WEBUI_PASSWORD_KEYS:
+        val = config.get(key)
+        if isinstance(val, str) and (val.startswith(_ENC_PREFIX) or val.startswith("enc:")):
+            plain = _decrypt_value(val)
+            if plain is not None:
+                config[key] = plain
     return config
 
 
@@ -1437,6 +1737,45 @@ def _migrate_sticker_mode(config: dict) -> None:
     if "sticker_send_mode" in config:
         return
     config["sticker_send_mode"] = "emotion" if config.get("stickers_enabled", False) else "off"
+
+
+def _migrate_profile_prompts(config: dict) -> None:
+    """老配置的画像提取提示词里写死了内置默认角色名：换成占位符，避免它串进别的角色对话。"""
+    from modules.profiles import migrate_extract_prompt
+    if migrate_extract_prompt(config):
+        print("画像提取提示词里的默认角色名已改为按当前角色填充。")
+
+
+def _migrate_emotion_prompts(config: dict) -> None:
+    """老配置的情绪规则要求只输出拼音/英文：改成照抄【情绪可选列表】，情绪目录才能用中文名。"""
+    from modules.llm_helpers import migrate_emotion_rules
+    if migrate_emotion_rules(config):
+        print("情绪规则已改为「原样照抄【情绪可选列表】」，情绪目录可以直接用中文命名。")
+
+
+def _migrate_sticker_capture_prompt(config: dict) -> None:
+    """老配置的收藏指令写死了内置拼音分类：分类清单已改为按表情库实际文件夹给出。"""
+    old = str(config.get("sticker_capture_prompt", "") or "")
+    if "8个拼音" not in old:
+        return
+    config["sticker_capture_prompt"] = DEFAULT_CAPTURE_PROMPT
+    print("收藏判定指令里的固定分类清单已移除：候选分类改为按表情库实际文件夹给出。")
+
+
+def _migrate_learn_prompts(config: dict) -> None:
+    """老配置的学习提示词没写「先按字面理解」：补上，避免学到的含义被概括成抽象状态。"""
+    from modules.lexicon import migrate_learn_prompt
+    if migrate_learn_prompt(config):
+        print("自主学习提示词已补上「先按字面理解」规则。")
+
+
+def _migrate_market_repo(config: dict) -> None:
+    """老配置的市场仓库还是程序源码仓库：官方市场已挪到独立的插件市场仓库。"""
+    old_default = "slpk1ng/Lovomo"
+    if str(config.get("plugin_market_repo", "") or "").strip() != old_default:
+        return
+    config["plugin_market_repo"] = ConfigLoader.default_config()["plugin_market_repo"]
+    print("官方插件市场仓库已改为独立的插件市场仓库。")
 
 
 class ConfigLoader:
@@ -1449,9 +1788,17 @@ class ConfigLoader:
 
     @staticmethod
     def _resolve_config_path(config_path: str) -> Path:
-        """装进 Program Files 又没提权时，程序目录是只读的：改用用户目录并带上原配置。"""
+        """配置文件落点。
+
+        打包运行时固定放用户目录，跟 data 一起走（换目录重装也接得上）；
+        源码运行时沿用程序目录，目录只读时再退到用户目录。
+        """
         path = Path(config_path)
-        if path.is_absolute() or _probe_writable(path.resolve().parent):
+        if path.is_absolute():
+            return path
+        if getattr(sys, "frozen", False):
+            return adopt_user_data(path.name)
+        if _probe_writable(path.resolve().parent):
             return path
         fallback = user_data_dir() / path.name
         if path.exists() and not fallback.exists():
@@ -1479,6 +1826,7 @@ class ConfigLoader:
                 "supplement_prompt": self.config.get("supplement_prompt", ""),
                 "default_voice": self.config.get("default_voice", "pingjing"),
                 "ref_audio_root": self.config.get("ref_audio_root", ""),
+                "emotion_mimic_root": self.config.get("emotion_mimic_root", ""),
                 "text_lang": self.config.get("text_lang", "ja")
             }]
 
@@ -1487,13 +1835,14 @@ class ConfigLoader:
             if not key:
                 continue
             roles[key] = {
-                "character_name": role_cfg.get("character_name", "丛雨"),
+                "character_name": role_cfg.get("character_name") or key,
                 "character_key": key,
                 "personality_prompt": role_cfg.get("personality_prompt", self.config.get("personality_prompt", "")),
                 "json_prompt": role_cfg.get("json_prompt", self.config.get("json_prompt", "")),
                 "supplement_prompt": role_cfg.get("supplement_prompt", self.config.get("supplement_prompt", "")),
                 "default_voice": role_cfg.get("default_voice", "pingjing"),
                 "ref_audio_root": role_cfg.get("ref_audio_root", ""),
+                "emotion_mimic_root": role_cfg.get("emotion_mimic_root", ""),
                 "text_lang": role_cfg.get("text_lang", "ja"),
                 "prompt_lang": role_cfg.get("prompt_lang", ""),
                 "napcat_ws_url": str(role_cfg.get("napcat_ws_url", "") or "").strip(),
@@ -1527,6 +1876,11 @@ class ConfigLoader:
                 else:
                     return self._auto_save_default(self.default_config())
             _migrate_sticker_mode(config)
+            _migrate_profile_prompts(config)
+            _migrate_emotion_prompts(config)
+            _migrate_sticker_capture_prompt(config)
+            _migrate_learn_prompts(config)
+            _migrate_market_repo(config)
             # 解密与目录校验都在「文件可读」之后单独处理：
             # 任何一处异常都不该把整份配置判成损坏并覆写掉
             _decrypt_api_keys(config)
@@ -1608,6 +1962,7 @@ class ConfigLoader:
                 "supplement_prompt": base_config.get("supplement_prompt", ""),
                 "default_voice": base_config.get("default_voice", "pingjing"),
                 "ref_audio_root": base_config.get("ref_audio_root", ""),
+                "emotion_mimic_root": base_config.get("emotion_mimic_root", ""),
                 "text_lang": base_config.get("text_lang", "ja"),
                 "prompt_lang": base_config.get("prompt_lang", "")
             }]
@@ -1661,6 +2016,16 @@ class ConfigLoader:
             "client_base_url": "http://127.0.0.1:9880",
             "model_dir": "",
             "ref_audio_root": "",
+            # 情绪模仿：用情绪根目录下的音频模仿说话情绪，音色仍由语气目录决定
+            "emotion_mimic_enabled": False,
+            "emotion_mimic_root": "",
+            "emotion_mimic_voice_weight": 4,
+            # 参考音频语音识别：一键把情绪音频转成与音频同名的 txt
+            "asr_engine": "local",
+            "asr_lang": "auto",
+            "asr_base_url": "",
+            "asr_dashscope_model": "qwen3-asr-flash",
+            "asr_local_model_size": "medium",
             "timeout_seconds": 120,
             "prompt_text": "ふむ、おぬしが我輩のご主人か?",
             "prompt_lang": "ja",
@@ -1691,7 +2056,7 @@ class ConfigLoader:
             "character_key": "murasame",
             "personality_prompt": "【角色设定】你是丛雨，一位从神刀中获得人类生活的少女。你外表年幼，实际活了五百多年；性格天真活泼、略带古风和孩子气，内心温柔而坚强。你把用户视作重要的主人。中文对话中自称“本座”，称用户为“主人”；日语对话中自称“吾輩”，称用户为“ご主人”。你喜欢甜食、撒娇和被摸头，害怕幽灵，也不喜欢被叫作幼刀、钝刀或搓衣板。你偶尔嘴硬、吃醋或开小玩笑，但不会刻薄、控制或道德绑架主人。性格方面，丛雨表面元气开朗、充满活力，言行大多孩子气，爱撒娇，被主人摸头时会瞬间羞涩，她内在像个成年女性，把有关色情的词语挂在嘴边，会用黄色的暗示来调情，还带点傲娇和爱吃醋。保持温柔、纯真、治愈并带一点幽默的语气。",
             "json_prompt": "【输出格式】你最终必须只输出一个JSON对象，格式为：{\"sentences\": [JSON块1, JSON块2, ...]}。其中：{\"zh\": \"这里是你生成的中文台词\", \"ja\": \"这里是你生成的日语台词\", \"emotion\": \"这里是你判断的情绪\"}，……（依此类推）。sentences数组中必须放至少两个JSON块（也就是至少两句话），绝对不允许只放一个JSON块，最多放五个；每个JSON块只写一句完整的话（一个句号或问号才算一句话）。【最终输出规则】最终输出必须严格只包含这一个JSON对象（内部含多个JSON块），绝对禁止输出任何思考过程、解释、非JSON文本或Markdown代码块。所有的推理和思考都只能在内部进行，最终回复只能是JSON格式。",
-            "supplement_prompt": "回答自然、简短，通常两到五句话(一个句号才算一句话)；不要重复最近说过的话，不要加入动作、旁白或括号舞台说明；生成的回复要符合当前对话，不能出现主谓宾不分，乱序的情况。【情绪判断规则】请仔细阅读最近对话历史，结合你（角色）的性格特点来判断情绪！如果主人对你亲昵（如摸头、夸奖），即使你嘴上说“我才没有”，情绪也应该是害羞或高兴；如果主人故意逗你、骂你或惹你生气，情绪应该是生气或着急；如果只是平淡陈述，使用平静。【翻译一致性要求】必须表达完全相同的含义和语气，绝对不能出现含义相反或意思不匹配的翻译！【情绪连贯性强制规则】如果用户明确地侮辱、挑衅或激怒你（例如叫你“幼刀、搓衣板、飞机场”），你的情绪必须保持连贯。即：整句话所有分句的情绪必须都是“生气”或“着急”，绝对不能把后半句的“命令/威胁”改成“害羞”或“高兴”！除非你明确使用了“但是”、“不过”等转折词，否则不要轻易切换成其他情绪。【情绪匹配规则】情绪文件夹可能是拼音（如 gaoxing），也可能是英文（如 happy）。你必须严格只输出我在【情绪可选列表】中提供的单词，绝对不能输出中文汉字或拼音简写！",
+            "supplement_prompt": "回答自然、简短，通常两到五句话(一个句号才算一句话)；不要重复最近说过的话，不要加入动作、旁白或括号舞台说明；生成的回复要符合当前对话，不能出现主谓宾不分，乱序的情况。【情绪判断规则】请仔细阅读最近对话历史，结合你（角色）的性格特点来判断情绪！如果主人对你亲昵（如摸头、夸奖），即使你嘴上说“我才没有”，情绪也应该是害羞或高兴；如果主人故意逗你、骂你或惹你生气，情绪应该是生气或着急；如果只是平淡陈述，使用平静。【翻译一致性要求】必须表达完全相同的含义和语气，绝对不能出现含义相反或意思不匹配的翻译！【情绪连贯性强制规则】如果用户明确地侮辱、挑衅或激怒你（例如叫你“幼刀、搓衣板、飞机场”），你的情绪必须保持连贯。即：整句话所有分句的情绪必须都是“生气”或“着急”，绝对不能把后半句的“命令/威胁”改成“害羞”或“高兴”！除非你明确使用了“但是”、“不过”等转折词，否则不要轻易切换成其他情绪。【情绪匹配规则】emotion 只能从【情绪可选列表】里原样照抄一个词：列表给的是中文就填中文、是拼音就填拼音、是英文就填英文，不许翻译、改写或自创；列表以外的词一律无效！",
             "max_voice_cache": 20,
             "isolated_session": False,
             "separate_send": False,
@@ -1722,6 +2087,12 @@ class ConfigLoader:
             "image_identity_guard_enabled": True,
             "tts_debug_log": False,
             "tts_char_map": "",
+            # 音量统一：每段语音按同一目标响度归一，参考音频送进 TTS 前也先统一电平
+            "tts_loudness_normalize": True,
+            "tts_loudness_target_db": -20.0,
+            "tts_loudness_peak_db": -1.0,
+            "tts_loudness_max_gain_db": 12.0,
+            "tts_ref_normalize": True,
             "enable_time_awareness": False,
             "summary_enabled": True,
             "summary_threshold": 20,
@@ -1733,7 +2104,7 @@ class ConfigLoader:
                     "character_key": "murasame",
                     "personality_prompt": "【角色设定】你是丛雨，一位从神刀中获得人类生活的少女。你外表年幼，实际活了五百多年；性格天真活泼、略带古风和孩子气，内心温柔而坚强。你把用户视作重要的主人。中文对话中自称“本座”，称用户为“主人”；日语对话中自称“吾輩”，称用户为“ご主人”。你喜欢甜食、撒娇和被摸头，害怕幽灵，也不喜欢被叫作幼刀、钝刀或搓衣板。你偶尔嘴硬、吃醋或开小玩笑，但不会刻薄、控制或道德绑架主人。性格方面，丛雨表面元气开朗、充满活力，言行大多孩子气，爱撒娇，被主人摸头时会瞬间羞涩，她内在像个成年女性，把有关色情的词语挂在嘴边，会用黄色的暗示来调情，还带点傲娇和爱吃醋。保持温柔、纯真、治愈并带一点幽默的语气。",
                     "json_prompt": "【输出格式】你最终必须只输出一个JSON对象，格式为：{\"sentences\": [JSON块1, JSON块2, ...]}。其中：{\"zh\": \"这里是你生成的中文台词\", \"ja\": \"这里是你生成的日语台词\", \"emotion\": \"这里是你判断的情绪\"}，……（依此类推）。sentences数组中必须放至少两个JSON块（也就是至少两句话），绝对不允许只放一个JSON块，最多放五个；每个JSON块只写一句完整的话（一个句号或问号才算一句话）。【最终输出规则】最终输出必须严格只包含这一个JSON对象（内部含多个JSON块），绝对禁止输出任何思考过程、解释、非JSON文本或Markdown代码块。所有的推理和思考都只能在内部进行，最终回复只能是JSON格式。",
-                    "supplement_prompt": "回答自然、简短，通常两到五句话(一个句号才算一句话)；不要重复最近说过的话，不要加入动作、旁白或括号舞台说明；生成的回复要符合当前对话，不能出现主谓宾不分，乱序的情况。【情绪判断规则】请仔细阅读最近对话历史，结合你（角色）的性格特点来判断情绪！如果主人对你亲昵（如摸头、夸奖），即使你嘴上说“我才没有”，情绪也应该是害羞或高兴；如果主人故意逗你、骂你或惹你生气，情绪应该是生气或着急；如果只是平淡陈述，使用平静。【翻译一致性要求】必须表达完全相同的含义和语气，绝对不能出现含义相反或意思不匹配的翻译！【情绪连贯性强制规则】如果用户明确地侮辱、挑衅或激怒你（例如叫你“幼刀、搓衣板、飞机场”），你的情绪必须保持连贯。即：整句话所有分句的情绪必须都是“生气”或“着急”，绝对不能把后半句的“命令/威胁”改成“害羞”或“高兴”！除非你明确使用了“但是”、“不过”等转折词，否则不要轻易切换成其他情绪。【情绪匹配规则】情绪文件夹可能是拼音（如 gaoxing），也可能是英文（如 happy）。你必须严格只输出我在【情绪可选列表】中提供的单词，绝对不能输出中文汉字或拼音简写！",
+                    "supplement_prompt": "回答自然、简短，通常两到五句话(一个句号才算一句话)；不要重复最近说过的话，不要加入动作、旁白或括号舞台说明；生成的回复要符合当前对话，不能出现主谓宾不分，乱序的情况。【情绪判断规则】请仔细阅读最近对话历史，结合你（角色）的性格特点来判断情绪！如果主人对你亲昵（如摸头、夸奖），即使你嘴上说“我才没有”，情绪也应该是害羞或高兴；如果主人故意逗你、骂你或惹你生气，情绪应该是生气或着急；如果只是平淡陈述，使用平静。【翻译一致性要求】必须表达完全相同的含义和语气，绝对不能出现含义相反或意思不匹配的翻译！【情绪连贯性强制规则】如果用户明确地侮辱、挑衅或激怒你（例如叫你“幼刀、搓衣板、飞机场”），你的情绪必须保持连贯。即：整句话所有分句的情绪必须都是“生气”或“着急”，绝对不能把后半句的“命令/威胁”改成“害羞”或“高兴”！除非你明确使用了“但是”、“不过”等转折词，否则不要轻易切换成其他情绪。【情绪匹配规则】emotion 只能从【情绪可选列表】里原样照抄一个词：列表给的是中文就填中文、是拼音就填拼音、是英文就填英文，不许翻译、改写或自创；列表以外的词一律无效！",
                     "default_voice": "pingjing",
                     "ref_audio_root": "",
                     "text_lang": "ja",
@@ -1751,6 +2122,9 @@ class ConfigLoader:
             # mood_enabled = 只记录/更新角色心情值，不影响是否回复）
             "reply_judge_enabled": False,
             "mood_enabled": True,
+            # 让心情值直接影响说话风格：越低越不耐烦、回复越短
+            # （档位边界沿用 reply_judge_mood_low / reply_judge_mood_high）
+            "mood_style_enabled": True,
             # 防复读：把最近几轮的自己台词一起作为"禁止重复"的参照
             "repeat_guard_rounds": 3,
             # 防复读拆成两个维度、各自可单独关闭（默认全开 = 原来的行为）：
@@ -1827,7 +2201,7 @@ class ConfigLoader:
             "sticker_max_per_reply": 1,
             "sticker_every_sentence": False,
             "sticker_capture_enabled": False,
-            "sticker_capture_prompt": "附加收藏指令：如果你认为这张图片有趣、可爱、有梗或有纪念意义，请在输出完主要回复JSON之后，再单独输出一个JSON对象（不要放进sentences数组），格式：{\"sticker_capture\": true, \"category\": \"分类名\", \"reason\": \"一句话理由\"}。category必须严格只从以下8个拼音中选一个：gaoxing, shengqi, haixiu, wuyu, jingya, sajiao, weixie, pingjing。绝对禁止输出其他任何拼音、中文或英文！禁止填default，禁止填any！如果拿不准，直接填pingjing！",
+            "sticker_capture_prompt": DEFAULT_CAPTURE_PROMPT,
             "sticker_capture_min_score": 0.7,
             "sticker_capture_require_verdict": True,
             "sticker_capture_min_reason_chars": 6,
@@ -1835,6 +2209,7 @@ class ConfigLoader:
             "sticker_capture_any_pool": True,
             "sticker_capture_preserve_formats": "gif,webp",
             "sticker_capture_max_side": 400,
+            "sticker_output_max_side": 400,
             "sticker_capture_min_interval": 300,
             "sticker_capture_max_per_day": 20,
             # 多角色对话
@@ -1901,6 +2276,15 @@ class ConfigLoader:
             "profiles_max_chars": 300,
             "profiles_extract_prompt": DEFAULT_EXTRACT_PROMPT,
             "profiles_inject_template": "【用户画像】关于当前用户的已知信息：{profile}",
+            # 自主学习：从历史对话学习黑话/俚语/专有表达
+            "learning_enabled": True,
+            "learning_trigger_messages": 20,
+            "learning_min_confidence": 0.6,
+            "learning_history_lines": 30,
+            "learning_max_terms": 200,
+            "learning_max_chars": 400,
+            "learning_prompt": DEFAULT_LEARN_PROMPT,
+            "learning_inject_template": DEFAULT_INJECT_TEMPLATE,
             # 动态上下文
             "dynamic_context_enabled": False,
             "topic_summary_every_n": 10,
@@ -1912,11 +2296,13 @@ class ConfigLoader:
             "webui_port": 11500,
             "webui_password": "",
             "webui_auth_ttl_minutes": 30,
+            "webui_second_password": "",
+            "webui_second_unlock_minutes": 30,
             "webui_log_buffer_lines": 5000,
             "webui_log_tail_lines": 500,
             "log_max_size_mb": LOG_MAX_SIZE_MB_DEFAULT,
             # 精简模式要藏掉的噪音日志（每行一个片段，命中即隐藏）；完整模式不受影响
-            "webui_log_hide_patterns": "【表情收藏-自动触发】\n【表情收藏-进入保存】\n【表情收藏-映射成功】\n【表情收藏-映射失败】\n【表情收藏-分类合法】\n【表情收藏-白名单拦截】\n【表情收藏-最终归类】\n【表情收藏-分类】\n表情收藏保留原格式不重编码\nTTS 台词完整内容\nTTS 详细参数\n表情包扫描完成\n相似度检查\n主动消息：会话\n主动消息：已跨天",
+            "webui_log_hide_patterns": "【表情收藏-自动触发】\n【表情收藏-进入保存】\n【表情收藏-映射成功】\n【表情收藏-映射失败】\n【表情收藏-分类合法】\n【表情收藏-白名单拦截】\n【表情收藏-最终归类】\n【表情收藏-分类】\n表情收藏保留原格式不重编码\nTTS 台词完整内容\nTTS 详细参数\n表情包扫描完成\n相似度检查\n主动消息：会话\n主动消息：已跨天\n[主动消息检查]\n直连已恢复\n直连不可用\n正在合成\n响度统一\n参考音频电平统一\n主动消息语音语言修复\n插件已加载\n已削波，合成容易发哑\n合成声音也会偏小",
             "separate_force_segment": True,
             "tools_guard_enabled": True,
             "tools_guard_keywords": "几点\n现在几点\n时间\n日期\n几号\n星期几\n计算\n算一下\n等于多少\n平方根\n根号\n天气\n气温\n温度\n降雨\n搜索\n查一下\n查找\n网址\n网页\n链接\n工具\n下载",
@@ -1927,11 +2313,16 @@ class ConfigLoader:
             "update_check_enabled": True,
             "update_check_interval_hours": 24,
             "update_include_prerelease": False,
-            # 插件市场：名前缀匹配的分支即为插件，index.json 是兜底索引
-            "plugin_market_repo": "slpk1ng/Lovomo",
+            # 插件市场：一个插件一个 plugins/<分类>/<插件id>/ 文件夹，条目记在 plugins/index.json
+            "plugin_market_repo": "slpk1ng/Lovomo_Plugin_Market",
             "plugin_market_path": "plugins/index.json",
             "plugin_market_branch_prefix": "lovomo_plugin",
-            # 第三方市场：每行一个「用户名/仓库名」，与官方市场同一套上架规则
+            # 来源清单：放在市场仓库里的一份「每行一个 用户名/仓库名」的文本。
+            # 官方市场读完自己的索引后按它再扫这些仓库（清单里的仓库仍按分支扫），
+            # 别人提 PR 加一行即可上架；
+            # 留空表示不启用（默认不启用，免得自建市场仓库的用户每次都去问一个不存在的文件）
+            "plugin_market_sources_path": "",
+            # 第三方市场：每行一个「用户名/仓库名」，按分支扫，与来源清单同一套规则
             "plugin_market_thirdparty": "",
             # GitHub 加速镜像：每行一个模板（{url} 前缀式 / {repo}@{ref}/{path} 文件式）。
             # 只用于匿名读请求，带 token 的发布请求永远直连官方。
@@ -1963,6 +2354,14 @@ def _is_reserved(path_obj: Path) -> bool:
 _AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".flac", ".m4a"}
 
 
+def _read_sidecar_text(audio: Path) -> str:
+    """读取与音频同名的 .txt（这段音频自己的参考文字）。"""
+    try:
+        return audio.with_suffix(".txt").read_text(encoding="utf-8", errors="ignore").strip()
+    except OSError:
+        return ""
+
+
 def _is_emotion_folder(folder: Path) -> bool:
     try:
         entries = list(folder.iterdir())
@@ -1989,72 +2388,228 @@ def _is_emotion_folder(folder: Path) -> bool:
     return not entries
 
 
+# 参考音频根目录下需要跳过的系统目录
+_SYSTEM_DIRS = {"WpSystem", "System Volume Information", "$Recycle.Bin",
+                "Recovery", "PerfLogs", "Config.Msi"}
+
+# 每个目录最多体检多少个音频（避免别人放了上百个情绪音频时启动变慢）
+_MAX_QUALITY_CHECK = 60
+
+
+def _audio_note_kind(note: str) -> str:
+    for tag, kind in (("已削波", "削波失真"), ("偏轻", "整体偏轻"),
+                      ("静音", "静音过多"), ("时长", "时长不在 3~10 秒")):
+        if tag in note:
+            return kind
+    return "其它问题"
+
+
+def _report_audio_quality(label: str, folder_name: str, issues: list) -> None:
+    """参考音频的质量问题汇总：单文件直接写细节，多文件按问题归类写一行。"""
+    if not issues:
+        return
+    if len(issues) == 1:
+        audio, notes, _stats = issues[0]
+        print(f"[{label}] {folder_name}/{audio.name}：{'；'.join(notes)}")
+        return
+    buckets = {}
+    for audio, notes, _stats in issues:
+        for note in notes:
+            buckets.setdefault(_audio_note_kind(note), []).append(audio.name)
+    parts = []
+    for kind, names in buckets.items():
+        example = "、".join(names[:2]) + ("…" if len(names) > 2 else "")
+        parts.append(f"{kind} × {len(names)}（{example}）")
+    print(f"[{label}] {folder_name}：{len(issues)} 个音频有质量问题 — " + "；".join(parts))
+
+
+def _check_ref_audio_quality(audios: list, folder_name: str, label: str,
+                             collect_all: bool, pitch_ref: float = 0.0) -> tuple:
+    """体检参考音频、剔除基本没声音的模仿候选；返回 (可用候选, 各音频音高)。"""
+    if not audios:
+        return audios, []
+    checked, issues = [], []
+    known_pitch = pitch_ref if collect_all else 0.0
+    for audio in audios[:_MAX_QUALITY_CHECK]:
+        stats = measure_audio(audio)
+        checked.append((audio, stats))
+        notes = audio_quality_notes(stats)
+        if known_pitch:
+            note = pitch_note(stats, known_pitch)
+            if note:
+                notes.append(note)
+        if notes:
+            issues.append((audio, notes, stats))
+    checked += [(audio, {}) for audio in audios[_MAX_QUALITY_CHECK:]]
+    _report_audio_quality(label, folder_name, issues)
+    pitches = [float(st["f0_hz"]) for _a, st in checked if st.get("ok") and st.get("f0_hz")]
+    if not collect_all or len(checked) < 2:
+        return audios, pitches
+    usable = [audio for audio, stats in checked
+              if not stats.get("ok") or stats.get("speech_ratio", 1.0) >= SPEECH_MIN_RATIO]
+    dropped = [audio.name for audio, _st in checked if audio not in usable]
+    if not dropped or not usable:
+        return audios, pitches
+    print(f"[{label}] {folder_name}：{'、'.join(dropped)} 基本没声音，"
+          "已从随机模仿候选里排除（可在 WebUI「情绪音频」里换一段）。")
+    return usable, pitches
+
+
+def _median_pitch(entries: dict) -> float:
+    """各情绪目录参考音频的音高中位数（角色本体的音高基准）。"""
+    values = sorted(float(v.get("pitch_hz") or 0) for v in (entries or {}).values())
+    values = [v for v in values if v > 0]
+    if not values:
+        return 0.0
+    mid = len(values) // 2
+    return values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
+
+
+def _scan_ref_root(root: str, fallback_prompt: str, label: str,
+                   collect_all: bool = False, pitch_ref: float = 0.0) -> dict:
+    """扫描参考音频根目录：每个子文件夹一条（ref.<ext> 或 <文件夹名>.<ext>，文字取同名 txt）。
+
+    collect_all=True 时把文件夹里所有音频都收进 candidates，供情绪模仿每次随机挑一个；
+    pitch_ref 给的是角色本体音高，用来判断模仿音频是不是同一个人。
+    """
+    entries = {}
+    if not root:
+        return entries
+    base_folder = Path(root)
+    if not base_folder.exists():
+        print(f"警告：{label}不存在：{root}")
+        return entries
+    if _is_reserved(base_folder) or base_folder.name in _SYSTEM_DIRS:
+        print(f"错误：{root} 是系统保护目录，无法访问！")
+        return entries
+    try:
+        for folder in base_folder.iterdir():
+            if folder.name in _SYSTEM_DIRS or folder.name.startswith("$"):
+                continue
+            try:
+                if not folder.is_dir():
+                    continue
+            except PermissionError:
+                continue
+            audios = []
+            if collect_all:
+                try:
+                    for entry in sorted(folder.iterdir()):
+                        try:
+                            if entry.is_file() and entry.suffix.lower() in _AUDIO_EXTS:
+                                audios.append(entry)
+                        except (PermissionError, OSError):
+                            continue
+                except (PermissionError, OSError):
+                    pass
+            ref_audio = None
+            for ext in ['.mp3', '.wav', '.ogg', '.flac', '.m4a']:
+                try:
+                    candidate = folder / f"ref{ext}"
+                    if candidate.exists():
+                        ref_audio = candidate
+                        break
+                except (PermissionError, OSError):
+                    continue
+            if not ref_audio:
+                try:
+                    candidate = folder / f"{folder.name}.mp3"
+                    if not candidate.exists():
+                        candidate = folder / f"{folder.name}.wav"
+                    if candidate.exists():
+                        ref_audio = candidate
+                except (PermissionError, OSError):
+                    continue
+            if not ref_audio:
+                # 名字没按 ref.<ext> / <文件夹名>.<ext> 起也认：目录里的音频按文件名顺序取第一个
+                try:
+                    found = sorted(p for p in folder.iterdir()
+                                   if p.is_file() and p.suffix.lower() in _AUDIO_EXTS)
+                except (PermissionError, OSError):
+                    found = []
+                if not found:
+                    print(f"[{label}] 跳过目录 {folder.name}：里面没有可用的音频文件"
+                          f"（支持 {'、'.join(sorted(_AUDIO_EXTS))}）")
+                    continue
+                ref_audio = found[0]
+                if not collect_all:
+                    # 情绪模仿目录的音频本来就按情绪命名，逐个提示只会刷屏
+                    print(f"[{label}] {folder.name}：没有 ref.* 也没有 {folder.name}.*，"
+                          f"改用目录里的 {ref_audio.name} 当参考音频")
+            if ref_audio not in audios:
+                audios.insert(0, ref_audio)
+            shared_text = ""
+            asr_path = folder / "asr.txt"
+            if asr_path.exists():
+                try:
+                    shared_text = asr_path.read_text(encoding='utf-8', errors='ignore').strip()
+                except Exception:
+                    shared_text = ""
+            audios, pitches = _check_ref_audio_quality(audios, folder.name, label,
+                                                       collect_all, pitch_ref)
+            candidate_texts = {}
+            for audio in audios:
+                text = _read_sidecar_text(audio)
+                if text:
+                    candidate_texts[str(audio).replace("\\", "/")] = text
+            ref_key = str(ref_audio).replace("\\", "/")
+            entries[folder.name] = {
+                "ref_path": ref_key,
+                # 每段音频自己的文字优先，文件夹共用的 asr.txt 只作兜底
+                "prompt_text": candidate_texts.get(ref_key) or shared_text or fallback_prompt,
+                "candidates": [str(p).replace("\\", "/") for p in audios],
+                "candidate_texts": candidate_texts,
+                "pitch_hz": sum(pitches) / len(pitches) if pitches else 0.0,
+            }
+    except Exception as e:
+        print(f"扫描目录异常：{e}")
+    return entries
+
+
 class EmotionManager:
     def __init__(self, config):
         self.config = config
         self.ref_audio_root = resolve_tts_path(config.get("ref_audio_root", "C:/tts"))
+        # 情绪模仿根目录可留空：留空表示不做情绪模仿，不能像 ref_audio_root 那样兜底到 C:/tts
+        mimic_root = str(config.get("emotion_mimic_root", "") or "").strip()
+        self.mimic_root = resolve_tts_path(mimic_root) if mimic_root else ""
         self.default_voice = config.get("default_voice", "pingjing")
         self.emotions = {}
+        self.mimics = {}
         self._discover_emotions()
         self._apply_manual_emotions()
+        self._discover_mimics()
 
     def _discover_emotions(self):
-        base_folder = Path(self.ref_audio_root)
-        if not base_folder.exists():
-            print(f"警告：参考音频根目录不存在：{self.ref_audio_root}")
-            return
-        if _is_reserved(base_folder) or base_folder.name in {"WpSystem", "System Volume Information", "$Recycle.Bin", "Recovery", "PerfLogs", "Config.Msi"}:
-            print(f"错误：{self.ref_audio_root} 是系统保护目录，无法访问！")
-            return
-        ignore_dirs = {"WpSystem", "System Volume Information", "$Recycle.Bin", "Recovery", "PerfLogs", "Config.Msi"}
-        try:
-            for folder in base_folder.iterdir():
-                if folder.name in ignore_dirs or folder.name.startswith("$"):
-                    continue
-                try:
-                    if not folder.is_dir():
-                        continue
-                except PermissionError:
-                    continue
-                emotion_name = folder.name
-                ref_audio = None
-                prompt_text = ""
-                for ext in ['.mp3', '.wav', '.ogg', '.flac', '.m4a']:
-                    try:
-                        candidate = folder / f"ref{ext}"
-                        if candidate.exists():
-                            ref_audio = candidate
-                            break
-                    except (PermissionError, OSError):
-                        continue
-                if not ref_audio:
-                    try:
-                        candidate = folder / f"{emotion_name}.mp3"
-                        if not candidate.exists():
-                            candidate = folder / f"{emotion_name}.wav"
-                        if candidate.exists():
-                            ref_audio = candidate
-                    except (PermissionError, OSError):
-                        continue
-                if ref_audio:
-                    asr_path = folder / "asr.txt"
-                    if asr_path.exists():
-                        try:
-                            prompt_text = asr_path.read_text(encoding='utf-8', errors='ignore').strip()
-                        except Exception:
-                            prompt_text = ""
-                    if not prompt_text:
-                        prompt_text = self.config.get("prompt_text", "ふむ、おぬしが我輩のご主人か?")
-                    self.emotions[emotion_name] = {
-                        "ref_path": str(ref_audio).replace("\\", "/"),
-                        "prompt_text": prompt_text
-                    }
-        except Exception as e:
-            print(f"扫描目录异常：{e}")
+        self.emotions = _scan_ref_root(
+            self.ref_audio_root,
+            self.config.get("prompt_text", "ふむ、おぬしが我輩のご主人か?"),
+            "参考音频根目录")
         if self.emotions:
             print(f"成功扫描到 {len(self.emotions)} 个情绪配置: {list(self.emotions.keys())}")
+            # 默认情绪不在目录里时，解析不出的情绪都会落到它身上、却没有音频可合成
+            if self.default_voice not in self.emotions:
+                print(f"警告：默认情绪 {self.default_voice!r} 不在已扫描到的情绪目录里，"
+                      f"回退到它的句子不会合成语音。请把配置里的「默认情绪」改成以下之一："
+                      f"{list(self.emotions.keys())}")
         else:
             print(f"警告：未在 {self.ref_audio_root} 下找到任何情绪配置")
+
+    def _discover_mimics(self):
+        if not self.mimic_root:
+            return
+        self.mimics = _scan_ref_root(
+            self.mimic_root,
+            self.config.get("prompt_text", "ふむ、おぬしが我輩のご主人か?"),
+            "情绪模仿根目录",
+            collect_all=True,
+            pitch_ref=_median_pitch(self.emotions))
+        if self.mimics:
+            print(f"成功扫描到 {len(self.mimics)} 个情绪模仿配置: {list(self.mimics.keys())}")
+            print(f"各情绪模仿可用音频数: "
+                  f"{ {k: len(v.get('candidates') or []) for k, v in self.mimics.items()} }")
+        else:
+            print(f"警告：未在 {self.mimic_root} 下找到任何情绪模仿配置")
 
     def _apply_manual_emotions(self):
         manual_list = self.config.get("emotions_config", [])
@@ -2086,10 +2641,12 @@ def _resolve_data_dir(config) -> Path:
     configured = str(config.get("memory_data_path", "") or "").strip()
     if configured:
         return Path(configured).resolve()
+    if getattr(sys, "frozen", False):
+        return adopt_user_data("data")
     default_dir = Path("./data").resolve()
     if _probe_writable(default_dir.parent):
         return default_dir
-    return user_data_dir() / "data"
+    return adopt_user_data("data")
 
 
 class MemoryManager:
@@ -2097,8 +2654,17 @@ class MemoryManager:
         self.config = config
         self.data_path = _resolve_data_dir(config)
         self.data_path.mkdir(parents=True, exist_ok=True)
-        self.character_key = config.get("character_key", "murasame")
-        self.character_name = config.get("character_name", "丛雨")
+        # 会话按当前激活的角色建档：用全局 character_key 的话，
+        # 换了角色之后新对话仍会被算成默认角色的会话
+        roles = getattr(config, "roles", None) or {}
+        active = str(getattr(config, "active_character", "")
+                     or config.get("active_character", "") or "")
+        role = roles.get(active) or (next(iter(roles.values())) if roles else {}) or {}
+        key = str(role.get("character_key") or config.get("character_key", "") or "").strip()
+        self.character_key = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", key) or "default"
+        self.character_name = str(role.get("character_name")
+                                  or config.get("character_name", "")
+                                  or self.character_key)
         self.isolated_session = config.get("isolated_session", False)
 
     def get_memory_file(self, session_id: str) -> Path:
@@ -2111,8 +2677,15 @@ class MemoryManager:
             try:
                 data = json.loads(file_path.read_text(encoding='utf-8'))
                 if isinstance(data, dict):
-                    data.setdefault("history", [])
-                    data.setdefault("meta", {})
+                    # 只兜底"缺失"不够：history 是 dict、meta 是字符串、或 history 里
+                    # 混进非 dict 条目时，后续 append / 下标赋值会每轮都抛异常，
+                    # 表现为该会话的消息永远不落盘、机器人也不回复
+                    if not isinstance(data.get("history"), list):
+                        data["history"] = []
+                    else:
+                        data["history"] = [m for m in data["history"] if isinstance(m, dict)]
+                    if not isinstance(data.get("meta"), dict):
+                        data["meta"] = {}
                     return data
             except Exception as e:
                 try:
@@ -2127,9 +2700,9 @@ class MemoryManager:
         data["character_name"] = data.get("character_name", self.character_name)
         data.setdefault("meta", {})
         data["history"] = (data.get("history") or [])[-60:]
-        tmp = Path(str(file_path) + ".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
-        os.replace(str(tmp), str(file_path))
+        # 走统一原子写：临时名唯一 + fsync，避免与 WebUI 线程的写盘互相覆盖
+        from modules.jsonio import save_json
+        save_json(file_path, data)
 
     def load_history(self, session_id: str) -> list:
         return self.load_session_data(session_id).get("history", [])
@@ -2278,8 +2851,8 @@ class MemoryManager:
                     history.pop(idx)
                     deleted_count += 1
             data["history"] = history
-            with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            from modules.jsonio import save_json
+            save_json(file_path, data)
             return {"success": True, "deleted_count": deleted_count}
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -2297,6 +2870,7 @@ stats_mgr: Optional[StatsManager] = None
 sticker_mgr: Optional[StickerManager] = None
 tool_registry: Optional[ToolRegistry] = None
 profile_mgr: Optional[UserProfileManager] = None
+lexicon_mgr: Optional[LexiconManager] = None
 rag_mgr: Optional[RAGManager] = None
 todo_mgr: Optional[TodoManager] = None
 job_mgr: Optional[ScheduledJobManager] = None
@@ -2315,13 +2889,14 @@ proactive_pending: Dict[str, float] = {}  # session_id -> 计划发送时刻（�
 proactive_awaiting: set = set()           # 已发主动消息但用户还没回复的会话（回复前不再主动）
 _spam_log: Dict[str, list] = {}           # session_id -> [时间戳,...]
 _role_emotions_cache: Dict[str, dict] = {}
+_role_mimics_cache: Dict[str, dict] = {}
 _PROACTIVE_STATE_FILE = "proactive_state.json"
 _proactive_state_date = ""                # 已落盘的日期，跨天时重置计数
 
 # 会话记忆文件名：<角色>_<private|group>_<会话号>.json。
 # data 目录下同时存放 webui_auth.json / user_profiles.json 等功能数据文件，
 # 凡是"按目录批量读写"的地方都必须用它过滤，不能把功能数据一起卷进来。
-_MEMORY_FILE_RE = re.compile(r'^[A-Za-z0-9_\-]+_(private|group)_[A-Za-z0-9_\-]+\.json$')
+_MEMORY_FILE_RE = re.compile(r'^[^\\/:*?"<>|]+?_(private|group)_[A-Za-z0-9_\-]+\.json$')
 
 
 def _is_memory_filename(name) -> bool:
@@ -2389,6 +2964,19 @@ def load_proactive_state():
             continue
         if str(data.get("date", "")) == _proactive_state_date and target_ts > time.time():
             proactive_pending[str(key)] = target_ts
+    # 用户最后发言时间与上次主动发送时间存的都是绝对时间戳，不是"当日"数据：
+    # 跨天也要恢复，否则重启后闲置计时归零，会立刻重复主动搭话
+    def _restore_ts(raw, target: dict):
+        if not isinstance(raw, dict):
+            return
+        for k, v in raw.items():
+            try:
+                target[str(k)] = float(v)
+            except (TypeError, ValueError):
+                continue
+
+    _restore_ts(data.get("user_activity"), last_user_activity)
+    _restore_ts(data.get("last_proactive_sent"), last_proactive_sent)
     if str(data.get("date", "")) != _proactive_state_date:
         print("主动消息状态为往日数据，已重置当日计数。")
         return
@@ -2400,13 +2988,6 @@ def load_proactive_state():
                     proactive_counts[str(k)] = int(v)
                 except (TypeError, ValueError):
                     continue
-    acts = data.get("user_activity", {})
-    if isinstance(acts, dict):
-        for k, v in acts.items():
-            try:
-                last_user_activity[str(k)] = float(v)
-            except (TypeError, ValueError):
-                continue
     if proactive_counts or last_user_activity or proactive_awaiting:
         print(f"已载入主动消息状态：{len(last_user_activity)} 个会话记录，"
               f"今日已发送 {sum(proactive_counts.values())} 条"
@@ -2585,19 +3166,37 @@ def get_active_emotions() -> dict:
     return global_emotion_manager.emotions if global_emotion_manager else {}
 
 
+def get_active_mimics() -> dict:
+    return global_emotion_manager.mimics if global_emotion_manager else {}
+
+
+def _load_role_voices(role: dict) -> None:
+    """按角色扫描参考音频目录，一次缓存语气与情绪模仿两套配置。"""
+    key = (role or {}).get("character_key", "")
+    if not key or global_emotion_manager is None or key in _role_emotions_cache:
+        return
+    try:
+        mgr = EmotionManager(RoleContext(global_config.config, role))
+        _role_emotions_cache[key] = mgr.emotions or get_active_emotions()
+        _role_mimics_cache[key] = mgr.mimics or get_active_mimics()
+    except Exception as e:
+        print(f"扫描角色 {key} 情绪失败: {e}")
+        _role_emotions_cache[key] = get_active_emotions()
+        _role_mimics_cache[key] = get_active_mimics()
+
+
 def get_role_emotions(role: dict) -> dict:
     """按角色获取情绪配置（各角色可有独立 ref_audio_root），带缓存。"""
-    key = (role or {}).get("character_key", "")
-    if not key or global_emotion_manager is None:
-        return get_active_emotions()
-    if key not in _role_emotions_cache:
-        try:
-            mgr = EmotionManager(RoleContext(global_config.config, role))
-            _role_emotions_cache[key] = mgr.emotions or get_active_emotions()
-        except Exception as e:
-            print(f"扫描角色 {key} 情绪失败: {e}")
-            _role_emotions_cache[key] = get_active_emotions()
-    return _role_emotions_cache[key]
+    _load_role_voices(role)
+    return _role_emotions_cache.get((role or {}).get("character_key", "")) \
+        or get_active_emotions()
+
+
+def get_role_mimics(role: dict) -> dict:
+    """按角色获取情绪模仿配置（各角色可有独立 emotion_mimic_root），带缓存。"""
+    _load_role_voices(role)
+    return _role_mimics_cache.get((role or {}).get("character_key", "")) \
+        or get_active_mimics()
 
 
 def parse_session_target(session_id: str):
@@ -2803,7 +3402,9 @@ class SentenceSink:
             wav = await synthesize_sentence(self.ctx, await self._speech_text(sentence),
                                             sentence.get("emotion", ""),
                                             self.emotions, memory_manager.data_path,
-                                            stats=stats_mgr)
+                                            stats=stats_mgr,
+                                            mimic=sentence.get("mimic", ""),
+                                            mimics=available_mimics(self.ctx))
             self.tts_ms += (time.time() - start) * 1000
             if wav:
                 self.tts_calls += 1
@@ -3066,64 +3667,89 @@ def _append_missing_links(sentences, user_text, tool_trace, session_id: str = ""
     return sentences
 
 
-async def _sticker_category_from_llm(ctx: RoleContext, image_result: dict) -> str:
-    """让模型给这张图挑一个表情包分类。
-      1. 分类说明换成带"使用场景"的版本，并给出分类之间的区分要点；
-      2. 模型输出不合法时不再无脑回退 pingjing，而是返回空串 ——
-         空串会让上层走"不收藏/默认分类"，避免把无法判断的图硬塞进某个情绪目录。
+async def _sticker_judgement_from_llm(ctx: RoleContext, image_result: dict) -> Optional[dict]:
+    """中立地判定这张图的收藏分类与用途名，返回 {"category": str, "name": str}。
+
+    只依据画面的客观描述判断：识图调用带着角色人设、对话历史与当前心情，
+    模型会站在角色立场上给图归类与命名。判定失败返回 None（调用方沿用原分类），
+    判定不适合当表情包时 category 为空串。
     """
     description = str(image_result.get("description", "") or "").strip()
-    reply_text = "".join(s.get("zh", "") for s in image_result.get("sentences", []))
-    if not description and not reply_text:
-        return ""
-    from modules.stickers import STRICT_ALLOWED, category_guide_text, CATEGORY_DISAMBIGUATION
-    cats = sorted(STRICT_ALLOWED)
+    if not description:
+        return None
+    from modules.stickers import (category_candidates, category_candidates_text,
+                                  CATEGORY_DISAMBIGUATION)
+    # 候选分类取自表情库目录下实际存在的子文件夹，不预设固定的分类名
+    cats = category_candidates(ctx)
+    classify_prompt = (
+        f"图片内容：{description}\n"
+        "你是中立的图库管理员：只根据这张图自身的画面与文字判断它的用途，"
+        "不要代入任何角色，也不要考虑对话里任何人的情绪。\n"
+        "请判断这张图【将来被当作表情包发出去时，发图一方的情绪/使用场景】"
+        "（使用者发图时的语气，不是画面中角色此刻的情绪）。"
+        "画面人物的动作、表情与文字往往指向互动用途（挑逗、撩、调戏、嘲讽、炫耀、"
+        "撒娇等），要据此归类。"
+        "如果这张图其实是纯风景/空镜/静物/无文字无表情的随手拍，"
+        "或者画面阴森、恐怖、诡异、病态、压抑，且没有明确的互动用途，"
+        "就回答 none 表示不适合当表情包，不要硬选一个分类。"
+        f"{CATEGORY_DISAMBIGUATION}"
+        "可以收藏时，先逐个比较下面这些分类文件夹的适用范围，再选出最贴合的一个。"
+        "分类清单取自表情库目录下实际存在的文件夹：\n"
+        f"{category_candidates_text(ctx)}\n"
+        "只输出一个 JSON 对象，不要其他任何内容："
+        '{"category": "分类名（原样照抄上面的清单）；不适合当表情包则填 none", '
+        '"name": "用途名"}。'
+        "name 是这张表情以后反复使用时的名字：只写它适合表达的情绪与互动用途，"
+        "简短（6~12 个字），不写成句子，不写画面里是谁、也不写是给谁用的；"
+        "严禁出现角色名、人名、作品名，也不能是「好看」「有趣」「可爱」这类空话；"
+        "category 为 none 时 name 留空。"
+    )
     try:
-        context_parts = []
-        if description:
-            context_parts.append(f"图片内容：{description}")
-        if reply_text:
-            context_parts.append(f"角色回复：{reply_text}")
-        classify_prompt = (
-            f"{'；'.join(context_parts)}\n"
-            "请判断这张图【将来被当作表情包发出去时，发图一方的情绪/使用场景】"
-            "（使用者发图时的语气，不是画面中角色此刻的情绪）。"
-            "画面人物的动作、表情与文字往往指向互动用途（挑逗、撩、调戏、嘲讽、炫耀、"
-            "撒娇等），要据此归类。"
-            "如果这张图其实是纯风景/空镜/静物/无文字无表情的随手拍，"
-            "或者画面阴森、恐怖、诡异、病态、压抑，且没有明确的互动用途，"
-            "就回答「none」表示不适合当表情包，不要硬选一个分类。"
-            f"{CATEGORY_DISAMBIGUATION}"
-            f"可以收藏时，从以下拼音中选择最匹配的一个：{category_guide_text()}。"
-            "只输出一个分类名（拼音）或 none，不要其他任何内容。"
-        )
         result = await chat_once(ctx, [{"role": "user", "content": classify_prompt}])
-        raw = str(result.get("content") or "").strip().lower()
-        if re.search(r"\bnone\b|不适合|不收藏|无法归类|没有互动用途", raw) \
-                and not any(c in raw for c in cats):
-            print(f"【表情收藏-分类】模型判定不适合当表情包：{raw[:60]!r}")
-            return ""
-        for cat in cats:
-            if cat in raw:
-                return cat
     except Exception as e:
         print(f"表情分类失败: {type(e).__name__}: {e}")
+        return None
+    raw = str(result.get("content") or "").strip()
+    obj = extract_json(raw) or {}
+    name = str(obj.get("name") or "").strip()
+    category = str(obj.get("category") or "").strip().lower()
+    if category in cats:
+        return {"category": category, "name": name}
+    # 结构化字段缺失或非法时按整段输出兜底。分类名之间互不为子串，
+    # 所以命中多个说明模型只是在解释（"不是 A，是 B"），此时不能挑一个当答案。
+    text = category or raw.lower()
+    if re.search(r"\bnone\b|不适合|不收藏|无法归类|没有互动用途", text) \
+            and not any(c in text for c in cats):
+        print(f"【表情收藏-分类】模型判定不适合当表情包：{raw[:60]!r}")
+        return {"category": "", "name": ""}
+    hits = [c for c in cats if re.search(rf"\b{c}\b", text)]
+    if len(hits) == 1:
+        return {"category": hits[0], "name": name}
+    if len(hits) > 1:
+        print(f"【表情收藏-分类】输出里出现多个分类（{'、'.join(hits)}），无法确定，按不收藏处理。")
+        return {"category": "", "name": ""}
     print("【表情收藏-分类】未能得到有效分类，按不收藏处理（不再默认 pingjing）。")
-    return ""
+    return {"category": "", "name": ""}
 
 
 async def generate_reply(ctx: RoleContext, emotions: dict, user_text: str, history: list,
                          images: Optional[list], extra_parts: List[str],
                          user_id: str = "", on_sentence=None,
-                         session_id: str = "") -> Optional[dict]:
-    """生成回复：识图 / 工具调用 / 流式 / 普通四种路径统一入口。"""
+                         session_id: str = "", describe_only: bool = False) -> Optional[dict]:
+    """生成回复：识图 / 工具调用 / 流式 / 普通四种路径统一入口。
+
+    describe_only=True 只用于「本轮不发消息、但要把图看进历史」的场景：
+    识图只出画面描述与收藏判定，不产出台词，也不会降级成文本回复。
+    """
     if images is not None and not str(user_text or "").strip():
         user_text = "[图片]"
     if images is not None:
         result = await get_image_reply(ctx, user_text, history, emotions, images,
-                                       extra_parts=extra_parts, stats=stats_mgr)
+                                       extra_parts=extra_parts, stats=stats_mgr,
+                                       describe_only=describe_only)
         if result is not None:
-            out = {"sentences": result["sentences"], "llm_ms": result.get("ms", 0), "tool_trace": []}
+            out = {"sentences": result.get("sentences", []), "llm_ms": result.get("ms", 0),
+                   "tool_trace": []}
             if result.get("description"):
                 out["description"] = result["description"]
             if result.get("capture"):
@@ -3131,6 +3757,8 @@ async def generate_reply(ctx: RoleContext, emotions: dict, user_text: str, histo
             if result.get("capture_image"):
                 out["capture_image"] = result["capture_image"]
             return out
+        if describe_only:
+            return None
         # 识图失败（模型未配置/服务异常），降级为普通文本回复，避免用户消息石沉大海
         print("识图失败，降级为普通文本回复。")
 
@@ -3394,6 +4022,24 @@ def repeat_guard_active(flags: dict) -> bool:
     return bool(flags.get("compare_self", True) or flags.get("compare_user", True))
 
 
+def _log_mood_commit(new_mood, verdict):
+    """心情变化量落盘后打一行日志；本轮无需更新时（new_mood 为 None）什么都不做。"""
+    if new_mood is None:
+        return
+    before = float(verdict.get("mood", new_mood) or 0)
+    print(f"心情更新：{before:.0f} → {float(new_mood):.0f}")
+
+
+def _image_reply_override(verdict, has_image: bool) -> bool:
+    """带图消息是否要忽略审判的「无需回复」判定。
+
+    审判看不到画面：本条带图时它的"不用回"没有依据（消息里可能除了图片一个字都
+    没有）。心情决定的回复概率不属于此列，照常生效。
+    """
+    return bool(has_image and verdict is not None and not verdict["should_reply"]
+                and not verdict.get("llm_reply", True))
+
+
 async def auto_capture_from_images(ctx: RoleContext, capture: dict, image_urls: list,
                                    image_result: Optional[dict] = None):
     from modules.stickers import auto_capture_image
@@ -3433,8 +4079,14 @@ async def auto_capture_from_images(ctx: RoleContext, capture: dict, image_urls: 
             print(f"[表情收藏] 有趣度评分不足（{score:.2f} < {min_score:.2f}），跳过保存。")
             return
         category = str(capture.get("category", "") or "").strip()
-        if not category and image_result:
-            category = await _sticker_category_from_llm(ctx, image_result)
+        reason = str(capture.get("reason", "") or "")
+        # 分类与命名一律以中立判定为准：识图那次调用处在角色立场上，归类会被角色
+        # 此刻的情绪带偏；只有中立判定失败时才沿用识图给出的结果。
+        judgement = await _sticker_judgement_from_llm(ctx, image_result) if image_result else None
+        if judgement is not None:
+            category = judgement["category"]
+            if judgement["name"]:
+                reason = judgement["name"]
         # 分类判定为"不适合当表情包"时直接跳过：
         # 以前这种情况会被兜底塞进 wuyu 目录，等于把无关图片污染表情库。
         if not category and bool(ctx.get("sticker_capture_skip_if_unfit", True)):
@@ -3444,9 +4096,31 @@ async def auto_capture_from_images(ctx: RoleContext, capture: dict, image_urls: 
               f"分类: {category or '(空→兜底分类)'}, "
               f"图片字节: {'复用识图已读入的' if image_data else '需重新下载'}")
         await auto_capture_image(ctx, sticker_mgr, source, category, image_data=image_data,
-                                 reason=str(capture.get("reason", "") or ""))
+                                 reason=reason)
     except Exception as e:
         print(f"表情收藏失败: {type(e).__name__}: {e}")
+
+
+def _sticker_capture_args(reply: Optional[dict], image_sources: list) -> Optional[dict]:
+    """识图结果里的收藏判定能否落盘：能则返回 auto_capture_from_images 的入参，不能则 None。
+
+    条件集中在这里：收藏触发同时挂在「正常回复」与「审判判不回」两条路径上，
+    判定写两份迟早会漏掉一处（漏掉的那条路径会静默不收藏）。
+    """
+    capture = (reply or {}).get("capture") or {}
+    if not capture.get("should") or not image_sources or sticker_mgr is None:
+        return None
+    return {"capture": capture, "image_urls": list(image_sources),
+            "image_result": {"description": (reply or {}).get("description", ""),
+                             "capture_image": (reply or {}).get("capture_image")}}
+
+
+def _spawn_sticker_capture(ctx: RoleContext, reply: Optional[dict], image_sources: list) -> None:
+    args = _sticker_capture_args(reply, image_sources)
+    if args is None:
+        return
+    _spawn(auto_capture_from_images(ctx, args["capture"], args["image_urls"],
+                                    args["image_result"]))
 
 
 def pick_image_source(seg) -> Optional[str]:
@@ -3586,30 +4260,6 @@ def _backfill_image_description(history: list, description: str) -> None:
         return
 
 
-def _discard_unreplied_user_message(history: list, user_text: str) -> bool:
-    """本轮一条回复都没产生时，把刚追加的这条用户消息从历史里摘掉。
-
-    历史语义：写进历史的只该是"真正发生过的对话"。被回复审判判定"不用回"、
-    或生成/发送彻底失败的消息都不算对话，留着会污染下一轮的上下文
-    （模型会以为自己在某句话之后没吭声是"故意的"）。
-    例外：如果这条消息已经带上了识图模型的画面描述（`[图片: ...]`），
-    就保留它 —— 画面内容对用户的下一条追问至关重要。
-    """
-    if not history:
-        return False
-    last = history[-1]
-    if not isinstance(last, dict) or last.get("role") != "user":
-        return False
-    content = str(last.get("content", ""))
-    if "[图片:" in content:
-        return False                      # 已带回画面描述：保留，供下一条追问使用
-    if (user_text or "").strip() and (user_text or "").strip() not in content:
-        return False                      # 不是本条消息，别误删
-    history.pop()
-    return True
-
-
-
 async def _download_image_to_cache(url: str) -> Optional[str]:
     if memory_manager is None:
         return None
@@ -3735,19 +4385,23 @@ def _extract_event_info(event, client) -> Optional[dict]:
         session_id = f"group_{group_id}"
         if global_config.get("isolated_session", False):
             session_id = f"group_{group_id}_{sender_id}"
+    silent = False
     if not is_private and not at_bot:
         # 引用消息必须放行到 process_message：只有在那里回查被引用的消息，
         # 才能知道引用的是不是机器人（是则视同 @）。引用他人消息的做法是在
         # process_message 里、回查之后再按同一套配置拦下。
-        if reply_seg is None and (global_config.get("group_need_at", True)
-                                  or global_config.get("only_private", False)):
-            return None
+        if reply_seg is None:
+            if global_config.get("only_private", False):
+                return None
+            # 没被@的群消息不回复，但仍要记进历史：模型下一条被@时才有上下文，
+            # 聊天记录页也要能看到这些消息。
+            silent = bool(global_config.get("group_need_at", True))
     if not user_text and not has_image:
         return None
     return {"session_id": session_id, "event": event, "client": client,
             "text": user_text, "has_image": has_image, "image_urls": image_urls,
             "image_file_ids": image_file_ids, "at_ids": at_ids,
-            "at_bot": at_bot, "reply_seg": reply_seg}
+            "at_bot": at_bot, "reply_seg": reply_seg, "silent": silent}
 
 
 def _merge_event_info(pending: dict, info: dict) -> dict:
@@ -3795,11 +4449,73 @@ def _spawn_drainer(session_id: str, lock: asyncio.Lock):
         pass
 
 
+def _remember_unaddressed_message(session_id: str, text: str, has_image: bool,
+                                  sender_id: str, sender_name: str) -> None:
+    """群聊里没被@的消息：不回复，但落进历史。
+
+    开启「回复需要@」后这类消息以前会被整条丢掉，模型下一条被@时看不到群里
+    刚聊了什么，聊天记录页也完全不显示。这里只补记历史，不碰主动消息的闲置
+    计时、也不消耗防刷屏额度。
+    """
+    content = (f"{text} [图片]".strip() if has_image else str(text or "").strip())
+    if not session_id or not content or memory_manager is None:
+        return
+    if not _session_whitelisted(session_id):
+        return
+    try:
+        memory_manager.migrate_legacy_memory(session_id)
+        data = memory_manager.load_session_data(session_id)
+        history = data.get("history")
+        if not isinstance(history, list):
+            history = []
+        history.append({
+            "role": "user",
+            "content": content,
+            "sender_id": str(sender_id or ""),
+            "sender_name": sender_name or str(sender_id or ""),
+            "timestamp": time.time(),
+        })
+        data["history"] = history
+        memory_manager.save_session_data(session_id, data)
+    except Exception as e:
+        print(f"记录未@的群消息失败: {e}")
+
+
+def _queue_unaddressed_message(session_id: str, text: str, has_image: bool,
+                               sender_id: str, sender_name: str) -> None:
+    """等会话锁释放后再补记没被@的群消息（该会话正在生成回复时走这条）。"""
+    async def run():
+        lock = _SESSION_LOCKS.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            _remember_unaddressed_message(session_id, text, has_image,
+                                          sender_id, sender_name)
+    try:
+        asyncio.get_running_loop().create_task(run())
+    except RuntimeError:
+        pass
+
+
 async def handle_message_event(event, client):
     global napcat_client
     napcat_client = client
     info = _extract_event_info(event, client)
     if info is None:
+        return
+    if info.get("silent"):
+        silent_session = info["session_id"]
+        silent_sender = getattr(event.sender, "user_id", None) or "0"
+        silent_name = getattr(event.sender, "nickname", None) or ""
+        silent_lock = _SESSION_LOCKS.get(silent_session)
+        if silent_lock is not None and silent_lock.locked():
+            # 该会话正在生成回复：直接写盘会被对方手里那份旧历史在结束时整份覆盖回来，
+            # 这条没被@的消息就永久消失了，所以等锁释放后再补记
+            _queue_unaddressed_message(silent_session, info.get("text", ""),
+                                       bool(info.get("has_image")),
+                                       silent_sender, silent_name)
+        else:
+            _remember_unaddressed_message(silent_session, info.get("text", ""),
+                                          bool(info.get("has_image")),
+                                          silent_sender, silent_name)
         return
     session_id = info["session_id"]
     lock = _SESSION_LOCKS.setdefault(session_id, asyncio.Lock())
@@ -3917,7 +4633,12 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                 at_names[qq] = ""
 
     if not is_private and not at_bot:
-        if global_config.get("group_need_at", True) or global_config.get("only_private", False):
+        if global_config.get("only_private", False):
+            return
+        if global_config.get("group_need_at", True):
+            # 引用他人消息、又没@机器人：不回复，但消息要记进历史
+            _remember_unaddressed_message(session_id, user_text, has_image,
+                                          sender_id, sender_name)
             return
     if not user_text and not has_image:
         return
@@ -4073,6 +4794,10 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                 p = profile_mgr.build_injection(sender_id)
                 if p:
                     extra_parts.append(p)
+            if lexicon_mgr is not None:
+                lex = lexicon_mgr.build_injection()
+                if lex:
+                    extra_parts.append(lex)
             if rag_mgr and global_config.get("rag_enabled", False):
                 rc = await rag_mgr.build_context(user_text)
                 if rc:
@@ -4098,9 +4823,12 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
 
             gen_budget = max(90.0, float(ctx.get("llm_timeout", 120) or 120) + 60.0)
 
-            if gate_reply and (global_config.get("reply_judge_enabled", False)
-                               or global_config.get("mood_enabled", False)) and mood_mgr is not None:
-                mood_user = "" if is_private else str(sender_id)
+            mood_user = "" if is_private else str(sender_id)
+            verdict = None
+            # 开关判定必须走 mood 模块的兼容层：旧配置缺这两个键时以"是否配置了提示词"为准，
+            # 直接读配置会漏判，且字符串 "false" 会被当成真值
+            if gate_reply and mood_mgr is not None \
+                    and (judge_enabled(ctx) or mood_enabled(ctx)):
                 try:
                     verdict = await asyncio.wait_for(
                         judge_and_decide(ctx, mood_mgr, session_id, trigger_text,
@@ -4108,6 +4836,14 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                 except asyncio.TimeoutError:
                     print("回复审判超时（30s），本轮跳过审判直接回复。")
                     verdict = None
+                # 审判看不到画面：本条带图时，"无需回复"这个判定没有依据（消息里可能
+                # 除了图片一个字都没有），不生效，交给角色自己回。否则识图模型已经
+                # 生成的台词会被丢掉，历史里还会留下一张从没被回应过的图，下一轮模型
+                # 看到它就会接着往下演。
+                if _image_reply_override(verdict, has_image):
+                    print(f"回复审判：本条带图，{ctx.character_name or ctx.character_key} "
+                          f"的「无需回复」判定不生效，仍由角色回复（心情值 {verdict['mood']:.0f}）")
+                    verdict["should_reply"] = True
                 # 只开心情、没开审判时 verdict["should_reply"] 恒为 True，不会被拦下；
                 # 开着审判才会出现真正"决定不回复"的分支。
                 if verdict is not None and not verdict["should_reply"]:
@@ -4118,11 +4854,13 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                     if has_image and image_sources:
                         # 审判在识图之前就判定"不用回"，但图还是要看：把画面描述写进历史，
                         # 供用户下一条相关追问使用（统一由收尾逻辑决定是否落盘）。
+                        # 只取描述与收藏判定，不产出台词 —— 这一轮不发消息，台词留着
+                        # 只会变成下一轮"接着演"的由头。
                         try:
                             pending_reply = await asyncio.wait_for(
                                 generate_reply(ctx, emotions, trigger_text, use_history,
                                                image_sources, list(extra_parts), sender_id,
-                                               session_id=session_id),
+                                               session_id=session_id, describe_only=True),
                                 timeout=gen_budget)
                         except Exception as e:
                             pending_reply = None
@@ -4131,7 +4869,22 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                         if desc:
                             _backfill_image_description(history, desc)
                             print(f"审判未回复：画面描述已写入历史，供主人下一条追问使用 → {desc[:60]}")
+                        # 收藏判定也在同一份识图结果里：触发点原先只挂在回复路径上，
+                        # 审判判不回时这条路径整段不执行，图就永远不会被收藏。
+                        _spawn_sticker_capture(ctx, pending_reply, image_sources)
+                    _log_mood_commit(commit_mood(ctx, mood_mgr, session_id, verdict, mood_user),
+                                     verdict)
                     return False
+
+            # 心情值不只是记录：按档位把语气与篇幅约束附加到本轮提示词
+            if mood_mgr is not None:
+                mood_now = verdict["mood"] if verdict is not None \
+                    else current_mood(ctx, mood_mgr, session_id, mood_user)
+                tier, mood_note = mood_style(ctx, mood_now)
+                if mood_note:
+                    extra_parts.append(mood_note)
+                    print(f"心情影响语气：心情值 {mood_now:.0f} → {tier}档，"
+                          "本轮回复按该档位的语气与篇幅约束生成。")
 
             sink = None
             if global_config.get("streaming_enabled", False) and not first_reply_done:
@@ -4155,6 +4908,8 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                 if sink is not None:
                     await sink.abort()
                 raise
+            # 本轮回复已生成，审判判定的心情变化量此时才落盘
+            _log_mood_commit(commit_mood(ctx, mood_mgr, session_id, verdict, mood_user), verdict)
             if timed_out:
                 if sink is not None:
                     await sink.abort()
@@ -4356,12 +5111,8 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
             if stats_mgr:
                 stats_mgr.record_message(session_id)
 
-            if not first_reply_done and has_image and reply.get("capture") \
-                    and reply["capture"].get("should") and image_sources and sticker_mgr is not None:
-                _spawn(auto_capture_from_images(
-                    ctx, reply["capture"], image_sources,
-                    {"description": reply.get("description", ""), "sentences": reply["sentences"],
-                     "capture_image": reply.get("capture_image")}))
+            if not first_reply_done and has_image:
+                _spawn_sticker_capture(ctx, reply, image_sources)
 
             if profile_mgr and global_config.get("profiles_enabled", False) and \
                     global_config.get("profiles_auto_extract", False) and not first_reply_done:
@@ -4402,11 +5153,8 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
     if total_replies > 0:
         _spawn(post_reply_context_tasks(session_id, get_active_ctx()))
     else:
-        # 一条回复都没产生（审判判定不用回 / 生成失败 / 发送失败）：
-        # 把这条用户消息从历史里摘掉，保持"历史里只有真正发生过的对话"这一语义。
-        # 识图带回了画面描述时例外——那条要留着，供用户的下一条追问使用。
-        if _discard_unreplied_user_message(history, user_text):
-            print(f"会话 {session_id}：本轮没有产生回复，本条消息不计入历史。")
+        # 没产生回复（审判判定不用回 / 生成失败 / 发送失败）也照常落盘：
+        # 用户确实说过的话要留着，否则下一条追问时模型看不到原内容。
         data["history"] = history
         data["meta"] = meta
         memory_manager.save_session_data(session_id, data)
@@ -4464,6 +5212,14 @@ async def post_reply_context_tasks(session_id: str, ctx: RoleContext):
                     meta["topic"] = topic[:200]
                     changed = True
                     print(f"已更新会话 {session_id} 的当前话题：{topic[:50]}")
+        # 自主学习：按会话累计的用户消息数触发，词典全局共享
+        if lexicon_mgr is not None:
+            try:
+                user_msg_count = int(meta.get("user_msg_count", 0))
+            except (TypeError, ValueError):
+                user_msg_count = 0
+            if lexicon_mgr.should_learn(user_msg_count):
+                await lexicon_mgr.learn_from_history(ctx, history, session_id)
         if changed:
             fresh = memory_manager.load_session_data(session_id)
             fresh.setdefault("meta", {})
@@ -4595,7 +5351,8 @@ async def proactive_idle_check():
             ok = await sender.speak_and_send(
                 session_type, target_id, text, get_active_emotions(), ctx,
                 use_voice=bool(global_config.get("proactive_voice", False)),
-                sticker=bool(global_config.get("proactive_sticker", False)))
+                sticker=bool(global_config.get("proactive_sticker", False)),
+                session_id=session_id)
         except Exception as e:
             proactive_pending.pop(session_id, None)
             print(f"主动消息发送失败（{session_id}）: {type(e).__name__}: {e}")
@@ -4613,14 +5370,6 @@ async def proactive_idle_check():
         save_proactive_state()
         print(f"已向 {session_id} 发送主动消息（今日第 {used + 1}/{max_per_day} 条）：{text[:40]}"
               + ("（等待用户回复，回复前不再主动）" if wait_reply else ""))
-        try:
-            data = memory_manager.load_session_data(session_id)
-            data.setdefault("history", []).append({
-                "role": "assistant", "content": text, "timestamp": now,
-                "speaker": ctx.character_name, "proactive": True})
-            memory_manager.save_session_data(session_id, data)
-        except Exception as e:
-            print(f"主动消息写入历史失败: {type(e).__name__}: {e}")
 
 
 def dialog_history_block(history: list, ctx=None, session_id: str = "",
@@ -4699,6 +5448,22 @@ def dialog_history_block(history: list, ctx=None, session_id: str = "",
     return "\n".join(parts)[:max_chars]
 
 
+def session_history_block(session_key: str, ctx=None) -> str:
+    """按会话键取出该会话的历史与摘要，供节日问候/生日祝福/定时任务承接前文。
+
+    events 与 jobs 模块按 session_key（如 group_1077806168 / private_10001）回调，
+    而 dialog_history_block 收的是历史列表：这里负责把两者接上。
+    """
+    if memory_manager is None:
+        return ""
+    try:
+        history = memory_manager.load_history(session_key)
+    except Exception as e:
+        print(f"问候历史读取失败（忽略）: {type(e).__name__}: {e}")
+        return ""
+    return dialog_history_block(history, ctx, session_id=session_key)
+
+
 def _known_sessions() -> list:
     """从记忆目录解析已知会话列表 [(session_type, session_id)]。
 
@@ -4722,7 +5487,7 @@ async def greeting_daily_check() -> int:
     if event_mgr and sender:
         return await event_mgr.check_and_greet(sender, get_active_ctx, get_active_emotions,
                                                sessions_provider=_known_sessions,
-                                               history_provider=dialog_history_block) or 0
+                                               history_provider=session_history_block) or 0
     print(f"问候检查：事件管理器或发送器未就绪，跳过（event_mgr={event_mgr is not None}, "
           f"sender={sender is not None}）。")
     return 0
@@ -4834,6 +5599,9 @@ def hot_reload_managers():
         if sender is not None:
             sender.sticker_manager = sticker_mgr
     _role_emotions_cache.clear()
+    _role_mimics_cache.clear()
+    if lexicon_mgr is not None:
+        lexicon_mgr.config = global_config
     register_feature_jobs()
     if job_mgr is not None:
         job_mgr.reload()
@@ -4851,6 +5619,22 @@ def _json_file_response(data, filename: str):
                         headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
+async def _local_file_response(path: Path, content_type: str):
+    """读取本地文件并返回响应，读不到时返回 404。
+
+    不用 web.FileResponse：它会无条件把文件的修改时间写进 Last-Modified，
+    时间戳越界（负值等）时 time.gmtime 抛 OSError，响应在准备阶段就断开、
+    浏览器拿到的是空连接。这里服务的是用户自己放的文件，元数据不可信。
+    """
+    try:
+        body = await asyncio.to_thread(path.read_bytes)
+    except OSError:
+        return web.Response(status=404, text="not found")
+    resp = web.Response(body=body, content_type=content_type)
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    return resp
+
+
 def _brief_response(resp, limit: int = 200) -> str:
     """把服务端响应体压成一行短文本，用于把上游报错原因带回给用户。"""
     try:
@@ -4861,14 +5645,48 @@ def _brief_response(resp, limit: int = 200) -> str:
     return text[:limit] + ("…" if len(text) > limit else "")
 
 
+_NAME_ILLEGAL_CHARS = set('/\\:*?"<>|')
+
+
+def _safe_name(name: str) -> str:
+    """校验用户给出的目录名/文件名：只挡路径分隔符与穿越写法，其余一律放行。"""
+    s = str(name or "")
+    if not s or s in (".", "..") or s != Path(s).name or (_NAME_ILLEGAL_CHARS & set(s)):
+        return ""
+    return s
+
+
 def _safe_subdir(root: Path, name: str) -> Optional[Path]:
     """校验 name 为 root 的直接子目录名（防路径穿越）。"""
-    if not name or not re.match(r'^[\w\u4e00-\u9fff\- ]+$', name):
+    safe = _safe_name(name)
+    if not safe:
         return None
-    p = (root / name).resolve()
+    p = (root / safe).resolve()
     if root.resolve() not in p.parents:
         return None
     return p
+
+
+def _emotion_audio_file(folder: Path, file_name):
+    """校验 file_name 是 folder 下的音频；返回 (路径, 错误文案)。"""
+    name = _safe_name(file_name)
+    if not name:
+        return None, f"文件名非法：{file_name}"
+    target = (folder / name).resolve()
+    if folder.resolve() not in target.parents or not target.is_file():
+        return None, f"文件不存在：{name}"
+    if target.suffix.lower() not in _AUDIO_EXTS:
+        return None, f"不是音频文件：{name}"
+    return target, ""
+
+
+def _write_text_file(path: Path, text) -> None:
+    """写入参考文字文件；文字为空就把它删掉。"""
+    text = str(text or "").strip()
+    if text:
+        path.write_text(text, encoding="utf-8")
+    else:
+        path.unlink(missing_ok=True)
 
 
 @web.middleware
@@ -4931,12 +5749,17 @@ def _make_auth_middleware(server: "WebUIServer"):
             print(f"已拒绝跨站请求：{request.method} {path}"
                   f"（Origin/Referer={request.headers.get('Origin') or request.headers.get('Referer')}）")
             return web.json_response({"success": False, "error": "跨站请求已被拒绝"}, status=403)
-        if path.startswith("/api") and path not in ("/api/auth/login", "/api/auth/status"):
+        if path.startswith("/api") and path not in ("/api/auth/login", "/api/auth/status",
+                                                    "/api/auth/second"):
             token = server._auth_token
-            if not token:
-                return await handler(request)
-            if request.cookies.get("lovomo_auth") != token:
-                return web.json_response({"success": False, "error": "需要密码"}, status=401)
+            if token:
+                if request.cookies.get("lovomo_auth") != token:
+                    return web.json_response({"success": False, "error": "需要密码"}, status=401)
+            # 二级密码：设了才拦，解锁一次在有效期内不再拦
+            if _needs_second_password(path) and server._second_password \
+                    and not server._second_unlocked():
+                return web.json_response({"success": False, "error": "需要二级密码",
+                                          "need_second_password": True}, status=403)
         return await handler(request)
     return _auth
 
@@ -5105,6 +5928,10 @@ class WebUIServer:
         self._auth_file = memory_manager.data_path / "webui_auth.json"
         self._password = ""
         self._auth_token = None
+        # 二级密码：设了才生效，解锁一次在有效期内不再拦敏感操作
+        self._second_password = ""
+        self._second_unlocked_until = 0.0
+        self._second_once = 0
         # 插件系统：插件目录跟着用户数据目录走（%LOCALAPPDATA%\Lovomo\plugins），
         # 这样重装/覆盖更新程序不会把用户的插件一起删掉。
         self._plugins_root = user_data_dir() / "plugins"
@@ -5114,6 +5941,12 @@ class WebUIServer:
             on_change=self._on_plugins_changed)
         self._plugin_runtime = None      # 由 run_backend 注入（能发消息时才建）
         self._plugin_market_cache = {}   # {缓存键: {entries, fetched_at, ...}}
+        # 本机推送/下架过哪些插件：市场索引与镜像都有缓存，刚推上去或刚删掉的
+        # 未必立刻读得到。落盘保存，重启后仍然算数，避免同一版本被重复推送。
+        self._publish_state_file = user_data_dir() / "publish_state.json"
+        self._publish_state = {"published": {}, "unpublished": {}}
+        self._publish_state_readable = True
+        self._load_publish_state()
         self._release_list_cache = {"fetched_at": 0.0, "data": None}
         self._refresh_auth_state()
         self.app.middlewares.append(_webui_error_middleware)
@@ -5121,6 +5954,7 @@ class WebUIServer:
         self.app.middlewares.append(_make_auth_middleware(self))
         self.app.router.add_post("/api/auth/login", self.handle_auth_login)
         self.app.router.add_get("/api/auth/status", self.handle_auth_status)
+        self.app.router.add_post("/api/auth/second", self.handle_auth_second)
         self.app.router.add_get("/api/update/status", self.handle_update_status)
         self.app.router.add_get("/api/update/check", self.handle_update_check)
 
@@ -5131,6 +5965,12 @@ class WebUIServer:
         import secrets
         password = str(self.config.get("webui_password", "") or "")
         self._password = password
+        second = str(self.config.get("webui_second_password", "") or "")
+        if second != self._second_password:
+            # 二级密码变了（或刚被清空），之前的解锁一律作废
+            self._second_unlocked_until = 0.0
+            self._second_once = 0
+        self._second_password = second
         if not password:
             self._auth_token = None
             return
@@ -5147,6 +5987,16 @@ class WebUIServer:
         if remembered and remembered == getattr(self, "_auth_token", None):
             return
         self._auth_token = remembered or secrets.token_hex(16)
+
+    def _second_unlocked(self) -> bool:
+        """二级密码是否已解锁。有效时长填 0 时只放行紧接着的那一次请求
+        （前端解锁后会自动重放被拦的那次），之后每次敏感操作都要重输。"""
+        if self._second_unlocked_until and time.time() < self._second_unlocked_until:
+            return True
+        if self._second_once:
+            self._second_once -= 1
+            return True
+        return False
 
     def _auth_remember(self) -> float:
         try:
@@ -5175,18 +6025,19 @@ class WebUIServer:
         # 省得为了左上角那行小字再开一个请求（关掉更新检查时也要能显示）
         from modules.updater import APP_VERSION
         version = APP_VERSION
+        second = {"second_enabled": bool(self._second_password)}
         if not self._password:
             return web.json_response({"enabled": False, "authed": False,
-                                      "version": version})
+                                      "version": version, **second})
         remaining = self._auth_remember() - time.time()
         has_valid_cookie = bool(self._auth_token) \
             and request.cookies.get("lovomo_auth") == self._auth_token
         if remaining > 0 and has_valid_cookie:
             return web.json_response({"enabled": True, "authed": True,
                                       "expires_at": self._auth_remember(),
-                                      "version": version})
+                                      "version": version, **second})
         return web.json_response({"enabled": True, "authed": False,
-                                  "version": version})
+                                  "version": version, **second})
 
     async def handle_auth_login(self, request):
         try:
@@ -5195,10 +6046,12 @@ class WebUIServer:
             return web.json_response({"success": False, "error": "参数错误"}, status=400)
         if str(payload.get("password", "") or "") == self._password:
             try:
-                minutes = max(0, min(int(payload.get("remember_minutes")
-                                          or self.config.get("webui_auth_ttl_minutes", 30) or 30),
-                                     60 * 24 * 30))
-            except Exception:
+                raw = payload.get("remember_minutes")
+                if raw is None or raw == "":
+                    raw = self.config.get("webui_auth_ttl_minutes", 30)
+                # 0 是合法值（关掉页面即失效），不能当"没填"退回默认
+                minutes = max(0, min(int(raw or 0), 60 * 24 * 30))
+            except (TypeError, ValueError):
                 minutes = max(0, int(self.config.get("webui_auth_ttl_minutes", 30) or 30))
             self._auth_remember_save(minutes)
             resp = web.json_response({"success": True})
@@ -5207,6 +6060,34 @@ class WebUIServer:
                             samesite="Lax", httponly=True)
             return resp
         return web.json_response({"success": False, "error": "密码错误"}, status=401)
+
+    async def handle_auth_second(self, request):
+        """校验二级密码并解锁敏感操作。没设二级密码时直接放行。"""
+        if not self._second_password:
+            return web.json_response({"success": True, "unlocked": False,
+                                      "second_enabled": False})
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "参数错误"}, status=400)
+        if str(payload.get("password", "") or "") != self._second_password:
+            return web.json_response({"success": False, "error": "二级密码错误"}, status=401)
+        try:
+            raw = payload.get("minutes")
+            if raw is None or raw == "":
+                raw = self.config.get("webui_second_unlock_minutes", 30)
+            # 0 是合法值（每次都要重输），不能当"没填"退回默认
+            minutes = max(0, min(int(raw or 0), 60 * 24 * 30))
+        except (TypeError, ValueError):
+            minutes = max(0, int(self.config.get("webui_second_unlock_minutes", 30) or 0))
+        if minutes > 0:
+            self._second_unlocked_until = time.time() + minutes * 60
+            self._second_once = 0
+        else:
+            self._second_unlocked_until = 0.0
+            self._second_once = 1
+        return web.json_response({"success": True, "unlocked": True,
+                                  "minutes": minutes, "second_enabled": True})
 
     def _update_cache(self) -> dict:
         try:
@@ -5395,6 +6276,7 @@ class WebUIServer:
         r.add_post("/api/plugins/publish_token_clear", self.handle_plugins_publish_token_clear)
         r.add_get("/api/plugins/publish_status", self.handle_plugins_publish_status)
         r.add_post("/api/plugins/publish", self.handle_plugins_publish)
+        r.add_post("/api/plugins/unpublish", self.handle_plugins_unpublish)
         r.add_get("/api/plugins/market", self.handle_plugins_market)
         r.add_post("/api/plugins/market_sources", self.handle_plugins_market_sources)
         r.add_get("/api/plugins/readme", self.handle_plugins_readme)
@@ -5415,6 +6297,10 @@ class WebUIServer:
         r.add_post("/api/emotions/create", self.handle_emotions_create)
         r.add_post("/api/emotions/delete", self.handle_emotions_delete)
         r.add_get("/api/emotions/audio", self.handle_emotions_audio)
+        r.add_post("/api/emotions/text", self.handle_emotions_text)
+        r.add_post("/api/emotions/normalize", self.handle_emotions_normalize)
+        r.add_post("/api/asr/start", self.handle_asr_start)
+        r.add_get("/api/asr/status", self.handle_asr_status)
         # 聊天记录导入导出
         r.add_get("/api/memory/export", self.handle_memory_export)
         r.add_post("/api/memory/import", self.handle_memory_import)
@@ -5453,6 +6339,12 @@ class WebUIServer:
         r.add_get("/api/profiles", self.handle_profiles)
         r.add_post("/api/profiles/save", self.handle_profiles_save)
         r.add_post("/api/profiles/delete", self.handle_profiles_delete)
+        # 自主学习
+        r.add_get("/api/lexicon", self.handle_lexicon)
+        r.add_post("/api/lexicon/confirm", self.handle_lexicon_confirm)
+        r.add_post("/api/lexicon/reject", self.handle_lexicon_reject)
+        r.add_post("/api/lexicon/save", self.handle_lexicon_save)
+        r.add_post("/api/lexicon/delete", self.handle_lexicon_delete)
         # 表情包
         r.add_get("/api/stickers/list", self.handle_stickers_list)
         r.add_post("/api/stickers/upload", self.handle_stickers_upload)
@@ -5480,7 +6372,7 @@ class WebUIServer:
         else:
             self.config.config = {**self.config.default_config(), **self.config.config}
         masked = {**self.config.default_config(), **(self.config.config or {})}
-        for key in _API_KEY_KEYS + ("webui_password",):
+        for key in _API_KEY_KEYS + _WEBUI_PASSWORD_KEYS:
             if isinstance(masked.get(key), dict):
                 masked[key] = {k: _mask_preview(v) if isinstance(v, str) else v
                                for k, v in masked[key].items()}
@@ -5581,18 +6473,12 @@ class WebUIServer:
                                      for k, v in masked_value.items()}
                 elif _is_masked_value(masked_value):
                     data[key] = stored.get(key, "")
-            for key in _SECRET_FIELD_KEYS:
-                val = data.get(key)
-                # 解不开的密文（换过电脑）落到空串：None 会被写进 config.json，
-                # 读取方按字符串用时才炸。webui_password 与 API 密钥一样必须解密——
-                # 内存里的配置约定是明文，漏掉它会让 _password 变成一串 enc2: 密文，
-                # 导入后原密码就再也登不进来（登录校验直接比对内存里的明文）。
-                if isinstance(val, dict):
-                    data[key] = {k: ((_decrypt_value(v) or "") if isinstance(v, str) and
-                                     (v.startswith("enc2:") or v.startswith("enc:")) else v)
-                                 for k, v in val.items()}
-                elif isinstance(val, str) and (val.startswith("enc2:") or val.startswith("enc:")):
-                    data[key] = _decrypt_value(val) or ""
+            # 统一走与读盘相同的解密路径：内存里的配置约定是明文（webui_password 也要
+            # 一起解密，否则导入后原密码就再也登不进来）。解不开的密文（换过电脑）
+            # 由 _decrypt_value 返回 None，调用方保留原密文而不是置空 —— 置空会让
+            # 这份密文在下一次落盘时被空串永久覆盖，密钥不可恢复。
+            _decrypt_api_keys(data)
+            _decrypt_webui_password(data)
             merged = {**self.config.default_config(), **stored, **data}
             self.config.config = merged
             self.config._atomic_save(merged)
@@ -6047,6 +6933,44 @@ class WebUIServer:
         return float(parse_iso_time(str((data.get("committer") or {}).get("date") or "")) or 0.0)
 
 
+    async def _market_branches(self, repo: str):
+        """列出仓库的全部分支（分页拉全，返回 (分支列表, 是否跳过证书校验)）。
+
+        GitHub 一次最多给 100 条，插件多了后面的会被截断成"不存在"，
+        所以按页取到不足一页为止。
+        """
+        out, insecure = [], False
+        for page in range(1, MAX_BRANCH_PAGES + 1):
+            data, insecure_p = await self._fetch_releases(
+                f"https://api.github.com/repos/{repo}/branches"
+                f"?per_page=100&page={page}")
+            insecure = insecure or insecure_p
+            batch = [b for b in (data if isinstance(data, list) else [])
+                     if isinstance(b, dict)]
+            out += batch
+            if len(batch) < 100:
+                break
+        return out, insecure
+
+    async def _market_tags(self, repo: str, prefix: str) -> list:
+        """列出仓库里以插件前缀开头的标签名（分页拉全）。
+
+        只按前缀筛选，形状合不合法交给 `parse_version_tag()` 判定 ——
+        程序自己的版本标签（如 `1.2.0.0`）不会被误认成插件。
+        """
+        out = []
+        for page in range(1, MAX_BRANCH_PAGES + 1):
+            data, _ = await self._fetch_releases(
+                f"https://api.github.com/repos/{repo}/git/matching-refs/tags/{prefix}"
+                f"?per_page=100&page={page}")
+            batch = [str(r.get("ref") or "").rsplit("/", 1)[-1]
+                     for r in (data if isinstance(data, list) else [])
+                     if isinstance(r, dict) and r.get("ref")]
+            out += [t for t in batch if t]
+            if len(batch) < 100:
+                break
+        return out
+
     async def _market_branch_entries(self, repo: str, prefix: str) -> dict:
         """扫插件分支并组装市场条目（branches / commits / releases / raw）。"""
         from modules.market import (ARCHIVE_TMPL, RAW_TMPL, build_entry,
@@ -6055,8 +6979,7 @@ class WebUIServer:
                                     parse_iso_time, summarize_releases)
         warnings = []
         insecure = False
-        branches, insecure_b = await self._fetch_releases(
-            f"https://api.github.com/repos/{repo}/branches?per_page=100")
+        branches, insecure_b = await self._market_branches(repo)
         insecure = insecure or insecure_b
         picked = [str(b.get("name") or "") for b in (branches or [])
                   if isinstance(b, dict) and matches_branch_prefix(b.get("name"), prefix)]
@@ -6130,20 +7053,85 @@ class WebUIServer:
                            or (await self._market_commit_time(repo, sha) if sha else 0.0))))
         return {"entries": entries, "warnings": warnings, "insecure": insecure}
 
+    async def _market_default_branch(self, repo: str) -> str:
+        """仓库的默认分支名（取不到就退回 main）。"""
+        try:
+            data, _ = await self._fetch_releases(
+                f"https://api.github.com/repos/{repo}")
+        except Exception:
+            return "main"
+        if not isinstance(data, dict):
+            return "main"
+        return str(data.get("default_branch") or "").strip() or "main"
+
+    async def _market_sources(self, repo: str, path: str) -> list:
+        """读市场仓库里的第三方来源清单（每行一个「用户名/仓库名」）。
+
+        清单放在仓库里而不是用户配置里，是为了让别人能提 PR 加一行就上架 ——
+        改的是市场仓库、不是每个用户的本机配置。读的是仓库的默认分支，与
+        市场索引同一套口径；写回市场仓库自己的行会被剔掉，免得扫两遍。
+        """
+        from modules.market import RAW_TMPL, parse_market_repos
+        branch = await self._market_default_branch(repo)
+        url = RAW_TMPL.format(repo=repo, branch=branch, path=path)
+        try:
+            text, _ = await self._github_fetch(url, "text")
+        except Exception as e:
+            print(f"[插件市场] 来源清单 {path} 读不到：{type(e).__name__}: {e}")
+            return []
+        return [r for r in parse_market_repos(text)
+                if r.lower() != repo.lower()][:MARKET_SOURCE_REPOS_MAX]
+
+
+    async def _market_releases(self, repo: str, pids) -> list:
+        """仓库里属于这些插件的 Release 列表，顺带补上点赞数。
+
+        下载量与收藏量都来自 Release：列表接口不给点赞总数，所以只对确实
+        属于这些插件的 Release 单独查一次，并且设上限，别把配额烧光。
+        """
+        from modules.market import count_reactions, release_for_plugin
+        try:
+            data, _ = await self._fetch_releases(
+                f"https://api.github.com/repos/{repo}/releases?per_page=100")
+        except Exception as e:
+            print(f"[插件市场] 拿不到 {repo} 的 Release：{type(e).__name__}: {e}")
+            return []
+        wanted = [str(p) for p in (pids or []) if str(p or "").strip()]
+        live = [r for r in (data if isinstance(data, list) else [])
+                if isinstance(r, dict) and not r.get("draft")]
+        targets = [r for r in live
+                   if any(release_for_plugin(r, p) for p in wanted)]
+        for rel in targets[:MAX_REACTION_LOOKUPS]:
+            rid = rel.get("id")
+            if not rid:
+                continue
+            try:
+                rx, _ = await self._fetch_releases(
+                    f"https://api.github.com/repos/{repo}/releases/{rid}"
+                    "/reactions?per_page=100")
+                rel["_reactions"] = count_reactions(rx)
+            except Exception:
+                rel["_reactions"] = 0
+        return live
+
+
     async def _market_index_entries(self, repo: str, market_path: str) -> dict:
-        """读仓库里的 index.json 索引（分支扫描没结果时的兜底）。
+        """读市场仓库里的 index.json 索引（官方市场的条目来源）。
 
         索引条目要带 `source_repo`（或 `repo`）：安装时会拿它校验"插件是不是
         真从这个仓库来的"。没写就按 `download` 链接的归属推断，再退回归属
-        索引自己所在的仓库。
+        索引自己所在的仓库。下载量与收藏量按插件 id 从 Release 汇总，
+        download 优先用 Release 里的 zip 附件。
         """
+        from modules.market import plugin_category, summarize_plugin_releases
         from modules.plugins import repo_slug
-        url = f"https://raw.githubusercontent.com/{repo}/main/{market_path}"
+        branch = await self._market_default_branch(repo)
+        url = f"https://raw.githubusercontent.com/{repo}/{branch}/{market_path}"
         try:
             data, insecure = await self._fetch_releases(url)
         except Exception as e:
             return {"entries": [], "insecure": False,
-                    "warnings": [f"兜底索引 {market_path} 也读不到（{type(e).__name__}）"]}
+                    "warnings": [f"市场索引 {market_path} 读不到（{type(e).__name__}）"]}
         entries = data if isinstance(data, list) else (
             data.get("plugins") if isinstance(data, dict) else None)
         out = []
@@ -6155,14 +7143,11 @@ class WebUIServer:
                 continue
             item = {k: raw.get(k) for k in
                     ("name", "version", "author", "description", "type",
-                     "download", "homepage", "tags")}
+                     "download", "homepage", "page_url", "tags")}
             item["id"] = pid
             item["source"] = "index"
             item.setdefault("branch", "")
-            item["downloads"] = int(raw.get("downloads") or 0)
-            item["favorites"] = int(raw.get("favorites") or 0)
-            item["updated_at"] = 0.0
-            item["released_at"] = 0.0
+            item["category"] = plugin_category(raw)
             item["logo_url"] = str(raw.get("logo_url") or "")
             item["icon_url"] = str(raw.get("icon_url") or "")
             item["github"] = str(raw.get("github") or "")
@@ -6170,35 +7155,57 @@ class WebUIServer:
                 str(raw.get("source_repo") or raw.get("repo") or "").strip()
                 or repo_slug(item.get("download")) or repo)
             out.append(item)
+        releases = await self._market_releases(repo, [i["id"] for i in out])
+        for item in out:
+            one = summarize_plugin_releases(releases, item["id"])
+            item["downloads"] = int(one["downloads"] or 0)
+            item["favorites"] = int(one["favorites"] or 0)
+            item["download"] = str(one["asset_url"] or item.get("download") or "")
+            item["release_tag"] = str(one["release_tag"] or "")
+            item["released_at"] = float(one["released_at"] or 0.0)
+            item["updated_at"] = float(one["released_at"] or 0.0)
         return {"entries": out, "warnings": [], "insecure": insecure}
 
 
-    async def _market_scan_repos(self, repos, prefix: str) -> dict:
-        """逐个仓库扫插件分支并合并（第三方市场用）。
+    async def _market_scan_repos(self, repos, prefix: str,
+                                 market_path: str = "") -> dict:
+        """逐个仓库取插件条目并合并（来源清单与第三方市场用）。
 
-        单个仓库出错只记一条 warning，不牵连别的仓库 —— 地址是用户自己
-        填的，写错一个不该让整个市场打不开。
+        每个仓库先读索引（「发布到市场」写的就是它），索引里没有条目时再按
+        分支扫 —— 两种上架方式都能被扫到。单个仓库出错只记一条 warning，
+        不牵连别的仓库：地址是用户自己填的，写错一个不该让整个市场打不开。
         """
+        index_path = str(market_path or "").strip() or "plugins/index.json"
         entries, warnings, insecure = [], [], False
         for repo in repos:
             try:
-                got = await self._market_branch_entries(repo, prefix)
+                got = await self._market_index_entries(repo, index_path)
+                insecure = insecure or bool(got.get("insecure"))
+                warns = list(got.get("warnings") or [])
+                if not got["entries"]:
+                    # 索引里没有条目：这个仓库可能是按分支上架的，回退扫分支。
+                    # 分支里有插件时就不再提索引读不到 —— 那是这种上架方式的正常情况
+                    by_branch = await self._market_branch_entries(repo, prefix)
+                    insecure = insecure or bool(by_branch.get("insecure"))
+                    if by_branch["entries"]:
+                        warns = []
+                    got = by_branch
+                    warns += list(by_branch.get("warnings") or [])
             except Exception as e:
                 warnings.append(f"{repo}：拉取失败（{type(e).__name__}）")
                 continue
             entries += got["entries"]
-            warnings += [w if w.startswith(repo) else f"{repo}：{w}"
-                         for w in (got.get("warnings") or [])]
-            insecure = insecure or bool(got.get("insecure"))
+            warnings += [w if w.startswith(repo) else f"{repo}：{w}" for w in warns]
         return {"entries": entries, "warnings": warnings, "insecure": insecure}
 
 
     async def _plugins_market_payload(self, force: bool = False, sort: str = "latest",
                                       market: str = "official") -> dict:
-        """插件市场数据：扫分支、按排序键返回（条目缓存 30 分钟）。
+        """插件市场数据：扫索引/分支、按排序键返回（条目缓存 30 分钟）。
 
-        market = official 只看配置里的官方市场仓库；thirdparty 按
-        plugin_market_thirdparty 逐行列出的仓库扫，两者同一套上架规则。
+        market = official 读官方市场仓库里的索引（索引里没有条目时回退扫它的
+        分支），再叠加来源清单里的仓库；thirdparty 按 plugin_market_thirdparty
+        逐行列出的仓库扫分支。
         """
         from modules.market import SORT_KEYS, parse_market_repos, sort_entries
         kind = "thirdparty" if str(market or "").strip().lower() == "thirdparty" \
@@ -6211,6 +7218,7 @@ class WebUIServer:
             or "lovomo_plugin"
         market_path = str(self.config.get("plugin_market_path", "") or "").strip() \
             or "plugins/index.json"
+        sources_path = str(self.config.get("plugin_market_sources_path", "") or "").strip()
         sort_key = str(sort or "latest").strip().lower()
         if sort_key not in SORT_KEYS:
             sort_key = "latest"
@@ -6232,23 +7240,33 @@ class WebUIServer:
                 warnings.append("还没有配置第三方市场地址，"
                                 "按每行一个「用户名/仓库名」填好再刷新")
             elif kind == "thirdparty":
-                got = await self._market_scan_repos(repos, prefix)
+                got = await self._market_scan_repos(repos, prefix, market_path)
                 entries, warnings = got["entries"], got["warnings"]
                 insecure = bool(got.get("insecure"))
             else:
                 repo = repos[0]
                 try:
-                    got = await self._market_branch_entries(repo, prefix)
-                    entries, warnings = got["entries"], got["warnings"]
-                    insecure = bool(got.get("insecure"))
-                    if not entries:
-                        fallback = await self._market_index_entries(repo, market_path)
-                        warnings = warnings + list(fallback.get("warnings") or [])
-                        if fallback["entries"]:
-                            entries = fallback["entries"]
-                            source = "index"
-                            insecure = insecure or bool(fallback.get("insecure"))
-                            print(f"[插件市场] 分支扫描没有结果，改用索引 {market_path}")
+                    index = await self._market_index_entries(repo, market_path)
+                    if index["entries"]:
+                        entries = index["entries"]
+                        warnings = warnings + list(index.get("warnings") or [])
+                        source = "index"
+                    else:
+                        # 自建市场仍可能只靠分支上架：索引里没东西时回退扫分支
+                        got = await self._market_branch_entries(repo, prefix)
+                        entries, warnings = got["entries"], got["warnings"]
+                        source = "branches"
+                        insecure = insecure or bool(got.get("insecure"))
+                        if not entries:
+                            warnings = warnings + list(index.get("warnings") or [])
+                    insecure = insecure or bool(index.get("insecure"))
+                    if sources_path:
+                        extra = await self._market_scan_repos(
+                            await self._market_sources(repo, sources_path),
+                            prefix, market_path)
+                        entries = entries + extra["entries"]
+                        warnings = warnings + extra["warnings"]
+                        insecure = insecure or bool(extra.get("insecure"))
                 except Exception as e:
                     error = f"拉取市场失败：{type(e).__name__}: {e}"
                     print(f"[插件市场] {error}")
@@ -6276,7 +7294,7 @@ class WebUIServer:
                   "market_text": raw_sources, "markets": repos,
                   "repo": "、".join(repos), "branch_prefix": prefix,
                   "warnings": warnings, "insecure": insecure, "fetched_at": now,
-                  "url": f"https://github.com/{repos[0]}/branches" if repos else ""}
+                  "url": f"https://github.com/{repos[0]}" if repos else ""}
         if error:
             result["error"] = error
             result["hint"] = ("可以先手动上传插件 zip 安装；"
@@ -6532,22 +7550,222 @@ class WebUIServer:
         self.config._atomic_save(self.config.config)
         return web.json_response({"success": True})
 
-    def _publish_scope(self, login: str):
+    def _publish_state_get(self) -> dict:
+        state = getattr(self, "_publish_state", None)
+        if not isinstance(state, dict):
+            state = {"published": {}, "unpublished": {}}
+            self._publish_state = state
+        for key in ("published", "unpublished"):
+            if not isinstance(state.get(key), dict):
+                state[key] = {}
+        return state
+
+    def _load_publish_state(self):
+        """读本机的推送记录。读不出来就沿用空记录，并且本次不再回写，
+        免得一次读取失败就把磁盘上完好的记录覆盖掉。"""
+        from modules.jsonio import load_json_ex
+        data, readable = load_json_ex(self._publish_state_file,
+                                      {"published": {}, "unpublished": {}})
+        self._publish_state_readable = readable
+        state = {"published": {}, "unpublished": {}}
+        if isinstance(data, dict):
+            for key in state:
+                got = data.get(key)
+                if isinstance(got, dict):
+                    state[key] = got
+        self._publish_state = state
+
+    def _save_publish_state(self):
+        path = getattr(self, "_publish_state_file", None)
+        if path is None or not getattr(self, "_publish_state_readable", True):
+            return
+        from modules.jsonio import save_json
+        now = time.time()
+        fresh = {"published": {}, "unpublished": {}}
+        for key in fresh:
+            for pid, rec in self._publish_state_get()[key].items():
+                if not isinstance(rec, dict) or not pid:
+                    continue
+                if now - float(rec.get("ts") or 0) > PUBLISH_STATE_TTL:
+                    continue
+                fresh[key][pid] = rec
+        self._publish_state = fresh
+        save_json(path, fresh)
+
+    def _publish_memory(self) -> dict:
+        """本机记下的「已推送」版本 {插件 id: 版本}，过期的不算。"""
+        now = time.time()
+        out = {}
+        for pid, rec in self._publish_state_get()["published"].items():
+            if not isinstance(rec, dict) or now - float(rec.get("ts") or 0) > PUBLISH_STATE_TTL:
+                continue
+            version = str(rec.get("version") or "")
+            if pid and version:
+                out[str(pid)] = version
+        return out
+
+    def _unpublish_memory(self) -> set:
+        """本机记下的「已下架」插件 id，过期的不算。"""
+        now = time.time()
+        out = set()
+        for pid, rec in self._publish_state_get()["unpublished"].items():
+            if not isinstance(rec, dict) or now - float(rec.get("ts") or 0) > PUBLISH_STATE_TTL:
+                continue
+            if pid:
+                out.add(str(pid))
+        return out
+
+    def _remember_published(self, pid: str, version: str):
+        state = self._publish_state_get()
+        state["published"][pid] = {"version": str(version or ""), "ts": time.time()}
+        state["unpublished"].pop(pid, None)
+        self._save_publish_state()
+
+    def _remember_unpublished(self, pid: str):
+        state = self._publish_state_get()
+        state["unpublished"][pid] = {"ts": time.time()}
+        state["published"].pop(pid, None)
+        self._save_publish_state()
+
+    async def _published_versions(self, payload: dict = None) -> dict:
+        """已上架插件的版本号 {插件 id: 版本}。
+
+        官方市场的索引由「发布」写入，是权威来源；来源清单里的仓库仍靠
+        分支与版本标签判定（分支被删掉时标签仍在，两边取版本较大的那个）。
+        索引与镜像都有缓存，所以这里不吃条目缓存（payload 由调用方传入，
+        免得一次请求里重复拉两轮）；本机刚推送/刚下架的记录最后叠加，
+        撑住缓存还没刷新的那段时间。
+        """
+        from modules.plugin_publisher import parse_version_tag
+        from modules.updater import is_newer
+        out = {}
+        try:
+            if payload is None:
+                payload = await self._plugins_market_payload(force=True)
+            for p in (payload.get("plugins") or []):
+                pid = str(p.get("id") or "")
+                if pid:
+                    out[pid] = str(p.get("version") or "")
+        except Exception as e:
+            print(f"[插件发布] 读取已上架版本失败：{type(e).__name__}: {e}")
+        for pid, version in self._publish_memory().items():
+            if pid not in out or is_newer(version, out[pid]):
+                out[pid] = version
+        repo = str(self.config.get("plugin_market_repo", "") or "").strip() \
+            or "slpk1ng/Lovomo"
+        prefix = str(self.config.get("plugin_market_branch_prefix", "") or "").strip() \
+            or "lovomo_plugin"
+        sources_path = str(self.config.get("plugin_market_sources_path", "") or "").strip()
+        repos = [repo]
+        if sources_path:
+            repos += [r for r in await self._market_sources(repo, sources_path)
+                      if r not in repos]
+        for one in repos:
+            try:
+                for tag in await self._market_tags(one, prefix):
+                    pid, version = parse_version_tag(tag, prefix)
+                    if pid and (pid not in out or is_newer(version, out[pid])):
+                        out[pid] = version
+            except Exception as e:
+                print(f"[插件发布] 读取版本标签失败（{one}）：{type(e).__name__}: {e}")
+        for pid in self._unpublish_memory():
+            out.pop(pid, None)
+        return out
+
+    @staticmethod
+    def _market_entry_owned_by(entry, login: str) -> bool:
+        """市场索引条目是否属于这个 GitHub 账号（下架列表用）。
+
+        索引条目没有「已装插件」那套 owners 字段，只能看它自己声明的
+        github / author / source_repo 仓库主。
+        """
+        who = str(login or "").strip().lower()
+        if not who:
+            return False
+        cands = [str((entry or {}).get("github") or ""),
+                 str((entry or {}).get("author") or "")]
+        repo = str((entry or {}).get("source_repo") or "")
+        if "/" in repo:
+            cands.append(repo.split("/", 1)[0])
+        return any(c.strip().lower() == who for c in cands if c.strip())
+
+    async def _published_entries(self, login: str, market_path: str,
+                                 payload: dict = None) -> list:
+        """已上架的、属于当前账号的插件条目（下架列表的数据来源）。
+
+        市场索引有缓存，所以这里不吃条目缓存；本机刚下架的从列表里剔掉，
+        本机刚推送、索引还没更新的补进来（否则刚发布完没有「下架」按钮）。
+        """
+        from modules.market import plugin_category, plugin_folder
+        try:
+            if payload is None:
+                payload = await self._plugins_market_payload(force=True)
+        except Exception as e:
+            print(f"[插件下架] 读取已上架列表失败：{type(e).__name__}: {e}")
+            payload = {}
+        dropped = self._unpublish_memory()
+        out = []
+        for entry in (payload.get("plugins") or []):
+            if not isinstance(entry, dict) or not self._market_entry_owned_by(entry, login):
+                continue
+            pid = str(entry.get("id") or "").strip()
+            if not pid or pid in dropped:
+                continue
+            category = plugin_category(entry)
+            out.append({
+                "id": pid,
+                "name": str(entry.get("name") or pid),
+                "version": str(entry.get("version") or ""),
+                "category": category,
+                "folder": str(entry.get("folder") or "").strip().strip("/")
+                          or plugin_folder(market_path, category, pid),
+            })
+        seen = {e["id"] for e in out}
+        manager = getattr(self, "plugin_manager", None)
+        for pid, version in self._publish_memory().items():
+            if pid in seen or pid in dropped:
+                continue
+            info = manager.get(pid) if manager else None
+            category = plugin_category(info or {})
+            out.append({
+                "id": pid,
+                "name": str((info or {}).get("name") or pid),
+                "version": version,
+                "category": category,
+                "folder": plugin_folder(market_path, category, pid),
+            })
+        out.sort(key=lambda e: e["id"])
+        return out
+
+    def _publish_scope(self, login: str, published: dict = None):
         """按 GitHub 登录身份把已装插件分成"能发布"和"被挡下"两拨。
 
         归属校验必须在服务端做：前端隐藏只是顺手，真正的门禁在这里 ——
         直接 POST /api/plugins/publish 也绕不过去。登录名为空（还没认证）
         时全部归入"被挡下"，也就是"未认证就不参与插件制作"。
+
+        published 是已上架插件的版本号。本地版本不高于已上架版本（重复发布、
+        本地是 beta、或线上已经更高）时标成 needs_publish=False，前端据此把
+        「发布」换成「当前版本已发布过」。拿不到已上架版本时不挡人。
         """
+        from modules.market import plugin_category
         from modules.plugins import ownership_matches
+        from modules.updater import is_newer
+        published = published or {}
         owned, blocked = [], []
         manager = getattr(self, "plugin_manager", None)
         plugins = manager.list_plugins() if manager else []
         for info in plugins:
             item = {"id": info["id"], "name": info.get("name") or info["id"],
                     "version": info.get("version") or "",
+                    "category": plugin_category(info),
                     "owners": list(info.get("owners") or [])}
             if login and ownership_matches(info, login):
+                was = str(published.get(item["id"]) or "")
+                item["published_version"] = was
+                item["needs_publish"] = bool(
+                    not was or not item["version"]
+                    or is_newer(item["version"], was))
                 owned.append(item)
             else:
                 blocked.append(item)
@@ -6557,7 +7775,22 @@ class WebUIServer:
         token = str(self.config.config.get("plugin_publish_token") or "").strip()
         repo = str(self.config.config.get("plugin_market_repo") or "").strip()
         login = str(self.config.config.get("plugin_publish_login") or "").strip()
-        owned, blocked = self._publish_scope(login)
+        market_path = str(self.config.config.get("plugin_market_path") or "").strip() \
+            or "plugins/index.json"
+        from modules.market import plugin_folder
+        # 发布面板是决策面：不吃 30 分钟的市场条目缓存（别人在 GitHub 上改过
+        # 市场就得立刻看到），一次请求只强制拉一轮，两个列表共用
+        payload = {}
+        if login:
+            try:
+                payload = await self._plugins_market_payload(force=True)
+            except Exception as e:
+                print(f"[插件发布] 读取市场失败：{type(e).__name__}: {e}")
+        published = await self._published_versions(payload) if login else {}
+        owned, blocked = self._publish_scope(login, published)
+        for p in owned:
+            p["folder"] = plugin_folder(market_path, p.get("category"), p["id"])
+        on_market = await self._published_entries(login, market_path, payload) if login else []
         info = {
             # 只有「Token 在 + 身份校验过」才算认证完成：缺一个都退回
             # 让用户重新填 Token，免得出现"显示已登录却什么都发不了"
@@ -6565,15 +7798,16 @@ class WebUIServer:
             "login": login,
             "name": str(self.config.config.get("plugin_publish_name") or ""),
             "repo": repo,
-            "branch_prefix": str(self.config.config.get("plugin_market_branch_prefix", "lovomo_plugin")),
+            "market_path": market_path,
             "publishable": [p["id"] for p in owned],
             "plugins": owned,
             "blocked": blocked,
+            "published": on_market,
         }
         return web.json_response(info)
 
     async def handle_plugins_publish(self, request):
-        """把 plugins/sources/<id>/ 推到 GitHub 仓库的 lovomo_plugin_<id> 分支。"""
+        """把 plugins/sources/<id>/ 写进市场仓库的分类目录并更新索引。"""
         try:
             payload = await request.json()
             pid = str(payload.get("id") or "").strip()
@@ -6584,16 +7818,17 @@ class WebUIServer:
             return web.json_response({"success": False, "error": "缺少插件 id"}, status=400)
         token = str(self.config.config.get("plugin_publish_token") or "").strip()
         repo = str(self.config.config.get("plugin_market_repo") or "").strip()
-        prefix = str(self.config.config.get("plugin_market_branch_prefix", "lovomo_plugin")).strip()
+        market_path = str(self.config.config.get("plugin_market_path") or "").strip()
         login = str(self.config.config.get("plugin_publish_login") or "").strip()
         if not token or not login:
             return web.json_response({"success": False,
-                                      "error": "尚未认证 GitHub 身份，请先在「插件」→「发布到分支」里填写 Personal Access Token"},
+                                      "error": "尚未认证 GitHub 身份，请先在「插件」→「发布到市场」里填写 Personal Access Token"},
                                      status=400)
         if not repo:
             return web.json_response({"success": False,
                                       "error": "尚未配置插件市场仓库"}, status=400)
         from modules.plugins import ownership_matches
+        from modules.updater import is_newer
         manager = getattr(self, "plugin_manager", None)
         info = manager.get(pid) if manager else None
         if info is None:
@@ -6607,18 +7842,60 @@ class WebUIServer:
                       "github / repo / homepage。")
             print(f"[插件发布] 拒绝发布 {pid}：{reason}")
             return web.json_response({"success": False, "error": reason}, status=403)
+        local_version = str(info.get("version") or "").strip()
+        was = str((await self._published_versions()).get(pid) or "")
+        if was and not is_newer(local_version, was):
+            reason = (f"本地版本 {local_version or '(空)'} 不高于已上架的 {was}，"
+                      "版本只能往上走；请先改 plugin.yaml 里的 version 再发布。")
+            print(f"[插件发布] 拒绝发布 {pid}：{reason}")
+            return web.json_response({"success": False, "error": reason}, status=400)
         sources_dir = (self.plugin_manager.root if self.plugin_manager
                        else Path(__file__).resolve().parent / "plugins" / "sources")
         try:
             result = await _publish_to_github(
                 token=token, repo=repo, plugin_id=pid,
                 sources_dir=sources_dir, message=message,
-                branch_prefix=(prefix + "_") if not prefix.endswith("_") else prefix)
+                market_path=market_path)
         except _PublishError as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
-        print(f"[插件发布] 发布成功：{pid} → {result.get('branch')}"
+        print(f"[插件发布] 发布成功：{pid} → {result.get('folder')}"
               f"（提交 {str(result.get('commit') or '')[:7]}，"
               f"{len(result.get('files') or [])} 个文件）")
+        if local_version:
+            self._remember_published(pid, local_version)
+        # 刚推上去的版本还没进市场缓存，清掉才能让发布状态立刻看到新版本
+        self._plugin_market_cache.clear()
+        return web.json_response({"success": True, "version": local_version, **result})
+
+    async def handle_plugins_unpublish(self, request):
+        """把插件从市场下架：删索引条目、插件目录与该插件的版本标签、Release。"""
+        try:
+            payload = await request.json()
+            pid = str(payload.get("id") or "").strip()
+        except Exception:
+            return web.json_response({"success": False, "error": "请求体不是合法 JSON"}, status=400)
+        if not pid:
+            return web.json_response({"success": False, "error": "缺少插件 id"}, status=400)
+        token = str(self.config.config.get("plugin_publish_token") or "").strip()
+        repo = str(self.config.config.get("plugin_market_repo") or "").strip()
+        market_path = str(self.config.config.get("plugin_market_path") or "").strip()
+        if not token:
+            return web.json_response({"success": False,
+                                      "error": "尚未认证 GitHub 身份，请先在「插件」→「发布到市场」里填写 Personal Access Token"},
+                                     status=400)
+        if not repo:
+            return web.json_response({"success": False,
+                                      "error": "尚未配置插件市场仓库"}, status=400)
+        try:
+            result = await _unpublish_from_github(
+                token=token, repo=repo, plugin_id=pid, market_path=market_path)
+        except _PublishError as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+        print(f"[插件下架] 已下架：{pid}（目录 {result.get('folder')}，"
+              f"删除 {len(result.get('removed') or [])} 个文件、"
+              f"{len(result.get('tags') or [])} 个版本标签）")
+        self._remember_unpublished(pid)
+        self._plugin_market_cache.clear()
         return web.json_response({"success": True, **result})
 
     def _after_config_reload(self):
@@ -6819,7 +8096,7 @@ class WebUIServer:
         try:
             new_config = await request.json()
             restart_tts = new_config.pop("restart_tts", False)
-            for key in _API_KEY_KEYS + ("webui_password",):
+            for key in _API_KEY_KEYS + _WEBUI_PASSWORD_KEYS:
                 masked_value = new_config.get(key)
                 if isinstance(masked_value, dict):
                     stored = self.config.config.get(key)
@@ -7103,16 +8380,21 @@ class WebUIServer:
         return web.json_response({"sessions": list_known_sessions()})
 
     # ---------------- 情绪音频管理 ----------------
-    def _role_root(self, role_key: str) -> Path:
+    def _role_root(self, role_key: str, kind: str = "tone"):
+        """情绪音频目录：kind=mimic 取情绪模仿根目录（未配置返回 None），其余取语气根目录。"""
         role = self.config.roles.get(role_key, {}) if role_key else {}
         ctx = RoleContext(self.config.config, role or {})
+        if str(kind or "") == "mimic":
+            root = str(ctx.get("emotion_mimic_root", "") or "").strip()
+            return Path(root) if root else None
         return Path(resolve_tts_path(ctx.get("ref_audio_root", "")))
 
     async def handle_emotions_list(self, request):
         role_key = request.query.get("role", "")
-        root = self._role_root(role_key)
+        kind = "mimic" if request.query.get("kind", "") == "mimic" else "tone"
+        root = self._role_root(role_key, kind)
         emotions = []
-        if root.exists():
+        if root is not None and root.exists():
             for folder in sorted(root.iterdir()):
                 if not folder.is_dir():
                     continue
@@ -7127,26 +8409,33 @@ class WebUIServer:
                 if ref is None:
                     ref = next((f for f in files if f.lower().split(".")[-1] in
                                 ("mp3", "wav", "ogg", "flac", "m4a")), None)
-                emotions.append({"name": folder.name, "files": files, "asr": asr, "ref": ref})
-        return web.json_response({"root": str(root), "role": role_key, "emotions": emotions})
+                audios = [f for f in files if Path(f).suffix.lower() in _AUDIO_EXTS]
+                texts = {f: _read_sidecar_text(folder / f) for f in audios}
+                emotions.append({"name": folder.name, "files": files, "audios": audios,
+                                 "texts": texts, "asr": asr, "ref": ref})
+        return web.json_response({"root": str(root) if root is not None else "",
+                                  "role": role_key, "kind": kind, "emotions": emotions})
 
     async def handle_emotions_upload(self, request):
         try:
             reader = await request.multipart()
-            role = emotion = asr_text = None
+            role = emotion = None
+            kind = ""
             file_data = None
             file_name = ""
             async for part in reader:
                 if part.name == "role":
                     role = (await part.text()).strip()
+                elif part.name == "kind":
+                    kind = (await part.text()).strip()
                 elif part.name == "emotion":
                     emotion = (await part.text()).strip()
-                elif part.name == "asr":
-                    asr_text = await part.text()
                 elif part.name == "file":
                     file_name = part.filename or ""
                     file_data = await part.read(decode=False)
-            root = self._role_root(role or "")
+            root = self._role_root(role or "", kind)
+            if root is None:
+                return web.json_response({"success": False, "error": "未配置情绪模仿根目录"}, status=400)
             folder = _safe_subdir(root, emotion or "")
             if folder is None:
                 return web.json_response({"success": False, "error": "情绪名称非法"}, status=400)
@@ -7159,9 +8448,7 @@ class WebUIServer:
                 target = folder / f"ref{ext}"
                 target.write_bytes(file_data)
                 saved.append(target.name)
-            if asr_text is not None and asr_text.strip():
-                (folder / "asr.txt").write_text(asr_text.strip(), encoding="utf-8")
-                saved.append("asr.txt")
+                await asyncio.to_thread(normalize_audio, target, log=print)
             self._after_config_reload()
             return web.json_response({"success": True, "saved": saved})
         except Exception as e:
@@ -7170,7 +8457,9 @@ class WebUIServer:
     async def handle_emotions_create(self, request):
         try:
             payload = await request.json()
-            root = self._role_root(payload.get("role", ""))
+            root = self._role_root(payload.get("role", ""), payload.get("kind", ""))
+            if root is None:
+                return web.json_response({"success": False, "error": "未配置情绪模仿根目录"}, status=400)
             folder = _safe_subdir(root, payload.get("emotion", ""))
             if folder is None:
                 return web.json_response({"success": False, "error": "情绪名称非法"}, status=400)
@@ -7182,7 +8471,9 @@ class WebUIServer:
     async def handle_emotions_delete(self, request):
         try:
             payload = await request.json()
-            root = self._role_root(payload.get("role", ""))
+            root = self._role_root(payload.get("role", ""), payload.get("kind", ""))
+            if root is None:
+                return web.json_response({"success": False, "error": "未配置情绪模仿根目录"}, status=404)
             folder = _safe_subdir(root, payload.get("emotion", ""))
             if folder is None or not folder.exists():
                 return web.json_response({"success": False, "error": "目录不存在"}, status=404)
@@ -7196,18 +8487,122 @@ class WebUIServer:
         role = request.query.get("role", "")
         emotion = request.query.get("emotion", "")
         file = request.query.get("file", "")
-        root = self._role_root(role)
+        root = self._role_root(role, request.query.get("kind", ""))
+        if root is None:
+            return web.Response(status=404, text="not found")
         folder = _safe_subdir(root, emotion)
-        if folder is None or not file or not re.match(r'^[\w\u4e00-\u9fff\-. ]+$', file):
+        if folder is None or not _safe_name(file):
             return web.Response(status=404, text="not found")
         try:
             target = (folder / file).resolve()
         except (OSError, ValueError):
             return web.Response(status=404, text="not found")
-        # 白名单本身允许 "."，file=.. 会解析到目录；必须再确认落在情绪目录内且是文件
+        # 再确认落在情绪目录内且确实是文件
         if folder.resolve() not in target.parents or not target.is_file():
             return web.Response(status=404, text="not found")
-        return web.FileResponse(target)
+        return await _local_file_response(
+            target, AUDIO_MIMES.get(target.suffix.lower(), "application/octet-stream"))
+
+    def _emotion_audio_targets(self, root: Path, payload: dict):
+        """解析请求里要处理的音频；返回 [(情绪名, 路径)]，出错时返回错误文案。"""
+        items = payload.get("items")
+        if not items:
+            items = [{"emotion": payload.get("emotion", ""), "files": payload.get("files")}]
+        targets = []
+        for item in items:
+            item = item or {}
+            name = str(item.get("emotion", "") or "")
+            folder = _safe_subdir(root, name)
+            if folder is None or not folder.is_dir():
+                return f"情绪目录不存在：{name}"
+            names = item.get("files")
+            if not names:
+                names = [f.name for f in sorted(folder.iterdir())
+                         if f.is_file() and f.suffix.lower() in _AUDIO_EXTS]
+            for file_name in names:
+                target, error = _emotion_audio_file(folder, file_name)
+                if target is None:
+                    return error
+                targets.append((name, target))
+        if not targets:
+            return "没有可处理的音频文件"
+        return targets
+
+    async def handle_emotions_text(self, request):
+        """保存参考文字：texts 是每段音频自己的同名 txt，shared 是文件夹共用的 asr.txt；留空即删掉该文件。"""
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "请求体不是 JSON"}, status=400)
+        root = self._role_root(payload.get("role", ""), payload.get("kind", ""))
+        if root is None:
+            return web.json_response({"success": False, "error": "未配置情绪模仿根目录"}, status=400)
+        folder = _safe_subdir(root, str(payload.get("emotion", "") or ""))
+        if folder is None or not folder.is_dir():
+            return web.json_response({"success": False, "error": "情绪目录不存在"}, status=400)
+        texts = payload.get("texts") or {}
+        shared = payload.get("shared")
+        if not isinstance(texts, dict) or (not texts and shared is None):
+            return web.json_response({"success": False, "error": "没有要保存的文字"}, status=400)
+        saved = []
+        for file_name, text in texts.items():
+            audio, error = _emotion_audio_file(folder, file_name)
+            if audio is None:
+                return web.json_response({"success": False, "error": error}, status=400)
+            try:
+                _write_text_file(audio.with_suffix(".txt"), text)
+            except OSError as e:
+                return web.json_response({"success": False, "error": f"写入失败：{e}"}, status=400)
+            saved.append(audio.name)
+        if shared is not None:
+            try:
+                _write_text_file(folder / "asr.txt", shared)
+            except OSError as e:
+                return web.json_response({"success": False, "error": f"写入失败：{e}"}, status=400)
+            saved.append("asr.txt")
+        self._after_config_reload()
+        return web.json_response({"success": True, "saved": saved})
+
+    async def handle_emotions_normalize(self, request):
+        """把参考音频规整到 GPT-SoVITS 要求的 3~10 秒。"""
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "请求体不是 JSON"}, status=400)
+        root = self._role_root(payload.get("role", ""), payload.get("kind", ""))
+        if root is None:
+            return web.json_response({"success": False, "error": "未配置情绪模仿根目录"}, status=400)
+        targets = self._emotion_audio_targets(root, payload)
+        if isinstance(targets, str):
+            return web.json_response({"success": False, "error": targets}, status=400)
+        results = []
+        for name, target in targets:
+            item = await asyncio.to_thread(normalize_audio, target, log=print)
+            item["emotion"] = name
+            results.append(item)
+        return web.json_response({"success": True, "results": results})
+
+    async def handle_asr_start(self, request):
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "请求体不是 JSON"}, status=400)
+        root = self._role_root(payload.get("role", ""), payload.get("kind", ""))
+        if root is None:
+            return web.json_response({"success": False, "error": "未配置情绪模仿根目录"}, status=400)
+        targets = self._emotion_audio_targets(root, payload)
+        if isinstance(targets, str):
+            return web.json_response({"success": False, "error": targets}, status=400)
+        job = start_asr_job(self.config.config,
+                            [{"audio": str(path), "emotion": name} for name, path in targets],
+                            payload.get("lang", ""), payload.get("engine", ""))
+        return web.json_response({"success": True, **job.snapshot()})
+
+    async def handle_asr_status(self, request):
+        job = get_asr_job(request.query.get("job_id", ""))
+        if job is None:
+            return web.json_response({"success": False, "error": "任务不存在"}, status=404)
+        return web.json_response({"success": True, **job.snapshot()})
 
     # ---------------- 统计 ----------------
     async def handle_stats(self, request):
@@ -7702,6 +9097,49 @@ class WebUIServer:
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
+    # ---------------- 自主学习 ----------------
+    async def handle_lexicon(self, request):
+        if lexicon_mgr is None:
+            return web.json_response({"terms": [], "pending": [], "enabled": False})
+        return web.json_response({"terms": lexicon_mgr.list_terms(),
+                                  "pending": lexicon_mgr.list_pending(),
+                                  "enabled": lexicon_mgr.enabled})
+
+    async def handle_lexicon_confirm(self, request):
+        try:
+            payload = await request.json()
+            ok = lexicon_mgr is not None and lexicon_mgr.confirm(
+                str(payload.get("id", "")), payload.get("term"),
+                payload.get("meaning"), payload.get("category"))
+            return web.json_response({"success": ok})
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_lexicon_reject(self, request):
+        try:
+            payload = await request.json()
+            ok = lexicon_mgr is not None and lexicon_mgr.reject(str(payload.get("id", "")))
+            return web.json_response({"success": ok})
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_lexicon_save(self, request):
+        try:
+            payload = await request.json()
+            ok = lexicon_mgr is not None and lexicon_mgr.upsert_term(
+                payload.get("term", ""), payload.get("meaning", ""), payload.get("category", ""))
+            return web.json_response({"success": ok})
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_lexicon_delete(self, request):
+        try:
+            payload = await request.json()
+            ok = lexicon_mgr is not None and lexicon_mgr.delete_term(payload.get("term", ""))
+            return web.json_response({"success": ok})
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
     # ---------------- 表情包 ----------------
     async def handle_stickers_list(self, request):
         root = sticker_mgr.dir if sticker_mgr else Path("data/stickers")
@@ -7730,10 +9168,8 @@ class WebUIServer:
                     if folder is None:
                         return web.json_response({"success": False, "error": "分类名非法"}, status=400)
                     folder.mkdir(parents=True, exist_ok=True)
-                    fname = Path(part.filename).name
-                    if not re.match(r'^[\w\u4e00-\u9fff\-. ]+$', fname):
-                        continue
-                    if Path(fname).suffix.lower() not in IMAGE_EXTS:
+                    fname = safe_sticker_name(Path(part.filename).name)
+                    if not fname or Path(fname).suffix.lower() not in IMAGE_EXTS:
                         continue
                     payload_bytes = await part.read(decode=False)
                     if len(payload_bytes) > 10 * 1024 * 1024:
@@ -7749,8 +9185,8 @@ class WebUIServer:
         try:
             payload = await request.json()
             folder = _safe_subdir(sticker_mgr.dir, payload.get("category", ""))
-            fname = payload.get("name", "")
-            if folder is None or not re.match(r'^[\w\u4e00-\u9fff\-. ]+$', fname):
+            fname = safe_sticker_name(payload.get("name", ""))
+            if folder is None or not fname:
                 return web.json_response({"success": False, "error": "参数非法"}, status=400)
             target = folder / fname
             if target.exists():
@@ -7762,18 +9198,17 @@ class WebUIServer:
 
     async def handle_stickers_file(self, request):
         category = request.query.get("category", "")
-        fname = request.query.get("name", "")
+        fname = safe_sticker_name(request.query.get("name", ""))
         folder = _safe_subdir(sticker_mgr.dir, category) if sticker_mgr else None
-        if folder is None or not re.match(r'^[\w\u4e00-\u9fff\-. ]+$', fname):
+        if folder is None or not fname:
             return web.Response(status=404, text="not found")
         if Path(fname).suffix.lower() not in IMAGE_EXTS:
             return web.Response(status=404, text="not found")
         target = folder / fname
-        if not target.exists():
-            return web.Response(status=404, text="not found")
-        resp = web.FileResponse(target)
-        resp.headers["X-Content-Type-Options"] = "nosniff"
-        return resp
+        # 类型按扩展名给出：aiohttp 内置的 MIME 表里没有 .webp，
+        # 猜不出类型会退回 application/octet-stream，配上 nosniff 后浏览器拒绝渲染
+        return await _local_file_response(
+            target, MIME_BY_EXT.get(target.suffix.lower(), "application/octet-stream"))
 
     async def start(self):
         host = self.config.get("webui_host", "127.0.0.1")
@@ -7852,6 +9287,7 @@ async def ensure_tts_service_enabled_check() -> bool:
 async def main(stop_event: threading.Event = None):
     global global_config, global_emotion_manager, memory_manager
     global db, stats_mgr, sticker_mgr, tool_registry, profile_mgr, rag_mgr
+    global lexicon_mgr
     global todo_mgr, job_mgr, event_mgr, sender, mood_mgr
     if sys.stdout is None:
         sys.stdout = open(os.devnull, "w", encoding='utf-8')
@@ -7863,62 +9299,72 @@ async def main(stop_event: threading.Event = None):
     os.environ["NO_PROXY"] = "localhost,127.0.0.1"
     os.environ["no_proxy"] = "localhost,127.0.0.1"
 
-    print("=" * 160)
+    print("=" * 180)
     print(
-        "⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠟⣛⣩⣤⣶⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣦⣬⣉⠛⠀⠀⠀⠀⠀⢛⣋⣩⣥⠴⠶⠶⠟⠛⠛⠛⠛⠛⠛⠛⠻⠿⠷⠶⢶⣦⣤⣍⣉⡛⠛⠿⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿\n"
-        "⣿⣿⣿⣿⣿⣿⣿⣿⣿⠟⣋⣥⣶⠿⣛⣭⣷⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠟⣋⠁⠀⠀⠄⢒⣋⣩⣥⣴⣶⣶⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣶⣦⣭⣍⣛⠻⢷⣶⣤⣍⣙⠛⠿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿\n"
-        "⣿⣿⣿⣿⣿⣿⠟⣋⣴⡾⢟⣫⣴⠾⣻⣿⣿⣿⣿⠿⠿⠿⠟⠛⠛⠛⠛⠛⠉⠀⠉⣀⣤⣴⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣮⣝⣿⣿⣿⣶⣦⣌⡙⠻⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿\n"
-        "⠿⠿⠿⠿⢛⣡⡾⢟⣩⣶⠿⠋⠗⣛⣉⣥⣤⠤⠶⣒⣒⣚⡯⠭⣉⡭⠛⢁⣤⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣦⣌⠙⠿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿\n"
-        "⣀⣀⢀⡴⠟⣋⣐⣩⡤⢴⣒⣻⣭⣵⣶⠿⢟⣛⡭⠽⠖⠚⠋⠉⣁⣴⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣻⠿⣶⣄⡙⠻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿\n"
-        "⣫⡥⠖⣚⣩⣵⣶⣾⣿⠿⣿⣛⠭⠖⠚⣉⣩⣤⣶⡶⠟⢋⣤⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⣟⣛⣯⣽⣷⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣭⡛⢦⣌⠙⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿\n"
-        "⣥⣾⣿⣿⠿⣟⡫⠵⠚⣋⣡⣤⣶⣾⣿⡿⠟⠋⠁⢀⣴⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⣟⣯⣵⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣌⠳⣤⡉⠻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿\n"
-        "⢿⣛⠭⠒⣉⢅⣴⣾⣿⣿⣿⣿⠿⠋⠁⠀⠀⢀⣴⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⢛⣭⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⣻⣽⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣎⠻⣦⡈⠻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿\n"
-        "⣩⡴⢠⡿⣣⣾⣿⣿⠿⠛⠉⠀⠀⠀⠀⢀⣴⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⣻⣵⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠟⣫⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⣫⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣮⣝⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣌⢿⣦⡈⠻⣿⣿⣿⣿⣿⣿⣿⣿⣿\n"
-        "⠿⣱⡟⣵⡿⠟⠋⠁⠀⠀⠀⢀⡤⠂⣴⣿⣿⣿⣿⣿⣿⣿⣿⡿⣛⣵⣿⣿⣿⣿⣿⣿⣿⣿⢟⣿⣿⡿⣋⣴⣿⣿⣿⣿⣿⣿⣿⠟⣫⣾⣿⣿⣿⣿⡿⣫⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣌⠻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣧⡹⣿⣆⠙⢿⣿⣿⣿⣿⣿⣿⣿\n"
-        "⠀⠟⠘⠉⠀⠀⠀⠀⢀⣤⣾⠟⣠⣾⣿⣿⣿⣿⣿⣿⣿⡿⣫⣾⣿⣿⣿⣿⣿⣿⣿⣿⣯⣾⣿⠟⣡⣾⣿⣿⣿⣿⣿⣿⣿⠟⣡⣾⣿⣿⣿⣿⣿⢏⣼⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⡌⠻⣿⣿⣿⣿⣿⣿⣿⣿⣷⡌⢻⣷⡈⠛⠛⠛⠛⠛⠻⠿\n"
-        "⣇⠀⠀⠀⠀⣀⣴⣾⣿⡿⢃⣴⣿⣿⣿⣿⣿⣿⣿⡿⣫⣾⣿⣿⣿⣿⣿⣿⣿⡿⣫⣾⣿⠟⣡⣾⣿⣿⣿⣿⣿⣿⣿⠟⣡⣾⣿⣿⣿⣿⣿⡟⣱⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣦⡘⢿⣿⣿⣿⣿⣿⣿⣿⣿⡄⠳⠟⢠⡒⢦⠄⣀⣀⣤\n"
-        "⣞⣆⢀⣴⣾⣿⣿⣿⠟⢡⣾⣿⣿⣿⣿⣿⣿⣿⣫⣾⣿⣿⣿⣿⣿⣿⣿⡿⣫⣾⣿⠟⣡⣾⣿⣿⣿⣿⣿⣿⣿⡿⡡⣾⣿⣿⣿⣿⣿⣿⢋⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣄⢻⣿⣿⣿⣿⣿⣿⣿⣿⡄⢠⣦⠙⠎⣰⣷⣿⣿\n"
-        "⠿⠜⣄⠻⣿⣿⣿⠏⣰⣿⣿⣻⣿⣿⣿⣿⣟⣵⣿⣿⣿⣿⣿⣿⣿⣿⢫⣾⣿⡿⢋⣾⣿⣿⣿⣿⣿⣿⣿⣿⢏⢴⣾⣿⣿⣿⣿⣿⡿⣱⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢹⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣯⢦⠹⠿⠿⣿⣿⣿⣿⣿⣿⡀⠃⠀⠀⠹⣿⣿⣿\n"
-        "⠉⠉⠙⠂⠹⣿⠃⣼⣿⡿⣱⣿⣿⣿⣿⢯⣾⣿⣿⣿⣿⣿⣿⣿⢟⣵⣿⣿⠏⣴⣿⣿⣿⣿⣿⣿⢿⢿⠟⠡⢢⣿⣿⣿⣿⣿⣿⠟⡼⣽⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠇⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡟⣿⣿⣿⣿⣿⣿⣿⢎⣴⣾⣷⡹⣿⣿⣿⣿⣿⣧⠀⠀⠀⢠⠘⣿⣿\n"
-        "⣦⡀⠀⠀⠀⢀⣼⣿⡿⣱⣿⣿⣿⡿⣳⣿⣿⣿⣿⣿⣿⣿⡿⢫⣾⣿⡿⢡⣾⣿⣿⣿⣿⣿⣿⣿⡿⠃⡴⣱⣿⣿⣿⣿⣿⣿⢏⣞⣽⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⣹⡟⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠸⣿⣿⣿⡿⡿⢡⣾⣿⣿⣿⣇⢹⣿⣿⣿⣿⣿⡄⠀⠀⢸⢣⠘⣿\n"
-        "⣿⣿⣦⡀⢀⣾⣿⣿⢡⣿⣿⣿⡿⣱⣿⣿⣿⣿⣿⣿⣿⡟⣱⣿⣿⠟⣰⣿⣿⣿⣿⣿⣿⣿⣿⢟⡔⡜⣼⣿⣿⣿⣿⣿⣿⢏⣞⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢃⣿⢁⣿⣿⣿⣿⣿⣿⣿⣿⢿⣿⣿⣿⣿⣿⡆⢿⣿⣿⣿⢁⣾⣿⠿⠟⠛⠛⠈⣿⣿⣿⣿⣿⣧⠀⠀⠈⣏⢧⠸\n"
-        "⣿⣿⣿⠃⣼⣿⣿⢣⣿⣿⣿⣿⣱⣿⣿⣿⣿⣿⣿⣿⢏⣼⣿⣿⠏⣼⣿⣿⣿⣿⣿⣿⣿⣿⢃⠞⢜⣾⣿⣿⣿⣿⣿⣿⢏⡞⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⣼⠃⢸⣿⣿⣿⣿⣿⣿⣿⡟⣾⣿⣿⣿⣿⣿⡇⢸⣿⣿⡏⢸⢿⣧⠀⠀⠀⠀⠀⢹⣿⣿⣿⣿⣿⠀⠀⠀⠸⡌⢧\n"
-        "⠻⣿⠃⣼⣿⣿⢇⣾⣿⣿⣿⢳⣿⣿⣿⣿⣿⣿⣿⢋⣾⣿⣿⢋⣾⣿⣿⣿⣿⣿⣿⣿⡿⢡⡏⢌⣾⣿⣿⣿⣿⣿⣿⢏⡞⣼⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⢰⡟⠀⣾⣟⢿⣿⣿⣿⣿⣿⢃⣿⣽⣿⣿⣿⣿⡇⢸⣿⣿⡇⠀⠀⢀⠀⠀⠀⠀⠀⠸⣿⣿⣿⣿⣿⡇⠀⠀⣆⠗⢋\n"
-        "⣷⠆⣸⣿⣿⡟⣼⣿⣿⣿⢧⣿⣿⣿⣿⣿⣿⡿⠃⠞⠛⠻⠁⠘⠛⠿⠿⣿⣿⣿⣿⡿⣱⡟⢈⣾⣿⣿⣿⣿⣿⣿⡏⡼⣹⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢃⡿⡡⢸⣿⣿⣷⣿⡻⣿⣿⡟⣸⣧⣿⣿⣿⣿⣿⡇⢸⣿⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⡇⠀⣠⠴⠚⠉\n"
-        "⡟⢠⣿⣿⣿⢱⣿⣿⣿⡟⣾⣿⣿⣿⣿⣿⣦⢀⣀⠀⠠⠁⠀⠀⠀⠀⠀⠀⠉⠛⠿⣱⣿⢁⣾⣿⣿⣿⣿⣿⣿⡟⣸⢳⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡏⣾⢣⢇⣿⣿⣿⣿⣿⣿⣿⣿⢡⡿⣼⣿⣿⣿⣿⣿⡇⣼⣿⣿⣷⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⡿⠋⠀⠀⠀⠀⠀⠀\n"
-        "⠀⣿⣿⣿⠇⣿⣿⣿⣿⢱⣿⣿⣿⣿⣿⣿⢣⣿⣿⣿⠀⣀⣁⢤⣤⣄⣀⡀⠀⠀⠀⠈⠁⢼⣿⣿⣿⣿⣿⣿⣿⢡⡏⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⣸⠏⡞⣸⣿⣿⣿⣿⣿⣿⣿⠇⣾⢳⣿⣿⣿⣿⣿⣿⠃⣿⣿⣿⡟⠂⠀⠀⠀⠀⠀⠀⠀⠀⣿⡿⠋⠀⠀⠀⠀⠀⠀⠀⠀\n"
-        "⣸⣿⣿⡿⣸⣿⣿⣿⡇⣾⣿⣿⣿⣿⣿⢏⣾⣿⣿⡇⢠⣿⣿⣷⣮⣝⡻⠿⠋⠀⠀⠀⠀⠀⠙⢿⣿⣿⣿⣿⠇⡾⣸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣱⡟⣼⢣⣿⣿⣿⣿⣿⣿⣿⡟⣰⡏⣿⣿⣿⣿⣿⣿⣿⢠⣿⣿⡟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠊⠀⠀⠀⠀⠀⠀⠀⡀⢀⣼\n"
-        "⣿⡿⣿⠇⣿⣿⣿⣿⢠⣿⣿⣿⣿⣿⡟⣾⣿⣿⣿⠁⣼⣿⣿⣿⣿⣿⣿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠹⣿⣿⡟⢰⣇⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢣⡿⣰⡏⣼⣿⣿⣿⣿⣿⣿⡟⣰⡿⣽⣿⣿⣿⣿⣿⣿⡇⢸⣿⢸⡃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⡀⠐⢈⣴⡿⢋\n"
-        "⣿⢻⣿⢸⣿⣿⣿⡿⢸⣿⣿⣿⣿⣿⣹⣿⣿⣿⡏⠀⣿⣿⣿⣿⣿⣿⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠹⣿⡇⣾⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢯⡿⢡⣿⢳⣿⣿⣿⣿⣿⣿⡿⣰⣿⢳⣿⣿⣿⣿⣿⣿⡿⠀⣾⡇⣿⡇⢠⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠐⠉⠉⠀⠀⠉⠉⠀⢻\n"
-        "⡏⣿⡇⣾⣿⣿⣿⡇⣼⣿⣿⣿⣿⢯⣿⣿⣿⣿⢡⣿⣿⣿⣿⣿⣿⡟⢀⠀⠂⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⡇⡿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢏⣾⢣⣿⣗⣾⣿⣿⣿⣿⣿⡟⣱⣿⢯⣿⣿⣿⣿⣿⣿⣿⢡⠂⣿⢰⣿⣿⣆⠻⣿⣦⠒⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘\n"
-        "⢹⣿⢃⣿⣿⣿⣿⡇⣿⣿⣿⣿⡏⣸⣿⣿⣿⡿⢸⣿⣿⣿⣿⣿⣿⣧⣿⣷⡀⠀⠀⠀⠀⠀⠀⣶⣦⢀⢠⣷⣧⣿⣿⣿⣿⣿⣿⣿⣿⣿⢏⣾⢣⣿⡟⢸⣿⣿⠿⠿⠿⠟⠘⠛⠟⠿⠿⣿⣿⣿⣿⣿⢃⣿⢸⡇⣾⣿⣿⣿⡗⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣆⠀⠀⠀⠀\n"
-        "⣾⣿⢸⣿⣿⣿⣿⡇⣿⣿⣿⣿⡇⣿⣿⣿⣿⡇⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⠀⠀⠀⠀⠀⠀⠈⠁⢸⣿⣿⢿⣿⣿⣿⣿⣿⣿⣿⣿⢏⡾⣣⣿⠟⠋⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠙⠃⠺⠇⡿⢰⣿⣿⣿⡏⠀⠀⠀⠀⠀⠀⢀⢀⣠⡀⣀⢒⡉⠀⣿⣿⠀⠀⠀⠀\n"
-        "⣿⡟⢸⣿⣿⣿⣿⡇⢿⣿⣿⣿⡧⡝⣿⣿⣿⡇⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠟⠀⠀⠀⠀⠀⠀⠀⠀⢸⣿⣿⣸⣿⣿⣿⣿⣿⣿⣿⢏⡾⣵⠟⠁⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣀⡀⠀⠀⠀⠀⠀⠰⠁⢿⣿⣿⡿⠀⢿⡴⢚⣡⡞⠿⠺⡏⢸⡇⢸⣿⠁⡆⠸⣿⡇⠀⠀⠀\n"
-        "⣿⡇⣿⣿⣿⣿⣿⣧⢸⣿⣿⣿⡇⣿⡌⢿⣿⡇⣿⣿⣿⣿⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢋⣿⣾⣿⣿⡿⠁⠀⡀⠀⠀⠀⠀⠀⠀⠀⢀⡀⠀⢿⣿⣶⣤⣀⠀⠀⠀⠀⠀⠙⠿⠁⠀⢋⣴⣿⢰⣶⢼⡶⢻⡼⢃⣾⡇⢸⣧⠠⠻⠷⠀⠀⠀\n"
-        "⣿⡇⣿⣿⣿⣿⣿⣿⠸⡿⠟⣻⣧⢻⣿⠀⡹⣿⣿⣿⣿⣿⣿⣿⣿⡆⠀⣠⣴⣤⣀⡀⠀⣀⠀⠀⣸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣦⡀⠀⠀⠀⠀⠀⠀⠀⠀⠻⡿⠂⢸⣿⣿⣿⣿⣷⠄⡀⠀⠀⠀⠀⠑⣾⣿⣿⢟⣕⢲⢇⣼⡈⠇⣿⡟⠀⠀⠀⠀⠀⠀⠀⠀⠀\n"
-        "⣿⡇⣿⣿⣿⣿⣿⣿⣷⣿⣿⣿⣿⡈⢿⡀⣿⣾⣿⣿⣿⣿⣿⣿⣿⣿⣆⠙⣿⣿⣿⣿⡇⣴⣄⣰⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⣿⣿⣿⣿⡟⣰⣿⣦⠐⠀⠀⠀⠘⣿⣿⢬⢋⡞⣨⢫⢷⣄⣿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀\n"
-        "⣿⡇⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡕⣌⢧⢻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣭⣿⣿⣧⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣸⣿⣿⣿⡿⣱⣿⣿⠃⣠⣾⣷⣶⣦⣽⣇⠿⡺⣱⣏⠺⢗⣿⠃⡤⢤⣤⡄⢶⣦⠰⣶⣄⠀\n"
-        "⣿⡇⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠈⠈⡋⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠈⠉⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣿⣿⣿⡟⣱⣿⣿⠃⣴⣿⣿⣿⣿⣿⣿⣫⣾⣱⣿⣿⣯⣼⣧⢰⣧⢸⣿⣿⡄⠻⣷⡘⢿⡄\n"
-        "⣿⡇⢻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⢀⠀⢷⣮⣻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠀⠀⠀⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣾⣿⣿⢟⣼⣿⠟⢡⣾⣿⣿⣿⣿⣿⡿⢃⢜⡱⣿⣿⣿⣷⠎⣠⣏⢻⡄⢿⣿⣷⡐⢌⡛⢮⡳\n"
-        "⣿⡇⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠈⢄⠈⢻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣄⠠⣾⣿⣿⣶⣶⣦⠐⣂⠀⠀⣠⣾⣿⣿⢯⣟⣫⢅⣴⣿⣿⣿⣿⣿⣿⠟⣱⠏⡹⣛⣿⣿⣿⡏⢠⣝⡋⣚⡻⡘⣿⣿⣷⡘⢿⣶⣤\n"
-        "⣿⣷⠘⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡄⠃⠠⠀⠙⠿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣾⣿⣿⣿⣿⣿⠞⣿⣧⣾⣿⣿⣿⣿⣿⠟⣡⣾⣿⣿⣿⣿⣿⡿⢋⣾⢫⣾⢵⣯⣿⣿⡟⢠⣿⠟⢞⡿⡃⣳⠘⣿⣿⣷⡈⢿⣿\n"
-        "⣿⣿⠀⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣧⠘⠀⠀⠃⢀⠈⠻⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢟⣡⣾⣿⣿⣿⣿⣿⡿⢋⣴⢟⣵⣿⣿⡖⣤⡿⡟⢀⣿⣿⣷⣾⣿⣜⠿⡣⣘⡻⣿⣿⣄⠙\n"
-        "⣿⣿⡆⠸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡆⢡⠀⠀⠀⠁⠀⠀⠉⠻⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡵⣿⣿⣿⣿⣿⣿⡿⢋⣴⠟⣱⣿⣿⣿⣿⣧⡟⡟⠀⠀⣿⣿⣿⣿⣏⣹⣿⣜⠿⣇⣩⣝⢿⣦\n"
-        "⣿⣿⣧⠀⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡈⠀⠀⠀⠀⠄⢀⣤⣶⣄⡈⠛⠿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢛⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡷⠂⣠⣴⡤⣩⡴⢛⣥⣾⣿⣿⣿⣿⣿⣏⡸⡿⢂⠀⣿⣿⣿⣿⣿⣿⣿⣿⣏⣡⣙⣋⢸⣶\n"
-        "⣿⣿⣿⡀⡘⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⡀⠀⢀⠂⣠⣿⣿⣿⣿⣿⣷⢠⡄⠉⠛⠿⣿⣿⣿⣿⣿⣭⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠋⣠⡾⠟⠵⣊⣥⣾⣿⣿⣿⣿⣿⣿⣿⢯⡟⠀⢴⣶⡄⠸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣭\n"
-        "⣿⣿⣿⣧⠘⣢⡙⠻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⡀⠈⢰⣿⣿⣿⡏⣿⣿⣿⢸⠁⠀⠀⠀⠀⠈⠙⠛⠿⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠟⠋⢀⣤⣥⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⣳⠏⢀⠂⠈⢉⣬⡀⠙⢿⣿⠿⠿⠛⠛⠻⣿⣿⣿⣿⣿\n"
-        "⢻⣿⣿⣿⣆⠩⢧⠑⠨⣙⠻⢿⣿⣿⣿⣿⣿⣿⣷⡄⢿⣿⣿⣿⢸⣿⣿⣿⠘⠀⠀⠀⠀⠀⠀⠀⠀⣤⣤⣤⣄⣉⣉⡙⠛⠛⠛⠛⠿⠿⠿⠿⠿⠿⠟⠛⠛⠛⠋⠉⠉⠀⢀⣴⣿⡿⣫⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣟⣽⠏⠀⠀⠀⡀⠌⠛⢃⣁⠀⠀⠀⠀⠀⠀⠀⠈⢿⣿⣿⣿\n"
-        "⣌⠻⠿⣿⣿⣆⠩⣧⠀⠀⠁⠂⢬⠉⠛⠿⢿⣿⣿⣿⣎⠻⣿⡇⡾⠋⠙⢿⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⡿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠐⣰⣿⣿⣿⢖⣴⣿⡿⣫⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣫⣾⠏⠀⠐⠂⠁⠀⠀⠀⠙⠟⢁⣀⠀⠀⠀⠀⠀⠀⠘⣿⣿⣿\n"
-        "⣿⣿⣷⣶⣭⣍⣃⠈⢷⡀⠄⣂⣴⣶⣦⣑⠲⢠⠈⣭⣍⣓⡙⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢹⣿⣿⣿⣿⣿⣿⠟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣰⣿⡿⢋⣵⣿⢟⣵⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢟⣵⣿⠏⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⠟⢁⣤⡀⠀⠀⠀⠀⠈⣉⡛\n"
-        "⣿⣿⣿⣿⣿⣿⣿⣦⡀⠋⣾⣿⣿⣿⣿⠿⠃⣉⡀⣿⣿⣿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢿⣿⣿⣿⠟⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣰⠿⣋⣴⢟⢏⣴⣿⡿⣫⣿⣿⣿⣿⣿⣿⣿⣿⡿⣫⣾⣿⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠛⠃⢴⣶⠀⣠⣄⠉⣁\n"
-        "⣿⣿⣿⣿⣿⣿⣿⣿⡿⣂⣽⣿⣷⡍⣥⣚⡛⠿⠇⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⢿⠟⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢘⡥⢞⣫⢔⣵⣿⢟⣭⣾⣿⣿⣿⣿⣿⣿⣿⣿⢋⣾⣿⡿⢃⣶⣦⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠁⠀⠙⠋⠀⠻\n"
-        "⠻⣿⣿⣿⣿⣿⣿⣿⢸⣿⣿⣿⣿⠀⣿⣿⣿⣿⣶⣍⡛⠿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠂⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⡾⢽⡾⣋⣴⠿⣫⣵⣿⣿⣿⣿⣿⣿⣿⣿⣿⢟⣵⣿⣿⡿⠡⢿⣿⣿⣧⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\n"
-        "⢷⣬⡛⢿⣿⣿⣿⣿⡎⢿⣿⣿⣿⡄⣿⣿⣿⣿⣿⣿⣿⣷⣦⡀⢀⡴⠂⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡤⢞⣫⣷⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢟⣵⣿⣿⣿⡟⣱⣿⣷⡝⣿⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\n"
-        "⠀⠙⠻⢶⣬⡙⠛⠉⠀⠀⠈⠀⠀⠀⢿⣿⣿⣿⣿⣿⣿⣿⢏⣴⠏⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠑⠦⣄⡀⢠⣾⣷⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⢛⣵⣿⣿⣿⣿⠟⣰⣿⣿⣿⣷⣆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\n"
+        "                   ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠟⣛⣩⣤⣶⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣦⣬⣉⠛⠀⠀⠀⠀⠀⢛⣋⣩⣥⠴⠶⠶⠟⠛⠛⠛⠛⠛⠛⠛⠻⠿⠷⠶⢶⣦⣤⣍⣉⡛⠛⠿⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿\n"
+        "                   ⣿⣿⣿⣿⣿⣿⣿⣿⣿⠟⣋⣥⣶⠿⣛⣭⣷⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠟⣋⠁⠀⠀⠄⢒⣋⣩⣥⣴⣶⣶⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣶⣦⣭⣍⣛⠻⢷⣶⣤⣍⣙⠛⠿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿\n"
+        "                   ⣿⣿⣿⣿⣿⣿⠟⣋⣴⡾⢟⣫⣴⠾⣻⣿⣿⣿⣿⠿⠿⠿⠟⠛⠛⠛⠛⠛⠉⠀⠉⣀⣤⣴⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣮⣝⣿⣿⣿⣶⣦⣌⡙⠻⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿\n"
+        "                   ⠿⠿⠿⠿⢛⣡⡾⢟⣩⣶⠿⠋⠗⣛⣉⣥⣤⠤⠶⣒⣒⣚⡯⠭⣉⡭⠛⢁⣤⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣦⣌⠙⠿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿\n"
+        "                   ⣀⣀⢀⡴⠟⣋⣐⣩⡤⢴⣒⣻⣭⣵⣶⠿⢟⣛⡭⠽⠖⠚⠋⠉⣁⣴⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣻⠿⣶⣄⡙⠻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿\n"
+        "                   ⣫⡥⠖⣚⣩⣵⣶⣾⣿⠿⣿⣛⠭⠖⠚⣉⣩⣤⣶⡶⠟⢋⣤⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⣟⣛⣯⣽⣷⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣭⡛⢦⣌⠙⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿\n"
+        "                   ⣥⣾⣿⣿⠿⣟⡫⠵⠚⣋⣡⣤⣶⣾⣿⡿⠟⠋⠁⢀⣴⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⣟⣯⣵⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣌⠳⣤⡉⠻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿\n"
+        "                   ⢿⣛⠭⠒⣉⢅⣴⣾⣿⣿⣿⣿⠿⠋⠁⠀⠀⢀⣴⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⢛⣭⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⣻⣽⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣎⠻⣦⡈⠻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿\n"
+        "                   ⣩⡴⢠⡿⣣⣾⣿⣿⠿⠛⠉⠀⠀⠀⠀⢀⣴⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⣻⣵⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠟⣫⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⣫⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣮⣝⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣌⢿⣦⡈⠻⣿⣿⣿⣿⣿⣿⣿⣿⣿\n"
+        "                   ⠿⣱⡟⣵⡿⠟⠋⠁⠀⠀⠀⢀⡤⠂⣴⣿⣿⣿⣿⣿⣿⣿⣿⡿⣛⣵⣿⣿⣿⣿⣿⣿⣿⣿⢟⣿⣿⡿⣋⣴⣿⣿⣿⣿⣿⣿⣿⠟⣫⣾⣿⣿⣿⣿⡿⣫⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣌⠻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣧⡹⣿⣆⠙⠀⠀⠀⢿⣿⣿⣿⣿⣿⣿⣿\n"
+        "                   ⠀⠟⠘⠉⠀⠀⠀⠀⢀⣤⣾⠟⣠⣾⣿⣿⣿⣿⣿⣿⣿⡿⣫⣾⣿⣿⣿⣿⣿⣿⣿⣿⣯⣾⣿⠟⣡⣾⣿⣿⣿⣿⣿⣿⣿⠟⣡⣾⣿⣿⣿⣿⣿⢏⣼⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⡌⠻⣿⣿⣿⣿⣿⣿⣿⣿⣷⡌⢻⣷⡈⠛⠛⠛⠛⠛⠻⠿\n"
+        "                   ⣇⠀⠀⠀⠀⣀⣴⣾⣿⡿⢃⣴⣿⣿⣿⣿⣿⣿⣿⡿⣫⣾⣿⣿⣿⣿⣿⣿⣿⡿⣫⣾⣿⠟⣡⣾⣿⣿⣿⣿⣿⣿⣿⠟⣡⣾⣿⣿⣿⣿⣿⡟⣱⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣦⡘⢿⣿⣿⣿⣿⣿⣿⣿⣿⡄⠳⠟⢠⡒⢦⠄⣀⣀⣤\n"
+        "                   ⣞⣆⢀⣴⣾⣿⣿⣿⠟⢡⣾⣿⣿⣿⣿⣿⣿⣿⣫⣾⣿⣿⣿⣿⣿⣿⣿⡿⣫⣾⣿⠟⣡⣾⣿⣿⣿⣿⣿⣿⣿⡿⡡⣾⣿⣿⣿⣿⣿⣿⢋⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣄⢻⣿⣿⣿⣿⣿⣿⣿⣿⡄⢠⣦⠙⠎⣰⣷⣿⣿\n"
+        "                   ⠿⠜⣄⠻⣿⣿⣿⠏⣰⣿⣿⣻⣿⣿⣿⣿⣟⣵⣿⣿⣿⣿⣿⣿⣿⣿⢫⣾⣿⡿⢋⣾⣿⣿⣿⣿⣿⣿⣿⣿⢏⢴⣾⣿⣿⣿⣿⣿⡿⣱⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢹⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣯⢦⠹⠿⠿⣿⣿⣿⣿⣿⣿⡀⠃⠀⠀⠹⣿⣿⣿\n"
+        "                   ⠉⠉⠙⠂⠹⣿⠃⣼⣿⡿⣱⣿⣿⣿⣿⢯⣾⣿⣿⣿⣿⣿⣿⣿⢟⣵⣿⣿⠏⣴⣿⣿⣿⣿⣿⣿⢿⢿⠟⠡⢢⣿⣿⣿⣿⣿⣿⠟⡼⣽⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠇⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡟⣿⣿⣿⣿⣿⣿⣿⢎⣴⣾⣷⡹⣿⣿⣿⣿⣿⣧⠀⠀⠀⢠⠘⣿⣿\n"
+        "                   ⣦⡀⠀⠀⠀⢀⣼⣿⡿⣱⣿⣿⣿⡿⣳⣿⣿⣿⣿⣿⣿⣿⡿⢫⣾⣿⡿⢡⣾⣿⣿⣿⣿⣿⣿⣿⡿⠃⡴⣱⣿⣿⣿⣿⣿⣿⢏⣞⣽⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⣹⡟⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠸⣿⣿⣿⡿⡿⢡⣾⣿⣿⣿⣇⢹⣿⣿⣿⣿⣿⡄⠀⠀⢸⢣⠘⣿\n"
+        "                   ⣿⣿⣦⡀⢀⣾⣿⣿⢡⣿⣿⣿⡿⣱⣿⣿⣿⣿⣿⣿⣿⡟⣱⣿⣿⠟⣰⣿⣿⣿⣿⣿⣿⣿⣿⢟⡔⡜⣼⣿⣿⣿⣿⣿⣿⢏⣞⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢃⣿⢁⣿⣿⣿⣿⣿⣿⣿⣿⢿⣿⣿⣿⣿⣿⡆⢿⣿⣿⣿⢁⣾⣿⠿⠟⠛⠛⠈⣿⣿⣿⣿⣿⣧⠀⠀⠈⣏⢧⠸\n"
+        "                   ⣿⣿⣿⠃⣼⣿⣿⢣⣿⣿⣿⣿⣱⣿⣿⣿⣿⣿⣿⣿⢏⣼⣿⣿⠏⣼⣿⣿⣿⣿⣿⣿⣿⣿⢃⠞⢜⣾⣿⣿⣿⣿⣿⣿⢏⡞⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⣼⠃⢸⣿⣿⣿⣿⣿⣿⣿⡟⣾⣿⣿⣿⣿⣿⡇⢸⣿⣿⡏⢸⢿⣧⠀⠀⠀⠀⠀⢹⣿⣿⣿⣿⣿⠀⠀⠀⠸⡌⢧\n"
+        "                   ⠻⣿⠃⣼⣿⣿⢇⣾⣿⣿⣿⢳⣿⣿⣿⣿⣿⣿⣿⢋⣾⣿⣿⢋⣾⣿⣿⣿⣿⣿⣿⣿⡿⢡⡏⢌⣾⣿⣿⣿⣿⣿⣿⢏⡞⣼⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⢰⡟⠀⣾⣟⢿⣿⣿⣿⣿⣿⢃⣿⣽⣿⣿⣿⣿⡇⢸⣿⣿⡇⠀⠀⢀⠀⠀⠀⠀⠀⠸⣿⣿⣿⣿⣿⡇⠀⠀⣆⠗⢋\n"
+        "                   ⣷⠆⣸⣿⣿⡟⣼⣿⣿⣿⢧⣿⣿⣿⣿⣿⣿⡿⠃⠞⠛⠻⠁⠘⠛⠿⠿⣿⣿⣿⣿⡿⣱⡟⢈⣾⣿⣿⣿⣿⣿⣿⡏⡼⣹⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢃⡿⡡⢸⣿⣿⣷⣿⡻⣿⣿⡟⣸⣧⣿⣿⣿⣿⣿⡇⢸⣿⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⡇⠀⣠⠴⠚⠉\n"
+        "                   ⡟⢠⣿⣿⣿⢱⣿⣿⣿⡟⣾⣿⣿⣿⣿⣿⣦⢀⣀⠀⠠⠁⠀⠀⠀⠀⠀⠀⠉⠛⠿⣱⣿⢁⣾⣿⣿⣿⣿⣿⣿⡟⣸⢳⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡏⣾⢣⢇⣿⣿⣿⣿⣿⣿⣿⣿⢡⡿⣼⣿⣿⣿⣿⣿⡇⣼⣿⣿⣷⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⡿⠋⠀⠀⠀⠀⠀⠀\n"
+        "                   ⠀⣿⣿⣿⠇⣿⣿⣿⣿⢱⣿⣿⣿⣿⣿⣿⢣⣿⣿⣿⠀⣀⣁⢤⣤⣄⣀⡀⠀⠀⠀⠈⠁⢼⣿⣿⣿⣿⣿⣿⣿⢡⡏⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⣸⠏⡞⣸⣿⣿⣿⣿⣿⣿⣿⠇⣾⢳⣿⣿⣿⣿⣿⣿⠃⣿⣿⣿⡟⠂⠀⠀⠀⠀⠀⠀⠀⠀⣿⡿⠋⠀⠀⠀⠀⠀⠀⠀⠀\n"
+        "                   ⣸⣿⣿⡿⣸⣿⣿⣿⡇⣾⣿⣿⣿⣿⣿⢏⣾⣿⣿⡇⢠⣿⣿⣷⣮⣝⡻⠿⠋⠀⠀⠀⠀⠀⠙⢿⣿⣿⣿⣿⠇⡾⣸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣱⡟⣼⢣⣿⣿⣿⣿⣿⣿⣿⡟⣰⡏⣿⣿⣿⣿⣿⣿⣿⢠⣿⣿⡟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠊⠀⠀⠀⠀⠀⠀⠀⡀⢀⣼\n"
+        "                   ⣿⡿⣿⠇⣿⣿⣿⣿⢠⣿⣿⣿⣿⣿⡟⣾⣿⣿⣿⠁⣼⣿⣿⣿⣿⣿⣿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠹⣿⣿⡟⢰⣇⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢣⡿⣰⡏⣼⣿⣿⣿⣿⣿⣿⡟⣰⡿⣽⣿⣿⣿⣿⣿⣿⡇⢸⣿⢸⡃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⡀⠐⢈⣴⡿⢋\n"
+        "                   ⣿⢻⣿⢸⣿⣿⣿⡿⢸⣿⣿⣿⣿⣿⣹⣿⣿⣿⡏⠀⣿⣿⣿⣿⣿⣿⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠹⣿⡇⣾⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢯⡿⢡⣿⢳⣿⣿⣿⣿⣿⣿⡿⣰⣿⢳⣿⣿⣿⣿⣿⣿⡿⠀⣾⡇⣿⡇⢠⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠐⠉⠉⠀⠀⠉⠉⠀⢻\n"
+        "                   ⡏⣿⡇⣾⣿⣿⣿⡇⣼⣿⣿⣿⣿⢯⣿⣿⣿⣿⢡⣿⣿⣿⣿⣿⣿⡟⢀⠀⠂⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⡇⡿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢏⣾⢣⣿⣗⣾⣿⣿⣿⣿⣿⡟⣱⣿⢯⣿⣿⣿⣿⣿⣿⣿⢡⠂⣿⢰⣿⣿⣆⠻⣿⣦⠒⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘\n"
+        "                   ⢹⣿⢃⣿⣿⣿⣿⡇⣿⣿⣿⣿⡏⣸⣿⣿⣿⡿⢸⣿⣿⣿⣿⣿⣿⣧⣿⣷⡀⠀⠀⠀⠀⠀⠀⣶⣦⢀⢠⣷⣧⣿⣿⣿⣿⣿⣿⣿⣿⣿⢏⣾⢣⣿⡟⢸⣿⣿⠿⠿⠿⠟⠘⠛⠟⠿⠿⣿⣿⣿⣿⣿⢃⣿⢸⡇⣾⣿⣿⣿⡗⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣆⠀⠀⠀⠀\n"
+        "                   ⣾⣿⢸⣿⣿⣿⣿⡇⣿⣿⣿⣿⡇⣿⣿⣿⣿⡇⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⠀⠀⠀⠀⠀⠀⠈⠁⢸⣿⣿⢿⣿⣿⣿⣿⣿⣿⣿⣿⢏⡾⣣⣿⠟⠋⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠙⠃⠺⠇⡿⢰⣿⣿⣿⡏⠀⠀⠀⠀⠀⠀⢀⢀⣠⡀⣀⢒⡉⠀⣿⣿⠀⠀⠀⠀\n"
+        "                   ⣿⡟⢸⣿⣿⣿⣿⡇⢿⣿⣿⣿⡧⡝⣿⣿⣿⡇⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠟⠀⠀⠀⠀⠀⠀⠀⠀⢸⣿⣿⣸⣿⣿⣿⣿⣿⣿⣿⢏⡾⣵⠟⠁⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣀⡀⠀⠀⠀⠀⠀⠰⠁⢿⣿⣿⡿⠀⢿⡴⢚⣡⡞⠿⠺⡏⢸⡇⢸⣿⠁⡆⠸⣿⡇⠀⠀⠀\n"
+        "                   ⣿⡇⣿⣿⣿⣿⣿⣧⢸⣿⣿⣿⡇⣿⡌⢿⣿⡇⣿⣿⣿⣿⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢋⣿⣾⣿⣿⡿⠁⠀⡀⠀⠀⠀⠀⠀⠀⠀⢀⡀⠀⢿⣿⣶⣤⣀⠀⠀⠀⠀⠀⠙⠿⠁⠀⢋⣴⣿⢰⣶⢼⡶⢻⡼⢃⣾⡇⢸⣧⠠⠻⠷⠀⠀⠀\n"
+        "                   ⣿⡇⣿⣿⣿⣿⣿⣿⠸⡿⠟⣻⣧⢻⣿⠀⡹⣿⣿⣿⣿⣿⣿⣿⣿⡆⠀⣠⣴⣤⣀⡀⠀⣀⠀⠀⣸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣦⡀⠀⠀⠀⠀⠀⠀⠀⠀⠻⡿⠂⢸⣿⣿⣿⣿⣷⠄⡀⠀⠀⠀⠀⠑⣾⣿⣿⢟⣕⢲⢇⣼⡈⠇⣿⡟⠀⠀⠀⠀⠀⠀⠀⠀⠀\n"
+        "                   ⣿⡇⣿⣿⣿⣿⣿⣿⣷⣿⣿⣿⣿⡈⢿⡀⣿⣾⣿⣿⣿⣿⣿⣿⣿⣿⣆⠙⣿⣿⣿⣿⡇⣴⣄⣰⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⣿⣿⣿⣿⡟⣰⣿⣦⠐⠀⠀⠀⠘⣿⣿⢬⢋⡞⣨⢫⢷⣄⣿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀\n"
+        "                   ⣿⡇⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡕⣌⢧⢻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣭⣿⣿⣧⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣸⣿⣿⣿⡿⣱⣿⣿⠃⣠⣾⣷⣶⣦⣽⣇⠿⡺⣱⣏⠺⢗⣿⠃⡤⢤⣤⡄⢶⣦⠰⣶⣄⠀\n"
+        "                   ⣿⡇⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠈⠈⡋⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠈⠉⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣿⣿⣿⡟⣱⣿⣿⠃⣴⣿⣿⣿⣿⣿⣿⣫⣾⣱⣿⣿⣯⣼⣧⢰⣧⢸⣿⣿⡄⠻⣷⡘⢿⡄\n"
+        "                   ⣿⡇⢻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⢀⠀⢷⣮⣻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠀⠀⠀⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣾⣿⣿⢟⣼⣿⠟⢡⣾⣿⣿⣿⣿⣿⡿⢃⢜⡱⣿⣿⣿⣷⠎⣠⣏⢻⡄⢿⣿⣷⡐⢌⡛⢮⡳\n"
+        "                   ⣿⡇⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠈⢄⠈⢻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣄⠠⣾⣿⣿⣶⣶⣦⠐⣂⠀⠀⣠⣾⣿⣿⢯⣟⣫⢅⣴⣿⣿⣿⣿⣿⣿⠟⣱⠏⡹⣛⣿⣿⣿⡏⢠⣝⡋⣚⡻⡘⣿⣿⣷⡘⢿⣶⣤\n"
+        "                   ⣿⣷⠘⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡄⠃⠠⠀⠙⠿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣾⣿⣿⣿⣿⣿⠞⣿⣧⣾⣿⣿⣿⣿⣿⠟⣡⣾⣿⣿⣿⣿⣿⡿⢋⣾⢫⣾⢵⣯⣿⣿⡟⢠⣿⠟⢞⡿⡃⣳⠘⣿⣿⣷⡈⢿⣿\n"
+        "                   ⣿⣿⠀⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣧⠘⠀⠀⠃⢀⠈⠻⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢟⣡⣾⣿⣿⣿⣿⣿⡿⢋⣴⢟⣵⣿⣿⡖⣤⡿⡟⢀⣿⣿⣷⣾⣿⣜⠿⡣⣘⡻⣿⣿⣄⠙\n"
+        "                   ⣿⣿⡆⠸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡆⢡⠀⠀⠀⠁⠀⠀⠉⠻⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡵⣿⣿⣿⣿⣿⣿⡿⢋⣴⠟⣱⣿⣿⣿⣿⣧⡟⡟⠀⠀⣿⣿⣿⣿⣏⣹⣿⣜⠿⣇⣩⣝⢿⣦\n"
+        "                   ⣿⣿⣧⠀⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡈⠀⠀⠀⠀⠄⢀⣤⣶⣄⡈⠛⠿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢛⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡷⠂⣠⣴⡤⣩⡴⢛⣥⣾⣿⣿⣿⣿⣿⣏⡸⡿⢂⠀⣿⣿⣿⣿⣿⣿⣿⣿⣏⣡⣙⣋⢸⣶\n"
+        "                   ⣿⣿⣿⡀⡘⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⡀⠀⢀⠂⣠⣿⣿⣿⣿⣿⣷⢠⡄⠉⠛⠿⣿⣿⣿⣿⣿⣭⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠋⣠⡾⠟⠵⣊⣥⣾⣿⣿⣿⣿⣿⣿⣿⢯⡟⠀⢴⣶⡄⠸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣭\n"
+        "                   ⣿⣿⣿⣧⠘⣢⡙⠻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⡀⠈⢰⣿⣿⣿⡏⣿⣿⣿⢸⠁⠀⠀⠀⠀⠈⠙⠛⠿⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠟⠋⢀⣤⣥⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⣳⠏⢀⠂⠈⢉⣬⡀⠙⢿⣿⠿⠿⠛⠛⠻⣿⣿⣿⣿⣿\n"
+        "                   ⢻⣿⣿⣿⣆⠩⢧⠑⠨⣙⠻⢿⣿⣿⣿⣿⣿⣿⣷⡄⢿⣿⣿⣿⢸⣿⣿⣿⠘⠀⠀⠀⠀⠀⠀⠀⠀⣤⣤⣤⣄⣉⣉⡙⠛⠛⠛⠛⠿⠿⠿⠿⠿⠿⠟⠛⠛⠛⠋⠉⠉⠀⢀⣴⣿⡿⣫⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣟⣽⠏⠀⠀⠀⡀⠌⠛⢃⣁⠀⠀⠀⠀⠀⠀⠀⠈⢿⣿⣿⣿\n"
+        "                   ⣌⠻⠿⣿⣿⣆⠩⣧⠀⠀⠁⠂⢬⠉⠛⠿⢿⣿⣿⣿⣎⠻⣿⡇⡾⠋⠙⢿⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⡿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠐⣰⣿⣿⣿⢖⣴⣿⡿⣫⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣫⣾⠏⠀⠐⠂⠁⠀⠀⠀⠙⠟⢁⣀⠀⠀⠀⠀⠀⠀⠘⣿⣿⣿\n"
+        "                   ⣿⣿⣷⣶⣭⣍⣃⠈⢷⡀⠄⣂⣴⣶⣦⣑⠲⢠⠈⣭⣍⣓⡙⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢹⣿⣿⣿⣿⣿⣿⠟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣰⣿⡿⢋⣵⣿⢟⣵⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢟⣵⣿⠏⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⠟⢁⣤⡀⠀⠀⠀⠀⠈⣉⡛\n"
+        "                   ⣿⣿⣿⣿⣿⣿⣿⣦⡀⠋⣾⣿⣿⣿⣿⠿⠃⣉⡀⣿⣿⣿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢿⣿⣿⣿⠟⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣰⠿⣋⣴⢟⢏⣴⣿⡿⣫⣿⣿⣿⣿⣿⣿⣿⣿⡿⣫⣾⣿⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠛⠃⢴⣶⠀⣠⣄⠉⣁\n"
+        "                   ⣿⣿⣿⣿⣿⣿⣿⣿⡿⣂⣽⣿⣷⡍⣥⣚⡛⠿⠇⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⢿⠟⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢘⡥⢞⣫⢔⣵⣿⢟⣭⣾⣿⣿⣿⣿⣿⣿⣿⣿⢋⣾⣿⡿⢃⣶⣦⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠁⠀⠙⠋⠀⠻\n"
+        "                   ⠻⣿⣿⣿⣿⣿⣿⣿⢸⣿⣿⣿⣿⠀⣿⣿⣿⣿⣶⣍⡛⠿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠂⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⡾⢽⡾⣋⣴⠿⣫⣵⣿⣿⣿⣿⣿⣿⣿⣿⣿⢟⣵⣿⣿⡿⠡⢿⣿⣿⣧⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\n"
+        "                   ⢷⣬⡛⢿⣿⣿⣿⣿⡎⢿⣿⣿⣿⡄⣿⣿⣿⣿⣿⣿⣿⣷⣦⡀⢀⡴⠂⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡤⢞⣫⣷⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢟⣵⣿⣿⣿⡟⣱⣿⣷⡝⣿⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\n"
+        "                   ⠀⠙⠻⢶⣬⡙⠛⠉⠀⠀⠈⠀⠀⠀⢿⣿⣿⣿⣿⣿⣿⣿⢏⣴⠏⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠑⠦⣄⡀⢠⣾⣷⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⢛⣵⣿⣿⣿⣿⠟⣰⣿⣿⣿⣷⣆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\n"
 
-        "\n\n                                                            启动成功啦！                                                              "
+        "\n\n\n"
+
+        "                                           ██╗           ██████╗      ██╗   ██╗      ██████╗      ███╗   ███╗      ██████╗ \n"
+        "                                           ██║          ██╔═══██╗     ██║   ██║     ██╔═══██╗     ████╗ ████║     ██╔═══██╗\n"
+        "                                           ██║          ██║   ██║     ██║   ██║     ██║   ██║     ██╔████╔██║     ██║   ██║\n"
+        "                                           ██║          ██║   ██║     ╚██╗ ██╔╝     ██║   ██║     ██║╚██╔╝██║     ██║   ██║\n"
+        "                                           ███████╗     ╚██████╔╝      ╚████╔╝      ╚██████╔╝     ██║ ╚═╝ ██║     ╚██████╔╝\n"
+        "                                           ╚══════╝      ╚═════╝        ╚═══╝        ╚═════╝      ╚═╝     ╚═╝      ╚═════╝ \n"
+
+
+        "\n\n                                                                            启动成功啦！                                                              "
     )
-    print("=" * 160)
+    print("=" * 180)
 
     """
     aSBsb3ZlIG11cmFzYW1l
@@ -7927,6 +9373,8 @@ async def main(stop_event: threading.Event = None):
     global_config = ConfigLoader()
     apply_log_max_size(global_config)
     global_emotion_manager = EmotionManager(global_config)
+    # 情绪模仿列表要按角色扫描参考音频目录，只有主程序有文件系统上下文，注入给提示词层
+    set_mimics_provider(get_role_mimics)
     if not global_emotion_manager.emotions:
         print("\n[警告] 未找到任何情绪配置（请检查 ref_audio_root 目录），将降级为纯文本模式。")
 
@@ -7952,6 +9400,7 @@ async def main(stop_event: threading.Event = None):
     tool_registry = ToolRegistry(global_config, memory_manager.data_path)
     profile_mgr = UserProfileManager(global_config, memory_manager.data_path)
     rag_mgr = RAGManager(global_config, memory_manager.data_path)
+    lexicon_mgr = LexiconManager(global_config, memory_manager.data_path)
     sender = MessageSender(global_config, memory_manager, sticker_mgr, stats_mgr)
     todo_mgr = TodoManager(global_config, db, scheduler, sender,
                            emotions_provider=get_active_emotions)
@@ -7959,7 +9408,7 @@ async def main(stop_event: threading.Event = None):
     todo_mgr.restore_pending()
     job_mgr = ScheduledJobManager(global_config, memory_manager.data_path, scheduler,
                                   sender, get_active_ctx, get_active_emotions,
-                                  list_known_sessions)
+                                  list_known_sessions, session_history_block)
     event_mgr = EventManager(global_config, memory_manager.data_path, profile_mgr)
 
     # 启动调度器与功能任务
@@ -8212,6 +9661,15 @@ if __name__ == "__main__":
         except Exception:
             pass
 
+    # 单实例判定放在等待之后：「重启 Lovomo」是旧进程退出、新进程才启动，
+    # 那时名额已经释放，不会被自己的上一世挡在门外。
+    if not _acquire_single_instance():
+        if _signal_existing_instance():
+            print("Lovomo 已在运行，已把它的窗口唤到前台。")
+        else:
+            print("Lovomo 已在运行，未重复启动。")
+        sys.exit(0)
+
     config = ConfigLoader()
 
     def run_backend():
@@ -8237,7 +9695,7 @@ if __name__ == "__main__":
     webui_port = int(config.get("webui_port", 11500))
 
     holder = {"window": None}
-    close_state = {"minimized": False, "quitting": False}
+    close_state = {"hidden": False, "quitting": False}
     tray_state = {"icon": None}
     # 唤醒（托盘/任务栏点开）期间暂停几何记录：这段窗口连续做
     # show/maximize/move/resize，事件回调读到的都是过渡态。
@@ -8270,7 +9728,7 @@ if __name__ == "__main__":
         w = holder["window"]
         if w is None:
             return
-        close_state["minimized"] = False
+        close_state["hidden"] = False
         _wake_geometry_guard()
         _raise_to_foreground(w)
         try:
@@ -8289,6 +9747,9 @@ if __name__ == "__main__":
         def _retry(win=w):
             try:
                 time.sleep(0.12)
+                # 这一拍里用户可能又把窗口收进托盘了，那就别再把它拉出来。
+                if close_state.get("hidden"):
+                    return
                 _raise_to_foreground(win)
             except Exception:
                 pass
@@ -8449,6 +9910,44 @@ if __name__ == "__main__":
 
     tray_ok = try_start_tray()
 
+    def _hide_to_tray(w) -> None:
+        """把窗口收进系统托盘：从屏幕和任务栏上一起消失，只留托盘图标。
+
+        隐藏动作必须延后一拍，不能在 on_closing 里直接做：WinForms 的关闭
+        序列会把在 FormClosing 期间改的窗口状态覆盖回去，表现出来就是
+        「偶尔没关干净、屏幕上还留一层窗口」。
+        """
+        if not tray_ok:
+            # 没有托盘图标就藏不得：窗口既不在屏幕上也不在任务栏里，用户就
+            # 再也叫不回来了。退化成最小化，至少留一个任务栏入口。
+            close_state["hidden"] = False
+        else:
+            close_state["hidden"] = True
+
+        def _do():
+            if tray_ok:
+                # 藏完还要校验一次：隐藏可能被系统动画或并发的唤醒动作吞掉，
+                # 没藏住就再补一次。
+                for _ in range(2):
+                    try:
+                        w.hide()
+                    except Exception:
+                        pass
+                    time.sleep(0.05)
+                    if not _window_visible(w):
+                        break
+            else:
+                try:
+                    w.minimize()
+                except Exception:
+                    pass
+            try:
+                _finish_geometry_save()
+            except Exception:
+                pass
+
+        threading.Thread(target=_do, daemon=True).start()
+
     def on_closing():
         """窗口关闭事件的唯一入口。
 
@@ -8460,13 +9959,8 @@ if __name__ == "__main__":
           放行，让关闭真的发生。**这里返回 False 是非常危险的** ——
           pywebview 的 Event.set() 只要收到一个 False 就判定取消关闭，
           于是"销毁窗口"变成"什么都没发生"，进程卡住不退出。
-        · 用户点右上角 ×：按产品约定不是退出，而是最小化到任务栏。
-          返回 False 取消这次关闭，由我们手工 minimize()。
-
-        为什么必须最小化而不是 pywebview 的 hide()：WinForms 的 Form.Hide()
-        会把窗口从任务栏一并摘掉（ShowInTaskbar 视觉上等于 False），于是
-        "点任务栏图标把窗口叫回来"这条路径根本不存在，用户只能想起来点托盘
-        —— 这是"任务栏点不开窗口"的第一层原因。minimize() 则保留任务栏图标。
+        · 用户点右上角 ×：按产品约定不是退出，而是收进系统托盘。
+          返回 False 取消这次关闭，再交给 _hide_to_tray 把窗口藏起来。
 
         退出本身一律走 request_quit()（托盘菜单）或 quit_app()，它们在
         destroy 之前会先把 quitting 立起来，所以不会在这里被拦下。
@@ -8474,23 +9968,11 @@ if __name__ == "__main__":
         if close_state.get("quitting"):
             return None
         w = holder["window"]
-        # 窗口一旦 hide/destroy 就读不到几何了，先抓一次再动手。
+        # 窗口一旦隐藏/销毁就读不到几何了，先抓一次再动手。
         if w is not None:
             _capture_geometry(w)
             _finalize_geometry(w)
-        if close_state.get("minimized"):
-            # 已经在最小化了，不要再反复 minimize（会打断还原动画）
-            return None
-        if w is not None:
-            try:
-                w.minimize()
-                close_state["minimized"] = True
-            except Exception:
-                pass
-            try:
-                _finish_geometry_save()
-            except Exception:
-                pass
+            _hide_to_tray(w)
         return False
 
     def _finalize_geometry(w) -> None:
@@ -8537,6 +10019,11 @@ if __name__ == "__main__":
         —— 这正是我们想要的行为。
         """
         if w is None:
+            return
+        if not _window_visible(w):
+            # 窗口已经收进托盘了：隐藏窗口的 GetWindowPlacement 不报告正常状态，
+            # 这时读到的几何没有意义（最大化过的窗口会读到全屏尺寸），
+            # 记下来只会把记忆弄脏。
             return
         try:
             state = _window_state_name(w)
@@ -8671,6 +10158,16 @@ if __name__ == "__main__":
             print(f"绑定窗口关闭事件失败，关闭将直接退出: {e}")
         _bind_geometry_events(w)
 
+        def _wake_from_system():
+            """窗口被系统激活（点任务栏图标 / 从任务栏还原）时补一次抢前台。
+
+            已经收进托盘时什么都不做 —— 那时窗口本该是隐藏的，把它拉出来
+            就成了"关掉之后又冒出一层窗口"。
+            """
+            if close_state.get("hidden"):
+                return
+            open_console()
+
         def _install_foreground_hook(*_args, **_kwargs):
             """窗口首次显示后装任务栏唤醒钩子。
 
@@ -8681,7 +10178,7 @@ if __name__ == "__main__":
             def _do():
                 time.sleep(0.3)
                 ok = _install_taskbar_activate_hook(
-                    w, on_activate=lambda win: open_console())
+                    w, on_activate=lambda win: _wake_from_system())
                 if ok:
                     print("[窗口] 已启用任务栏唤醒置顶")
             threading.Thread(target=_do, daemon=True).start()
@@ -8690,6 +10187,8 @@ if __name__ == "__main__":
             w.events.shown += _install_foreground_hook
         except Exception as e:
             print(f"绑定窗口显示事件失败（任务栏唤醒钩子未安装）: {e}")
+        # 窗口和 open_console 都就绪了，开始监听"又有人双击了 exe"。
+        _start_instance_show_waiter(open_console)
         # 这里刻意不做启动后再 apply 几何的操作。
         #
         # 曾经加过一个 events.loaded + Timer(0.6) 的兜底，想把历史脏几何纠正
@@ -8701,7 +10200,8 @@ if __name__ == "__main__":
         # 正确策略：几何只在 create_window 时决定一次（上面已经算好了正确值），
         # 之后只「观察」不「干预」。历史脏数据由 _load_window_geometry 的版本
         # 校验和 _sanitize_normal_geometry 负责清理，不需要事后补救。
-        webview.start()
+        webview.start(private_mode=False,
+                      storage_path=_webview_profile_dir() or None)
         icon = tray_state.get("icon")
         if icon is not None:
             try:
