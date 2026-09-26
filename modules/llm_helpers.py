@@ -3941,7 +3941,7 @@ async def get_image_reply(ctx: RoleContext, user_text: str, history: list,
                 "temperature": _cfg_num(ctx, "temperature", 0.7),
                 "max_tokens": 1024
             }
-            api_key = ctx.get("llm_api_key", "")
+            api_key = ctx.get("image_caption_api_key", "") or ctx.get("llm_api_key", "")
             headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         async with httpx.AsyncClient(timeout=timeout, verify=verified_context()) as client:
             resp = await client.post(endpoint, json=payload, headers=headers)

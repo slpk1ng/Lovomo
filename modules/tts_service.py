@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 import httpx
 
 from .tls import verified_context
+from .tts_cloud import is_cloud_tts
 
 
 def no_window_kwargs() -> dict:
@@ -364,6 +365,10 @@ _tts_started_flag = False
 
 
 async def check_tts_service(config) -> bool:
+    if is_cloud_tts(config):
+        # 云端合成不经过本地服务，端口探测只会把「本机没起 GPT-SoVITS」误判成
+        # 未就绪，进而挡掉自动启动与语音发送
+        return True
     base_url = config.get("client_base_url", "http://127.0.0.1:9880")
     try:
         async with httpx.AsyncClient(timeout=2, trust_env=False,

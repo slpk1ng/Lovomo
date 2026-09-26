@@ -252,11 +252,15 @@ def _content_chars(text: str) -> str:
     return re.sub(r'[\W_]+', '', str(text or ""), flags=re.UNICODE)
 
 
-def _log_tts_payload(config, original: str, clean_text: str, emotion: str, ref_path: str):
+def _log_tts_payload(config, original: str, clean_text: str, emotion: str, ref_path: str,
+                     cloud: bool = False):
     """打印"LLM 交过来的完整内容 → 实际送去合成的文本"，便于排查少词问题。
 
     只要合成文本长度与原文不同（含只剩装饰符号被去掉的情况），就打印两边完整内容，
     这样"语音少词"的排查可以只看日志定位；内容与长度都没变时不刷屏。
+
+    cloud=True 时不打印参考音频、文本语言、切分、语速这几项：它们是 GPT-SoVITS 的
+    请求参数，云端请求里没有，打出来会让人误以为它们被送进了云端接口。
     """
     debug = str((config.get("tts_debug_log", "") if config is not None else "") or "").lower() \
         in ("true", "1", "yes", "on")
@@ -275,10 +279,13 @@ def _log_tts_payload(config, original: str, clean_text: str, emotion: str, ref_p
         _safe_print(f"TTS 说明：仅去掉了装饰符号，内容字未变"
                     f"（{_content_chars(original)!r}）")
     if debug:
-        _safe_print(f"TTS 详细参数: 情绪={emotion} 参考音频={ref_path} "
-                    f"text_lang={config.get('text_lang')} "
-                    f"split={config.get('text_split_method')} "
-                    f"speed={config.get('speed_factor')} 字符数={len(clean_text)}")
+        if cloud:
+            _safe_print(f"TTS 详细参数(云): 音色={ref_path} 字符数={len(clean_text)}")
+        else:
+            _safe_print(f"TTS 详细参数: 情绪={emotion} 参考音频={ref_path} "
+                        f"text_lang={config.get('text_lang')} "
+                        f"split={config.get('text_split_method')} "
+                        f"speed={config.get('speed_factor')} 字符数={len(clean_text)}")
 
 
 def _sanitize_tts_text(text: str, emotion: str = "", log: bool = True,
@@ -478,6 +485,8 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
     模型合成出无法辨认的语音；合成结果过短时按备用切分方式重试，
     仍然拿不到可用音频就返回 None（调用方只发文本），绝不把半截语音发出去。
 
+    tts_backend=cloud 时整句交给 modules.tts_cloud（云端不看参考音频与情绪表）。
+
     mimic 命中 mimics 时启用情绪模仿：情绪音频当主参考决定说话情绪，
     语气音频当辅助参考（按 emotion_mimic_voice_weight 重复加权）决定音色。
     """
@@ -494,6 +503,10 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
         _safe_print(f"TTS arg order looks swapped (text={text!r}, emotion={emotion!r}); "
                     "auto-corrected.")
         text, emotion = emotion, text
+    from .tts_cloud import is_cloud_tts, synthesize_cloud
+    if is_cloud_tts(config):
+        # 云端不需要参考音频，情绪只用来查音色映射，因此不校验它是否在情绪表里
+        return await synthesize_cloud(config, text, emotion, data_path, stats=stats)
     default_voice = str(config.get("default_voice", "pingjing") or "pingjing")
     if emotion not in emotions:
         if emotion and emotion != default_voice:

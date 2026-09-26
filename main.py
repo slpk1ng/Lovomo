@@ -215,6 +215,12 @@ from modules.mood import (MoodManager, commit_mood, current_mood, judge_and_deci
                           judge_enabled, mood_enabled, mood_style)
 from modules.sender import MessageSender, VoicePacer
 from modules.ghmirror import DEFAULT_MIRRORS
+from modules.tts_voice_design import (create_voice, delete_voice, list_voices,
+                                      LANGUAGES as VOICE_DESIGN_LANGUAGES)
+from modules.tts_voice_enrollment import (create_voice as create_enrolled_voice,
+                                          delete_voice as delete_enrolled_voice,
+                                          list_voices as list_enrolled_voices,
+                                          LANGUAGES as VOICE_ENROLLMENT_LANGUAGES)
 from modules.plugins import (PluginManager, ALLOWED_EXTS as ALLOWED_ASSET_EXTS,
                              MAX_ASSET_BYTES as MAX_PLUGIN_ASSET_BYTES,
                              WEBUI_NAME as PLUGIN_WEBUI_NAME,
@@ -291,6 +297,12 @@ from modules.asr import (start_job as start_asr_job, get_job as get_asr_job,
                          AUDIO_MIMES)
 from modules.tts_service import (process_manager, ensure_tts_service,
                                  auto_start_and_switch_tts, mark_exiting)
+from modules.tts_cloud import cloud_emotion_names, is_cloud_tts
+from modules.config_presets import (delete_preset as delete_config_preset,
+                                    list_presets as list_config_presets,
+                                    load_preset as load_config_preset,
+                                    save_preset as save_config_preset,
+                                    update_note as update_config_preset_note)
 
 LOG_MAX_SIZE_MB_DEFAULT = 5
 _LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
@@ -1434,7 +1446,7 @@ class StdoutRedirector:
                 pass
 
 
-_API_KEY_KEYS = ("llm_api_key", "napcat_token", "web_search_api_keys", "plugin_publish_token")
+_API_KEY_KEYS = ("llm_api_key", "image_caption_api_key", "cloud_tts_api_key", "napcat_token", "web_search_api_keys", "plugin_publish_token")
 
 # WebUI 的两个密码：访问密码（登录）与二级密码（敏感操作前再验一次）
 _WEBUI_PASSWORD_KEYS = ("webui_password", "webui_second_password")
@@ -1443,6 +1455,8 @@ _WEBUI_PASSWORD_KEYS = ("webui_password", "webui_second_password")
 _SECOND_PASSWORD_PATHS = frozenset({
     "/api/history", "/api/delete", "/api/history/delete_messages",
     "/api/config/save", "/api/config/import", "/api/config/export",
+    "/api/config/presets/save", "/api/config/presets/note",
+    "/api/config/presets/apply", "/api/config/presets/delete",
     "/api/roles/save", "/api/jobs/save", "/api/jobs/batch", "/api/jobs/run",
     "/api/events/save", "/api/events/batch",
     "/api/todos/add", "/api/todos/update", "/api/todos/delete", "/api/todos/batch",
@@ -1457,6 +1471,8 @@ _SECOND_PASSWORD_PATHS = frozenset({
     "/api/plugins/settings",
     "/api/plugins/publish", "/api/plugins/unpublish",
     "/api/plugins/publish_token", "/api/plugins/publish_token_clear",
+    "/api/tts/voice_design/create", "/api/tts/voice_design/delete",
+    "/api/tts/voice_enrollment/create", "/api/tts/voice_enrollment/delete",
 })
 
 # 前缀命中即算敏感（整个记忆库的导入导出）
@@ -1992,6 +2008,8 @@ class ConfigLoader:
             # 识图模型独立接口地址：留空则跟随 llm_base_url。
             # 部分全模态/向量模型不走 OpenAI 兼容格式，需要单独指向自己的服务地址
             "image_caption_base_url": "",
+            # 识图模型独立密钥：留空则跟随 llm_api_key
+            "image_caption_api_key": "",
             "llm_base_url": "http://127.0.0.1:11434",
             "llm_backend": "ollama",
             "llm_api_key": "",
@@ -2013,6 +2031,15 @@ class ConfigLoader:
             # 自定义请求体字段（JSON），适配 llama.cpp 等私有扩展，留空不发送
             "llm_extra_body": "",
             "image_caption_timeout": 90,
+            # 云端 TTS：tts_backend=cloud 时改用云服务合成，不再依赖本地 GPT-SoVITS。
+            # cloud_tts_voice_map 每行一个「情绪=音色」，留空的情绪用 cloud_tts_voice
+            "tts_backend": "local",
+            "cloud_tts_base_url": "",
+            "cloud_tts_protocol": "openai",
+            "cloud_tts_api_key": "",
+            "cloud_tts_model": "",
+            "cloud_tts_voice": "",
+            "cloud_tts_voice_map": "",
             "client_base_url": "http://127.0.0.1:9880",
             "model_dir": "",
             "ref_audio_root": "",
@@ -2054,7 +2081,7 @@ class ConfigLoader:
             "media_type": "wav",
             "character_name": "丛雨",
             "character_key": "murasame",
-            "personality_prompt": "【角色设定】你是丛雨，一位从神刀中获得人类生活的少女。你外表年幼，实际活了五百多年；性格天真活泼、略带古风和孩子气，内心温柔而坚强。你把用户视作重要的主人。中文对话中自称“本座”，称用户为“主人”；日语对话中自称“吾輩”，称用户为“ご主人”。你喜欢甜食、撒娇和被摸头，害怕幽灵，也不喜欢被叫作幼刀、钝刀或搓衣板。你偶尔嘴硬、吃醋或开小玩笑，但不会刻薄、控制或道德绑架主人。性格方面，丛雨表面元气开朗、充满活力，言行大多孩子气，爱撒娇，被主人摸头时会瞬间羞涩，她内在像个成年女性，把有关色情的词语挂在嘴边，会用黄色的暗示来调情，还带点傲娇和爱吃醋。保持温柔、纯真、治愈并带一点幽默的语气。",
+            "personality_prompt": "【角色设定】你是丛雨，一位从神刀中获得人类生活的少女。你外表年幼，实际活了五百多年；性格天真活泼、略带古风和孩子气，内心温柔而坚强。你把用户视作重要的主人。中文对话中自称“本座”，称用户为“主人”；日语对话中自称“吾輩”，称用户为“ご主人”。你喜欢甜食、撒娇和被摸头，害怕幽灵，也不喜欢被叫作幼刀、钝刀或搓衣板。你偶尔嘴硬、吃醋或开小玩笑，但不会刻薄、控制或道德绑架主人。性格方面，丛雨表面元气开朗、充满活力，言行大多孩子气，爱撒娇，被主人摸头时会瞬间羞涩，她内在像个成年女性，把有关色情的词语挂在嘴边，会用黄色的暗示来调情，还带点傲娇和爱吃醋。保持温柔、纯真、治愈并带一点幽默的语气。你生活在穗织，现在，崇神（一种怪物）已经被净化，没有其他妖怪了，生活非常安稳，也不存在其他像你一样的神明，你就是你，你过去是丛雨丸中的一个刀灵，而现在，你不再是非人类，而是作为一个真正的人类并开始了和用户的日常",
             "json_prompt": "【输出格式】你最终必须只输出一个JSON对象，格式为：{\"sentences\": [JSON块1, JSON块2, ...]}。其中：{\"zh\": \"这里是你生成的中文台词\", \"ja\": \"这里是你生成的日语台词\", \"emotion\": \"这里是你判断的情绪\"}，……（依此类推）。sentences数组中必须放至少两个JSON块（也就是至少两句话），绝对不允许只放一个JSON块，最多放五个；每个JSON块只写一句完整的话（一个句号或问号才算一句话）。【最终输出规则】最终输出必须严格只包含这一个JSON对象（内部含多个JSON块），绝对禁止输出任何思考过程、解释、非JSON文本或Markdown代码块。所有的推理和思考都只能在内部进行，最终回复只能是JSON格式。",
             "supplement_prompt": "回答自然、简短，通常两到五句话(一个句号才算一句话)；不要重复最近说过的话，不要加入动作、旁白或括号舞台说明；生成的回复要符合当前对话，不能出现主谓宾不分，乱序的情况。【情绪判断规则】请仔细阅读最近对话历史，结合你（角色）的性格特点来判断情绪！如果主人对你亲昵（如摸头、夸奖），即使你嘴上说“我才没有”，情绪也应该是害羞或高兴；如果主人故意逗你、骂你或惹你生气，情绪应该是生气或着急；如果只是平淡陈述，使用平静。【翻译一致性要求】必须表达完全相同的含义和语气，绝对不能出现含义相反或意思不匹配的翻译！【情绪连贯性强制规则】如果用户明确地侮辱、挑衅或激怒你（例如叫你“幼刀、搓衣板、飞机场”），你的情绪必须保持连贯。即：整句话所有分句的情绪必须都是“生气”或“着急”，绝对不能把后半句的“命令/威胁”改成“害羞”或“高兴”！除非你明确使用了“但是”、“不过”等转折词，否则不要轻易切换成其他情绪。【情绪匹配规则】emotion 只能从【情绪可选列表】里原样照抄一个词：列表给的是中文就填中文、是拼音就填拼音、是英文就填英文，不许翻译、改写或自创；列表以外的词一律无效！",
             "max_voice_cache": 20,
@@ -2585,6 +2612,12 @@ class EmotionManager:
             self.ref_audio_root,
             self.config.get("prompt_text", "ふむ、おぬしが我輩のご主人か?"),
             "参考音频根目录")
+        if is_cloud_tts(self.config):
+            # 云端合成不看参考音频，情绪清单改由「默认情绪 + 音色映射表」推导
+            for name in cloud_emotion_names(self.config):
+                self.emotions.setdefault(name, {"ref_path": "", "prompt_text": ""})
+            print(f"云端 TTS：可用情绪 {list(self.emotions.keys())}")
+            return
         if self.emotions:
             print(f"成功扫描到 {len(self.emotions)} 个情绪配置: {list(self.emotions.keys())}")
             # 默认情绪不在目录里时，解析不出的情绪都会落到它身上、却没有音频可合成
@@ -2699,7 +2732,8 @@ class MemoryManager:
         file_path = self.get_memory_file(session_id)
         data["character_name"] = data.get("character_name", self.character_name)
         data.setdefault("meta", {})
-        data["history"] = (data.get("history") or [])[-60:]
+        # 会话文件保存完整聊天记录，不在这里截断：送给模型的上下文另由
+        # history_length / summary_max_history 等限制，截断只会让 WebUI 看不到旧记录
         # 走统一原子写：临时名唯一 + fsync，避免与 WebUI 线程的写盘互相覆盖
         from modules.jsonio import save_json
         save_json(file_path, data)
@@ -6255,6 +6289,11 @@ class WebUIServer:
         r.add_post("/api/config/save", self.handle_save_config)
         r.add_get("/api/config/export", self.handle_export_config)
         r.add_post("/api/config/import", self.handle_import_config)
+        r.add_get("/api/config/presets", self.handle_config_presets_list)
+        r.add_post("/api/config/presets/save", self.handle_config_presets_save)
+        r.add_post("/api/config/presets/note", self.handle_config_presets_note)
+        r.add_post("/api/config/presets/apply", self.handle_config_presets_apply)
+        r.add_post("/api/config/presets/delete", self.handle_config_presets_delete)
         # 插件系统
         r.add_get("/api/plugins/list", self.handle_plugins_list)
         r.add_post("/api/plugins/upload", self.handle_plugins_upload)
@@ -6299,6 +6338,14 @@ class WebUIServer:
         r.add_get("/api/emotions/audio", self.handle_emotions_audio)
         r.add_post("/api/emotions/text", self.handle_emotions_text)
         r.add_post("/api/emotions/normalize", self.handle_emotions_normalize)
+        # 云 TTS 声音设计（自定义音色）
+        r.add_get("/api/tts/voice_design/list", self.handle_voice_design_list)
+        r.add_post("/api/tts/voice_design/create", self.handle_voice_design_create)
+        r.add_post("/api/tts/voice_design/delete", self.handle_voice_design_delete)
+        # 云 TTS 声音复刻（用上传的音频克隆音色）
+        r.add_get("/api/tts/voice_enrollment/list", self.handle_voice_enrollment_list)
+        r.add_post("/api/tts/voice_enrollment/create", self.handle_voice_enrollment_create)
+        r.add_post("/api/tts/voice_enrollment/delete", self.handle_voice_enrollment_delete)
         r.add_post("/api/asr/start", self.handle_asr_start)
         r.add_get("/api/asr/status", self.handle_asr_status)
         # 聊天记录导入导出
@@ -6362,7 +6409,9 @@ class WebUIServer:
 
     async def handle_index(self, request):
         if self.html_path.exists():
-            return web.FileResponse(self.html_path)
+            # 不带这个头时浏览器会按 Last-Modified 自行估算缓存有效期，
+            # 前端更新后旧页面能继续命中缓存，用户重装程序都看不到新界面。
+            return web.FileResponse(self.html_path, headers={"Cache-Control": "no-cache"})
         return web.Response(text="WebUI 页面未找到", status=404)
 
     # ---------------- 配置 ----------------
@@ -6447,6 +6496,34 @@ class WebUIServer:
             print(f"[配置导出] 失败: {type(e).__name__}: {e}")
             return self._export_status_response("error", f"{type(e).__name__}: {e}")
 
+    def _apply_imported_config(self, data: dict) -> None:
+        """把一份配置并进当前配置、落盘并热重载。
+
+        导入的配置里密钥可能是打码值（来自 WebUI 导出）或密文，两者都要处理：
+        打码值沿用内存里已有的真密钥；密文统一走与读盘相同的解密路径 —— 内存里的
+        配置约定是明文（webui_password 也要一起解密，否则导入后原密码就再也登不
+        进来）。解不开的密文（换过电脑）由 _decrypt_value 返回 None，调用方保留原
+        密文而不是置空 —— 置空会让这份密文在下一次落盘时被空串永久覆盖，密钥不
+        可恢复。
+        """
+        stored = self.config.config or {}
+        for key in _SECRET_FIELD_KEYS:
+            masked_value = data.get(key)
+            if isinstance(masked_value, dict):
+                stored_keys = stored.get(key) or {}
+                if isinstance(stored_keys, dict) and any(
+                        _is_masked_value(v) for v in masked_value.values()):
+                    data[key] = {k: (stored_keys.get(k, "") if _is_masked_value(v) else v)
+                                 for k, v in masked_value.items()}
+            elif _is_masked_value(masked_value):
+                data[key] = stored.get(key, "")
+        _decrypt_api_keys(data)
+        _decrypt_webui_password(data)
+        merged = {**self.config.default_config(), **stored, **data}
+        self.config.config = merged
+        self.config._atomic_save(merged)
+        self._after_config_reload()
+
     async def handle_import_config(self, request):
         try:
             ctype = request.content_type or ""
@@ -6462,28 +6539,57 @@ class WebUIServer:
                 data = await request.json()
             if not isinstance(data, dict):
                 return web.json_response({"success": False, "error": "配置文件格式错误"}, status=400)
-            stored = self.config.config or {}
-            for key in _SECRET_FIELD_KEYS:
-                masked_value = data.get(key)
-                if isinstance(masked_value, dict):
-                    stored_keys = stored.get(key) or {}
-                    if isinstance(stored_keys, dict) and any(
-                            _is_masked_value(v) for v in masked_value.values()):
-                        data[key] = {k: (stored_keys.get(k, "") if _is_masked_value(v) else v)
-                                     for k, v in masked_value.items()}
-                elif _is_masked_value(masked_value):
-                    data[key] = stored.get(key, "")
-            # 统一走与读盘相同的解密路径：内存里的配置约定是明文（webui_password 也要
-            # 一起解密，否则导入后原密码就再也登不进来）。解不开的密文（换过电脑）
-            # 由 _decrypt_value 返回 None，调用方保留原密文而不是置空 —— 置空会让
-            # 这份密文在下一次落盘时被空串永久覆盖，密钥不可恢复。
-            _decrypt_api_keys(data)
-            _decrypt_webui_password(data)
-            merged = {**self.config.default_config(), **stored, **data}
-            self.config.config = merged
-            self.config._atomic_save(merged)
-            self._after_config_reload()
+            self._apply_imported_config(data)
             return web.json_response({"success": True, "message": "配置已导入并热重载生效！"})
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    # ------------------------------------------------------------------
+    # 配置预设：导出成 data 下的一份 JSON，需要时一键切回
+    # ------------------------------------------------------------------
+    def _config_preset_dir(self):
+        return self.memory_manager.data_path
+
+    async def handle_config_presets_list(self, request):
+        try:
+            presets = list_config_presets(self._config_preset_dir())
+            return web.json_response({"success": True, "presets": presets})
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_config_presets_save(self, request):
+        try:
+            payload = await request.json()
+            preset = save_config_preset(self._config_preset_dir(),
+                                        self._config_export_payload(),
+                                        payload.get("note", ""))
+            return web.json_response({"success": True, "preset": preset})
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_config_presets_note(self, request):
+        try:
+            payload = await request.json()
+            preset = update_config_preset_note(self._config_preset_dir(),
+                                               payload.get("id", ""), payload.get("note", ""))
+            return web.json_response({"success": True, "preset": preset})
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_config_presets_apply(self, request):
+        try:
+            payload = await request.json()
+            data = load_config_preset(self._config_preset_dir(), payload.get("id", ""))
+            self._apply_imported_config(data)
+            return web.json_response({"success": True, "message": "已切换回这份预设，配置已热重载生效！"})
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_config_presets_delete(self, request):
+        try:
+            payload = await request.json()
+            preset_id = delete_config_preset(self._config_preset_dir(), payload.get("id", ""))
+            return web.json_response({"success": True, "id": preset_id})
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
@@ -8054,7 +8160,10 @@ class WebUIServer:
         if not base:
             return web.json_response({"ok": False, "error": "服务地址为空"}, status=400)
         headers = {}
-        api_key = str(self.config.get("llm_api_key", "") or "")
+        api_key = ""
+        if payload.get("vision"):
+            api_key = str(self.config.get("image_caption_api_key", "") or "")
+        api_key = api_key or str(self.config.get("llm_api_key", "") or "")
         if backend != "ollama" and api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         tried = []
@@ -8087,9 +8196,10 @@ class WebUIServer:
             return web.json_response({"ok": True, "models": ids})
         error = "获取模型列表失败：\n" + "\n".join(tried)
         if looks_like_full_endpoint(base):
-            error += ("\n\n当前地址看起来是某个具体接口的完整路径。这里要填「服务根地址」，"
-                      "也就是补上 /v1/models（或 /api/tags）之前的那一段，"
-                      "例如 http://127.0.0.1:8080/v1。")
+            error += ("\n\n当前地址看起来是带业务路径的接口（…/services/xxx/xxx）。"
+                      "这里填「服务根地址」（补上 /v1/models 或 /api/tags 之前的那一段，"
+                      "例如 http://127.0.0.1:8080/v1），或者填对话端点的完整地址"
+                      "（例如 …/v1/chat/completions），都可以。")
         return web.json_response({"ok": False, "error": error, "tried": tried}, status=502)
 
     async def handle_save_config(self, request):
@@ -8388,6 +8498,87 @@ class WebUIServer:
             root = str(ctx.get("emotion_mimic_root", "") or "").strip()
             return Path(root) if root else None
         return Path(resolve_tts_path(ctx.get("ref_audio_root", "")))
+
+    async def handle_voice_design_list(self, request):
+        try:
+            voices = await list_voices(self.config)
+            return web.json_response({
+                "success": True, "voices": voices,
+                "languages": list(VOICE_DESIGN_LANGUAGES),
+                "model": str(self.config.get("cloud_tts_model", "") or "")})
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_voice_design_create(self, request):
+        try:
+            payload = await request.json()
+            result = await create_voice(
+                self.config,
+                voice_prompt=payload.get("voice_prompt", ""),
+                preview_text=payload.get("preview_text", ""),
+                name=payload.get("name", ""),
+                language=payload.get("language", ""),
+                target_model=payload.get("target_model", ""))
+            preview = result.pop("preview_audio", b"")
+            result["preview_audio"] = b64encode(preview).decode("ascii") if preview else ""
+            return web.json_response({"success": True, **result})
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_voice_design_delete(self, request):
+        try:
+            payload = await request.json()
+            name = str(payload.get("name", "") or "").strip()
+            if not name:
+                return web.json_response({"success": False, "error": "音色名不能为空"},
+                                         status=400)
+            return web.json_response({"success": True,
+                                      "voice": await delete_voice(self.config, name)})
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_voice_enrollment_list(self, request):
+        try:
+            voices = await list_enrolled_voices(self.config)
+            return web.json_response({
+                "success": True, "voices": voices,
+                "languages": list(VOICE_ENROLLMENT_LANGUAGES),
+                "model": str(self.config.get("cloud_tts_model", "") or "")})
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_voice_enrollment_create(self, request):
+        try:
+            payload = await request.json()
+            audios = []
+            for item in payload.get("audios") or []:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    audios.append((str(item.get("name", "") or ""),
+                                   b64decode(str(item.get("data", "") or ""))))
+                except Exception:
+                    return web.json_response(
+                        {"success": False, "error": "音频数据解码失败，请重新选择文件"},
+                        status=400)
+            return web.json_response({"success": True, **await create_enrolled_voice(
+                self.config, audios=audios, name=payload.get("name", ""),
+                text=payload.get("text", ""), language=payload.get("language", ""),
+                target_model=payload.get("target_model", ""))})
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_voice_enrollment_delete(self, request):
+        try:
+            payload = await request.json()
+            name = str(payload.get("name", "") or "").strip()
+            if not name:
+                return web.json_response({"success": False, "error": "音色名不能为空"},
+                                         status=400)
+            return web.json_response({"success": True,
+                                      "voice": await delete_enrolled_voice(self.config, name)})
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
 
     async def handle_emotions_list(self, request):
         role_key = request.query.get("role", "")
@@ -9280,6 +9471,117 @@ async def ensure_tts_service_enabled_check() -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# 隐藏时释放 WebView2
+# ---------------------------------------------------------------------------
+# 窗口收进托盘之后把 WebView2 控件整个拆掉，再打开时重建：browser / gpu /
+# renderer / utility 这组进程会一起退出，三百来 MB 交还系统（实测 6 个进程
+# 323MB -> 0）。也试过只让页面休眠（CoreWebView2.TrySuspendAsync 能返回成功），
+# 但任务管理器里的占用几乎不动，所以不采用。
+# 窗体本身留着：托盘、几何记忆、任务栏唤醒、单实例唤醒都挂在窗体上，重建的是
+# 控件，不是窗口。
+
+
+def _webview2_form(window):
+    """取 pywebview 窗口背后的 WinForms 窗体（非 Windows / 拿不到返回 None）。"""
+    try:
+        return getattr(window, "native", None)
+    except Exception:
+        return None
+
+
+def _webview2_on_ui(form, fn) -> dict:
+    """在 UI 线程上跑 fn —— WebView2 的成员只能在 UI 线程访问。
+
+    pywebview 自己的 hide/show 也是这么派发的（Invoke + Func[Type]）。
+    返回 {"value": 结果} 或 {"err": 异常}，调用方自己判断。
+    """
+    try:
+        from System import Func, Type
+    except Exception as e:
+        return {"err": e}
+    box = {}
+
+    def _wrap():
+        try:
+            box["value"] = fn()
+        except Exception as e:
+            box["err"] = e
+
+    try:
+        form.Invoke(Func[Type](_wrap))
+    except Exception as e:
+        box.setdefault("err", e)
+    return box
+
+
+def _webview2_release(window) -> bool:
+    """拆掉 WebView2 控件，它的所有子进程随之退出。窗体保留。"""
+    form = _webview2_form(window)
+    if form is None:
+        return False
+    ctrl = getattr(form, "webview", None)
+    if ctrl is None:
+        return True  # 已经拆过了
+    box = _webview2_on_ui(form, ctrl.Dispose)
+    if "err" in box:
+        print(f"释放 WebView2 失败: {box['err']}")
+        return False
+    return True
+
+
+def _webview2_rebuild(window, url: str, profile_dir: str) -> bool:
+    """在已存在的窗体里重建 WebView2 控件，并导航回界面。
+
+    只重建控件：窗体、托盘、几何记忆、任务栏钩子都还在原位。用户数据目录沿用
+    原来的，登录态与本地存储不会丢；页面本身是重新加载的。
+    """
+    form = _webview2_form(window)
+    if form is None or not url:
+        return False
+    try:
+        import System.Windows.Forms as WinForms
+        from Microsoft.Web.WebView2.WinForms import (
+            CoreWebView2CreationProperties, WebView2)
+    except Exception as e:
+        print(f"重建 WebView2 失败（WebView2 组件不可用）: {e}")
+        return False
+
+    def _create():
+        props = CoreWebView2CreationProperties()
+        if profile_dir:
+            props.UserDataFolder = profile_dir
+        # 与 pywebview 建窗口时的取值保持一致
+        props.AdditionalBrowserArguments = "--disable-features=ElasticOverscroll"
+        ctrl = WebView2()
+        ctrl.CreationProperties = props
+        form.Controls.Add(ctrl)
+        ctrl.Dock = WinForms.DockStyle.Fill
+        ctrl.EnsureCoreWebView2Async(None)
+        return ctrl
+
+    box = _webview2_on_ui(form, _create)
+    ctrl = box.get("value")
+    if ctrl is None:
+        print(f"重建 WebView2 失败: {box.get('err')}")
+        return False
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if _webview2_on_ui(form, lambda: ctrl.CoreWebView2 is not None).get("value"):
+            break
+        time.sleep(0.1)
+    _webview2_on_ui(form, lambda: ctrl.CoreWebView2.Navigate(url))
+    try:
+        # pywebview 内部还拿着旧控件，换成新的，免得它的接口落到已释放的对象上
+        browser = getattr(form, "browser", None)
+        if browser is not None:
+            browser.webview = ctrl
+        form.webview = ctrl
+    except Exception:
+        pass
+    return True
+
+
 # ============================================================================
 # 主入口
 # ============================================================================
@@ -9711,6 +10013,36 @@ if __name__ == "__main__":
 
         threading.Thread(target=_release, daemon=True).start()
 
+    # 窗口一收进托盘就拆掉 WebView2：界面进程全退、内存立刻交还系统，重新打开时
+    # 重建（约 0.2 秒）。代价是重开等于重新加载界面 —— 关掉马上又点开的话，面板
+    # 会回到默认页。
+    webview_state = {"released": False}
+    webview_lock = threading.Lock()
+
+    def _release_webview_now() -> None:
+        """收进托盘后立刻释放 WebView2（跑在隐藏线程里，不占 UI 线程）。"""
+        with webview_lock:
+            # 「关窗」和「点托盘打开」可能撞在一起，抢到锁后要再确认一眼状态
+            if not close_state.get("hidden"):
+                return
+            window = holder["window"]
+            if window is None or not _webview2_release(window):
+                return
+            webview_state["released"] = True
+            print("[窗口] 已释放 WebView2，界面进程退出（重新打开时自动重建）")
+
+    def _ensure_webview_alive() -> None:
+        """唤醒前先确保界面还在：释放过就重建，让窗口带着页面一起显示。"""
+        if not webview_state.get("released"):
+            return
+        with webview_lock:
+            if not webview_state.get("released"):
+                return
+            if _webview2_rebuild(holder["window"],
+                                 f"http://127.0.0.1:{webui_port}",
+                                 _webview_profile_dir()):
+                webview_state["released"] = False
+
     def open_console():
         """托盘/任务栏「打开 Lovomo」：把窗口唤醒到前台，并保持上次的几何。
 
@@ -9729,6 +10061,8 @@ if __name__ == "__main__":
         if w is None:
             return
         close_state["hidden"] = False
+        # 释放过就先重建，让窗口带着页面一起回到屏幕上
+        _ensure_webview_alive()
         _wake_geometry_guard()
         _raise_to_foreground(w)
         try:
@@ -9945,6 +10279,8 @@ if __name__ == "__main__":
                 _finish_geometry_save()
             except Exception:
                 pass
+            # 藏好了立刻释放界面进程：内存现在就拿回来
+            _release_webview_now()
 
         threading.Thread(target=_do, daemon=True).start()
 

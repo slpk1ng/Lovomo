@@ -26,6 +26,24 @@ from .llm_helpers import (RoleContext, generate_text_reply, strip_thinking,
 
 JOB_PREFIX = "sched_"
 
+_SENTENCE_END_MARKS = "。！？!?…"
+_CLAUSE_MARKS = "，、；,;"
+
+
+def clip_to_limit(text: str, limit: int) -> str:
+    """把超长台词压回 limit 以内：优先断在句末标点，其次断在逗号/顿号/分号。
+
+    截出来的部分不足上限一半时说明没截到有用的内容，返回空串交给调用方丢弃。
+    """
+    head = text[:limit]
+    for marks in (_SENTENCE_END_MARKS, _CLAUSE_MARKS):
+        cut = max(head.rfind(m) for m in marks)
+        if cut >= 0:
+            clipped = head[:cut + 1].strip()
+            if len(clipped) * 2 >= limit:
+                return clipped
+    return ""
+
 
 def render_template(template: str, character_name: str = "") -> str:
     lt = time.localtime()
@@ -52,8 +70,8 @@ async def generate_in_character_text(ctx: RoleContext, instruction: str,
     安全约束（血泪教训）：推理型模型可能把思维链写进输出，
     一旦被当成台词就会合成出一分多钟的"思考内容语音"。因此：
       1. 统一剥离 thinking（strip_thinking / chat_once 双重清洗）；
-      2. 输出超长或仍带思考特征时，判定为失败返回空串（调用方走预设模板或跳过），
-         绝不把一大段文字丢给 TTS。
+      2. 输出仍带思考特征时，判定为失败返回空串（调用方走预设模板或跳过）；
+      3. 输出超长时按标点截断到字数上限内（见 clip_to_limit），绝不把整段丢给 TTS。
     """
     raw_limit = max(40, int(ctx.get("proactive_text_max_chars", 120) or 120))
     system = (
@@ -84,8 +102,12 @@ async def generate_in_character_text(ctx: RoleContext, instruction: str,
     if not text:
         return ""
     if len(text) > raw_limit:
-        print(f"角色话术过长（{len(text)} 字，上限 {raw_limit}），已丢弃：{text[:80]!r}")
-        return ""
+        clipped = clip_to_limit(text, raw_limit)
+        if not clipped:
+            print(f"角色话术过长（{len(text)} 字，上限 {raw_limit}）且截不出完整句子，已丢弃：{text[:80]!r}")
+            return ""
+        print(f"角色话术过长（{len(text)} 字，上限 {raw_limit}），已截断为 {len(clipped)} 字")
+        text = clipped
     return text
 
 

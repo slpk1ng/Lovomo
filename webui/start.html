@@ -798,6 +798,32 @@
         .modal-close:hover { background: rgba(255, 255, 255, 0.18); }
         .modal-tools { background: var(--surface-2); border-bottom: 1px solid var(--line); }
 
+        /* ---------- 配置预设弹窗 ---------- */
+        .preset-body { display: flex; gap: 14px; align-items: flex-start; }
+        .preset-nav { flex: 0 0 116px; display: flex; flex-direction: column; gap: 6px; }
+        .preset-nav-item {
+            padding: 10px 12px; border-radius: var(--radius); cursor: pointer; user-select: none;
+            font-size: 13.5px; color: var(--ink-2); background: var(--surface-2);
+            border: 1px solid transparent; transition: background 0.15s var(--ease);
+        }
+        .preset-nav-item:hover { background: var(--brand-light); }
+        .preset-nav-item.active {
+            background: var(--brand-light); color: var(--brand-dark);
+            font-weight: 600; border-color: rgba(47, 107, 237, 0.28);
+        }
+        .preset-main { flex: 1; min-width: 0; }
+        .preset-row { padding: 10px 0; border-bottom: 1px solid var(--line); }
+        .preset-row:last-child { border-bottom: 0; }
+        .preset-head { display: flex; align-items: center; gap: 8px; }
+        .preset-note {
+            flex: 1; min-width: 0; padding: 7px 10px; font-size: 13px;
+            border: 1px solid var(--line-strong); border-radius: var(--radius-ctl);
+            background: var(--surface); color: var(--ink);
+        }
+        .preset-note:focus { outline: none; border-color: var(--brand); }
+        .preset-head .btn { flex: 0 0 auto; padding: 7px 12px; font-size: 13px; }
+        .preset-meta { margin-top: 5px; font-size: 12px; color: var(--ink-3); }
+
         /* ---------- 右下角悬浮操作区 ---------- */
         .float-actions, .plugin-apply-bar {
             right: clamp(16px, 1.7vw, 28px);
@@ -973,9 +999,7 @@
                 <button class="save-btn" id="save-only-btn" data-icon="save">仅保存</button>
                 <button class="save-btn-restart" id="save-restart-btn" data-icon="refresh">保存并重启TTS</button>
                 <button class="btn btn-gray" id="check-update-btn" data-icon="checkUpdate">检查更新</button>
-                <button class="btn btn-gray" id="export-config-btn" data-icon="export">导出配置</button>
-                <button class="btn btn-gray" id="import-config-btn" data-icon="importIn">导入配置</button>
-                <input type="file" id="import-config-file" accept=".json" style="display:none;">
+                <button class="btn btn-gray" id="config-preset-btn" data-icon="swap">切换预设</button>
             </div>
         </div>
         <div class="panel" id="panel-plugins">
@@ -1122,6 +1146,133 @@
                             <button class="btn" id="plugin-uninstall-ok">确定卸载</button>
                         </div>
                     </div>
+                </div>
+            </div>
+        </div>
+        <div class="modal-overlay" id="voice-design-modal">
+            <div class="modal-content" style="height:auto;max-height:86%;width:640px;">
+                <div class="modal-header">
+                    <h3>云 TTS 声音设计</h3>
+                    <span class="modal-close" id="voice-design-close">×</span>
+                </div>
+                <div class="modal-body">
+                    <div class="sub-desc" style="margin-bottom:10px;">
+                        用一段文字描述设计一个自定义音色，创建后可直接填入「云 TTS 默认音色」。
+                        驱动模型取自上一步填的「云 TTS 模型」，两者必须一致。
+                    </div>
+                    <div class="form-row">
+                        <label>声音描述</label>
+                        <div class="field-wrapper">
+                            <textarea id="vd-prompt" rows="3" placeholder="例如：沉稳的中年男性播音员，音色低沉浑厚"></textarea>
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <label>预览文本</label>
+                        <div class="field-wrapper">
+                            <textarea id="vd-preview" rows="2" placeholder="用来试听效果的一句话"></textarea>
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <label>音色名称</label>
+                        <div class="field-wrapper">
+                            <input type="text" id="vd-name" placeholder="字母、数字、下划线，最多 16 位">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <label>语言</label>
+                        <div class="field-wrapper"><select id="vd-lang"></select></div>
+                    </div>
+                    <div class="inline-form" style="margin-top:12px;">
+                        <div class="field" style="flex:0;"><button class="btn" id="vd-create">创建音色</button></div>
+                        <div class="field" style="flex:0;"><button class="btn btn-gray" id="vd-refresh">刷新列表</button></div>
+                    </div>
+                    <div class="sub-desc" id="vd-msg" style="margin-top:8px;"></div>
+                    <div id="vd-preview-box" style="display:none;margin-top:8px;">
+                        <audio id="vd-preview-audio" controls style="width:100%;"></audio>
+                    </div>
+                    <h4 style="margin:16px 0 8px;">已创建的音色</h4>
+                    <div id="vd-list"></div>
+                </div>
+            </div>
+        </div>
+        <div class="modal-overlay" id="config-preset-modal">
+            <div class="modal-content" style="height:auto;max-height:86%;width:720px;">
+                <div class="modal-header">
+                    <h3>切换预设</h3>
+                    <span class="modal-close" id="config-preset-close">×</span>
+                </div>
+                <div class="modal-body preset-body">
+                    <div class="preset-nav">
+                        <div class="preset-nav-item active" id="preset-tab-import">导入配置</div>
+                        <div class="preset-nav-item" id="preset-tab-export">导出配置</div>
+                    </div>
+                    <div class="preset-main">
+                        <div id="preset-pane-import">
+                            <div class="sub-desc">选一份之前导出的预设，一键切回当时的配置。</div>
+                            <div id="preset-import-list"></div>
+                        </div>
+                        <div id="preset-pane-export" style="display:none;">
+                            <div class="sub-desc">把当前配置存成一份预设放在本机，之后随时可以切回来。</div>
+                            <div class="form-row">
+                                <label>备注</label>
+                                <div class="field-wrapper">
+                                    <input type="text" id="preset-note" placeholder="选填，例如「换声线前」">
+                                </div>
+                            </div>
+                            <div class="inline-form">
+                                <div class="field" style="flex:0;">
+                                    <button class="btn" id="preset-save" data-icon="export">导出当前配置</button>
+                                </div>
+                            </div>
+                            <div id="preset-export-list"></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="sub-desc" id="preset-msg" style="padding:0 15px 12px;"></div>
+            </div>
+        </div>
+        <div class="modal-overlay" id="voice-enroll-modal">
+            <div class="modal-content" style="height:auto;max-height:86%;width:640px;">
+                <div class="modal-header">
+                    <h3>云 TTS 声音复刻</h3>
+                    <span class="modal-close" id="voice-enroll-close">×</span>
+                </div>
+                <div class="modal-body">
+                    <div class="sub-desc" style="margin-bottom:10px;">
+                        上传一段或多段音频，让模型照着学出这个音色，创建后可直接填入「云 TTS 默认音色」。
+                        驱动模型取自上一步填的「云 TTS 模型」，两者必须一致，且要用声音复刻类模型。
+                    </div>
+                    <div class="form-row">
+                        <label>音频文件</label>
+                        <div class="field-wrapper">
+                            <input type="file" id="ve-files" accept=".wav,.mp3,.m4a,audio/*" multiple>
+                            <div class="sub-desc" id="ve-file-list"></div>
+                            <div class="field-desc">建议 10～20 秒、最长 60 秒，合计不超过 10MB；多个文件会合并成一段。一次只能选一个文件时，可以再选几次逐个添加。</div>
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <label>音色名称</label>
+                        <div class="field-wrapper">
+                            <input type="text" id="ve-name" placeholder="字母、数字、下划线，最多 16 位">
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <label>音频文本</label>
+                        <div class="field-wrapper">
+                            <textarea id="ve-text" rows="2" placeholder="选填：音频里念的内容，填了复刻更准"></textarea>
+                        </div>
+                    </div>
+                    <div class="form-row">
+                        <label>语言</label>
+                        <div class="field-wrapper"><select id="ve-lang"></select></div>
+                    </div>
+                    <div class="inline-form" style="margin-top:12px;">
+                        <div class="field" style="flex:0;"><button class="btn" id="ve-create">创建音色</button></div>
+                        <div class="field" style="flex:0;"><button class="btn btn-gray" id="ve-refresh">刷新列表</button></div>
+                    </div>
+                    <div class="sub-desc" id="ve-msg" style="margin-top:8px;"></div>
+                    <h4 style="margin:16px 0 8px;">已复刻的音色</h4>
+                    <div id="ve-list"></div>
                 </div>
             </div>
         </div>
@@ -1502,7 +1653,7 @@
                    所有功能都必须先打开对应开关才会生效。</p>
 
                 <h3>一、每个页面的作用</h3>
-                <p><strong>1. 配置文件</strong>：所有运行参数与功能总开关。左侧有锚点导航，右上角可导出/导入配置（换机器时用导出文件最省事）。</p>
+                <p><strong>1. 配置文件</strong>：所有运行参数与功能总开关。左侧有锚点导航，右上角可切换预设（把当前配置存一份在本机，之后随时切回来）。</p>
                 <p><strong>2. 聊天记录</strong>：查看/管理会话与历史，可单会话或整包导出导入。</p>
                 <p><strong>3. 情绪音频</strong>：每个情绪文件夹 = 一套参考音频，每段音频可单独填写它念的文字；上传后可试听。</p>
                 <p><strong>4. 定时任务</strong>：自定义定时消息、节日/生日问候、待办提醒。</p>
@@ -1519,8 +1670,8 @@
                 <p><strong>1. LLM 接口</strong>：在「LLM 大模型」里选对<strong>接口类型</strong>。
                    本地 Ollama 用 <code>ollama</code>；LM Studio、llama.cpp（llama-server，地址要带 <code>/v1</code>）、
                    vLLM、云端 API 一律用 <code>openai</code>。服务地址、模型名要与你的服务完全一致。</p>
-                <p><strong>2. TTS</strong>：「TTS 服务与模型」里填 GPT-SoVITS 服务地址（默认 <code>http://127.0.0.1:9880</code>）、
-                   模型目录、参考音频根目录；「TTS 参考音频与语言」里的文本语言要与参考音频的实际语言一致。</p>
+                <p><strong>2. TTS</strong>：「TTS 服务与模型」里选本地还是云端。本地填 GPT-SoVITS 服务地址（默认 <code>http://127.0.0.1:9880</code>）、
+                   模型目录、参考音频根目录，文本语言要与参考音频的实际语言一致；云端填服务商地址、模型与音色。</p>
                 <p><strong>3. 情绪音频目录</strong>：参考音频根目录下的<strong>每个子文件夹就是一个情绪</strong>
                    （如 <code>pingjing</code>、<code>gaoxing</code>），文件夹里放参考音频，文字按音频同名 txt 填写
                    （可用「一键识别」自动生成；某段音频没单独填写时，用文件夹里的 <code>asr.txt</code>，
@@ -1698,6 +1849,19 @@
             "检查更新": "Check for Updates",
             "导出配置": "Export Configuration",
             "导入配置": "Import Configuration",
+            "切换预设": "Switch preset",
+            "选一份之前导出的预设，一键切回当时的配置。": "Pick a preset you exported earlier to switch back to that configuration in one click.",
+            "把当前配置存成一份预设放在本机，之后随时可以切回来。": "Save the current configuration as a preset on this machine; you can switch back to it at any time.",
+            "选填，例如「换声线前」": "Optional, e.g. \"before switching the voice\"",
+            "导出当前配置": "Export current configuration",
+            "还没有导出过预设。": "No preset has been exported yet.",
+            "正在导出…": "Exporting…",
+            "已导出这份预设。": "Preset exported.",
+            "切换回这份预设？当前的配置会被覆盖。": "Switch back to this preset? The current configuration will be overwritten.",
+            "已切换回这份预设。": "Switched back to this preset.",
+            "备注已保存。": "Note saved.",
+            "删除这份预设？": "Delete this preset?",
+            "已删除这份预设。": "Preset deleted.",
             "插件可以给 Lovomo 加新功能或换外观。安装前会自动做安全扫描， 含高危操作的插件需要你确认后才会装上。": "Plugins add features or change the look of Lovomo. Every package is scanned before install; plugins with high-risk operations are only installed after you confirm.",
             "已装插件的启用/停用与各自的设置，都在左侧栏的「插件」里。": "Enable, disable and configure installed plugins under Plugins in the sidebar.",
             "上传插件包 (.zip)": "Upload Plugin Package (.zip)",
@@ -1848,7 +2012,7 @@
             "以下内容按「先配通、再调优、出问题怎么查」的顺序整理，并写清了每类现象背后的原因与对应设置。 所有功能都必须先打开对应开关才会生效。": "This guide is ordered as “get it connected, then tune it, then how to diagnose problems”, and explains the cause behind each symptom together with the setting that fixes it. Every feature only takes effect after its switch is turned on.",
             "一、每个页面的作用": "1. What each page does",
             "1. 配置文件": "1. Configuration",
-            "：所有运行参数与功能总开关。左侧有锚点导航，右上角可导出/导入配置（换机器时用导出文件最省事）。": ": every runtime parameter and feature master switch. The left side has anchor navigation and the top right can export or import the configuration (exporting is the easiest way to move to another machine).",
+            "：所有运行参数与功能总开关。左侧有锚点导航，右上角可切换预设（把当前配置存一份在本机，之后随时切回来）。": ": every runtime parameter and feature master switch. The left side has anchor navigation and the top right can switch presets (save the current configuration on this machine and switch back to it at any time).",
             "2. 聊天记录": "2. Chat History",
             "：查看/管理会话与历史，可单会话或整包导出导入。": ": view and manage sessions and history; export or import a single session or everything at once.",
             "3. 情绪音频": "3. Emotion Audio",
@@ -1877,8 +2041,8 @@
             "；LM Studio、llama.cpp（llama-server，地址要带": "; LM Studio, llama.cpp (llama-server, the URL must include ",
             "）、 vLLM、云端 API 一律用": ") and vLLM or any cloud API all use ",
             "。服务地址、模型名要与你的服务完全一致。": ". The service URL and model name must match your service exactly.",
-            "：「TTS 服务与模型」里填 GPT-SoVITS 服务地址（默认": ": under TTS Service and Model fill in the GPT-SoVITS service URL (default ",
-            "）、 模型目录、参考音频根目录；「TTS 参考音频与语言」里的文本语言要与参考音频的实际语言一致。": "), the model directory and the reference audio root; the text language under TTS Reference Audio and Language must match the actual language of the reference audio.",
+            "：「TTS 服务与模型」里选本地还是云端。本地填 GPT-SoVITS 服务地址（默认": ": under TTS Service and Model choose local or cloud. For local, fill in the GPT-SoVITS service URL (default ",
+            "）、 模型目录、参考音频根目录，文本语言要与参考音频的实际语言一致；云端填服务商地址、模型与音色。": "), the model directory and the reference audio root, with the text language matching the actual language of the reference audio; for cloud, fill in the provider URL, model and voice.",
             "3. 情绪音频目录": "3. Emotion audio directory",
             "：参考音频根目录下的": ": under the reference audio root, ",
             "每个子文件夹就是一个情绪": "each subfolder is one emotion",
@@ -2067,8 +2231,11 @@
             "识图模型后端接口类型": "Backend API type for the vision model",
             "留空则跟随 LLM 接口类型。ollama：本地 Ollama；openai：云端 OpenAI 兼容接口。": "Empty follows the LLM API type. ollama: local Ollama; openai: a cloud OpenAI-compatible API.",
             "识图模型服务地址": "Vision model service URL",
+            "识图模型 API Key": "Vision model API Key",
+            "【可选】识图模型独立的接口密钥": "[Optional] Separate API key for the vision model",
+            "留空则跟随「LLM API Key」。识图模型与语言模型不是同一家服务商（服务地址不同）时才需要单独填写。保存后只显示头尾各4位和长度，密钥本体加密存储在 config.json 中。": "Empty follows the LLM API Key. Fill it in only when the vision model comes from a different provider than the language model (a different service URL). After saving, only the first and last 4 characters plus the length are shown; the key itself is stored encrypted in config.json.",
             "【可选】识图模型独立的接口地址": "[Optional] Separate endpoint for the vision model",
-            "留空则跟随「LLM 服务地址」。要填「服务根地址」——即补上 /chat/completions 之前的那一段（如 http://127.0.0.1:8080/v1、https://xxx/compatible-mode/v1），不要填某个具体接口的完整路径（…/chat/completions、…/services/xxx/xxx）。填错时点「服务列表」会明确报出实际请求的地址与上游返回的原因。": "Empty follows the LLM service URL. Enter the service root — the part before /chat/completions (for example http://127.0.0.1:8080/v1 or https://xxx/compatible-mode/v1), not the full path of one endpoint (…/chat/completions, …/services/xxx/xxx). If it is wrong, Service List reports the URL actually requested and what the upstream returned.",
+            "留空则跟随「LLM 服务地址」。服务根地址（如 http://127.0.0.1:8080/v1、https://xxx/compatible-mode/v1）和带对话端点的完整地址（如 https://xxx/compatible-mode/v1/chat/completions）都可以，程序会自动补全；不要填带业务路径的接口（…/services/xxx/xxx）。填错时点「服务列表」会明确报出实际请求的地址与上游返回的原因。": "Empty follows the LLM service URL. Both the service root (for example http://127.0.0.1:8080/v1 or https://xxx/compatible-mode/v1) and the full endpoint (for example https://xxx/compatible-mode/v1/chat/completions) work — the endpoint is completed automatically; do not use an interface with a business path (…/services/xxx/xxx). If it is wrong, Service List reports the URL actually requested and what the upstream returned.",
             "LLM 服务地址": "LLM service URL",
             "LLM服务地址": "LLM service URL",
             "Ollama 默认 http://127.0.0.1:11434；llama.cpp（llama-server）填 http://127.0.0.1:8080/v1（必须带 /v1，接口类型选 openai）；DeepSeek 等云 API 请填 https://api.deepseek.com（需将接口类型改为 openai）。": "Ollama defaults to http://127.0.0.1:11434; for llama.cpp (llama-server) use http://127.0.0.1:8080/v1 (the /v1 is required and the API type must be openai); for cloud APIs such as DeepSeek use https://api.deepseek.com (and switch the API type to openai).",
@@ -2097,7 +2264,122 @@
             "默认 1.1；大于 1 抑制重复，1 = 不惩罚。仅 Ollama 后端生效（OpenAI 兼容接口用 frequency_penalty/presence_penalty，字段名不同，故此处隐藏）。": "Default 1.1; values above 1 discourage repetition and 1 means no penalty. Only the Ollama backend honours it (OpenAI-compatible endpoints use frequency_penalty/presence_penalty, which is why the field is hidden here).",
             "自定义请求体字段（JSON）": "Custom request body fields (JSON)",
             "随请求合并进 OpenAI 兼容接口请求体的额外字段": "Extra fields merged into the request body sent to OpenAI-compatible endpoints",
-            "JSON 对象，留空不发送。llama.cpp 示例：{\"chat_template_kwargs\": {\"enable_thinking\": false}} 关闭思考模式——思考模型经 llama-server --jinja 启动时默认开思考，不关会导致回复正文为空。解析失败时忽略；LM Studio 目前版本中有bug导致这个选项无效，请前往该软件自行关闭 Enable Thinking": "A JSON object; empty means nothing is sent. llama.cpp example: {\"chat_template_kwargs\": {\"enable_thinking\": false}} disables thinking mode — a thinking model started via llama-server --jinja thinks by default and would otherwise return an empty reply. Parse failures are ignored; the current LM Studio version has a bug that makes this option ineffective, so turn Enable Thinking off in that app instead.",
+            "JSON 对象，留空不发送。左侧预设可直接填入常见服务商的「关闭思考」写法。解析失败时忽略；LM Studio 目前版本中有bug导致这个选项无效，请前往该软件自行关闭 Enable Thinking": "A JSON object; empty means nothing is sent. The presets on the left fill in the disable-thinking syntax for common providers. Parse failures are ignored; the current LM Studio version has a bug that makes this option ineffective, so turn Enable Thinking off in that app instead.",
+            "选择预设": "Choose a preset",
+            "Ollama（本地）": "Ollama (local)",
+            "llama.cpp（llama-server）": "llama.cpp (llama-server)",
+            "阿里云百炼（通义千问）": "Alibaba Cloud Model Studio (Qwen)",
+            "火山方舟（豆包）": "Volcengine Ark (Doubao)",
+            "智谱 GLM": "Zhipu GLM",
+            "月之暗面 Kimi": "Moonshot Kimi",
+            "硅基流动": "SiliconFlow",
+            "Google Gemini（OpenAI 兼容）": "Google Gemini (OpenAI-compatible)",
+            "通义千问 / 硅基流动": "Qwen / SiliconFlow",
+            "豆包 / 智谱 GLM / Kimi / DeepSeek": "Doubao / Zhipu GLM / Kimi / DeepSeek",
+            "本地 vLLM / llama.cpp": "Local vLLM / llama.cpp",
+            "OpenAI GPT-5.1+ / Gemini 2.5": "OpenAI GPT-5.1+ / Gemini 2.5",
+            "OpenAI GPT-5（最低档）": "OpenAI GPT-5 (lowest)",
+            "云 TTS": "Cloud TTS",
+            "TTS 后端": "TTS backend",
+            "语音合成的来源": "Where the synthesized voice comes from",
+            "local：本地 GPT-SoVITS（默认）；cloud：云端语音合成，不需要本地推理服务，也不需要参考音频。": "local: the local GPT-SoVITS (default); cloud: a cloud speech service, which needs neither a local inference server nor reference audio.",
+            "云 TTS 服务地址": "Cloud TTS service URL",
+            "云端语音合成的服务地址": "Service URL of the cloud speech synthesis",
+            "选一个服务商即可自动填好协议、模型与默认音色；也可手动填其它 OpenAI 兼容服务的地址。": "Picking a provider fills in the protocol, model and default voice for you; you can also enter the URL of any other OpenAI-compatible service.",
+            "云 TTS 接口协议": "Cloud TTS API protocol",
+            "云端语音合成的接口协议": "API protocol used by the cloud speech synthesis",
+            "openai：OpenAI 兼容的 /audio/speech（硅基流动、智谱 GLM、OpenAI 等）；dashscope：阿里云百炼（通义千问）原生接口。选服务商时会自动填。": "openai: the OpenAI-compatible /audio/speech (SiliconFlow, Zhipu GLM, OpenAI and others); dashscope: the native Alibaba Cloud Model Studio (Qwen) API. Filled in automatically when you pick a provider.",
+            "云 TTS API Key": "Cloud TTS API Key",
+            "云端语音合成的密钥": "Key for the cloud speech synthesis",
+            "云 TTS 模型": "Cloud TTS model",
+            "云端语音合成使用的模型名": "Model name used for cloud speech synthesis",
+            "如 qwen3-tts-flash、FunAudioLLM/CosyVoice2-0.5B、glm-tts、gpt-4o-mini-tts。选服务商时会自动填。": "For example qwen3-tts-flash, FunAudioLLM/CosyVoice2-0.5B, glm-tts or gpt-4o-mini-tts. Filled in automatically when you pick a provider.",
+            "云 TTS 默认音色": "Cloud TTS default voice",
+            "没有单独指定音色的情绪都用它": "Used by every emotion that has no voice of its own",
+            "下面的「音色映射」里没列出的情绪用这个音色。选服务商时会自动填一个可用的音色；声音设计、声音复刻类模型要先用旁边的按钮创建音色。": "Emotions that are not listed in Voice mapping below use this voice. Picking a provider fills in one of its available voices; for a voice-design or voice-cloning model, create a voice with the buttons next to this field first.",
+            "云 TTS 音色映射": "Cloud TTS voice mapping",
+            "为每个情绪单独指定云端音色": "Assign a separate cloud voice to each emotion",
+            "每行一个「情绪=音色」，例如 pingjing=Cherry。没写的情绪用上面的默认音色；这里出现的情绪名就是模型可选的语气列表。": "One “emotion=voice” per line, for example pingjing=Cherry. Emotions that are not listed use the default voice above; the emotion names listed here are the tones offered to the model.",
+            "云 TTS 声音设计": "Cloud TTS voice design",
+            "用一段文字描述设计一个自定义音色，创建后可直接填入「云 TTS 默认音色」。 驱动模型取自上一步填的「云 TTS 模型」，两者必须一致。": "Describe a voice in words to design a custom one, then fill it straight into Cloud TTS default voice. The driving model is the one in Cloud TTS model above, and the two must match.",
+            "声音描述": "Voice description",
+            "例如：沉稳的中年男性播音员，音色低沉浑厚": "For example: a steady middle-aged male announcer with a deep, rich voice",
+            "预览文本": "Preview text",
+            "用来试听效果的一句话": "A sentence used to preview the result",
+            "音色名称": "Voice name",
+            "字母、数字、下划线，最多 16 位": "Letters, digits and underscores, up to 16 characters",
+            "语言": "Language",
+            "创建音色": "Create voice",
+            "刷新列表": "Refresh list",
+            "已创建的音色": "Created voices",
+            "声音设计…": "Voice design…",
+            "用一段文字描述创建一个自定义音色": "Create a custom voice from a written description",
+            "还没有创建过音色。": "No voice has been created yet.",
+            "填入默认音色": "Use as default voice",
+            "正在创建…": "Creating…",
+            "已创建音色 {0}（驱动模型 {1}）。": "Created voice {0} (driving model {1}).",
+            "已填入「云 TTS 默认音色」：{0}，保存后生效。": "Filled into Cloud TTS default voice: {0}. It takes effect after saving.",
+            "删除音色 {0}？": "Delete voice {0}?",
+            "已删除音色 {0}。": "Deleted voice {0}.",
+            "云 TTS 声音复刻": "Cloud TTS voice cloning",
+            "上传一段或多段音频，让模型照着学出这个音色，创建后可直接填入「云 TTS 默认音色」。 驱动模型取自上一步填的「云 TTS 模型」，两者必须一致，且要用声音复刻类模型。": "Upload one or more audio clips and let the model learn the voice, then fill it straight into Cloud TTS default voice. The driving model is the one in Cloud TTS model above, and the two must match; it also has to be a voice-cloning model.",
+            "音频文件": "Audio files",
+            "建议 10～20 秒、最长 60 秒，合计不超过 10MB；多个文件会合并成一段。一次只能选一个文件时，可以再选几次逐个添加。": "10-20 seconds recommended, 60 seconds maximum, 10MB in total; multiple files are merged into one clip. If the picker allows only one file at a time, select again to add more.",
+            "音频文本": "Audio transcript",
+            "选填：音频里念的内容，填了复刻更准": "Optional: what is said in the audio; filling it in improves the clone",
+            "已复刻的音色": "Cloned voices",
+            "声音复刻…": "Voice cloning…",
+            "上传一段或多段音频，让模型照着学出这个音色": "Upload one or more audio clips and let the model learn the voice",
+            "还没有复刻过音色。": "No voice has been cloned yet.",
+            "请先选择音频文件。": "Pick an audio file first.",
+            "已选 {0} 个：": "{0} file(s) selected:",
+            "移除": "Remove",
+            "正在上传并创建…": "Uploading and creating…",
+            "已创建音色 {0}，但音频质量一般（{1}），效果可能不理想。": "Created voice {0}, but the audio quality is poor ({1}); the result may not be ideal.",
+            "阿里云百炼 · qwen3-tts-flash": "Alibaba Cloud Model Studio · qwen3-tts-flash",
+            "阿里云百炼 · qwen3-tts-instruct-flash": "Alibaba Cloud Model Studio · qwen3-tts-instruct-flash",
+            "阿里云百炼 · qwen-tts": "Alibaba Cloud Model Studio · qwen-tts",
+            "硅基流动 · FunAudioLLM/CosyVoice2-0.5B": "SiliconFlow · FunAudioLLM/CosyVoice2-0.5B",
+            "硅基流动 · fnlp/MOSS-TTSD-v0.5": "SiliconFlow · fnlp/MOSS-TTSD-v0.5",
+            "智谱 GLM · glm-tts": "Zhipu GLM · glm-tts",
+            "OpenAI · gpt-4o-mini-tts": "OpenAI · gpt-4o-mini-tts",
+            "OpenAI · tts-1": "OpenAI · tts-1",
+            "OpenAI · tts-1-hd": "OpenAI · tts-1-hd",
+            "Cherry · 芊悦（女）": "Cherry · QianYue (female)",
+            "Serena · 苏瑶（女）": "Serena · SuYao (female)",
+            "Chelsie · 千雪（女）": "Chelsie · QianXue (female)",
+            "Momo · 茉兔（女）": "Momo · MoTu (female)",
+            "Vivian · 十三（女）": "Vivian · ShiSan (female)",
+            "Bella · 萌宝（女）": "Bella · MengBao (female)",
+            "Nini · 邻家妹妹（女）": "Nini · girl next door (female)",
+            "Mia · 乖小妹（女）": "Mia · sweet little sister (female)",
+            "Seren · 小婉（女）": "Seren · XiaoWan (female)",
+            "Stella · 少女阿月（女）": "Stella · young girl A-Yue (female)",
+            "Ethan · 晨煦（男）": "Ethan · ChenXu (male)",
+            "Nofish · 不吃鱼（男）": "Nofish · BuChiYu (male)",
+            "Moon · 月白（男）": "Moon · YueBai (male)",
+            "Kai · 凯（男）": "Kai (male)",
+            "Mochi · 沙小弥（男）": "Mochi · ShaXiaoMi (male)",
+            "Vincent · 田叔（男）": "Vincent · Uncle Tian (male)",
+            "Neil · 阿闻（男）": "Neil · A-Wen (male)",
+            "Eldric Sage · 沧明子（男）": "Eldric Sage · CangMingZi (male)",
+            "Arthur · 徐大爷（男）": "Arthur · Old Xu (male)",
+            "Pip · 顽屁小孩（男）": "Pip · naughty kid (male)",
+            "alex · 沉稳男声": "alex · steady male",
+            "benjamin · 低沉男声": "benjamin · deep male",
+            "charles · 磁性男声": "charles · magnetic male",
+            "david · 欢快男声": "david · cheerful male",
+            "anna · 沉稳女声": "anna · steady female",
+            "bella · 激情女声": "bella · passionate female",
+            "claire · 温柔女声": "claire · gentle female",
+            "diana · 欢快女声": "diana · cheerful female",
+            "tongtong · 彤彤（女，默认）": "tongtong · TongTong (female, default)",
+            "chuichui · 锤锤": "chuichui · ChuiChui",
+            "xiaochen · 小陈": "xiaochen · XiaoChen",
+            "jam · 动动动物圈 jam": "jam · Animal Circle jam",
+            "kazi · 动动动物圈 kazi": "kazi · Animal Circle kazi",
+            "douji · 动动动物圈 douji": "douji · Animal Circle douji",
+            "luodo · 动动动物圈 luodo": "luodo · Animal Circle luodo",
             "识图模型请求超时（秒）": "Vision model request timeout (seconds)",
             "识图模型请求超时时间（秒）": "Vision model request timeout (seconds)",
             "单位秒。识图模型推理较慢，建议 60 秒以上。": "In seconds. Vision inference is slow, so 60 seconds or more is recommended.",
@@ -2369,8 +2651,8 @@
             "让 LLM 生成开场白时的指令": "Instructions used when the LLM writes the opener",
             "告诉模型在什么情境下说什么。": "Tell the model what to say in which situation.",
             "主动消息/提醒话术字数上限": "Character limit for proactive messages and reminders",
-            "生成的文本超过该字数就直接丢弃，不会发送": "Text longer than this is discarded and never sent",
-            "默认 120。防止推理模型的思考内容或超长文本被合成成一分钟以上的语音；想让主动消息更长可以调大（如 200）。": "Default 120. Keeps reasoning output or overlong text from becoming a minute-long voice message; raise it (for example 200) if you want longer proactive messages.",
+            "生成的文本超过该字数会按标点截断后再发送": "Text longer than this is cut back at punctuation before sending",
+            "默认 120。防止推理模型的思考内容或超长文本被合成成一分钟以上的语音；想让主动消息更长可以调大（如 200）。整段没有任何标点时无法截断，仍会丢弃。": "Default 120. Keeps reasoning output or overlong text from becoming a minute-long voice message; raise it (for example 200) if you want longer proactive messages. Text without any punctuation cannot be cut and is still discarded.",
             "主动消息附带语音": "Attach voice to proactive messages",
             "主动消息是否合成语音": "Whether proactive messages are synthesized",
             "需要 TTS 服务在线。": "The TTS service must be online.",
@@ -3596,6 +3878,81 @@
             return (label || btn).textContent;
         }
 
+        /* 云端 TTS 服务商：选中后顺带把协议、模型与默认音色一起填好 */
+        const CLOUD_TTS_PROVIDERS = [
+            { label: '阿里云百炼（通义千问）', value: 'https://dashscope.aliyuncs.com/api/v1',
+              protocol: 'dashscope', model: 'qwen3-tts-flash', voice: 'Cherry' },
+            { label: '硅基流动', value: 'https://api.siliconflow.cn/v1',
+              protocol: 'openai', model: 'FunAudioLLM/CosyVoice2-0.5B',
+              voice: 'FunAudioLLM/CosyVoice2-0.5B:alex' },
+            { label: '智谱 GLM', value: 'https://open.bigmodel.cn/api/paas/v4',
+              protocol: 'openai', model: 'glm-tts', voice: 'tongtong' },
+            { label: 'OpenAI', value: 'https://api.openai.com/v1',
+              protocol: 'openai', model: 'gpt-4o-mini-tts', voice: 'alloy' }
+        ];
+
+        /* 云端 TTS 模型：选服务商时已自动填好，这里供手动改选 */
+        const CLOUD_TTS_MODEL_PRESETS = [
+            { label: '阿里云百炼 · qwen3-tts-flash', value: 'qwen3-tts-flash' },
+            { label: '阿里云百炼 · qwen3-tts-instruct-flash', value: 'qwen3-tts-instruct-flash' },
+            { label: '阿里云百炼 · qwen-tts', value: 'qwen-tts' },
+            { label: '硅基流动 · FunAudioLLM/CosyVoice2-0.5B', value: 'FunAudioLLM/CosyVoice2-0.5B' },
+            { label: '硅基流动 · fnlp/MOSS-TTSD-v0.5', value: 'fnlp/MOSS-TTSD-v0.5' },
+            { label: '智谱 GLM · glm-tts', value: 'glm-tts' },
+            { label: 'OpenAI · gpt-4o-mini-tts', value: 'gpt-4o-mini-tts' },
+            { label: 'OpenAI · tts-1', value: 'tts-1' },
+            { label: 'OpenAI · tts-1-hd', value: 'tts-1-hd' }
+        ];
+
+        /* 云端 TTS 音色：按服务商分组，与上面的服务商一一对应 */
+        const CLOUD_TTS_VOICE_PRESETS = [
+            { group: '阿里云百炼（通义千问）', label: 'Cherry · 芊悦（女）', value: 'Cherry' },
+            { group: '阿里云百炼（通义千问）', label: 'Serena · 苏瑶（女）', value: 'Serena' },
+            { group: '阿里云百炼（通义千问）', label: 'Chelsie · 千雪（女）', value: 'Chelsie' },
+            { group: '阿里云百炼（通义千问）', label: 'Momo · 茉兔（女）', value: 'Momo' },
+            { group: '阿里云百炼（通义千问）', label: 'Vivian · 十三（女）', value: 'Vivian' },
+            { group: '阿里云百炼（通义千问）', label: 'Bella · 萌宝（女）', value: 'Bella' },
+            { group: '阿里云百炼（通义千问）', label: 'Nini · 邻家妹妹（女）', value: 'Nini' },
+            { group: '阿里云百炼（通义千问）', label: 'Mia · 乖小妹（女）', value: 'Mia' },
+            { group: '阿里云百炼（通义千问）', label: 'Seren · 小婉（女）', value: 'Seren' },
+            { group: '阿里云百炼（通义千问）', label: 'Stella · 少女阿月（女）', value: 'Stella' },
+            { group: '阿里云百炼（通义千问）', label: 'Ethan · 晨煦（男）', value: 'Ethan' },
+            { group: '阿里云百炼（通义千问）', label: 'Nofish · 不吃鱼（男）', value: 'Nofish' },
+            { group: '阿里云百炼（通义千问）', label: 'Moon · 月白（男）', value: 'Moon' },
+            { group: '阿里云百炼（通义千问）', label: 'Kai · 凯（男）', value: 'Kai' },
+            { group: '阿里云百炼（通义千问）', label: 'Mochi · 沙小弥（男）', value: 'Mochi' },
+            { group: '阿里云百炼（通义千问）', label: 'Vincent · 田叔（男）', value: 'Vincent' },
+            { group: '阿里云百炼（通义千问）', label: 'Neil · 阿闻（男）', value: 'Neil' },
+            { group: '阿里云百炼（通义千问）', label: 'Eldric Sage · 沧明子（男）', value: 'Eldric Sage' },
+            { group: '阿里云百炼（通义千问）', label: 'Arthur · 徐大爷（男）', value: 'Arthur' },
+            { group: '阿里云百炼（通义千问）', label: 'Pip · 顽屁小孩（男）', value: 'Pip' },
+            { group: '硅基流动', label: 'alex · 沉稳男声', value: 'FunAudioLLM/CosyVoice2-0.5B:alex' },
+            { group: '硅基流动', label: 'benjamin · 低沉男声', value: 'FunAudioLLM/CosyVoice2-0.5B:benjamin' },
+            { group: '硅基流动', label: 'charles · 磁性男声', value: 'FunAudioLLM/CosyVoice2-0.5B:charles' },
+            { group: '硅基流动', label: 'david · 欢快男声', value: 'FunAudioLLM/CosyVoice2-0.5B:david' },
+            { group: '硅基流动', label: 'anna · 沉稳女声', value: 'FunAudioLLM/CosyVoice2-0.5B:anna' },
+            { group: '硅基流动', label: 'bella · 激情女声', value: 'FunAudioLLM/CosyVoice2-0.5B:bella' },
+            { group: '硅基流动', label: 'claire · 温柔女声', value: 'FunAudioLLM/CosyVoice2-0.5B:claire' },
+            { group: '硅基流动', label: 'diana · 欢快女声', value: 'FunAudioLLM/CosyVoice2-0.5B:diana' },
+            { group: '智谱 GLM', label: 'tongtong · 彤彤（女，默认）', value: 'tongtong' },
+            { group: '智谱 GLM', label: 'chuichui · 锤锤', value: 'chuichui' },
+            { group: '智谱 GLM', label: 'xiaochen · 小陈', value: 'xiaochen' },
+            { group: '智谱 GLM', label: 'jam · 动动动物圈 jam', value: 'jam' },
+            { group: '智谱 GLM', label: 'kazi · 动动动物圈 kazi', value: 'kazi' },
+            { group: '智谱 GLM', label: 'douji · 动动动物圈 douji', value: 'douji' },
+            { group: '智谱 GLM', label: 'luodo · 动动动物圈 luodo', value: 'luodo' },
+            { group: 'OpenAI', label: 'alloy', value: 'alloy' },
+            { group: 'OpenAI', label: 'ash', value: 'ash' },
+            { group: 'OpenAI', label: 'ballad', value: 'ballad' },
+            { group: 'OpenAI', label: 'coral', value: 'coral' },
+            { group: 'OpenAI', label: 'echo', value: 'echo' },
+            { group: 'OpenAI', label: 'fable', value: 'fable' },
+            { group: 'OpenAI', label: 'nova', value: 'nova' },
+            { group: 'OpenAI', label: 'onyx', value: 'onyx' },
+            { group: 'OpenAI', label: 'sage', value: 'sage' },
+            { group: 'OpenAI', label: 'shimmer', value: 'shimmer' }
+        ];
+
         const configGroups = [
             /* ===== 基础连接 ===== */
             { title: 'NapCat 连接', keys: ['napcat_ws_url', 'napcat_token'] },
@@ -3603,11 +3960,10 @@
 
             /* ===== 模型 ===== */
             { title: 'LLM 大模型', keys: ['llm_backend', 'llm_base_url', 'llm_model_name', 'llm_api_key', 'num_ctx', 'history_length', 'enable_think', 'llm_timeout', 'llm_auto_unload_old', 'text_clean_blocklist', 'llm_sampling_enabled', 'llm_top_p', 'llm_top_k', 'llm_repeat_penalty', 'llm_extra_body'] },
-            { title: '识图模型', keys: ['image_caption_model_name', 'image_caption_backend', 'image_caption_base_url', 'image_caption_timeout'] },
+            { title: '识图模型', keys: ['image_caption_model_name', 'image_caption_backend', 'image_caption_base_url', 'image_caption_api_key', 'image_caption_timeout'] },
 
             /* ===== TTS 语音 ===== */
-            { title: 'TTS 服务与模型', keys: ['auto_start_tts', 'tts_start_script', 'client_base_url', 'model_dir', 'ref_audio_root', 'timeout_seconds', 'device', 'media_type'] },
-            { title: 'TTS 参考音频与语言', keys: ['prompt_text', 'prompt_lang', 'text_lang', 'tts_auto_lang', 'display_lang'] },
+            { title: 'TTS 服务与模型', keys: ['tts_backend', 'auto_start_tts', 'tts_start_script', 'client_base_url', 'model_dir', 'ref_audio_root', 'timeout_seconds', 'device', 'media_type', 'cloud_tts_base_url', 'cloud_tts_protocol', 'cloud_tts_api_key', 'cloud_tts_model', 'cloud_tts_voice', 'cloud_tts_voice_map', 'prompt_text', 'prompt_lang', 'text_lang', 'tts_auto_lang', 'display_lang'] },
             { title: 'TTS 推理参数', keys: ['top_k', 'top_p', 'temperature', 'text_split_method', 'batch_size', 'batch_threshold', 'split_bucket', 'speed_factor', 'fragment_interval', 'streaming_mode', 'seed', 'parallel_infer', 'repetition_penalty'] },
             { title: 'TTS 台词清洗与日志', keys: ['tts_char_map', 'tts_duration_guard', 'tts_min_seconds_per_char', 'tts_max_seconds_per_char', 'tts_debug_log'] },
             { title: '音量统一', keys: ['tts_loudness_normalize', 'tts_loudness_target_db', 'tts_loudness_peak_db', 'tts_loudness_max_gain_db', 'tts_ref_normalize'] },
@@ -3643,6 +3999,23 @@
             { title: '其他', keys: ['active_character', 'hide_gsv_options'] }
         ];
 
+        /* 常见模型服务商的 OpenAI 兼容服务地址，LLM 与识图模型的服务地址共用 */
+        const LLM_ENDPOINT_PRESETS = [
+            { label: 'Ollama（本地）', value: 'http://127.0.0.1:11434' },
+            { label: 'llama.cpp（llama-server）', value: 'http://127.0.0.1:8080/v1' },
+            { label: 'LM Studio', value: 'http://127.0.0.1:1234/v1' },
+            { label: 'vLLM', value: 'http://127.0.0.1:8000/v1' },
+            { label: 'DeepSeek', value: 'https://api.deepseek.com' },
+            { label: '阿里云百炼（通义千问）', value: 'https://dashscope.aliyuncs.com/compatible-mode/v1' },
+            { label: '火山方舟（豆包）', value: 'https://ark.cn-beijing.volces.com/api/v3' },
+            { label: '智谱 GLM', value: 'https://open.bigmodel.cn/api/paas/v4' },
+            { label: '月之暗面 Kimi', value: 'https://api.moonshot.cn/v1' },
+            { label: '硅基流动', value: 'https://api.siliconflow.cn/v1' },
+            { label: 'OpenAI', value: 'https://api.openai.com/v1' },
+            { label: 'Google Gemini（OpenAI 兼容）', value: 'https://generativelanguage.googleapis.com/v1beta/openai' },
+            { label: 'OpenRouter', value: 'https://openrouter.ai/api/v1' }
+        ];
+
         const configMeta = {
             'active_character': { label: '当前激活的角色标识符', description: '默认使用哪个角色', hint: '私聊与未提及角色的消息由它回复。', required: false, type: 'string' },
             'napcat_ws_url': { label: 'NapCat WebSocket 地址', description: 'NapCat 服务的 WebSocket 连接地址', hint: '默认为 ws://127.0.0.1:3001', required: true, type: 'string' },
@@ -3657,8 +4030,9 @@
             'text_clean_blocklist': { label: '文本清洗屏蔽词', description: 'LLM 回复中出现这些字符/词时会被剔除后再发送（语音和文字都生效）', hint: '每行一个字符或词，也可用逗号分隔，例如剔除不想出现的口癖词、符号。留空不启用。', required: false, type: 'text' },
             'image_caption_model_name': { label: '识图模型名称', description: '【可选】识图模型名称', hint: '用于处理图片，接收图片并输出JSON。可手动填写或点「选文件夹」/「服务列表」选择。留空则遇到图片时直接跳过。', required: false, type: 'model_select' },
             'image_caption_backend': { label: '识图模型接口', description: '识图模型后端接口类型', hint: '留空则跟随 LLM 接口类型。ollama：本地 Ollama；openai：云端 OpenAI 兼容接口。', required: false, type: 'string', options: ['', 'ollama', 'openai'], default: '' },
-            'image_caption_base_url': { label: '识图模型服务地址', description: '【可选】识图模型独立的接口地址', hint: '留空则跟随「LLM 服务地址」。要填「服务根地址」——即补上 /chat/completions 之前的那一段（如 http://127.0.0.1:8080/v1、https://xxx/compatible-mode/v1），不要填某个具体接口的完整路径（…/chat/completions、…/services/xxx/xxx）。填错时点「服务列表」会明确报出实际请求的地址与上游返回的原因。', required: false, type: 'string', allowCustom: true, options: ['http://127.0.0.1:11434', 'http://127.0.0.1:8080/v1', 'http://127.0.0.1:1234/v1'], default: '' },
-            'llm_base_url': { label: 'LLM 服务地址', description: 'LLM服务地址', hint: 'Ollama 默认 http://127.0.0.1:11434；llama.cpp（llama-server）填 http://127.0.0.1:8080/v1（必须带 /v1，接口类型选 openai）；DeepSeek 等云 API 请填 https://api.deepseek.com（需将接口类型改为 openai）。', required: true, type: 'string', allowCustom: true, options: ['http://127.0.0.1:11434', 'http://127.0.0.1:8080/v1', 'http://127.0.0.1:1234/v1', 'http://127.0.0.1:8000/v1', 'https://api.deepseek.com', 'https://api.deepseek.com/v1'], default: 'http://127.0.0.1:11434' },
+            'image_caption_base_url': { label: '识图模型服务地址', description: '【可选】识图模型独立的接口地址', hint: '留空则跟随「LLM 服务地址」。服务根地址（如 http://127.0.0.1:8080/v1、https://xxx/compatible-mode/v1）和带对话端点的完整地址（如 https://xxx/compatible-mode/v1/chat/completions）都可以，程序会自动补全；不要填带业务路径的接口（…/services/xxx/xxx）。填错时点「服务列表」会明确报出实际请求的地址与上游返回的原因。', required: false, type: 'string', presets: LLM_ENDPOINT_PRESETS, default: '' },
+            'image_caption_api_key': { label: '识图模型 API Key', description: '【可选】识图模型独立的接口密钥', hint: '留空则跟随「LLM API Key」。识图模型与语言模型不是同一家服务商（服务地址不同）时才需要单独填写。保存后只显示头尾各4位和长度，密钥本体加密存储在 config.json 中。', required: false, type: 'string', condition: { image_caption_base_url: { differsFrom: 'llm_base_url' } } },
+            'llm_base_url': { label: 'LLM 服务地址', description: 'LLM服务地址', hint: 'Ollama 默认 http://127.0.0.1:11434；llama.cpp（llama-server）填 http://127.0.0.1:8080/v1（必须带 /v1，接口类型选 openai）；DeepSeek 等云 API 请填 https://api.deepseek.com（需将接口类型改为 openai）。', required: true, type: 'string', presets: LLM_ENDPOINT_PRESETS, default: 'http://127.0.0.1:11434' },
             'num_ctx': { label: '上下文长度 (num_ctx)', description: '大模型上下文长度', hint: '默认8192，决定模型能记住的对话历史长度（Token数）。', required: false, type: 'int', default: 8192 },
             'history_length': { label: '历史消息条数', description: '模型可读上下文条数', hint: '模型直接读取的最近对话条数，默认 8 条。', required: false, type: 'int', default: 8 },
             'enable_think': { label: '启用深度思考', description: '开启深度思考', hint: '开启后，模型会在回答前先内部推理。注意：会让响应变慢。', required: false, type: 'boolean', default: false },
@@ -3667,7 +4041,13 @@
             'llm_top_p': { label: 'Top-P（核采样）', description: '只从累计概率前 top_p 的候选词中采样', hint: '默认 0.9，范围 0~1。Ollama 与支持该参数的 OpenAI 兼容接口生效；调小输出更稳定，调大更多样。', required: false, type: 'float', condition: { llm_sampling_enabled: true }, default: 0.9 },
             'llm_top_k': { label: 'Top-K', description: '每步只从概率最高的 k 个候选词中采样', hint: '默认 40。仅 Ollama 后端生效（OpenAI 兼容接口不接受该字段，发送会被严格服务拒绝）。', required: false, type: 'int', condition: { llm_sampling_enabled: true, llm_backend: 'ollama' }, default: 40 },
             'llm_repeat_penalty': { label: '重复惩罚', description: '对已出现过的内容施加惩罚，抑制复读', hint: '默认 1.1；大于 1 抑制重复，1 = 不惩罚。仅 Ollama 后端生效（OpenAI 兼容接口用 frequency_penalty/presence_penalty，字段名不同，故此处隐藏）。', required: false, type: 'float', condition: { llm_sampling_enabled: true, llm_backend: 'ollama' }, default: 1.1 },
-            'llm_extra_body': { label: '自定义请求体字段（JSON）', description: '随请求合并进 OpenAI 兼容接口请求体的额外字段', hint: 'JSON 对象，留空不发送。llama.cpp 示例：{"chat_template_kwargs": {"enable_thinking": false}} 关闭思考模式——思考模型经 llama-server --jinja 启动时默认开思考，不关会导致回复正文为空。解析失败时忽略；LM Studio 目前版本中有bug导致这个选项无效，请前往该软件自行关闭 Enable Thinking', required: false, type: 'string', condition: { llm_backend: 'openai' }, default: '' },
+            'llm_extra_body': { label: '自定义请求体字段（JSON）', description: '随请求合并进 OpenAI 兼容接口请求体的额外字段', hint: 'JSON 对象，留空不发送。左侧预设可直接填入常见服务商的「关闭思考」写法。解析失败时忽略；LM Studio 目前版本中有bug导致这个选项无效，请前往该软件自行关闭 Enable Thinking', required: false, type: 'string', condition: { llm_backend: 'openai' }, presets: [
+                { label: '通义千问 / 硅基流动', value: '{"enable_thinking": false}' },
+                { label: '豆包 / 智谱 GLM / Kimi / DeepSeek', value: '{"thinking": {"type": "disabled"}}' },
+                { label: '本地 vLLM / llama.cpp', value: '{"chat_template_kwargs": {"enable_thinking": false}}' },
+                { label: 'OpenAI GPT-5.1+ / Gemini 2.5', value: '{"reasoning_effort": "none"}' },
+                { label: 'OpenAI GPT-5（最低档）', value: '{"reasoning_effort": "minimal"}' }
+            ], default: '' },
             'image_caption_timeout': { label: '识图模型请求超时（秒）', description: '识图模型请求超时时间（秒）', hint: '单位秒。识图模型推理较慢，建议 60 秒以上。', required: false, type: 'int', default: 90 },
             'tts_reply_enabled': { label: '回复附带语音', description: '关闭后所有回复只发文字不发语音', hint: 'TTS 故障排查或纯文字场景可关闭。', required: false, type: 'boolean', default: true },
             'display_pure_language': { label: '展示文本只保留展示语言', description: '剔除聊天文本里混入的口语语言片段（模型把日文台词连同中文翻译塞进同一句时）', hint: '默认开启。日文片段按假名识别并整段剔除；纯日文的句子不再发文本、语音照常合成。仅对"中文展示 + 日文口语"的组合生效。', required: false, type: 'boolean', default: true },
@@ -3679,9 +4059,16 @@
             'repeat_guard_compare_self': { label: '③ 比对角色历史回复', description: '比对对象包含「角色自己最近几轮说过的台词」', hint: '默认开启。关闭后不再把历史台词作为参照，也不会再注入「禁止重复」的提示词，模型可以自由重复之前说过的话。', required: false, type: 'boolean', default: true },
             'repeat_guard_compare_user': { label: '④ 比对用户本条消息', description: '比对对象包含「用户本条消息的原话」，用于拦截把对方的话复述一遍的回复', hint: '默认开启。关闭后不再检查"复述用户原话"。注意 ③④ 都关闭时，整套防复读等于没开。', required: false, type: 'boolean', default: true },
             'streaming_enabled': { label: '实时流式回复', description: '边生成边逐句合成并发送，大幅降低等待时间', hint: '开启后每句话生成完毕立即合成发送，无需等整段回复完成。需要模型支持流式输出（Ollama / OpenAI 均支持）。', required: false, type: 'boolean', default: false },
-            'client_base_url': { label: 'GPT-SoVITS 服务地址', description: 'GPT-SoVITS 服务地址', hint: '默认为 http://127.0.0.1:9880', required: true, type: 'string', condition: { hide_gsv_options: false }, default: 'http://127.0.0.1:9880' },
-            'model_dir': { label: '模型文件夹路径', description: '【必填】模型文件夹所在路径', hint: '存放 .ckpt 和 .pth 的文件夹路径，可点「浏览」直接选择', required: true, type: 'path', condition: { hide_gsv_options: false } },
-            'ref_audio_root': { label: '参考音频根目录', description: '【必填】参考音频根目录', hint: '填有所有语气的文件夹路径即可，可点「浏览」直接选择。', required: true, type: 'path', condition: { hide_gsv_options: false } },
+            'tts_backend': { label: 'TTS 后端', description: '语音合成的来源', hint: 'local：本地 GPT-SoVITS（默认）；cloud：云端语音合成，不需要本地推理服务，也不需要参考音频。', required: false, type: 'string', options: ['local', 'cloud'], default: 'local' },
+            'cloud_tts_base_url': { label: '云 TTS 服务地址', description: '云端语音合成的服务地址', hint: '选一个服务商即可自动填好协议、模型与默认音色；也可手动填其它 OpenAI 兼容服务的地址。', required: false, type: 'string', condition: { tts_backend: 'cloud' }, presets: CLOUD_TTS_PROVIDERS.map(p => ({ label: p.label, value: p.value, also: { cloud_tts_protocol: p.protocol, cloud_tts_model: p.model, cloud_tts_voice: p.voice } })), default: '' },
+            'cloud_tts_protocol': { label: '云 TTS 接口协议', description: '云端语音合成的接口协议', hint: 'openai：OpenAI 兼容的 /audio/speech（硅基流动、智谱 GLM、OpenAI 等）；dashscope：阿里云百炼（通义千问）原生接口。选服务商时会自动填。', required: false, type: 'string', condition: { tts_backend: 'cloud' }, options: ['openai', 'dashscope'], default: 'openai' },
+            'cloud_tts_api_key': { label: '云 TTS API Key', description: '云端语音合成的密钥', hint: '本地服务可留空。保存后只显示头尾各4位和长度，密钥本体加密存储在 config.json 中。', required: false, type: 'string', condition: { tts_backend: 'cloud' } },
+            'cloud_tts_model': { label: '云 TTS 模型', description: '云端语音合成使用的模型名', hint: '如 qwen3-tts-flash、FunAudioLLM/CosyVoice2-0.5B、glm-tts、gpt-4o-mini-tts。选服务商时会自动填。', required: false, type: 'string', condition: { tts_backend: 'cloud' }, presets: CLOUD_TTS_MODEL_PRESETS, default: '' },
+            'cloud_tts_voice': { label: '云 TTS 默认音色', description: '没有单独指定音色的情绪都用它', hint: '下面的「音色映射」里没列出的情绪用这个音色。选服务商时会自动填一个可用的音色；声音设计、声音复刻类模型要先用旁边的按钮创建音色。', required: false, type: 'string', condition: { tts_backend: 'cloud' }, presets: CLOUD_TTS_VOICE_PRESETS, voiceDesigner: true, voiceEnroller: true, default: '' },
+            'cloud_tts_voice_map': { label: '云 TTS 音色映射', description: '为每个情绪单独指定云端音色', hint: '每行一个「情绪=音色」，例如 pingjing=Cherry。没写的情绪用上面的默认音色；这里出现的情绪名就是模型可选的语气列表。', required: false, type: 'text', condition: { tts_backend: 'cloud' }, default: '' },
+            'client_base_url': { label: 'GPT-SoVITS 服务地址', description: 'GPT-SoVITS 服务地址', hint: '默认为 http://127.0.0.1:9880', required: true, type: 'string', condition: { hide_gsv_options: false, tts_backend: 'local' }, default: 'http://127.0.0.1:9880' },
+            'model_dir': { label: '模型文件夹路径', description: '【必填】模型文件夹所在路径', hint: '存放 .ckpt 和 .pth 的文件夹路径，可点「浏览」直接选择', required: true, type: 'path', condition: { hide_gsv_options: false, tts_backend: 'local' } },
+            'ref_audio_root': { label: '参考音频根目录', description: '【必填】参考音频根目录', hint: '填有所有语气的文件夹路径即可，可点「浏览」直接选择。', required: true, type: 'path', condition: { hide_gsv_options: false, tts_backend: 'local' } },
             'timeout_seconds': { label: 'TTS 超时时间（秒）', description: 'TTS 超时时间', hint: '单位秒。防止超时导致插件一直等待。', required: false, type: 'int', default: 120 },
             'prompt_text': { label: '默认参考音频文本', description: '默认参考音频文本', hint: '某段参考音频既没填自己的文字、文件夹里也没有 asr.txt 时用它兜底。', required: false, type: 'string', condition: { hide_gsv_options: false }, default: 'ふむ、おぬしが我輩のご主人か?' },
             'prompt_lang': { label: '参考音频文本语言', description: '参考音频文本语言', hint: '请填写参考音频所念文本的语言代码（如 ja 或 zh）。', required: false, type: 'string', condition: { hide_gsv_options: false }, default: 'ja' },
@@ -3708,7 +4095,7 @@
             'tts_duration_guard': { label: '合成音频时长校验', description: '合成结果明显短于台词应有长度时，换一种切分方式重试，避免只发出一声语气的短语音', hint: '默认开启。判定标准由下一项「每秒最少字符数」决定；重试仍偏短时返回其中最长的一段，不会整句语音缺失。', required: false, type: 'boolean', condition: { hide_gsv_options: false }, default: true },
             'tts_min_seconds_per_char': { label: '每秒最少字符数（时长下限）', description: '按台词可朗读字数估算音频最短时长：字符数 × 该值', hint: '默认 0.05 秒/字。正常人声远慢于此，所以不会误判正常语音；调大更严格，调小更宽松。', required: false, type: 'float', condition: { hide_gsv_options: false, tts_duration_guard: true }, default: 0.05 },
             'tts_max_seconds_per_char': { label: '每秒最多字符数（时长上限）', description: '合成音频超过「可朗读字数 × 该值」时判定为异常（拖腔/复读），作废并换切分方式重试', hint: '默认 0.6 秒/字（且不少于 6 秒）。合成引擎偶发"同一个音节无限重复"，一句台词能拖成几十秒——这类结果不是语音而是噪音，宁可这句只发文本也不发出去。填 0 关闭该上限。', required: false, type: 'float', default: 0.6 },
-            'media_type': { label: '输出媒体类型', description: '输出媒体的类型', hint: '建议保持 wav 以获得最优音质。', required: false, type: 'string', condition: { hide_gsv_options: false }, default: 'wav' },
+            'media_type': { label: '输出媒体类型', description: '输出媒体的类型', hint: '建议保持 wav 以获得最优音质。', required: false, type: 'string', condition: { hide_gsv_options: false, tts_backend: 'local' }, default: 'wav' },
             'max_voice_cache': { label: '最大语音缓存数', description: '最大语音缓存数量', hint: '最多保留的临时/合并音频文件数。', required: false, type: 'int', default: 20 },
             'isolated_session': { label: '隔离会话', description: '隔离会话', hint: '启用后，群成员的上下文独立。', required: false, type: 'boolean', default: false },
             'separate_send': { label: '分开发送', description: '分开发送', hint: '开启后，显示语音分开发送和文本分开发送选项。', required: false, type: 'boolean', default: false },
@@ -3718,9 +4105,9 @@
             'only_private': { label: '仅响应私聊', description: '仅响应私聊', hint: '开启后，群聊仅在被@时响应。', required: false, type: 'boolean', default: false },
             'group_need_at': { label: '群聊需要@才回复', description: '群聊中仅当消息@机器人时才触发回复', hint: '开启后，群聊里没有@机器人的消息会被忽略（引用机器人消息视同@）。关闭则恢复旧的「群聊全部回复」行为。', required: false, type: 'boolean', condition: { only_private: false }, default: true },
             'whitelist_ids': { label: '会话白名单', description: '只响应白名单内的 QQ 号 / QQ 群号', hint: '每行一个号码（也可用逗号分隔）；私聊填 QQ 号、群聊填群号。留空则响应所有会话。', required: false, type: 'text' },
-            'auto_start_tts': { label: '自动启动 TTS 服务', description: '【推荐开启】一键启动本地 TTS 服务', hint: '开启后，插件会自动检测后台服务是否在线并自动启动。', required: false, type: 'boolean', default: true },
-            'tts_start_script': { label: 'TTS 启动脚本路径', description: '【必填】TTS 后端启动命令', hint: '填写 api_v2.py 当前所在的文件夹路径即可（即含有 __pycache__ 和 GPT-Sovits 文件夹的路径）。', required: true, type: 'path', condition: { auto_start_tts: true } },
-            'device': { label: 'TTS 合成设备', description: 'TTS 合成设备', hint: '选择 CUDA 使用显卡（GPU），选择 CPU 使用处理器。', required: false, type: 'string', options: ['cuda', 'cpu'], condition: { auto_start_tts: true }, default: 'cuda' },
+            'auto_start_tts': { label: '自动启动 TTS 服务', description: '【推荐开启】一键启动本地 TTS 服务', hint: '开启后，插件会自动检测后台服务是否在线并自动启动。', required: false, type: 'boolean', condition: { tts_backend: 'local' }, default: true },
+            'tts_start_script': { label: 'TTS 启动脚本路径', description: '【必填】TTS 后端启动命令', hint: '填写 api_v2.py 当前所在的文件夹路径即可（即含有 __pycache__ 和 GPT-Sovits 文件夹的路径）。', required: true, type: 'path', condition: { auto_start_tts: true, tts_backend: 'local' } },
+            'device': { label: 'TTS 合成设备', description: 'TTS 合成设备', hint: '选择 CUDA 使用显卡（GPU），选择 CPU 使用处理器。', required: false, type: 'string', options: ['cuda', 'cpu'], condition: { auto_start_tts: true, tts_backend: 'local' }, default: 'cuda' },
             'llm_judge': { label: 'LLM 自动判别情绪', description: '是否使用 LLM 自动判别情绪', hint: '开启后，大模型会根据语境自动从文件夹中挑一个情绪；关闭则固定使用默认情绪。', required: false, type: 'boolean', default: true },
             'display_lang': { label: '显示文本语言', description: '显示文本语言', hint: '选择发送消息时文字的语言，可选：中文（zh）、日语（ja）、英语（en）、韩语（ko）或跟随语音（auto）。', required: false, type: 'string', options: ['zh', 'ja', 'en', 'ko', 'auto'], condition: { llm_judge: true }, default: 'zh' },
             'default_voice': { label: '默认情绪', description: '默认情绪', hint: 'LLM 未开启或判别失败时使用，必须与文件夹名一致（例如 pingjing）。', required: false, type: 'string', condition: { llm_judge: false }, default: 'pingjing' },
@@ -3770,7 +4157,7 @@
             'proactive_quiet_start': { label: '静默时段开始', description: '该时段内不发送主动消息', hint: '格式 HH:MM，默认 23:00。', required: false, type: 'string', default: '23:00' },
             'proactive_quiet_end': { label: '静默时段结束', description: '静默时段结束时间', hint: '格式 HH:MM，默认 08:00（支持跨零点）。', required: false, type: 'string', default: '08:00' },
             'proactive_prompt': { label: '主动开场白指令', description: '让 LLM 生成开场白时的指令', hint: '告诉模型在什么情境下说什么。', required: false, type: 'text' },
-            'proactive_text_max_chars': { label: '主动消息/提醒话术字数上限', description: '生成的文本超过该字数就直接丢弃，不会发送', hint: '默认 120。防止推理模型的思考内容或超长文本被合成成一分钟以上的语音；想让主动消息更长可以调大（如 200）。', required: false, type: 'int', default: 120 },
+            'proactive_text_max_chars': { label: '主动消息/提醒话术字数上限', description: '生成的文本超过该字数会按标点截断后再发送', hint: '默认 120。防止推理模型的思考内容或超长文本被合成成一分钟以上的语音；想让主动消息更长可以调大（如 200）。整段没有任何标点时无法截断，仍会丢弃。', required: false, type: 'int', default: 120 },
             'proactive_voice': { label: '主动消息附带语音', description: '主动消息是否合成语音', hint: '需要 TTS 服务在线。', required: false, type: 'boolean', default: false },
             'proactive_sticker': { label: '主动消息附带表情包', description: '发送主动消息时随机附带一张表情', hint: '需开启表情包功能并有可用图片。', required: false, type: 'boolean', default: false },
             'history_context_recent': { label: '主动消息/问候携带的历史条数', description: '主动消息与节日问候生成时，把最近几条对话全文发给模型', hint: '默认 6 条。设为 0 则不携带历史。历史越长越能承接话题，但模型请求也会慢一些。', required: false, type: 'int', condition: { proactive_enabled: true }, default: 6 },
@@ -4190,7 +4577,8 @@
                 ? visionBackend.value : (backendSel ? backendSel.value : 'ollama');
             const res = await apiPostSoft('api/llm/list_remote_models', {
                 base_url: ownedBase,
-                backend: ownedBackend
+                backend: ownedBackend,
+                vision: !!isVision
             });
             if (!res.ok) { alert(res.error || '获取模型列表失败'); return; }
             showModelChoice(input, res.models || [], '服务上');
@@ -4515,6 +4903,350 @@
             return meta.type === 'boolean' ? false : '';
         }
 
+        const VOICE_LANG_LABELS = {
+            zh: '中文', en: 'English', de: 'Deutsch', it: 'Italiano', pt: 'Português',
+            es: 'Español', ja: '日本語', ko: '한국어', fr: 'Français', ru: 'Русский'
+        };
+
+        function makeVoiceDesignButton() {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'btn btn-gray';
+            btn.textContent = '声音设计…';
+            btn.title = '用一段文字描述创建一个自定义音色';
+            btn.addEventListener('click', openVoiceDesignModal);
+            return btn;
+        }
+
+        function vdMsg(text, isError) {
+            const el = document.getElementById('vd-msg');
+            if (!el) return;
+            el.textContent = text || '';
+            el.style.color = isError ? '#c0392b' : '';
+        }
+
+        function openVoiceDesignModal() {
+            const overlay = document.getElementById('voice-design-modal');
+            if (!overlay) return;
+            overlay.classList.add('active');
+            vdMsg('');
+            const box = document.getElementById('vd-preview-box');
+            if (box) box.style.display = 'none';
+            loadDesignedVoices();
+        }
+
+        function closeVoiceDesignModal() {
+            const overlay = document.getElementById('voice-design-modal');
+            if (overlay) overlay.classList.remove('active');
+            const audio = document.getElementById('vd-preview-audio');
+            if (audio) { audio.pause(); audio.removeAttribute('src'); }
+        }
+
+        function fillVoiceDesignLanguages(languages) {
+            const select = document.getElementById('vd-lang');
+            if (!select) return;
+            const current = select.value;
+            select.innerHTML = '';
+            (languages || []).forEach(code => {
+                const option = document.createElement('option');
+                option.value = code;
+                option.textContent = VOICE_LANG_LABELS[code] || code;
+                select.appendChild(option);
+            });
+            if (current) select.value = current;
+        }
+
+        async function loadDesignedVoices() {
+            const box = document.getElementById('vd-list');
+            if (box) box.textContent = '加载中…';
+            try {
+                const data = await apiGet('api/tts/voice_design/list');
+                fillVoiceDesignLanguages(data.languages);
+                renderDesignedVoices(data.voices || []);
+            } catch (e) {
+                if (box) box.textContent = '';
+                vdMsg(e.message, true);
+            }
+        }
+
+        function renderDesignedVoices(voices) {
+            const box = document.getElementById('vd-list');
+            if (!box) return;
+            box.innerHTML = '';
+            if (!voices.length) {
+                const empty = document.createElement('div');
+                empty.className = 'sub-desc';
+                empty.textContent = '还没有创建过音色。';
+                box.appendChild(empty);
+                return;
+            }
+            voices.forEach(item => {
+                const name = item.voice || '';
+                const row = document.createElement('div');
+                row.className = 'form-row';
+                row.style.alignItems = 'center';
+                const label = document.createElement('label');
+                label.style.flex = '1';
+                label.textContent = name;
+                label.title = item.voice_prompt || '';
+                const applyBtn = document.createElement('button');
+                applyBtn.type = 'button';
+                applyBtn.className = 'btn';
+                applyBtn.textContent = '填入默认音色';
+                applyBtn.addEventListener('click', () => applyDesignedVoice(name));
+                const delBtn = document.createElement('button');
+                delBtn.type = 'button';
+                delBtn.className = 'btn btn-gray';
+                delBtn.style.marginLeft = '6px';
+                delBtn.textContent = '删除';
+                delBtn.addEventListener('click', () => deleteDesignedVoice(name));
+                row.append(label, applyBtn, delBtn);
+                box.appendChild(row);
+            });
+        }
+
+        function applyDesignedVoice(voice, silent) {
+            const input = document.querySelector('[data-key="cloud_tts_voice"]');
+            if (!input || !voice) return;
+            input.value = voice;
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            if (!silent) vdMsg(`已填入「云 TTS 默认音色」：${voice}，保存后生效。`, false);
+        }
+
+        function playVoiceDesignPreview(base64Audio) {
+            const box = document.getElementById('vd-preview-box');
+            const audio = document.getElementById('vd-preview-audio');
+            if (!box || !audio || !base64Audio) return;
+            box.style.display = 'block';
+            audio.src = `data:audio/wav;base64,${base64Audio}`;
+            audio.play().catch(() => {});
+        }
+
+        async function createDesignedVoice() {
+            const btn = document.getElementById('vd-create');
+            if (btn) btn.disabled = true;
+            vdMsg('正在创建…', false);
+            try {
+                const data = await apiPost('api/tts/voice_design/create', {
+                    voice_prompt: (document.getElementById('vd-prompt') || {}).value || '',
+                    preview_text: (document.getElementById('vd-preview') || {}).value || '',
+                    name: ((document.getElementById('vd-name') || {}).value || '').trim(),
+                    language: (document.getElementById('vd-lang') || {}).value || ''
+                });
+                playVoiceDesignPreview(data.preview_audio);
+                applyDesignedVoice(data.voice, true);
+                vdMsg(`已创建音色 ${data.voice}（驱动模型 ${data.target_model}）。`, false);
+                await loadDesignedVoices();
+            } catch (e) {
+                vdMsg(e.message, true);
+            } finally {
+                if (btn) btn.disabled = false;
+            }
+        }
+
+        async function deleteDesignedVoice(name) {
+            if (!name || !confirm(`删除音色 ${name}？`)) return;
+            try {
+                await apiPost('api/tts/voice_design/delete', { name: name });
+                vdMsg(`已删除音色 ${name}。`, false);
+                await loadDesignedVoices();
+            } catch (e) {
+                vdMsg(e.message, true);
+            }
+        }
+
+        // 桌面窗口的文件对话框不一定给多选，所以每次选中的文件都追加进来而不是替换
+        let enrollFiles = [];
+
+        function makeVoiceEnrollButton() {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'btn btn-gray';
+            btn.textContent = '声音复刻…';
+            btn.title = '上传一段或多段音频，让模型照着学出这个音色';
+            btn.addEventListener('click', openVoiceEnrollModal);
+            return btn;
+        }
+
+        function veMsg(text, isError) {
+            const el = document.getElementById('ve-msg');
+            if (!el) return;
+            el.textContent = text || '';
+            el.style.color = isError ? '#c0392b' : '';
+        }
+
+        function openVoiceEnrollModal() {
+            const overlay = document.getElementById('voice-enroll-modal');
+            if (!overlay) return;
+            overlay.classList.add('active');
+            veMsg('');
+            renderEnrollFileList();
+            loadEnrolledVoices();
+        }
+
+        function closeVoiceEnrollModal() {
+            const overlay = document.getElementById('voice-enroll-modal');
+            if (overlay) overlay.classList.remove('active');
+        }
+
+        function fillVoiceEnrollLanguages(languages) {
+            const select = document.getElementById('ve-lang');
+            if (!select) return;
+            const current = select.value;
+            select.innerHTML = '';
+            (languages || []).forEach(code => {
+                const option = document.createElement('option');
+                option.value = code;
+                option.textContent = VOICE_LANG_LABELS[code] || code;
+                select.appendChild(option);
+            });
+            if (current) select.value = current;
+        }
+
+        function readAudioFiles(files) {
+            return Promise.all(Array.from(files).map(file => new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => {
+                    const url = String(reader.result || '');
+                    resolve({ name: file.name, data: url.slice(url.indexOf(',') + 1) });
+                };
+                reader.onerror = () => reject(new Error(`读取 ${file.name} 失败`));
+                reader.readAsDataURL(file);
+            })));
+        }
+
+        function renderEnrollFileList() {
+            const list = document.getElementById('ve-file-list');
+            if (!list) return;
+            list.innerHTML = '';
+            if (!enrollFiles.length) return;
+            const summary = document.createElement('div');
+            summary.textContent = `已选 ${enrollFiles.length} 个：`;
+            list.appendChild(summary);
+            enrollFiles.forEach((file, index) => {
+                const row = document.createElement('div');
+                row.style.cssText = 'display:flex;align-items:center;gap:6px;margin-top:4px;';
+                const name = document.createElement('span');
+                name.style.cssText = 'flex:1;word-break:break-all;';
+                name.textContent = file.name;
+                const remove = document.createElement('button');
+                remove.type = 'button';
+                remove.className = 'btn btn-gray';
+                remove.textContent = '移除';
+                remove.addEventListener('click', () => {
+                    enrollFiles.splice(index, 1);
+                    renderEnrollFileList();
+                });
+                row.append(name, remove);
+                list.appendChild(row);
+            });
+        }
+
+        function addEnrollFiles(files) {
+            Array.from(files || []).forEach(file => {
+                const dup = enrollFiles.some(f => f.name === file.name && f.size === file.size
+                    && f.lastModified === file.lastModified);
+                if (!dup) enrollFiles.push(file);
+            });
+            renderEnrollFileList();
+        }
+
+        async function loadEnrolledVoices() {
+            const box = document.getElementById('ve-list');
+            if (box) box.textContent = '加载中…';
+            try {
+                const data = await apiGet('api/tts/voice_enrollment/list');
+                fillVoiceEnrollLanguages(data.languages);
+                renderEnrolledVoices(data.voices || []);
+            } catch (e) {
+                if (box) box.textContent = '';
+                veMsg(e.message, true);
+            }
+        }
+
+        function renderEnrolledVoices(voices) {
+            const box = document.getElementById('ve-list');
+            if (!box) return;
+            box.innerHTML = '';
+            if (!voices.length) {
+                const empty = document.createElement('div');
+                empty.className = 'sub-desc';
+                empty.textContent = '还没有复刻过音色。';
+                box.appendChild(empty);
+                return;
+            }
+            voices.forEach(item => {
+                const name = item.voice || '';
+                const row = document.createElement('div');
+                row.className = 'form-row';
+                row.style.alignItems = 'center';
+                const label = document.createElement('label');
+                label.style.flex = '1';
+                label.textContent = name;
+                label.title = item.target_model || '';
+                const applyBtn = document.createElement('button');
+                applyBtn.type = 'button';
+                applyBtn.className = 'btn';
+                applyBtn.textContent = '填入默认音色';
+                applyBtn.addEventListener('click', () => applyEnrolledVoice(name));
+                const delBtn = document.createElement('button');
+                delBtn.type = 'button';
+                delBtn.className = 'btn btn-gray';
+                delBtn.style.marginLeft = '6px';
+                delBtn.textContent = '删除';
+                delBtn.addEventListener('click', () => deleteEnrolledVoice(name));
+                row.append(label, applyBtn, delBtn);
+                box.appendChild(row);
+            });
+        }
+
+        function applyEnrolledVoice(voice, silent) {
+            const input = document.querySelector('[data-key="cloud_tts_voice"]');
+            if (!input || !voice) return;
+            input.value = voice;
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            if (!silent) veMsg(`已填入「云 TTS 默认音色」：${voice}，保存后生效。`, false);
+        }
+
+        async function createEnrolledVoice() {
+            if (!enrollFiles.length) { veMsg('请先选择音频文件。', true); return; }
+            const btn = document.getElementById('ve-create');
+            if (btn) btn.disabled = true;
+            veMsg('正在上传并创建…', false);
+            try {
+                const data = await apiPost('api/tts/voice_enrollment/create', {
+                    audios: await readAudioFiles(enrollFiles),
+                    name: ((document.getElementById('ve-name') || {}).value || '').trim(),
+                    text: (document.getElementById('ve-text') || {}).value || '',
+                    language: (document.getElementById('ve-lang') || {}).value || ''
+                });
+                applyEnrolledVoice(data.voice, true);
+                veMsg(data.fallback_mode
+                    ? `已创建音色 ${data.voice}，但音频质量一般（${data.fallback_reason || '已降级'}），效果可能不理想。`
+                    : `已创建音色 ${data.voice}（驱动模型 ${data.target_model}）。`, false);
+                enrollFiles = [];
+                const picker = document.getElementById('ve-files');
+                if (picker) picker.value = '';
+                renderEnrollFileList();
+                await loadEnrolledVoices();
+            } catch (e) {
+                veMsg(e.message, true);
+            } finally {
+                if (btn) btn.disabled = false;
+            }
+        }
+
+        async function deleteEnrolledVoice(name) {
+            if (!name || !confirm(`删除音色 ${name}？`)) return;
+            try {
+                await apiPost('api/tts/voice_enrollment/delete', { name: name });
+                veMsg(`已删除音色 ${name}。`, false);
+                await loadEnrolledVoices();
+            } catch (e) {
+                veMsg(e.message, true);
+            }
+        }
+
         function renderConfigForm(config, defaults = {}) {
             const container = document.getElementById('config-groups');
             container.innerHTML = '';
@@ -4574,6 +5306,62 @@
                         checkboxWrapper.appendChild(input);
                         checkboxWrapper.appendChild(span);
                         controlRow.appendChild(checkboxWrapper);
+                    } else if (meta.presets && meta.presets.length > 0) {
+                        const select = document.createElement('select');
+                        // 固定宽度：width:auto 会按最长选项撑开，把右侧输入框挤窄
+                        select.style.cssText = 'flex:0 0 auto;width:132px;max-width:132px;';
+                        const placeholder = document.createElement('option');
+                        placeholder.value = '';
+                        placeholder.textContent = '选择预设';
+                        select.appendChild(placeholder);
+                        // p.group 相同的预设归进同一个 optgroup（各家服务商的音色各成一档）
+                        let presetGroup = null;
+                        let presetGroupName = null;
+                        meta.presets.forEach(p => {
+                            if (p.group && p.group !== presetGroupName) {
+                                presetGroupName = p.group;
+                                presetGroup = document.createElement('optgroup');
+                                presetGroup.label = presetGroupName;
+                                select.appendChild(presetGroup);
+                            } else if (!p.group) {
+                                presetGroup = null;
+                                presetGroupName = null;
+                            }
+                            const option = document.createElement('option');
+                            option.value = p.value;
+                            option.textContent = p.label;
+                            (presetGroup || select).appendChild(option);
+                        });
+                        const input = document.createElement('input');
+                        input.type = 'text';
+                        input.value = value;
+                        input.dataset.key = key;
+                        input.style.cssText = 'flex:1 1 auto;width:auto;min-width:220px;';
+                        input.addEventListener('change', updateConditionalVisibility);
+                        const syncPreset = () => {
+                            const hit = meta.presets.find(p => String(p.value) === String(input.value));
+                            select.value = hit ? hit.value : '';
+                        };
+                        syncPreset();
+                        select.addEventListener('change', () => {
+                            if (!select.value) return;
+                            const hit = meta.presets.find(p => String(p.value) === String(select.value));
+                            input.value = select.value;
+                            // 预设可顺带把配套字段一起填好（如选服务商同时定协议/模型/音色）
+                            Object.entries((hit && hit.also) || {}).forEach(([targetKey, targetValue]) => {
+                                const target = document.querySelector(`[data-key="${targetKey}"]`);
+                                if (!target) return;
+                                target.value = targetValue;
+                                target.dispatchEvent(new Event('change', { bubbles: true }));
+                            });
+                            updateConditionalVisibility();
+                        });
+                        input.addEventListener('input', syncPreset);
+                        input.addEventListener('change', syncPreset);
+                        controlRow.appendChild(select);
+                        controlRow.appendChild(input);
+                        if (meta.voiceDesigner) controlRow.appendChild(makeVoiceDesignButton());
+                        if (meta.voiceEnroller) controlRow.appendChild(makeVoiceEnrollButton());
                     } else if (meta.options && meta.options.length > 0) {
                         if (meta.allowCustom) {
                             const input = document.createElement('input');
@@ -4834,6 +5622,17 @@
                 for (const [parentKey, expectedValue] of Object.entries(meta.condition)) {
                     const parentInput = document.querySelector(`[data-key="${parentKey}"]`);
                     if (!parentInput) { visible = false; break; }
+                    // { differsFrom: '另一字段' }：本字段留空表示「跟随」，
+                    // 只有非空且与目标字段不同才算满足；比较时去掉结尾斜杠，
+                    // 与后端把两个地址 rstrip("/") 后再拼接口路径的做法一致
+                    if (expectedValue && typeof expectedValue === 'object') {
+                        const norm = v => String(v || '').trim().replace(/\/+$/, '');
+                        const other = document.querySelector(`[data-key="${expectedValue.differsFrom}"]`);
+                        const ownValue = norm(parentInput.value);
+                        const otherValue = other ? norm(other.value) : '';
+                        if (!ownValue || ownValue === otherValue) { visible = false; break; }
+                        continue;
+                    }
                     let currentValue;
                     if (parentInput.type === 'checkbox') currentValue = parentInput.checked;
                     else currentValue = parentInput.value;
@@ -4862,6 +5661,156 @@
             } catch (e) {
                 console.error('加载配置失败：', e);
                 showConfigMessage('加载配置失败: ' + e.message, 'error');
+            }
+        }
+
+        /* ==================== 配置预设 ==================== */
+        function presetMsg(text, isError) {
+            const el = document.getElementById('preset-msg');
+            if (!el) return;
+            el.textContent = text || '';
+            el.style.color = isError ? '#c0392b' : '';
+        }
+
+        function openConfigPresetModal() {
+            const overlay = document.getElementById('config-preset-modal');
+            if (!overlay) return;
+            overlay.classList.add('active');
+            presetMsg('');
+            switchPresetTab('import');
+            loadConfigPresets();
+        }
+
+        function closeConfigPresetModal() {
+            const overlay = document.getElementById('config-preset-modal');
+            if (overlay) overlay.classList.remove('active');
+        }
+
+        function switchPresetTab(which) {
+            const isImport = which !== 'export';
+            document.getElementById('preset-tab-import').classList.toggle('active', isImport);
+            document.getElementById('preset-tab-export').classList.toggle('active', !isImport);
+            document.getElementById('preset-pane-import').style.display = isImport ? '' : 'none';
+            document.getElementById('preset-pane-export').style.display = isImport ? 'none' : '';
+        }
+
+        function formatPresetSize(bytes) {
+            const size = Number(bytes) || 0;
+            if (size < 1024) return `${size} B`;
+            if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+            return `${(size / 1024 / 1024).toFixed(1)} MB`;
+        }
+
+        async function loadConfigPresets() {
+            try {
+                const data = await apiGet('api/config/presets');
+                renderConfigPresets(data.presets || []);
+            } catch (e) {
+                presetMsg(e.message, true);
+            }
+        }
+
+        function renderConfigPresets(presets) {
+            const boxes = ['preset-import-list', 'preset-export-list']
+                .map(id => document.getElementById(id)).filter(Boolean);
+            boxes.forEach(box => { box.innerHTML = ''; });
+            if (!boxes.length) return;
+            if (!presets.length) {
+                boxes.forEach(box => {
+                    const empty = document.createElement('div');
+                    empty.className = 'sub-desc';
+                    empty.textContent = '还没有导出过预设。';
+                    box.appendChild(empty);
+                });
+                return;
+            }
+            presets.forEach(item => boxes.forEach(box => box.appendChild(buildPresetRow(item))));
+        }
+
+        function buildPresetRow(item) {
+            const note = document.createElement('input');
+            note.type = 'text';
+            note.className = 'preset-note';
+            note.value = item.note || '';
+            note.placeholder = '备注';
+            note.addEventListener('change', () => savePresetNote(item.id, note.value));
+
+            const applyBtn = document.createElement('button');
+            applyBtn.type = 'button';
+            applyBtn.className = 'btn';
+            applyBtn.textContent = '导入配置';
+            applyBtn.addEventListener('click', () => applyConfigPreset(item.id, applyBtn));
+
+            const delBtn = document.createElement('button');
+            delBtn.type = 'button';
+            delBtn.className = 'btn btn-gray';
+            delBtn.textContent = '删除';
+            delBtn.addEventListener('click', () => deleteConfigPreset(item.id));
+
+            const head = document.createElement('div');
+            head.className = 'preset-head';
+            head.append(note, applyBtn, delBtn);
+
+            const meta = document.createElement('div');
+            meta.className = 'preset-meta';
+            meta.textContent = `${item.created_at} · ${formatPresetSize(item.size)}`;
+
+            const row = document.createElement('div');
+            row.className = 'preset-row';
+            row.append(head, meta);
+            return row;
+        }
+
+        async function exportConfigPreset() {
+            const btn = document.getElementById('preset-save');
+            const noteInput = document.getElementById('preset-note');
+            if (btn) btn.disabled = true;
+            presetMsg('正在导出…', false);
+            try {
+                await apiPost('api/config/presets/save',
+                              { note: (noteInput || {}).value || '' });
+                if (noteInput) noteInput.value = '';
+                presetMsg('已导出这份预设。', false);
+                await loadConfigPresets();
+            } catch (e) {
+                presetMsg(e.message, true);
+            } finally {
+                if (btn) btn.disabled = false;
+            }
+        }
+
+        async function applyConfigPreset(id, btn) {
+            if (!confirm('切换回这份预设？当前的配置会被覆盖。')) return;
+            if (btn) btn.disabled = true;
+            try {
+                await apiPost('api/config/presets/apply', { id: id });
+                closeConfigPresetModal();
+                showConfigMessage('已切换回这份预设。', 'success');
+                loadConfig();
+            } catch (e) {
+                presetMsg(e.message, true);
+            } finally {
+                if (btn) btn.disabled = false;
+            }
+        }
+
+        async function savePresetNote(id, note) {
+            try {
+                await apiPost('api/config/presets/note', { id: id, note: note });
+                presetMsg('备注已保存。', false);
+            } catch (e) {
+                presetMsg(e.message, true);
+            }
+        }
+
+        async function deleteConfigPreset(id) {
+            if (!confirm('删除这份预设？')) return;
+            try {
+                await apiPost('api/config/presets/delete', { id: id });
+                presetMsg('已删除这份预设。', false);
+                await loadConfigPresets();
+            } catch (e) {
+                presetMsg(e.message, true);
             }
         }
 
@@ -4964,41 +5913,14 @@
 
         document.getElementById('save-only-btn').addEventListener('click', () => saveConfig(false));
         document.getElementById('save-restart-btn').addEventListener('click', () => saveConfig(true));
-        document.getElementById('export-config-btn').addEventListener('click', async (ev) => {
-            const btn = ev.currentTarget;
-            if (btn.dataset.busy === '1') return;      // 防连点重复弹保存框
-            btn.dataset.busy = '1';
-            btn.disabled = true;
-            setBtnText(btn, '导出中…');
-            try {
-                const r = await downloadFile(`${API_BASE}/api/config/export`);
-                exportResultMessage(r,
-                                    (t, e) => showConfigMessage(t, e ? 'error' : 'success'));
-            } catch (e) {
-                showConfigMessage('导出失败: ' + e.message, 'error');
-            } finally {
-                btn.dataset.busy = '';
-                btn.disabled = false;
-                setBtnText(btn, '导出配置');
-            }
+        document.getElementById('config-preset-btn').addEventListener('click', openConfigPresetModal);
+        document.getElementById('config-preset-close').addEventListener('click', closeConfigPresetModal);
+        document.getElementById('config-preset-modal').addEventListener('click', (ev) => {
+            if (ev.target.id === 'config-preset-modal') closeConfigPresetModal();
         });
-        document.getElementById('import-config-btn').addEventListener('click', () => {
-            document.getElementById('import-config-file').click();
-        });
-        document.getElementById('import-config-file').addEventListener('change', async (e) => {
-            const file = e.target.files[0];
-            if (!file) return;
-            const fd = new FormData();
-            fd.append('file', file);
-            try {
-                const r = await apiPostForm('api/config/import', fd);
-                showConfigMessage(r.message || '导入成功', 'success');
-                loadConfig();
-            } catch (err) {
-                showConfigMessage('导入失败: ' + err.message, 'error');
-            }
-            e.target.value = '';
-        });
+        document.getElementById('preset-tab-import').addEventListener('click', () => switchPresetTab('import'));
+        document.getElementById('preset-tab-export').addEventListener('click', () => switchPresetTab('export'));
+        document.getElementById('preset-save').addEventListener('click', exportConfigPreset);
 
         /* ==================== 聊天记录 ==================== */
         const chatMsgDiv = document.getElementById('chat-message');
@@ -5020,8 +5942,15 @@
 
         function sortAndRender() {
             if (currentSort === 'role') {
+                const newestOfRole = {};
+                memoriesData.forEach(mem => {
+                    const role = mem.role_name || '';
+                    const t = mem.modified_time || 0;
+                    if (!(role in newestOfRole) || t > newestOfRole[role]) newestOfRole[role] = t;
+                });
                 memoriesData.sort((a,b) => {
-                    if (a.role_name !== b.role_name) return (a.role_name||'').localeCompare(b.role_name||'');
+                    const ra = a.role_name || '', rb = b.role_name || '';
+                    if (ra !== rb) return (newestOfRole[rb] - newestOfRole[ra]) || ra.localeCompare(rb);
                     return (b.modified_time||0) - (a.modified_time||0);
                 });
             } else if (currentSort === 'newest') {
@@ -8853,6 +9782,34 @@
                         if (ev.target === docOverlay) closePluginDoc();
                     });
                 }
+                const vdClose = document.getElementById('voice-design-close');
+                if (vdClose) vdClose.addEventListener('click', closeVoiceDesignModal);
+                const vdOverlay = document.getElementById('voice-design-modal');
+                if (vdOverlay) {
+                    vdOverlay.addEventListener('click', ev => {
+                        if (ev.target === vdOverlay) closeVoiceDesignModal();
+                    });
+                }
+                const vdCreateBtn = document.getElementById('vd-create');
+                if (vdCreateBtn) vdCreateBtn.addEventListener('click', createDesignedVoice);
+                const vdRefreshBtn = document.getElementById('vd-refresh');
+                if (vdRefreshBtn) vdRefreshBtn.addEventListener('click', loadDesignedVoices);
+                const veClose = document.getElementById('voice-enroll-close');
+                if (veClose) veClose.addEventListener('click', closeVoiceEnrollModal);
+                const veOverlay = document.getElementById('voice-enroll-modal');
+                if (veOverlay) {
+                    veOverlay.addEventListener('click', ev => {
+                        if (ev.target === veOverlay) closeVoiceEnrollModal();
+                    });
+                }
+                const veFiles = document.getElementById('ve-files');
+                if (veFiles) {
+                    veFiles.addEventListener('change', () => addEnrollFiles(veFiles.files));
+                }
+                const veCreateBtn = document.getElementById('ve-create');
+                if (veCreateBtn) veCreateBtn.addEventListener('click', createEnrolledVoice);
+                const veRefreshBtn = document.getElementById('ve-refresh');
+                if (veRefreshBtn) veRefreshBtn.addEventListener('click', loadEnrolledVoices);
                 document.addEventListener('keydown', ev => {
                     if (ev.key === 'Escape') closePluginDoc();
                 });
