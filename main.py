@@ -1,3 +1,4 @@
+# 注：代码大部分由 Deepseek 、 GLM 、 混元 大模型协助生成，可能存在不准确或不完整的地方，请谨慎使用。 
 import asyncio
 import hashlib
 import hmac
@@ -23,7 +24,7 @@ def _harden_stdio():
     """让 print 在任何终端/无终端环境下都不会把程序带崩。
 
     console=False 打包时 sys.stdout 是 None（print 直接 AttributeError）；
-    从 GBK 代码页的 cmd 启动时，⚠️ 这类字符编码不了会抛 UnicodeEncodeError。
+    从 GBK 代码页的 cmd 启动时，这类字符编码不了会抛 UnicodeEncodeError。
     两种都在任何 print 之前处理掉。
     """
     for name in ("stdout", "stderr"):
@@ -5991,6 +5992,9 @@ class WebUIServer:
         self.app.router.add_post("/api/auth/second", self.handle_auth_second)
         self.app.router.add_get("/api/update/status", self.handle_update_status)
         self.app.router.add_get("/api/update/check", self.handle_update_check)
+        self.app.router.add_post("/api/update/download", self.handle_update_download)
+        self.app.router.add_get("/api/update/progress", self.handle_update_progress)
+        self.app.router.add_post("/api/update/install", self.handle_update_install)
 
     def _refresh_auth_state(self):
         """按当前 webui_password 重建会话令牌。「记住我」的令牌与密码哈希一起
@@ -6155,7 +6159,8 @@ class WebUIServer:
         if not first_this_run and interval > 0:
             if self._update_last_result \
                     and time.time() - self._update_last_result[0] < interval:
-                return web.json_response(self._update_last_result[1])
+                return web.json_response(
+                    self._with_update_download(self._update_last_result[1]))
             cache = self._update_cache()
             cached_result = cache.get("result") or {}
             try:
@@ -6165,15 +6170,184 @@ class WebUIServer:
             if cached_result.get("current") == APP_VERSION \
                     and bool(cache.get("include_prerelease", False)) == include_pre \
                     and cache.get("checked_at") and cached_age < interval:
-                return web.json_response(cached_result)
+                return web.json_response(self._with_update_download(cached_result))
         payload = await self._update_check_payload()
         self._update_last_result = (time.time(), payload)
-        return web.json_response(payload)
+        return web.json_response(self._with_update_download(payload))
 
     async def handle_update_check(self, request):
         if not self.config.get("update_check_enabled", True):
             return web.json_response({"enabled": False, "has_update": False})
-        return web.json_response(await self._update_check_payload())
+        return web.json_response(
+            self._with_update_download(await self._update_check_payload()))
+
+    # ---------------- 在线更新（下载 / 进度 / 安装） ----------------
+    def _update_download_payload(self) -> dict:
+        """下载状态：内存里的进度优先；没有就把磁盘上已下好的安装包报上来。"""
+        with _UPDATE_LOCK:
+            state = dict(_UPDATE_STATE)
+        ready = find_ready_installer()
+        if ready and not state["active"]:
+            state.update({"finished": True, "version": ready["version"],
+                          "path": ready["path"], "total": ready["size"],
+                          "received": ready["size"]})
+        state["ready"] = bool(ready)
+        return state
+
+    def _with_update_download(self, payload: dict) -> dict:
+        """把「有没有下好的安装包」并进检查结果：前端据此直接跳到安装提示。"""
+        result = dict(payload or {})
+        result["download"] = self._update_download_payload()
+        return result
+
+    async def handle_update_progress(self, request):
+        return web.json_response({"ok": True, **self._update_download_payload()})
+
+    async def handle_update_download(self, request):
+        """开始下载安装包（后台跑，前端轮询进度、日志里看同一行）。"""
+        if not self.config.get("update_check_enabled", True):
+            return web.json_response({"ok": False, "error": "更新检查已在配置里关闭"},
+                                     status=400)
+        with _UPDATE_LOCK:
+            if _UPDATE_STATE["active"]:
+                return web.json_response({"ok": True, "already": True,
+                                          **self._update_download_payload()})
+        ready = find_ready_installer()
+        if ready:
+            return web.json_response({"ok": True, "already": True,
+                                      **self._update_download_payload()})
+        with _UPDATE_LOCK:
+            _UPDATE_STATE.update({"active": True, "phase": "准备中", "error": "",
+                                  "received": 0, "total": 0, "finished": False,
+                                  "started_at": time.time(), "source": ""})
+        asyncio.create_task(self._update_download_task())
+        return web.json_response({"ok": True, "started": True})
+
+    async def _race_mirrors(self, url: str):
+        """镜像测速：直连与各镜像并发试，谁先响应就用谁；证书问题降级再试一遍。"""
+        from modules import updater as U
+        from modules.ghmirror import candidates
+        from modules.tls import is_cert_error
+        urls = candidates(url, self._github_mirrors())
+        try:
+            winner, elapsed = await U.race_candidates(urls, verify=True)
+            return winner, elapsed, False
+        except Exception as e:
+            if not is_cert_error(e):
+                raise
+            print("[更新] 证书校验失败，改用不校验证书的方式测速（本机可能装了"
+                  "自签根证书的安全软件/加速器）")
+            winner, elapsed = await U.race_candidates(urls, verify=False)
+            return winner, elapsed, True
+
+    async def _update_download_task(self):
+        """后台任务：查发布 → 测速挑最快镜像 → 流式下载 → 落盘。"""
+        from modules import updater as U
+        from modules.ghmirror import mirror_label, note_success
+        try:
+            payload = await self._update_check_payload()
+            installer = (payload or {}).get("installer") or {}
+            version = str((payload or {}).get("latest") or "")
+            url = str(installer.get("url") or "")
+            if not (payload or {}).get("has_update"):
+                raise RuntimeError("当前已是最新版本，不需要下载")
+            if not url:
+                raise RuntimeError("这个版本没有上传安装包（.exe）资源，"
+                                   "请点「前往 GitHub 更新」手动下载")
+            if not is_own_release_asset(url):
+                raise RuntimeError("安装包地址不在本仓库的 Releases 里")
+            try:
+                expected = int(installer.get("size") or 0)
+            except (TypeError, ValueError):
+                expected = 0
+            kind = str(installer.get("kind") or "exe")
+            suffix = ".zip" if kind == "archive" else ".exe"
+            update_dir().mkdir(parents=True, exist_ok=True)
+            dest = update_dir() / f"Lovomo_Setup_{version}{suffix}"
+            with _UPDATE_LOCK:
+                _UPDATE_STATE.update({"phase": "测速中", "version": version,
+                                      "path": str(dest), "total": expected,
+                                      "received": 0, "source": ""})
+            print(f"[更新] 开始在线更新：{version}"
+                  f"（{installer.get('name') or dest.name}）")
+            winner, elapsed, insecure = await self._race_mirrors(url)
+            label = mirror_label(winner, url)
+            if note_success(url, winner):
+                print("[GitHub] " + (f"下载改用镜像 {label}" if winner != url
+                                     else "直连已恢复"))
+            print(f"[更新] 镜像测速完成：{label} 最快"
+                  f"（{elapsed * 1000:.0f} ms，候选 {len(self._github_mirrors()) + 1} 个）")
+            with _UPDATE_LOCK:
+                _UPDATE_STATE.update({"phase": "下载中", "source": label})
+
+            last = {"at": 0.0}
+
+            def on_progress(received, total):
+                with _UPDATE_LOCK:
+                    _UPDATE_STATE.update({"received": received, "total": total})
+                now = time.time()
+                if now - last["at"] < 1.0 and (not total or received < total):
+                    return
+                last["at"] = now
+                log_progress(update_progress_line(received, total, label))
+
+            started = time.time()
+            size = await U.download_asset(winner, dest, expected_size=expected,
+                                          verify=not insecure, on_progress=on_progress)
+            used = max(0.001, time.time() - started)
+            # 类型校验按资源类型来：exe 看 MZ、压缩包看 PK（镜像可能回 HTML 错误页）
+            await asyncio.to_thread(U.check_downloaded_head, dest, kind)
+            print(f"[更新] 下载完成：{dest.name}（{size / 1048576:.1f} MB，"
+                  f"用时 {used:.0f} 秒，平均 {size / used / 1048576:.1f} MB/s，"
+                  f"来源 {label}）")
+            if kind == "archive":
+                # 发布的是压缩包：自动解出里面的 exe 再用；解完把压缩包删掉，
+                # 留着只会让用户目录里躺双份
+                with _UPDATE_LOCK:
+                    _UPDATE_STATE.update({"phase": "解压中"})
+                target = update_dir() / f"Lovomo_Setup_{version}.exe"
+                info = await asyncio.to_thread(U.extract_installer, dest, target)
+                print(f"[更新] 已从压缩包解出安装包：{info['entry']} → {target.name}"
+                      f"（{info['size'] / 1048576:.1f} MB）")
+                try:
+                    dest.unlink()
+                    print(f"[更新] 压缩包已删除：{dest.name}")
+                except OSError as e:
+                    print(f"[更新] 删除压缩包失败：{e}")
+                dest, size = target, info["size"]
+            with _UPDATE_LOCK:
+                _UPDATE_STATE.update({"active": False, "finished": True,
+                                      "received": size, "total": size, "error": "",
+                                      "phase": "已完成", "path": str(dest)})
+        except Exception as e:
+            with _UPDATE_LOCK:
+                _UPDATE_STATE.update({"active": False, "finished": False,
+                                      "phase": "失败",
+                                      "error": f"{type(e).__name__}: {e}"})
+            print(f"[更新] 下载失败：{type(e).__name__}: {e}")
+
+    async def handle_update_install(self, request):
+        """立即安装：把安装包交给主程序那边的入口（起助手 → 退出本进程）。"""
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        path = str(payload.get("path") or "").strip()
+        ready = find_ready_installer()
+        if not path:
+            path = str(ready.get("path") or "")
+        if not path or not Path(path).is_file():
+            return web.json_response({"ok": False, "error": "安装包不存在（可能已被删除）"},
+                                     status=400)
+        hook = _APP_HOOKS.get("install_update")
+        if hook is None:
+            return web.json_response({"ok": False, "error": "当前模式不支持自动安装"
+                                                        "（请点「前往 GitHub 更新」手动下载）"},
+                                     status=400)
+        error = hook(path) or ""
+        if error:
+            return web.json_response({"ok": False, "error": error}, status=400)
+        return web.json_response({"ok": True})
 
     def _github_mirrors(self) -> tuple:
         from modules.ghmirror import parse_mirrors
@@ -6261,6 +6435,7 @@ class WebUIServer:
                 page_url = release_home
             result = {"enabled": True, "current": current, "latest": latest,
                       "has_update": has_update, "url": page_url,
+                      "installer": picked.get("installer", {}),
                       "prerelease": picked.get("prerelease", False),
                       "checked_at": checked_at, "include_prerelease": include_pre,
                       "releases_seen": seen, "prerelease_seen": pre_seen,
@@ -6399,6 +6574,31 @@ class WebUIServer:
         r.add_get("/api/stickers/file", self.handle_stickers_file)
         r.add_get("/favicon.ico", self.handle_favicon)
         r.add_get("/", self.handle_index)
+        r.add_post("/api/clear-ui-cache", self.handle_clear_ui_cache)
+
+    async def handle_clear_ui_cache(self, request):
+        """「清理界面缓存」按钮：把界面缓存真的删掉。
+
+        拆界面进程会把当前页面一起带走，所以先把响应发回去，再在后台线程里
+        拆 → 删 → 重建；页面自己会带着新界面回来。
+        """
+        window = _WEBVIEW_WINDOW_HOLDER.get("window")
+        try:
+            alive = webview2_control_alive(window) if window is not None else False
+        except Exception:
+            alive = False
+        url = str(request.url.origin())
+
+        def _run():
+            try:
+                result = clear_webview_cache_and_reload(window, url)
+                print(f"[窗口] 手动清理界面缓存：释放 {result['freed'] / 1048576:.1f} MB"
+                      f"（拆界面={result['released']}，重建={result['rebuilt']}）")
+            except Exception as e:
+                print(f"清理界面缓存失败: {type(e).__name__}: {e}")
+
+        threading.Thread(target=_run, daemon=True).start()
+        return web.json_response({"ok": True, "desktop": alive})
 
     async def handle_favicon(self, request):
         """浏览器每次打开页面都会自己来要 favicon，没有就报 404 刷控制台。"""
@@ -6409,9 +6609,10 @@ class WebUIServer:
 
     async def handle_index(self, request):
         if self.html_path.exists():
-            # 不带这个头时浏览器会按 Last-Modified 自行估算缓存有效期，
-            # 前端更新后旧页面能继续命中缓存，用户重装程序都看不到新界面。
-            return web.FileResponse(self.html_path, headers={"Cache-Control": "no-cache"})
+            # 界面是单文件前端，整个界面都在这个页面里，缓存它没有好处：
+            # 前端更新后旧页面会继续命中缓存，用户重装程序都看不到新界面。
+            # （WebView2 还有自己独立的一份缓存，由 purge_webview_cache 收拾。）
+            return web.FileResponse(self.html_path, headers={"Cache-Control": "no-store"})
         return web.Response(text="WebUI 页面未找到", status=404)
 
     # ---------------- 配置 ----------------
@@ -9582,6 +9783,243 @@ def _webview2_rebuild(window, url: str, profile_dir: str) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# WebView2 缓存
+# ---------------------------------------------------------------------------
+# WebView2 用的是完全独立的用户数据目录（<数据目录>/webview/EBWebView），
+# 系统浏览器里清缓存对它无效 —— 程序更新后界面可能一直停在老版本上。
+# 所以这里在「版本号或界面文件变了」的时候把那几个缓存目录删掉重建。
+# 只删缓存，不碰 Cookies 与 Local Storage：那是登录态与界面偏好，删了用户
+# 每次开窗口都要重输密码、面板还会回到默认页。
+
+_WEBVIEW_CACHE_DIRS = (
+    "Cache",
+    "Code Cache",
+    "GPUCache",
+    "DawnCache",
+    "DawnGraphiteCache",
+    "DawnWebGPUCache",
+    "GraphiteDawnCache",
+    "ShaderCache",
+    "GrShaderCache",
+    "Service Worker/CacheStorage",
+    "Service Worker/ScriptCache",
+)
+_WEBVIEW_CACHE_KEY_FILE = "lovomo_cache_key.txt"
+
+
+def webview_cache_key() -> str:
+    """缓存的新鲜度指纹：版本号 + 界面文件的修改时间与大小。
+
+    只看版本号不够 —— 同一个版本号反复重打包（开发期常态）时界面照样会变。
+    """
+    stamp = "unknown"
+    try:
+        info = (get_resource_path("webui") / "start.html").stat()
+        stamp = f"{int(info.st_mtime)}-{info.st_size}"
+    except OSError:
+        pass
+    try:
+        from modules.updater import APP_VERSION
+    except Exception:
+        APP_VERSION = ""
+    return f"{APP_VERSION}|{stamp}"
+
+
+def _remove_cache_dir(path: Path) -> int:
+    """删掉一个缓存目录，返回它占用的字节数；被占用时重试几次。"""
+    size = 0
+    try:
+        for item in path.rglob("*"):
+            if item.is_file():
+                size += item.stat().st_size
+    except OSError:
+        pass
+    for _ in range(3):
+        shutil.rmtree(path, ignore_errors=True)
+        if not path.exists():
+            break
+        time.sleep(0.3)
+    return size
+
+
+def purge_webview_cache(force: bool = False) -> int:
+    """清一次 WebView2 缓存，返回释放的字节数（0 = 不需要清）。
+
+    界面文件和版本号都没变时不重复动手：那会把用户攒下来的静态资源缓存
+    白白删掉，下次开窗口反而更慢。
+    """
+    profile = _webview_profile_dir()
+    if not profile:
+        return 0
+    profile_dir = Path(profile)
+    marker = profile_dir / _WEBVIEW_CACHE_KEY_FILE
+    key = webview_cache_key()
+    if not force:
+        try:
+            if marker.read_text(encoding="utf-8").strip() == key:
+                return 0
+        except OSError:
+            pass
+    root = profile_dir / "EBWebView"
+    freed = 0
+    # 老版本把缓存放在 EBWebView 根下，新版本放在 EBWebView/Default 下，都扫一遍
+    for base in (root, root / "Default"):
+        for rel in _WEBVIEW_CACHE_DIRS:
+            target = base / rel
+            if target.exists():
+                freed += _remove_cache_dir(target)
+    try:
+        marker.write_text(key, encoding="utf-8")
+    except OSError:
+        pass
+    return freed
+
+
+def webview2_control_alive(window) -> bool:
+    """界面进程还在不在（窗口收进托盘后会被拆掉，那时它是已释放状态）。"""
+    form = _webview2_form(window)
+    if form is None:
+        return False
+    ctrl = getattr(form, "webview", None)
+    if ctrl is None:
+        return False
+    return bool(_webview2_on_ui(form, lambda: not bool(ctrl.IsDisposed)).get("value"))
+
+
+def clear_webview_cache_and_reload(window, url: str) -> dict:
+    """「清理界面缓存」按钮的实体：拆界面进程 → 删缓存 → 重建界面。
+
+    程序跑着的时候缓存目录被 WebView2 占着，直接删只会删掉一半，所以先把控件
+    拆掉（进程全退、句柄放开）再删，最后重建 —— 用户看到的就是界面重新加载了
+    一次。没有界面进程（浏览器访问）时只清缓存，由页面自己刷新。
+    """
+    alive = webview2_control_alive(window) if window is not None else False
+    if alive:
+        _webview2_release(window)
+        time.sleep(0.4)          # 等 WebView2 的进程把文件句柄放开
+    freed = purge_webview_cache(force=True)
+    rebuilt = bool(alive and url
+                   and _webview2_rebuild(window, url, _webview_profile_dir()))
+    return {"released": alive, "rebuilt": rebuilt, "freed": freed}
+
+
+# ---------------------------------------------------------------------------
+# 在线更新：下载安装包 / 安装 / 收尾
+# ---------------------------------------------------------------------------
+# 安装包落在 <用户数据目录>/update/Lovomo_Setup_<版本>.exe。用户在「下载已完成，
+# 是否立即安装？」选「否」时它得留着（下次点「检查更新」还要接着用），所以只在
+# 「已经装上或更旧」时才删；彻底清掉由卸载程序负责（安装脚本里有 [UninstallDelete]）。
+_UPDATE_STATE = {
+    "active": False, "phase": "idle", "version": "", "path": "", "source": "",
+    "received": 0, "total": 0, "error": "", "started_at": 0.0, "finished": False,
+}
+_UPDATE_LOCK = threading.Lock()
+# main() 里注册的「安装并退出」入口：WebUI 线程不能直接调窗口那边的局部函数
+_APP_HOOKS = {"install_update": None}
+# 进度日志固定替换同一行，免得日志面板被百分比刷满
+_PROGRESS_LINE = {"index": -1, "text": ""}
+_APP_RELEASE_REPO = "slpk1ng/Lovomo"
+
+
+def update_dir() -> Path:
+    """在线更新的安装包落点（用户目录，卸载时由安装脚本清整目录）。"""
+    return user_data_dir() / "update"
+
+
+def parse_installer_version(filename) -> str:
+    """从 Lovomo_Setup_1.2.3.0.exe 里取出 1.2.3.0；不是这个命名就返回空串。"""
+    match = re.match(r"^Lovomo_Setup[_-]?v?(\d[\d.]*)$", Path(filename).stem, re.I)
+    return match.group(1).rstrip(".") if match else ""
+
+
+def find_ready_installer() -> dict:
+    """已经下好、且比当前版本新的安装包（没有就返回空字典）。"""
+    from modules.updater import APP_VERSION, is_newer
+    best = {}
+    try:
+        files = sorted(update_dir().glob("*.exe"))
+    except OSError:
+        return {}
+    for path in files:
+        version = parse_installer_version(path.name)
+        if not version or not is_newer(version, APP_VERSION):
+            continue
+        if best and not is_newer(version, best["version"]):
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        best = {"version": version, "path": str(path), "size": size}
+    return best
+
+
+def cleanup_old_installers() -> int:
+    """删掉「已经装上或更旧」的安装包 —— 更新之后由新版本自己收尾。"""
+    from modules.updater import APP_VERSION, is_newer
+    freed = 0
+    try:
+        files = (sorted(update_dir().glob("*.exe"))
+                 + sorted(update_dir().glob("*.zip")))
+    except OSError:
+        return 0
+    for path in files:
+        version = parse_installer_version(path.name)
+        if version and is_newer(version, APP_VERSION):
+            continue  # 还没装的新版本，留着
+        try:
+            size = path.stat().st_size
+            path.unlink()
+            freed += size
+            print(f"[更新] 已删除用过的安装包 {path.name}（{size / 1048576:.1f} MB）")
+        except OSError as e:
+            print(f"[更新] 清理安装包失败 {path.name}: {e}")
+    return freed
+
+
+def update_progress_line(received: int, total: int, source: str) -> str:
+    """进度日志的文案（同一行反复替换，所以信息要能一口气看完）。"""
+    got = received / 1048576
+    if total:
+        return (f"[更新] 下载中 {received * 100 // total}%"
+                f"（{got:.1f}/{total / 1048576:.1f} MB，来源 {source}）")
+    return f"[更新] 下载中 {got:.1f} MB（来源 {source}）"
+
+
+def log_progress(text: str) -> None:
+    """原地刷新一条进度日志：日志面板里那一行数字在跳，而不是一屏一屏刷。
+
+    只在「上一行还是我们自己写的那条」时才替换 —— 中间夹了别的日志（比如切换
+    镜像的提示）就另起一行，否则进度会往回跳到旧位置上去。
+    """
+    with log_lock:
+        index = _PROGRESS_LINE["index"]
+        if index == len(global_log_buffer) - 1 and index >= 0 \
+                and global_log_buffer[index] == _PROGRESS_LINE["text"]:
+            global_log_buffer[index] = text
+        else:
+            global_log_buffer.append(text)
+            _PROGRESS_LINE["index"] = len(global_log_buffer) - 1
+        _PROGRESS_LINE["text"] = text
+    # 源码运行时还有真控制台：那边也用同一行滚动
+    stream = getattr(sys.stdout, "original_stream", None)
+    if stream is not None:
+        try:
+            stream.write("\r" + text)
+            stream.flush()
+        except Exception:
+            pass
+
+
+def is_own_release_asset(url: str) -> bool:
+    """安装包必须来自本仓库的 Releases（GitHub 转发出来的域名也算）。"""
+    head = str(url or "").lower()
+    return (head.startswith(f"https://github.com/{_APP_RELEASE_REPO.lower()}/releases/download/")
+            or head.startswith("https://objects.githubusercontent.com/")
+            or head.startswith("https://github-releases.githubusercontent.com/"))
+
+
 # ============================================================================
 # 主入口
 # ============================================================================
@@ -9953,6 +10391,7 @@ if __name__ == "__main__":
 
     stop_event = threading.Event()
 
+    run_exe = os.environ.pop("LOVOMO_RUN_EXE", "")
     wait_pid = os.environ.pop("LOVOMO_WAIT_PID", "")
     if wait_pid:
         try:
@@ -9962,6 +10401,17 @@ if __name__ == "__main__":
                 time.sleep(0.3)
         except Exception:
             pass
+    if run_exe:
+        # 在线更新的助手：旧进程已经退干净，替它把安装包拉起来再走人。
+        # 安装包要替换正在运行的程序文件，所以必须等这边完全退出（这里不加
+        # CREATE_NO_WINDOW —— 安装界面要正常显示给用户）。
+        try:
+            import subprocess
+            subprocess.Popen([run_exe], close_fds=True)
+            print(f"[更新] 已拉起安装包：{run_exe}")
+        except Exception as e:
+            print(f"[更新] 拉起安装包失败：{type(e).__name__}: {e}")
+        sys.exit(0)
 
     # 单实例判定放在等待之后：「重启 Lovomo」是旧进程退出、新进程才启动，
     # 那时名额已经释放，不会被自己的上一世挡在门外。
@@ -9971,6 +10421,12 @@ if __name__ == "__main__":
         else:
             print("Lovomo 已在运行，未重复启动。")
         sys.exit(0)
+
+    # 更新过之后把用过的安装包收掉（新版本的那个留着，下次「检查更新」还能用）
+    try:
+        cleanup_old_installers()
+    except Exception as e:
+        print(f"[更新] 清理旧安装包失败：{type(e).__name__}: {e}")
 
     config = ConfigLoader()
 
@@ -10208,6 +10664,30 @@ if __name__ == "__main__":
                 w.destroy()
             except Exception:
                 pass
+
+    def install_update_package(installer_path: str) -> str:
+        """启动安装包并退出本程序；返回空串表示已安排，否则是给用户看的原因。
+
+        安装包要替换正在运行的程序文件，直接在自己进程里拉会被文件占用挡下来，
+        所以起一个「自己」当助手（LOVOMO_RUN_EXE），等本进程退干净再由它拉起
+        安装包 —— 复用重启那套 LOVOMO_WAIT_PID 机制。
+        """
+        path = Path(str(installer_path or ""))
+        if not path.is_file():
+            return "安装包不存在或已被删除"
+        try:
+            exe, extra = _resolve_spawn_exe()
+            env = dict(os.environ)
+            env["LOVOMO_WAIT_PID"] = str(os.getpid())
+            env["LOVOMO_RUN_EXE"] = str(path)
+            _spawn_detached([exe, *extra], env)
+        except Exception as e:
+            return f"启动安装程序失败：{type(e).__name__}: {e}"
+        print(f"[更新] 已安排安装：{path.name}（本程序退出后由助手拉起安装包）")
+        request_quit()
+        return ""
+
+    _APP_HOOKS["install_update"] = install_update_package
 
     def try_start_tray() -> bool:
         if tray_state.get("icon") is not None:
@@ -10448,6 +10928,11 @@ if __name__ == "__main__":
 
     def run_webview_loop():
         import webview
+        # 界面更新过就先清 WebView2 的缓存：它有自己的缓存目录，浏览器那边
+        # 清缓存对它无效，不清就会「重装了还是老界面」
+        freed = purge_webview_cache()
+        if freed:
+            print(f"[窗口] 界面已更新，已清理 WebView2 缓存（{freed / 1048576:.1f} MB）")
         geom = _load_window_geometry()
         normal = _sanitize_normal_geometry(geom.get("normal") or {})
         scale = _window_scale()
@@ -10530,7 +11015,7 @@ if __name__ == "__main__":
         # 曾经加过一个 events.loaded + Timer(0.6) 的兜底，想把历史脏几何纠正
         # 回来，结果制造了更严重的 bug：定时器在窗口还没初始化完成时触发，
         # 此时 GetWindowRect 拿到的是 MinimumSize(200x100)，_apply_saved_geometry
-        # 就照着 200x100 去 resize，窗口被压成一个 200x100 的小方块，玩家还会
+        # 就照着 200x100 去 resize，窗口被压成一个 200x100 的小方块
 
         #
         # 正确策略：几何只在 create_window 时决定一次（上面已经算好了正确值），

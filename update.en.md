@@ -18,6 +18,10 @@
 
 - Cloud TTS voice cloning: the same spot uploads one or more audio clips to clone a voice, merging multiple files automatically, with an optional transcript for better results, listing and deletion, and one-click fill into the default voice.
 
+- A "Clear interface cache" button was added to the bottom right of the configuration page: when the interface looks unchanged after an update, one click tears down the interface processes, clears the WebView2 cache and reloads the interface.
+
+- Updating is now a choice: when a new version is found you can update online from inside the app (mirrors are speed-tested concurrently and the fastest one wins, with a progress bar and progress in the log if you leave it running in the background), or use "Update from GitHub" as before; when the download finishes it asks whether to install now, and installing closes the old process and launches the installer.
+
 
 
 #### 🛠 Fixed
@@ -29,6 +33,8 @@
 - Chat history: a session file keeps the complete chat log instead of only the most recent messages, so earlier conversations no longer disappear from "Chat History".
 
 - Chat history: with "By character (newest in group)" selected, the character groups themselves are now ordered by their newest conversation, so the character you talked to most recently comes first.
+
+- The interface could still be the old one after an update: the page is no longer kept in the cache, and the WebView2 cache directory is cleared automatically when the version or the interface file changes (clearing the system browser's cache has no effect on it).
 
 
 

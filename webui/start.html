@@ -841,6 +841,17 @@
         .plugin-apply-bar .btn { box-shadow: inset 0 1px 0 rgba(255,255,255,.22), var(--shadow-pop); }
         .plugin-apply-note { border-radius: var(--radius); }
 
+        /* ---------- 在线更新进度条 ---------- */
+        .up-bar {
+            height: 8px; border-radius: 4px; overflow: hidden;
+            background: rgba(127, 127, 127, 0.18);
+        }
+        .up-bar-fill {
+            height: 100%; width: 0; border-radius: 4px;
+            background: var(--skin-accent, var(--brand));
+            transition: width 0.3s ease;
+        }
+
         /* ---------- 轻提示 ---------- */
         .toast {
             background: linear-gradient(180deg, #16b45e 0%, var(--ok) 100%);
@@ -1000,6 +1011,7 @@
                 <button class="save-btn-restart" id="save-restart-btn" data-icon="refresh">保存并重启TTS</button>
                 <button class="btn btn-gray" id="check-update-btn" data-icon="checkUpdate">检查更新</button>
                 <button class="btn btn-gray" id="config-preset-btn" data-icon="swap">切换预设</button>
+                <button class="btn btn-gray" id="clear-ui-cache-btn" data-icon="clean" title="更新了但是感觉没有变化？点击这个按钮清理界面缓存。">清理界面缓存</button>
             </div>
         </div>
         <div class="panel" id="panel-plugins">
@@ -1814,12 +1826,20 @@
         </div>
     </div>
     <div class="modal-overlay" id="update-modal">
-        <div class="modal-content" style="width:460px; height:auto; padding:24px;">
+        <div class="modal-content" style="width:520px; height:auto; padding:24px;">
             <h3>发现新版本</h3>
             <p id="update-info" style="margin:14px 0; line-height:1.6;"></p>
+            <div id="update-progress-box" style="display:none; margin:2px 0 16px;">
+                <div class="up-bar"><div class="up-bar-fill" id="update-bar-fill"></div></div>
+                <p class="muted" style="margin:8px 0 0; font-size:12px;">
+                    <span id="update-phase"></span><span id="update-nums"></span>
+                </p>
+            </div>
             <div style="display:flex; gap:10px;">
                 <button class="btn" id="update-later" style="flex:1;">稍后</button>
-                <button class="btn btn-green" id="update-go" style="flex:1;">前往更新</button>
+                <button class="btn" id="update-go" style="flex:1;">前往 GitHub 更新</button>
+                <button class="btn btn-green" id="update-online" style="flex:1;">在线更新</button>
+                <button class="btn btn-green" id="update-install" style="flex:1; display:none;">立即安装</button>
             </div>
         </div>
     </div>
@@ -1850,6 +1870,25 @@
             "导出配置": "Export Configuration",
             "导入配置": "Import Configuration",
             "切换预设": "Switch preset",
+            "清理界面缓存": "Clear interface cache",
+            "前往 GitHub 更新": "Update from GitHub",
+            "在线更新": "Update online",
+            "立即安装": "Install now",
+            "后台下载": "Download in background",
+            "准备中…": "Preparing…",
+            "准备中": "Preparing",
+            "测速中": "Testing mirrors",
+            "解压中": "Extracting",
+            "下载中": "Downloading",
+            "下载完成": "Download complete",
+            "已完成": "Finished",
+            "下载已完成，是否立即安装？安装时会关闭本程序。": "The download is complete. Install now? Lovomo will be closed during the installation.",
+            "正在启动安装程序，本程序随后会退出。": "Starting the installer; Lovomo will quit right after.",
+            "正在启动安装程序…": "Starting the installer…",
+            "正在下载新版本…可以点「后台下载」关掉这个窗口，进度会写在日志里。": "Downloading the new version… you can hit \"Download in background\" to close this window; the progress is written to the log.",
+            "更新了但是感觉没有变化？点击这个按钮清理界面缓存。": "Updated but nothing seems to have changed? Click this button to clear the interface cache.",
+            "清理中…": "Clearing…",
+            "正在重新加载…": "Reloading…",
             "选一份之前导出的预设，一键切回当时的配置。": "Pick a preset you exported earlier to switch back to that configuration in one click.",
             "把当前配置存成一份预设放在本机，之后随时可以切回来。": "Save the current configuration as a preset on this machine; you can switch back to it at any time.",
             "选填，例如「换声线前」": "Optional, e.g. \"before switching the voice\"",
@@ -3795,6 +3834,7 @@
             check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
             /* 更新 / 导入导出 */
             checkUpdate: '<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5v8"/><path d="M8.7 12.4 12 15.7l3.3-3.3"/>',
+            clean: '<path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21"/><path d="M22 21H7"/><path d="m5 11 9 9"/>',
             export: '<path d="M4.5 15v3.5a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V15"/><path d="M12 15.5V4"/><path d="M7.8 8.2 12 4l4.2 4.2"/>',
             importIn: '<path d="M4.5 15v3.5a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V15"/><path d="M12 4v11.5"/><path d="M7.8 11.3 12 15.5l4.2-4.2"/>',
             upload: '<path d="M4.5 15v3.5a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V15"/><path d="M12 16.5V5"/><path d="M7.8 9.2 12 5l4.2 4.2"/>',
@@ -4583,23 +4623,171 @@
             if (!res.ok) { alert(res.error || '获取模型列表失败'); return; }
             showModelChoice(input, res.models || [], '服务上');
         }
+        /* ---------------- 在线更新 ----------------
+         * 下载在服务端做（关掉这个窗口也继续），进度同时写进日志的同一行；
+         * 镜像由服务端测速挑最快的。下完弹「下载已完成，是否立即安装？」，
+         * 选「否」时安装包留着，下次点「检查更新」会直接回到这一步。 */
+        const updPoll = {timer: null};
+
+        function updMB(bytes) {
+            const n = Number(bytes || 0);
+            return n ? (n / 1048576).toFixed(1) + ' MB' : '';
+        }
+
+        function setUpdButtons(mode) {
+            const set = (id, on) => {
+                const el = document.getElementById(id);
+                if (el) el.style.display = on ? '' : 'none';
+            };
+            set('update-go', mode === 'choice');
+            set('update-online', mode === 'choice');
+            set('update-install', mode === 'ready');
+            setBtnText(document.getElementById('update-later'),
+                       mode === 'progress' ? '后台下载' : '稍后');
+        }
+
+        function setUpdProgress(state) {
+            const box = document.getElementById('update-progress-box');
+            if (!box) return;
+            if (!state || (!state.active && !state.finished)) {
+                box.style.display = 'none';
+                return;
+            }
+            box.style.display = '';
+            const total = Number(state.total || 0);
+            const got = Number(state.received || 0);
+            const pct = state.finished ? 100
+                : (total ? Math.min(100, Math.round(got * 100 / total)) : 0);
+            const fill = document.getElementById('update-bar-fill');
+            if (fill) fill.style.width = pct + '%';
+            const phase = document.getElementById('update-phase');
+            if (phase) phase.textContent = state.finished ? '下载完成' : (state.phase || '下载中');
+            const nums = document.getElementById('update-nums');
+            if (nums) {
+                nums.textContent = (total ? ` ${pct}% · ${updMB(got)} / ${updMB(total)}`
+                                          : ` ${updMB(got)}`)
+                    + (state.source ? ` · ${state.source}` : '');
+            }
+        }
+
+        function stopUpdPoll() {
+            if (updPoll.timer) { clearInterval(updPoll.timer); updPoll.timer = null; }
+        }
+
+        function askInstallUpdate() {
+            document.getElementById('update-info').textContent =
+                '下载已完成，是否立即安装？安装时会关闭本程序。';
+            setUpdButtons('ready');
+            const m = document.getElementById('update-modal');
+            if (m) m.classList.add('active');
+        }
+
+        function startUpdPoll() {
+            if (updPoll.timer) return;
+            const tick = async () => {
+                let state = null;
+                try {
+                    state = await apiGet('api/update/progress');
+                } catch (e) { stopUpdPoll(); return; }
+                setUpdProgress(state);
+                if (state.error) {
+                    stopUpdPoll();
+                    setUpdButtons('choice');
+                    alert('在线更新下载失败：' + state.error
+                          + '\n\n可以点「前往 GitHub 更新」手动下载。');
+                    return;
+                }
+                if (state.active) {
+                    const m = document.getElementById('update-modal');
+                    if (m && m.classList.contains('active')) setUpdButtons('progress');
+                    return;
+                }
+                stopUpdPoll();
+                if (state.finished) askInstallUpdate();
+            };
+            updPoll.timer = setInterval(tick, 700);
+            tick();
+        }
+
         function showUpdateModal(info) {
             const m = document.getElementById('update-modal');
             if (!m) return;
+            window._lovomoUpdate = info || {};
+            const dl = (info || {}).download || {};
+            if (dl.active) {
+                setUpdProgress(dl);
+                setUpdButtons('progress');
+                document.getElementById('update-info').textContent =
+                    `正在下载新版本 ${dl.version || ''}…可以点「后台下载」关掉这个窗口，`
+                    + '进度会写在日志里。';
+                m.classList.add('active');
+                startUpdPoll();
+                return;
+            }
+            if (dl.ready) {           // 已经下好过：直接回到「是否立即安装」
+                setUpdProgress({finished: true, total: dl.total, received: dl.total});
+                askInstallUpdate();
+                return;
+            }
+            setUpdProgress(null);
             document.getElementById('update-info').textContent =
                 `当前版本 ${info.current || '未知'}，发现新版本 ${info.latest || '未知'}`
                 + (info.prerelease ? '（测试版）' : '')
-                + `。是否前往下载更新？`;
+                + '。可以在程序里直接下载，也可以前往 GitHub 手动下载。';
+            setUpdButtons('choice');
             m.classList.add('active');
         }
+
         document.getElementById('update-later').addEventListener('click', () => {
+            const installBtn = document.getElementById('update-install');
+            const wasReady = installBtn && installBtn.style.display !== 'none';
             document.getElementById('update-modal').classList.remove('active');
+            if (wasReady) {
+                alert('需要更新时请点击「检查更新」，安装包在更新后/卸载时才删除。');
+            }
         });
         document.getElementById('update-go').addEventListener('click', () => {
             const info = window._lovomoUpdate || {};
             if (info.url) window.open(info.url, '_blank');
             document.getElementById('update-modal').classList.remove('active');
         });
+        document.getElementById('update-online').addEventListener('click', async () => {
+            const btn = document.getElementById('update-online');
+            if (btn.disabled) return;
+            btn.disabled = true;
+            const label = btnLabel(btn);
+            setBtnText(btn, '准备中…');
+            try {
+                await apiPost('api/update/download', {});
+                setUpdButtons('progress');
+                document.getElementById('update-info').textContent =
+                    '正在下载新版本…可以点「后台下载」关掉这个窗口，进度会写在日志里。';
+                startUpdPoll();
+            } catch (e) {
+                alert('开始下载失败：' + e);
+                setUpdButtons('choice');
+            } finally {
+                btn.disabled = false;
+                setBtnText(btn, label);
+            }
+        });
+        document.getElementById('update-install').addEventListener('click', async () => {
+            const btn = document.getElementById('update-install');
+            if (btn.disabled) return;
+            btn.disabled = true;
+            const label = btnLabel(btn);
+            setBtnText(btn, '正在启动安装程序…');
+            try {
+                await apiPost('api/update/install', {});
+                document.getElementById('update-info').textContent =
+                    '正在启动安装程序，本程序随后会退出。';
+            } catch (e) {
+                alert('启动安装程序失败：' + e);
+                btn.disabled = false;
+                setBtnText(btn, label);
+            }
+        });
+        startUpdPoll();   // 上次没下完就接着显示进度
         async function maybeCheckUpdate() {
             try {
                 const r = await apiGet('api/update/status');
@@ -4638,6 +4826,29 @@
                 } finally {
                     checkUpdateBtn.disabled = false;
                     setBtnText(checkUpdateBtn, labelText);
+                }
+            });
+        }
+        const clearUiCacheBtn = document.getElementById('clear-ui-cache-btn');
+        if (clearUiCacheBtn) {
+            clearUiCacheBtn.addEventListener('click', async () => {
+                if (clearUiCacheBtn.disabled) return;
+                clearUiCacheBtn.disabled = true;
+                const labelText = btnLabel(clearUiCacheBtn);
+                setBtnText(clearUiCacheBtn, '清理中…');
+                try {
+                    const r = await apiPost('api/clear-ui-cache', {});
+                    if (r && r.desktop) {
+                        // 界面进程会被拆掉重建，页面自己会带着新界面回来；下面只是兜底
+                        setBtnText(clearUiCacheBtn, '正在重新加载…');
+                        setTimeout(() => location.reload(), 5000);
+                    } else {
+                        location.reload();
+                    }
+                } catch (e) {
+                    alert('清理界面缓存失败：' + e);
+                    clearUiCacheBtn.disabled = false;
+                    setBtnText(clearUiCacheBtn, labelText);
                 }
             });
         }
