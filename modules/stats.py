@@ -102,10 +102,18 @@ class StatsManager:
                 " GROUP BY day_idx, emotion ORDER BY day_idx",
                 (today0, start, end))
             # 三个 TOP 榜同样只在所选区间内统计，之前无 WHERE 会与区间汇总对不上
+            # 会话榜的「用户」列取该会话里发言最多的那个人（群聊才有意义，
+            # 私聊就是会话对方）
             out["top_sessions"] = self.db.query_all(
                 "SELECT session_id, MAX(session_type) AS session_type, COUNT(*) AS n,"
-                " MAX(ts) AS last_ts FROM interactions WHERE ts >= ? AND ts < ?"
-                " GROUP BY session_id ORDER BY n DESC LIMIT 10", (start, end))
+                " MAX(ts) AS last_ts,"
+                " (SELECT user_name FROM interactions AS u"
+                "   WHERE u.session_id = interactions.session_id"
+                "     AND u.ts >= ? AND u.ts < ? AND IFNULL(u.user_name,'') != ''"
+                "   GROUP BY u.user_name ORDER BY COUNT(*) DESC, MAX(u.ts) DESC"
+                "   LIMIT 1) AS user_name"
+                " FROM interactions WHERE ts >= ? AND ts < ?"
+                " GROUP BY session_id ORDER BY n DESC LIMIT 10", (start, end, start, end))
             out["top_users"] = self.db.query_all(
                 "SELECT user_id, IFNULL(MAX(user_name),'') AS user_name, COUNT(*) AS n FROM interactions"
                 " WHERE ts >= ? AND ts < ? AND IFNULL(user_id,'') != ''"

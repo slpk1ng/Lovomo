@@ -91,18 +91,24 @@
         .msg-row .msg-bubble { max-width: 70%; padding: 10px 15px; border-radius: 10px; font-size: 14px; white-space: pre-wrap; word-break: break-word; position: relative; }
         .msg-row.user .msg-bubble { background: #95ec69; color: #222; }
         .msg-row.bot .msg-bubble { background: #fff; border: 1px solid #ddd; color: #333; }
+        /* 不同用户的气泡用不同底色区分（按发言顺序分配 u1…u6），角色的气泡固定不变 */
+        .msg-row.user.u2 .msg-bubble { background: #a8dcff; }
+        .msg-row.user.u3 .msg-bubble { background: #ffd9a0; }
+        .msg-row.user.u4 .msg-bubble { background: #f5b8d0; }
+        .msg-row.user.u5 .msg-bubble { background: #cfc4ff; }
+        .msg-row.user.u6 .msg-bubble { background: #b8e6d5; }
         .msg-row.selected .msg-bubble { outline: 2px solid #2196F3; }
         .msg-checkbox { margin-right: 8px; display: none; }
         .msg-row.multi-mode .msg-checkbox { display: inline-block; }
         .log-container { background: #1e1e1e; color: #d4d4d4; border-radius: 8px; display: flex; flex-direction: column; overflow: hidden; }
         /* 日志区等宽字体固定为 Consolas：制表符/块状字符必须有等宽字形，否则会回退到中文全角字体，把横幅艺术字拉宽错位 */
         .log-output { flex: 1; min-height: 0; overflow-y: auto; padding: 15px; font-family: Consolas, 'Courier New', monospace; font-size: 13px; white-space: pre-wrap; user-select: text; cursor: text; }
-        /* 启动横幅艺术字：整块做一次斜切 + 横向拉伸。逐行或逐字斜切会在行界处错位，
-           块状字符的竖线就接不上了；横向用 scaleX 而不是加字距，字距会在相邻块字符
-           之间留缝，把双线框变成虚线。字重与字号保持与其它日志一致 */
+        /* 启动横幅艺术字：整块横向拉伸一点，让块状字符的竖线连起来。
+           不做斜切——横竖笔画一歪，字就成了斜体。横向用 scaleX 而不是加字距，
+           字距会在相邻块字符之间留缝，把双线框变成虚线。字重与字号与其它日志一致 */
         .log-output .log-banner {
             display: inline-block; transform-origin: left top;
-            transform: scaleX(1.03) skewX(-8deg);
+            transform: scaleX(1.03);
         }
         .tutorial { background: white; padding: 20px; border-radius: 8px; max-width: 900px; margin: 0 auto; }
         .tutorial h2 { margin-bottom: 15px; color: #333; }
@@ -150,6 +156,22 @@
         .ref-shared textarea { margin-top: 4px; }
         /* ===== 插件市场 ===== */
         .plugin-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 14px; }
+        /* 已安装插件：固定一行三个，卡片宽到四个操作按钮并排铺满整行
+         * （左右留白与卡片内边距一致，字号与上下内边距不动，卡片高度不变） */
+        .plugin-grid.installed { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        .plugin-grid.installed > * { min-width: 0; }
+        .plugin-grid.installed .plugin-actions { flex-wrap: nowrap; gap: 4px; }
+        .plugin-grid.installed .plugin-actions .btn {
+            flex: 1 1 0; min-width: 0; padding: 7.5px 6px; justify-content: center;
+        }
+        /* 这一页用满内容区宽度：三张卡片各自更宽，四个按钮不挤 */
+        #panel-installed-plugins .section-block,
+        #panel-installed-plugins .plugin-panel-footer { max-width: none; }
+        /* 面板右下角的操作：在内容块之外，右端与卡片右边缘对齐 */
+        .plugin-panel-footer {
+            display: flex; justify-content: flex-end;
+            max-width: 1100px; margin: 14px auto 0; padding: 0 20px;
+        }
         /* 插件自带界面：iframe 撑满内容区高度，插件在里面自由布局 */
         .plugin-panel-frame { width: 100%; min-height: 460px; height: calc(100vh - 300px); border: 1px solid #e0e0e0; border-radius: 8px; background: #fff; display: block; }
         .plugin-card { border: 1px solid #e0e0e0; border-radius: 8px; padding: 14px; background: #fff; display: flex; flex-direction: column; }
@@ -488,6 +510,13 @@
             background: linear-gradient(180deg, var(--brand), var(--accent));
         }
         .sub-desc { color: var(--ink-3); line-height: 1.7; }
+        /* 「更多」这类分组里的小标题：比分组标题低一级，只做分段用 */
+        .config-group .config-subtitle {
+            font-size: 13.5px; font-weight: 600; color: var(--ink-2);
+            margin: 18px 0 10px; padding-bottom: 6px;
+            border-bottom: 1px dashed var(--line);
+        }
+        .config-group .config-subtitle:first-of-type { margin-top: 4px; }
         code {
             font-family: "JetBrains Mono", Consolas, Menlo, monospace;
             font-size: 0.92em;
@@ -788,6 +817,10 @@
             font-family: Consolas, 'Courier New', monospace; font-size: 12.5px; color: #9aa3b2;
         }
         .log-actions label { display: flex; align-items: center; gap: 7px; cursor: pointer; }
+        /* 日志按级别着色：正常输出白色，警告黄色，报错红色 */
+        .log-output { color: #ffffff; }
+        .log-output .log-warn { color: #e3b341; }
+        .log-output .log-err { color: #f85149; }
 
         /* ---------- 弹窗 ---------- */
         .modal-overlay { background: rgba(16, 24, 40, 0.42); backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); }
@@ -812,6 +845,11 @@
             font-weight: 600; border-color: rgba(47, 107, 237, 0.28);
         }
         .preset-main { flex: 1; min-width: 0; }
+        .preset-footer {
+            display: flex; align-items: center; gap: 12px;
+            padding: 10px 15px 14px;
+        }
+        .preset-footer .sub-desc { flex: 1; min-width: 0; margin: 0; }
         .preset-row { padding: 10px 0; border-bottom: 1px solid var(--line); }
         .preset-row:last-child { border-bottom: 0; }
         .preset-head { display: flex; align-items: center; gap: 8px; }
@@ -951,6 +989,8 @@
              * label 挤在同一行」，于是独占不到空间、宽度塌成 0（输入框直接消失）。 */
             .form-row .field-wrapper { flex: 1 1 100%; min-width: 0; }
             .plugin-grid, .emotion-grid { grid-template-columns: 1fr; }
+            .plugin-grid.installed { grid-template-columns: 1fr; }
+            .plugin-grid.installed .plugin-actions { flex-wrap: wrap; }
             .config-form { padding-bottom: 150px; }   /* 给底部横排操作条让位 */
             .float-actions {
                 left: 12px; right: 12px; bottom: 12px;
@@ -1035,6 +1075,37 @@
                     </div>
                 </div>
                 <div id="plugin-message" class="muted" style="margin:8px 0;"></div>
+            </div>
+
+            <div class="section-block" id="plugin-publish-block">
+                <h3>发布到市场
+                    <button class="btn btn-gray" id="plugin-publish-toggle" data-icon="sliders">配置 / 折叠</button>
+                </h3>
+                <div class="sub-desc">
+                    把本地插件源包写进市场仓库的 <code>plugins/&lt;插件id&gt;/</code> 目录，
+                    同步更新 <code>plugins/index.json</code> 里本插件那一条，并把插件打成
+                    zip 作为该版本 Release 的附件。<br>
+                    需要一个 <b>Personal Access Token</b>（建议只勾 <code>public_repo</code> 权限），
+                    保存时会调用 <code>GET /user</code> 校验身份。<br>
+                    只有清单里声明了<b>属于你本人</b>（<code>github</code> / <code>repo</code> /
+                    <code>homepage</code>）的插件才会出现在下面的列表里 ——
+                    别人的插件不会显示，直接调接口也发不出去。
+                </div>
+                <div id="plugin-publish-status" class="muted">正在检查 Token …</div>
+                <div id="plugin-publish-config" style="display:none;">
+                    <div class="inline-form">
+                        <div class="field wide"><label>Personal Access Token</label>
+                            <input type="password" id="plugin-publish-token" placeholder="ghp_xxx 或 github_pat_xxx"></div>
+                        <div class="field" style="flex:0;">
+                            <button class="btn btn-green" id="plugin-publish-token-save" data-icon="check">保存并校验</button>
+                        </div>
+                        <div class="field" style="flex:0;">
+                            <button class="btn btn-red" id="plugin-publish-token-clear" data-icon="trash">清除</button>
+                        </div>
+                    </div>
+                    <div id="plugin-publish-message" class="muted"></div>
+                </div>
+                <div id="plugin-publish-list" style="display:none;"></div>
             </div>
 
             <div class="section-block">
@@ -1207,6 +1278,28 @@
                 </div>
             </div>
         </div>
+        <div class="modal-overlay" id="sticker-auto-modal">
+            <div class="modal-content" style="height:auto;max-height:86%;width:720px;">
+                <div class="modal-header">
+                    <h3>一键识别表情包</h3>
+                    <span class="modal-close" id="sticker-auto-close">×</span>
+                </div>
+                <div class="modal-body">
+                    <div class="sub-desc" style="margin-bottom:10px;">
+                        选好图片或文件夹后点「开始识别」：逐张交给识图模型判断该放进哪个情绪分类、并给出通用命名，
+                        然后自动归档到「表情包目录」对应的文件夹里（识别结果建议使用后手动检查一遍）。
+                    </div>
+                    <div class="inline-form">
+                        <div class="field" style="flex:0;"><button class="btn btn-gray" id="sticker-auto-pick-folder">选择文件夹</button></div>
+                        <div class="field" style="flex:0;"><button class="btn btn-gray" id="sticker-auto-pick-files">选择图片（可多选）</button></div>
+                        <div class="field" style="flex:0;"><button class="btn btn-green" id="sticker-auto-start">开始识别</button></div>
+                    </div>
+                    <div id="sticker-auto-picked" class="muted">还没有选择图片或文件夹</div>
+                    <div id="sticker-auto-progress" class="muted"></div>
+                    <div id="sticker-auto-result"></div>
+                </div>
+            </div>
+        </div>
         <div class="modal-overlay" id="config-preset-modal">
             <div class="modal-content" style="height:auto;max-height:86%;width:720px;">
                 <div class="modal-header">
@@ -1240,7 +1333,10 @@
                         </div>
                     </div>
                 </div>
-                <div class="sub-desc" id="preset-msg" style="padding:0 15px 12px;"></div>
+                <div class="preset-footer">
+                    <button class="btn btn-gray" id="preset-open-dir" data-icon="folder">查看文件夹</button>
+                    <span class="sub-desc" id="preset-msg"></span>
+                </div>
             </div>
         </div>
         <div class="modal-overlay" id="voice-enroll-modal">
@@ -1291,37 +1387,23 @@
         <div class="panel" id="panel-installed-plugins">
             <div class="section-block">
                 <h3>已安装插件</h3>
-                <div id="plugin-list-body" class="plugin-grid"></div>
+                <div id="plugin-list-body" class="plugin-grid installed"></div>
             </div>
-            <div class="section-block" id="plugin-publish-block">
-                <h3>发布到市场
-                    <button class="btn btn-gray" id="plugin-publish-toggle" data-icon="sliders">配置 / 折叠</button>
-                </h3>
-                <div class="sub-desc">
-                    把本地插件源包写进市场仓库的 <code>plugins/&lt;插件id&gt;/</code> 目录，
-                    同步更新 <code>plugins/index.json</code> 里本插件那一条，并把插件打成
-                    zip 作为该版本 Release 的附件。<br>
-                    需要一个 <b>Personal Access Token</b>（建议只勾 <code>public_repo</code> 权限），
-                    保存时会调用 <code>GET /user</code> 校验身份。<br>
-                    只有清单里声明了<b>属于你本人</b>（<code>github</code> / <code>repo</code> /
-                    <code>homepage</code>）的插件才会出现在下面的列表里 ——
-                    别人的插件不会显示，直接调接口也发不出去。
+            <div class="plugin-panel-footer">
+                <button class="btn btn-gray" id="plugin-update-check-btn"
+                        data-icon="checkUpdate">检查插件更新</button>
+            </div>
+        </div>
+        <div class="modal-overlay" id="plugin-update-modal">
+            <div class="modal-content" style="height:auto;max-height:80%;width:640px;">
+                <div class="modal-header">
+                    <h3>检查插件更新</h3>
+                    <span class="modal-close" id="plugin-update-close">×</span>
                 </div>
-                <div id="plugin-publish-status" class="muted">正在检查 Token …</div>
-                <div id="plugin-publish-config" style="display:none;">
-                    <div class="inline-form">
-                        <div class="field wide"><label>Personal Access Token</label>
-                            <input type="password" id="plugin-publish-token" placeholder="ghp_xxx 或 github_pat_xxx"></div>
-                        <div class="field" style="flex:0;">
-                            <button class="btn btn-green" id="plugin-publish-token-save" data-icon="check">保存并校验</button>
-                        </div>
-                        <div class="field" style="flex:0;">
-                            <button class="btn btn-red" id="plugin-publish-token-clear" data-icon="trash">清除</button>
-                        </div>
-                    </div>
-                    <div id="plugin-publish-message" class="muted"></div>
+                <div class="modal-body">
+                    <div class="sub-desc" id="plugin-update-sub"></div>
+                    <div id="plugin-update-list"></div>
                 </div>
-                <div id="plugin-publish-list" style="display:none;"></div>
             </div>
         </div>
         <div class="panel" id="panel-plugin-page">
@@ -1559,6 +1641,9 @@
                 <div class="inline-form">
                     <div class="field"><label>分类名</label><input type="text" id="sticker-category" placeholder="如 happy / gaoxing"></div>
                     <div class="field"><label>选择图片（可多选）</label><label class="btn btn-gray" style="cursor:pointer;align-self:flex-start;">选择文件（可多选）<input type="file" id="sticker-files" accept="image/*" multiple style="display:none;"></label></div>
+                    <div class="field" style="flex:0;">
+                        <button class="btn btn-green" id="sticker-auto-btn" title="一键识别文件夹中的所有表情包应被放进哪个文件夹并给出适合的命名（建议使用后手动检查一遍）">一键识别</button>
+                    </div>
                 </div>
                 <div id="sticker-message" class="muted"></div>
                 <div id="stickers-wrap"></div>
@@ -1633,10 +1718,10 @@
                 <h3>自主学习
                     <button class="btn btn-green" id="add-term-btn" data-icon="plus">手动添加</button>
                 </h3>
-                <div class="sub-desc">开启后每隔若干条用户消息扫描一次近期对话，自动学习其中的黑话、俚语与专有表达，并在回复时按学到的含义理解。把握不足的词条不会直接生效，而是进入下面的「待确认」列表由你裁决；确认前不参与回复。总开关与参数见「配置文件 → 自主学习」（默认开启）。</div>
+                <div class="sub-desc">开启后每隔若干条用户消息扫描一次近期对话，自动学习其中的黑话、俚语与专有表达，并在回复时按学到的含义理解。词条是所有角色共用的，含义按通用写法记录、不会绑定某个角色；把握不足或含义绑定了具体角色的词条不会直接生效，而是进入下面的「待确认」列表由你裁决，确认前不参与回复。总开关与参数见「配置文件 → 自主学习」（默认开启）。</div>
                 <div id="term-message" class="muted"></div>
                 <h4 style="margin:14px 0 4px;">待确认</h4>
-                <div class="sub-desc">这些词条是 LLM 推断出来但把握不足的，通过后才会注入回复；也可以改完含义再通过。</div>
+                <div class="sub-desc">这些词条是 LLM 推断出来但把握不足、或含义绑定了某个角色（换个角色就不适用）的，通过后才会注入回复；也可以改完含义再通过。</div>
                 <div id="terms-pending-wrap"></div>
                 <h4 style="margin:14px 0 4px;">已学习</h4>
                 <div class="editor-form" id="term-editor"></div>
@@ -1665,18 +1750,20 @@
                    所有功能都必须先打开对应开关才会生效。</p>
 
                 <h3>一、每个页面的作用</h3>
-                <p><strong>1. 配置文件</strong>：所有运行参数与功能总开关。左侧有锚点导航，右上角可切换预设（把当前配置存一份在本机，之后随时切回来）。</p>
-                <p><strong>2. 聊天记录</strong>：查看/管理会话与历史，可单会话或整包导出导入。</p>
+                <p><strong>1. 配置文件</strong>：所有运行参数与功能总开关。左侧有锚点导航，右上角可切换预设（把当前配置存一份在本机，之后随时切回来；「查看文件夹」直接打开预设目录）。日常使用关系不大的开关都在页面最底部的「更多」里，例如统计、软件更新、插件系统、音量统一、语音识别、防刷屏与「隐藏高级 GSV 参数」。</p>
+                <p><strong>2. 聊天记录</strong>：查看/管理会话与历史，可单会话或整包导出导入；角色回复在 QQ 里分成几条发出，这里就记成几条，不同用户的气泡颜色不同。</p>
                 <p><strong>3. 情绪音频</strong>：每个情绪文件夹 = 一套参考音频，每段音频可单独填写它念的文字；上传后可试听。</p>
                 <p><strong>4. 定时任务</strong>：自定义定时消息、节日/生日问候、待办提醒。</p>
                 <p><strong>5. 统计面板</strong>：消息量、情绪分布、角色心情值与实时性能。</p>
                 <p><strong>6. 高级功能</strong>：表情包、工具调用、知识库 RAG、用户画像、自主学习。</p>
-                <p><strong>7. 日志输出</strong>：排查问题的第一现场，详见第五节。插件输出的日志也会出现在这里（带 <code>[插件]</code> 前缀）。</p>
+                <p><strong>7. 日志输出</strong>：排查问题的第一现场，详见第五节。每行都以 [时:分:秒.毫秒][来源][级别] 开头（来源是 Lovomo 或 插件，级别是信息/警告/错误），并按级别着色：白色正常、黄色警告、红色报错。</p>
 		<p><strong>8. 插件市场（测试版）</strong>：管<strong>装插件</strong>——
-		   上传自己的 .zip 包、打开插件目录、刷新在线市场。
+		   上传自己的 .zip 包、打开插件目录、刷新在线市场；自己写的插件也用这一页的
+		   「发布到市场」上架。
 		   安装前会自动做安全扫描，含高危操作的插件需要你确认后才会装上。</p>
 		<p><strong>9. 插件</strong>：管<strong>已装插件</strong>——所有安装的插件都在这里，
-		   可以启用/停用/卸载；带功能页的插件，点卡片空白处就能进去设置。</p>
+		   一行三张卡片，可以启用/停用/卸载；带功能页的插件，点卡片空白处就能进去设置；
+		   页面右下角的「检查插件更新」会列出市场上有新版本的插件并一键替换。</p>
 
                 <h3>二、最小可用配置</h3>
                 <p><strong>1. LLM 接口</strong>：在「LLM 大模型」里选对<strong>接口类型</strong>。
@@ -1689,8 +1776,10 @@
                    （可用「一键识别」自动生成；某段音频没单独填写时，用文件夹里的 <code>asr.txt</code>，
                    再没有就用配置里的「默认参考音频文本」兜底）。
                    模型/其他杂物目录不会被误识别成情绪。</p>
-                <p><strong>4. 验证</strong>：保存配置后看日志——启动时会打印 LLM 连通性探测结果、扫到的情绪数量、
-                   调度任务注册情况。有 <code>[警告]</code> 就先解决它，再谈调优。</p>
+                <p><strong>4. 语音识别</strong>：同一套设置还负责<strong>把用户发来的语音转成文字</strong>，
+                   位置在「配置文件 → 更多 → 语音识别」：本地走 GPT-SoVITS 自带的 ASR，线上走 DashScope。</p>
+                <p><strong>5. 验证</strong>：保存配置后看日志——启动时会打印 LLM 连通性探测结果、扫到的情绪数量、
+                   调度任务注册情况。级别为「警告」或「错误」的行先解决，再谈调优。</p>
 
                 <h3>三、参数怎么调（按效果分类）</h3>
                 <p><strong>· 回复太长/太慢</strong>：「历史消息条数」控制模型能看到的对话长度（默认 8）；
@@ -1717,6 +1806,12 @@
                    启动时日志会打印"已恢复 N 个会话的闲置计时"。</p>
                 <p><strong>· 生成了语音但没声音/半截语音</strong>：日志里出现"分段音频合并已降级为…"说明合并走了兜底路径
                    （内容不丢，只是过渡更生硬）；出现"TTS 合成失败"则去看 TTS 服务本身。</p>
+                <p><strong>· 用户发的语音没被理睬 / 答非所问</strong>：对方发来的语音会先用「配置文件 → 更多 → 语音识别」
+                   里的设置转成文字，再当作普通消息处理。转不出文字时日志会写明"这条语音没转出文字"：
+                   本地通道需要 GPT-SoVITS 的 ASR 环境（首次会下载模型），线上通道需要填好密钥与模型名。</p>
+                <p><strong>· 聊天记录里角色的回复被合并成一整段</strong>：开启「分开发送」后，QQ 里发了几条，
+                   记录页就记成几条；关闭时按整段记一条。记录页里角色的气泡颜色固定、不同用户的气泡颜色不同，
+                   一眼能看出某句话是谁说的。</p>
 
                 <h3>四、工具调用</h3>
                 <p><strong>1. 总开关</strong>：「工具调用」分组里的「工具调用 (Function Calling)」；
@@ -1757,7 +1852,10 @@
                 <p><strong>· 补发问候没有发生</strong>：日志里搜索"问候补发"。
                    常见原因：程序启动时还没到问候时刻、处于静默时段、事件没有目标会话、
                    或等待 NapCat 连接超时（可调「补发等待 NapCat 的超时」）。每一种都会打印明确原因。</p>
-                <p><strong>· 日志怎么看</strong>：默认是"精简模式"（只回尾部若干行）；勾选「显示完整日志」看自启动以来的全部输出。
+                <p><strong>· 日志怎么看</strong>：每行都以 <code>[时:分:秒.毫秒][来源][级别]</code> 开头，
+                   来源是 <code>Lovomo</code> 或 <code>[插件]</code>，级别是信息、警告、错误；
+                   界面按级别着色（白/黄/红），和 <code>app.log</code> 里写的是同一套前缀。
+                   默认是"精简模式"（只回尾部若干行）；勾选「显示完整日志」看自启动以来的全部输出。
                    排查时建议打开它，并按关键词搜索：<code>回复审判</code>、<code>工具调用</code>、
                    <code>搜索预取</code>、<code>待办提取</code>、<code>问候补发</code>、<code>TTS</code>。</p>
                 <p><strong>· 日志文件</strong>：程序日志同时写入 <code>app.log</code>（程序目录；装到只读目录时在
@@ -1769,6 +1867,9 @@
                 <p>· 主动消息/问候的历史承接依赖会话里已有记录，全新会话等于没有上下文。</p>
                 <p>· 「识图自动收藏表情」需要同时开启「表情包功能」，且模型没给出明确收藏判定时默认不收藏。</p>
                 <p>· 「分开发送」关闭时，下面的「语音分开发送」「文本分开发送」等选项会自动隐藏（它们只在那条路径上生效）。</p>
+                <p>· 黑话词典是所有角色共用的：含义按通用写法记录，写着角色名或只对某一次对话成立的说法不会入库，
+                   已有的这类旧词条会移进「待确认」；在页面上点过「通过」的词条不会再被打回待确认。</p>
+                <p>· 用户画像的昵称默认取对方的 QQ 昵称，自动提取不会改写它，只有对方明确要求你怎么称呼时才跟着变。</p>
                 <p>· 待办提取的「触发关键词」是第一道门槛：消息不含其中任何一个词就不会被提取，
                    删掉「叫我」会导致"8点半叫我起床"这类消息被直接跳过（日志有提示）。</p>
                 <p class="muted">提示：若某项没显示，通常是因为它依赖的上级开关没打开。</p>
@@ -1783,6 +1884,15 @@
                    这是 AGPL 与 GPL 的关键区别。</p>
                 <p>· 本程序按「现状」提供，不含任何担保（协议第 15、16 条）。
                    完整的免责条款另见 <code>DISCLAIMER.txt</code>（语音合成内容责任、第三方平台风险、硬件与数据风险等）。</p>
+
+                <h3>八、更新与卸载</h3>
+                <p>覆盖安装（包括程序里的「在线更新」）与卸载都会<strong>先关闭正在运行的 Lovomo</strong>：
+                   程序平时是把窗口收进托盘而不是退出，不先关掉会占着 exe 与日志文件，安装/卸载就会失败或只删一半。
+                   关闭前会先请求一次正常退出，几秒内没退出就直接结束进程。</p>
+                <p>卸载仍会逐项询问是否删除配置文件、聊天记录与插件数据，<strong>默认一律保留</strong>；
+                   静默卸载（覆盖升级时由安装程序自动触发）不问，也不会动这些数据。</p>
+                <p>用户数据固定放在 <code>%LOCALAPPDATA%\Lovomo</code>（配置、聊天记录、插件、发布记录、窗口位置），
+                   换目录重装或覆盖升级都能接着用。</p>
             </div>
         </div>
     </div>
@@ -1945,6 +2055,12 @@
             "取消": "Cancel",
             "确定卸载": "Uninstall",
             "已安装插件": "Installed Plugins",
+            "检查插件更新": "Check for Plugin Updates",
+            "正在检查更新…": "Checking for updates…",
+            "正在从市场核对版本…": "Comparing versions with the market…",
+            "所有插件都是最新版本。": "All plugins are up to date.",
+            "下载并替换": "Download and Replace",
+            "查看文件夹": "Open Folder",
             "发布到市场": "Publish to Market",
             "配置 / 折叠": "Settings / collapse",
             "把本地插件源包写进市场仓库的": "Write the local plugin source package into the ",
@@ -1988,7 +2104,21 @@
             "英语": "English",
             "韩语": "Korean",
             "全不选": "Select none",
-            "一键识别": "Transcribe All",
+            "一键识别": "Auto-recognize",
+            "一键识别表情包": "Auto-recognize stickers",
+            "一键识别文件夹中的所有表情包应被放进哪个文件夹并给出适合的命名（建议使用后手动检查一遍）": "Recognize every sticker in a folder, decide which folder each one belongs in and give it a suitable name (check the result by hand afterwards)",
+            "选好图片或文件夹后点「开始识别」：逐张交给识图模型判断该放进哪个情绪分类、并给出通用命名， 然后自动归档到「表情包目录」对应的文件夹里（识别结果建议使用后手动检查一遍）。": "Pick images or a folder and click Start: every image goes to the vision model, which decides the emotion category and gives it a generic name, and the file is filed into that folder under the sticker directory (check the result by hand afterwards).",
+            "选择文件夹": "Choose folder",
+            "开始识别": "Start",
+            "还没有选择图片或文件夹": "No images or folder selected yet",
+            "已选择 {0} 项：": "Selected {0} item(s):",
+            "正在打开选择对话框…": "Opening the picker…",
+            "选择失败: {0}": "Selection failed: {0}",
+            "先选择图片或文件夹": "Pick images or a folder first",
+            "识别超时（可稍后在表情包页刷新查看结果）": "Recognition timed out (refresh the sticker page later to see the result)",
+            "完成：归档 {0} 张，重复 {1} 张，失败 {2} 张": "Done: {0} filed, {1} duplicates, {2} failed",
+            "逐张结果：": "Per-image result:",
+            "跳过：": "Skipped:",
             "规整时长": "Normalize Duration",
             "勾选音频后可一键识别成文字（结果写成与音频同名的 txt）；规整时长把音频补到 3~10 秒，原地替换。": "Tick audio files and Transcribe All writes the text into a .txt named after each file; Normalize Duration pads each clip to 3-10 seconds and replaces it in place.",
             "定时任务（主动问候 / 例行消息）": "Scheduled Tasks (proactive greetings / routine messages)",
@@ -2051,9 +2181,9 @@
             "以下内容按「先配通、再调优、出问题怎么查」的顺序整理，并写清了每类现象背后的原因与对应设置。 所有功能都必须先打开对应开关才会生效。": "This guide is ordered as “get it connected, then tune it, then how to diagnose problems”, and explains the cause behind each symptom together with the setting that fixes it. Every feature only takes effect after its switch is turned on.",
             "一、每个页面的作用": "1. What each page does",
             "1. 配置文件": "1. Configuration",
-            "：所有运行参数与功能总开关。左侧有锚点导航，右上角可切换预设（把当前配置存一份在本机，之后随时切回来）。": ": every runtime parameter and feature master switch. The left side has anchor navigation and the top right can switch presets (save the current configuration on this machine and switch back to it at any time).",
+            "：所有运行参数与功能总开关。左侧有锚点导航，右上角可切换预设（把当前配置存一份在本机，之后随时切回来；「查看文件夹」直接打开预设目录）。日常使用关系不大的开关都在页面最底部的「更多」里，例如统计、软件更新、插件系统、音量统一、语音识别、防刷屏与「隐藏高级 GSV 参数」。": ": every runtime parameter and feature master switch. The left side has anchor navigation and the top right can switch presets (save the current configuration on this machine and switch back to it at any time; Open Folder opens the preset directory). Switches unrelated to day-to-day use sit under “More” at the bottom of the page: statistics, software updates, the plugin system, volume normalisation, speech recognition, flood control and Hide advanced GSV parameters.",
             "2. 聊天记录": "2. Chat History",
-            "：查看/管理会话与历史，可单会话或整包导出导入。": ": view and manage sessions and history; export or import a single session or everything at once.",
+            "：查看/管理会话与历史，可单会话或整包导出导入；角色回复在 QQ 里分成几条发出，这里就记成几条，不同用户的气泡颜色不同。": ": view and manage sessions and history; export or import a single session or everything at once. A reply sent as several messages in QQ is recorded here as several entries, and each person's bubbles are coloured differently.",
             "3. 情绪音频": "3. Emotion Audio",
             "：每个情绪文件夹 = 一套参考音频，每段音频可单独填写它念的文字；上传后可试听。": ": each emotion folder is one set of reference audio and each clip can carry its own transcript; uploads can be previewed.",
             "4. 定时任务": "4. Scheduled Tasks",
@@ -2063,15 +2193,14 @@
             "6. 高级功能": "6. Advanced Features",
             "：表情包、工具调用、知识库 RAG、用户画像、自主学习。": ": stickers, tool calling, knowledge base (RAG), user profiles and self-learning.",
             "7. 日志输出": "7. Logs",
-            "：排查问题的第一现场，详见第五节。插件输出的日志也会出现在这里（带": ": your first stop when diagnosing problems, see section 5. Logs written by plugins also appear here (with a ",
-            "前缀）。": " prefix).",
+            "：排查问题的第一现场，详见第五节。每行都以 [时:分:秒.毫秒][来源][级别] 开头（来源是 Lovomo 或 插件，级别是信息/警告/错误），并按级别着色：白色正常、黄色警告、红色报错。": ": your first stop when diagnosing problems, see section 5. Every line starts with [hh:mm:ss.mmm][source][level] (source is Lovomo or 插件, level is 信息 / 警告 / 错误) and is coloured by level: white normal, yellow warning, red error.",
             "8. 插件市场（测试版）": "8. Plugin Market (beta)",
             "：管": ": manage ",
             "装插件": "installing plugins",
-            "—— 上传自己的 .zip 包、打开插件目录、刷新在线市场。 安装前会自动做安全扫描，含高危操作的插件需要你确认后才会装上。": "— upload your own .zip package, open the plugin folder, refresh the online market. Every package is scanned before install; plugins with high-risk operations are only installed after you confirm.",
+            "—— 上传自己的 .zip 包、打开插件目录、刷新在线市场；自己写的插件也用这一页的 「发布到市场」上架。 安装前会自动做安全扫描，含高危操作的插件需要你确认后才会装上。": "— upload your own .zip package, open the plugin folder, refresh the online market; your own plugins are published from “Publish to Market” on this page too. Every package is scanned before install; plugins with high-risk operations are only installed after you confirm.",
             "9. 插件": "9. Plugins",
             "已装插件": "installed plugins",
-            "——所有安装的插件都在这里， 可以启用/停用/卸载；带功能页的插件，点卡片空白处就能进去设置。": "— every installed plugin lives here and can be enabled, disabled or uninstalled; for plugins with a settings page, click the blank part of the card to open it.",
+            "——所有安装的插件都在这里， 一行三张卡片，可以启用/停用/卸载；带功能页的插件，点卡片空白处就能进去设置； 页面右下角的「检查插件更新」会列出市场上有新版本的插件并一键替换。": "— every installed plugin lives here in rows of three cards, and can be enabled, disabled or uninstalled; for plugins with a settings page, click the blank part of the card to open it; “Check for Plugin Updates” in the bottom-right corner of the page lists the plugins with a newer release in the market and replaces them in one click.",
             "二、最小可用配置": "2. Minimum working setup",
             "1. LLM 接口": "1. LLM API",
             "：在「LLM 大模型」里选对": ": under LLM Model pick the right ",
@@ -2088,9 +2217,12 @@
             "（如": " (e.g. ",
             "），文件夹里放参考音频，文字按音频同名 txt 填写 （可用「一键识别」自动生成；某段音频没单独填写时，用文件夹里的": "); put the reference audio in the folder and write the transcript into a .txt named after the clip (Transcribe All can generate it; when a clip has no transcript of its own, the folder's ",
             "， 再没有就用配置里的「默认参考音频文本」兜底）。 模型/其他杂物目录不会被误识别成情绪。": " is used, and failing that the Default Reference Audio Text from the configuration). Model folders and other clutter are never mistaken for emotions.",
-            "4. 验证": "4. Verify",
-            "：保存配置后看日志——启动时会打印 LLM 连通性探测结果、扫到的情绪数量、 调度任务注册情况。有": ": after saving, check the log — startup prints the LLM connectivity probe, the number of emotions found and the registered scheduled jobs. If there is a ",
-            "就先解决它，再谈调优。": " warning, fix it first and tune afterwards.",
+            "4. 语音识别": "4. Speech recognition",
+            "：同一套设置还负责": ": the same settings also ",
+            "把用户发来的语音转成文字": "transcribe voice messages from users",
+            "， 位置在「配置文件 → 更多 → 语音识别」：本地走 GPT-SoVITS 自带的 ASR，线上走 DashScope。": ", and live under Configuration → More → Speech Recognition: local uses the ASR bundled with GPT-SoVITS, online uses DashScope.",
+            "5. 验证": "5. Verify",
+            "：保存配置后看日志——启动时会打印 LLM 连通性探测结果、扫到的情绪数量、 调度任务注册情况。级别为「警告」或「错误」的行先解决，再谈调优。": ": after saving, check the log — startup prints the LLM connectivity probe, the number of emotions found and the registered scheduled jobs. Fix the lines whose level is 警告 or 错误 first, then tune.",
             "三、参数怎么调（按效果分类）": "3. Tuning parameters (grouped by effect)",
             "· 回复太长/太慢": "· Replies too long or too slow",
             "：「历史消息条数」控制模型能看到的对话长度（默认 8）； 「回复生成超时」别设太小，本地推理模型首字就要几秒。": ": History Length controls how much conversation the model sees (default 8); do not set Reply Timeout too low, a local model needs seconds just for the first token.",
@@ -2114,6 +2246,10 @@
             "：确认「主动消息（闲置唤醒）」已开， 并注意三个限制：闲置阈值、静默时段、单会话每日上限； 若开了「回复前不再主动」，用户没回复之前不会再开口。 启动时日志会打印\"已恢复 N 个会话的闲置计时\"。": ": make sure Proactive Messages (Idle Wake-up) is on, and note the three limits: the idle threshold, the quiet hours and the daily cap per session; with No Proactive Messages Before a Reply enabled it stays silent until the user answers. Startup logs “restored idle timers for N sessions”.",
             "· 生成了语音但没声音/半截语音": "· Audio is generated but silent or cut off",
             "：日志里出现\"分段音频合并已降级为…\"说明合并走了兜底路径 （内容不丢，只是过渡更生硬）；出现\"TTS 合成失败\"则去看 TTS 服务本身。": ": if the log shows “segment merge degraded to …” the merge fell back to a simpler path (nothing is lost, transitions are just harsher); if it shows “TTS synthesis failed”, look at the TTS service itself.",
+            "· 用户发的语音没被理睬 / 答非所问": "· A voice message from the user is ignored or answered off-topic",
+            "：对方发来的语音会先用「配置文件 → 更多 → 语音识别」 里的设置转成文字，再当作普通消息处理。转不出文字时日志会写明\"这条语音没转出文字\"： 本地通道需要 GPT-SoVITS 的 ASR 环境（首次会下载模型），线上通道需要填好密钥与模型名。": ": a voice message from the other side is first transcribed with the settings under Configuration → More → Speech Recognition and then handled like a normal message. When nothing can be transcribed the log says so; the local channel needs the ASR environment of GPT-SoVITS (the model downloads on first use) and the online channel needs a valid key and model name.",
+            "· 聊天记录里角色的回复被合并成一整段": "· Replies are merged into one long record in the chat history",
+            "：开启「分开发送」后，QQ 里发了几条， 记录页就记成几条；关闭时按整段记一条。记录页里角色的气泡颜色固定、不同用户的气泡颜色不同， 一眼能看出某句话是谁说的。": ": with Split Sending on, the history keeps one record per message actually sent in QQ; with it off the whole reply is one record. In the history the character's bubbles keep one fixed colour and each person gets a different one, so you can tell at a glance who said what.",
             "四、工具调用": "4. Tool Calling",
             "1. 总开关": "1. Master switch",
             "：「工具调用」分组里的「工具调用 (Function Calling)」； 每个工具还要在「高级功能 → 工具调用」里单独启用（表格里勾一下就会保存）。": ": Tool Calling (Function Calling) in the Tool Calling group; each tool must also be enabled individually under Advanced Features → Tool Calling (ticking it in the table saves immediately).",
@@ -2153,7 +2289,11 @@
             "· 补发问候没有发生": "· A missed greeting was not sent",
             "：日志里搜索\"问候补发\"。 常见原因：程序启动时还没到问候时刻、处于静默时段、事件没有目标会话、 或等待 NapCat 连接超时（可调「补发等待 NapCat 的超时」）。每一种都会打印明确原因。": ": search the log for “greeting catch-up”. Common causes: startup happened before the greeting time, quiet hours are active, the event has no target session, or the wait for the NapCat connection timed out (tune Catch-up NapCat Wait Timeout). Each case prints an explicit reason.",
             "· 日志怎么看": "· How to read the log",
-            "：默认是\"精简模式\"（只回尾部若干行）；勾选「显示完整日志」看自启动以来的全部输出。 排查时建议打开它，并按关键词搜索：": ": the default is compact mode (only the last few lines); tick Show Full Log for everything since startup. It is recommended while diagnosing; search for keywords such as ",
+            "：每行都以": ": every line starts with ",
+            "[时:分:秒.毫秒][来源][级别]": "[hh:mm:ss.mmm][source][level]",
+            "开头， 来源是": ", where the source is ",
+            "，级别是信息、警告、错误； 界面按级别着色（白/黄/红），和": " and the level is 信息 / 警告 / 错误; the interface colours lines by level (white / yellow / red), using the same prefix as ",
+            "里写的是同一套前缀。 默认是\"精简模式\"（只回尾部若干行）；勾选「显示完整日志」看自启动以来的全部输出。 排查时建议打开它，并按关键词搜索：": ". The default is compact mode (only the last few lines); tick Show Full Log for everything since startup. It is recommended while diagnosing; search for keywords such as ",
             "回复审判": "reply judgement",
             "工具调用": "tool calling",
             "搜索预取": "search prefetch",
@@ -2169,6 +2309,8 @@
             "· 「识图自动收藏表情」需要同时开启「表情包功能」，且模型没给出明确收藏判定时默认不收藏。": "· Auto-collect Stickers on Image Recognition also requires the sticker feature to be on, and nothing is collected unless the model explicitly says so.",
             "· 「分开发送」关闭时，下面的「语音分开发送」「文本分开发送」等选项会自动隐藏（它们只在那条路径上生效）。": "· With Split Sending off, the options below it (Split Voice Sending, Split Text Sending and so on) are hidden automatically because they only apply on that path.",
             "· 待办提取的「触发关键词」是第一道门槛：消息不含其中任何一个词就不会被提取， 删掉「叫我」会导致\"8点半叫我起床\"这类消息被直接跳过（日志有提示）。": "· The to-do trigger keywords are the first gate: a message containing none of them is never extracted, so removing “wake me” makes messages like “wake me up at 8:30” be skipped entirely (the log says so).",
+            "· 黑话词典是所有角色共用的：含义按通用写法记录，写着角色名或只对某一次对话成立的说法不会入库， 已有的这类旧词条会移进「待确认」；在页面上点过「通过」的词条不会再被打回待确认。": "· The slang dictionary is shared by every character: meanings are recorded generically, wording that names a character or only holds for one conversation is never stored, existing entries like that move to Pending, and a term you approved on the page is never pushed back into Pending.",
+            "· 用户画像的昵称默认取对方的 QQ 昵称，自动提取不会改写它，只有对方明确要求你怎么称呼时才跟着变。": "· A profile nickname defaults to the person's QQ nickname; automatic extraction never overwrites it, and it only changes when they explicitly ask you to call them something.",
             "提示：若某项没显示，通常是因为它依赖的上级开关没打开。": "Tip: when an option is missing, it is usually because the switch it depends on is off.",
             "七、开源协议（AGPL-3.0）": "7. License (AGPL-3.0)",
             "本程序基于": "This program is released under ",
@@ -2182,6 +2324,15 @@
             "。 这是 AGPL 与 GPL 的关键区别。": ". This is the key difference between AGPL and GPL.",
             "· 本程序按「现状」提供，不含任何担保（协议第 15、16 条）。 完整的免责条款另见": "· This program is provided “as is”, without warranty (sections 15 and 16 of the license). The full disclaimer is in ",
             "（语音合成内容责任、第三方平台风险、硬件与数据风险等）。": " (liability for synthesized speech, third-party platform risks, hardware and data risks, and so on).",
+            "八、更新与卸载": "8. Updating and uninstalling",
+            "覆盖安装（包括程序里的「在线更新」）与卸载都会": "Both an overwrite install (including Online Update inside the program) and an uninstall will ",
+            "先关闭正在运行的 Lovomo": "close a running Lovomo first",
+            "： 程序平时是把窗口收进托盘而不是退出，不先关掉会占着 exe 与日志文件，安装/卸载就会失败或只删一半。 关闭前会先请求一次正常退出，几秒内没退出就直接结束进程。": ": the program normally minimizes to the tray instead of exiting, and a running copy holds Lovomo.exe plus the log files, so installing or uninstalling would fail or delete only half of it. It asks for a normal exit first and terminates the process if that does not happen within a few seconds.",
+            "卸载仍会逐项询问是否删除配置文件、聊天记录与插件数据，": "Uninstalling still asks separately about the configuration file, the chat history and the plugin data, and ",
+            "默认一律保留": "keeps them all by default",
+            "； 静默卸载（覆盖升级时由安装程序自动触发）不问，也不会动这些数据。": "; a silent uninstall (triggered automatically when an install overwrites the program) asks nothing and never touches that data.",
+            "用户数据固定放在": "User data always lives in ",
+            "（配置、聊天记录、插件、发布记录、窗口位置）， 换目录重装或覆盖升级都能接着用。": " (configuration, chat history, plugins, publish records, window position), so reinstalling elsewhere or installing over the old copy keeps it working.",
             "输入访问密码": "Enter Access Password",
             "本次解锁有效时长（分钟，0 = 关闭页面后失效）": "Unlock duration (minutes, 0 = expires when the page closes)",
             "解锁": "Unlock",
@@ -2232,6 +2383,7 @@
             "软件更新": "Software Updates",
             "插件系统": "Plugin System",
             "其他": "Other",
+            "更多": "More",
             "当前激活的角色标识符": "Identifier of the active role",
             "默认使用哪个角色": "Which role to use by default",
             "私聊与未提及角色的消息由它回复。": "It answers private chats and messages that mention no role.",
@@ -3062,9 +3214,9 @@
             "按 QQ 号记录用户偏好与生日；开启 profiles_auto_extract 后可由 LLM 自动从对话中提取。生日匹配当日时会自动送上祝福。": "Records each user's preferences and birthday by QQ number; with profiles_auto_extract enabled the LLM extracts them from conversations automatically. A matching birthday is greeted on the day itself.",
             "自主学习": "Self-learning",
             "手动添加": "Add Manually",
-            "开启后每隔若干条用户消息扫描一次近期对话，自动学习其中的黑话、俚语与专有表达，并在回复时按学到的含义理解。把握不足的词条不会直接生效，而是进入下面的「待确认」列表由你裁决；确认前不参与回复。总开关与参数见「配置文件 → 自主学习」（默认开启）。": "Once enabled, recent conversations are scanned every few user messages to learn slang, jargon and proper expressions automatically, and replies then read them by the learned meaning. Entries the model is unsure about do not take effect directly — they go to the “Pending” list below for you to decide, and are not used until confirmed. The master switch and parameters are under “Configuration → Self-learning” (on by default).",
+            "开启后每隔若干条用户消息扫描一次近期对话，自动学习其中的黑话、俚语与专有表达，并在回复时按学到的含义理解。词条是所有角色共用的，含义按通用写法记录、不会绑定某个角色；把握不足或含义绑定了具体角色的词条不会直接生效，而是进入下面的「待确认」列表由你裁决，确认前不参与回复。总开关与参数见「配置文件 → 自主学习」（默认开启）。": "Once enabled, recent conversations are scanned every few user messages to learn slang, jargon and proper expressions automatically, and replies then read them by the learned meaning. Entries are shared by every character and their meanings are written generically, never tied to one character; entries the model is unsure about, or whose meaning is tied to a specific character, do not take effect directly — they go to the “Pending” list below for you to decide, and are not used until confirmed. The master switch and parameters are under “Configuration → Self-learning” (on by default).",
             "待确认": "Pending",
-            "这些词条是 LLM 推断出来但把握不足的，通过后才会注入回复；也可以改完含义再通过。": "These entries were inferred by the LLM but with low confidence; they are only injected into replies after approval. You can also correct the meaning and then approve.",
+            "这些词条是 LLM 推断出来但把握不足、或含义绑定了某个角色（换个角色就不适用）的，通过后才会注入回复；也可以改完含义再通过。": "These entries were inferred by the LLM with low confidence, or their meaning is tied to one character (so it does not work for another); they are only injected into replies after approval. You can also correct the meaning and then approve.",
             "已学习": "Learned",
             "Lovomo 控制台日志": "Lovomo Console Log",
             "显示完整日志": "Show Full Log",
@@ -4006,10 +4158,8 @@
             { title: 'TTS 服务与模型', keys: ['tts_backend', 'auto_start_tts', 'tts_start_script', 'client_base_url', 'model_dir', 'ref_audio_root', 'timeout_seconds', 'device', 'media_type', 'cloud_tts_base_url', 'cloud_tts_protocol', 'cloud_tts_api_key', 'cloud_tts_model', 'cloud_tts_voice', 'cloud_tts_voice_map', 'prompt_text', 'prompt_lang', 'text_lang', 'tts_auto_lang', 'display_lang'] },
             { title: 'TTS 推理参数', keys: ['top_k', 'top_p', 'temperature', 'text_split_method', 'batch_size', 'batch_threshold', 'split_bucket', 'speed_factor', 'fragment_interval', 'streaming_mode', 'seed', 'parallel_infer', 'repetition_penalty'] },
             { title: 'TTS 台词清洗与日志', keys: ['tts_char_map', 'tts_duration_guard', 'tts_min_seconds_per_char', 'tts_max_seconds_per_char', 'tts_debug_log'] },
-            { title: '音量统一', keys: ['tts_loudness_normalize', 'tts_loudness_target_db', 'tts_loudness_peak_db', 'tts_loudness_max_gain_db', 'tts_ref_normalize'] },
             { title: '情绪与语气', keys: ['llm_judge', 'default_voice', 'voice_transition', 'breathing_gap_ms', 'crossfade_ms', 'enable_default_emotions', 'llm_emotion_intensity', 'intensity_to_temperature', 'intensity_to_top_k', 'emotion_guide_enabled', 'emotion_guide_extra', 'image_identity_guard_enabled'] },
             { title: '【实验性】情绪模仿', keys: ['emotion_mimic_enabled', 'emotion_mimic_root', 'emotion_mimic_voice_weight'] },
-            { title: '语音识别', keys: ['asr_engine', 'asr_lang', 'asr_base_url', 'asr_dashscope_model', 'asr_local_model_size'] },
 
             /* ===== 回复与发送 ===== */
             { title: '回复方式', keys: ['tts_reply_enabled', 'streaming_enabled', 'display_pure_language'] },
@@ -4031,13 +4181,21 @@
             { title: '工具调用', keys: ['tools_enabled', 'tools_trigger_mode', 'tools_skip_pure_chatter', 'tools_allow_commands', 'tools_max_iterations', 'tools_guard_enabled', 'tools_guard_keywords', 'tool_notes_max_entries', 'tool_notes_max_chars', 'tool_log_output_chars', 'tool_uncertain_fallback', 'search_prefetch_enabled', 'search_query_llm_extract', 'web_fetch_precheck', 'web_fetch_precheck_max', 'search_links_auto_append', 'search_links_max', 'web_search_safe', 'web_search_block_words', 'web_search_allow_words', 'web_search_max_results', 'web_search_result_chars', 'web_search_max_chars'] },
             { title: '知识库 RAG', keys: ['rag_enabled', 'rag_embedding_backend', 'rag_embedding_model', 'llm_embedding_model', 'llm_embedding_url', 'rag_chunk_size', 'rag_chunk_overlap', 'rag_top_k', 'rag_min_similarity', 'rag_max_context_chars'] },
 
-            /* ===== 系统 ===== */
-            { title: '防刷屏', keys: ['anti_spam_enabled', 'anti_spam_window_seconds', 'anti_spam_max_in_window'] },
-            { title: '统计', keys: ['stats_enabled'] },
-            { title: '软件更新', keys: ['update_check_enabled', 'update_check_interval_hours', 'update_include_prerelease'] },
-            { title: '插件系统', keys: ['plugins_enabled', 'plugin_market_repo', 'plugin_market_branch_prefix', 'plugin_market_sources_path', 'plugin_market_thirdparty', 'plugin_market_path', 'github_mirrors'] },
-            { title: '其他', keys: ['active_character', 'hide_gsv_options'] }
+            /* ===== 更多：和日常使用关系不大的开关都收在这里，固定在页面最底部 ===== */
+            { title: '更多', children: [
+                { title: '统计', keys: ['stats_enabled'] },
+                { title: '软件更新', keys: ['update_check_enabled', 'update_check_interval_hours', 'update_include_prerelease'] },
+                { title: '插件系统', keys: ['plugins_enabled', 'github_mirrors'] },
+                { title: '音量统一', keys: ['tts_loudness_normalize', 'tts_loudness_target_db', 'tts_loudness_peak_db', 'tts_loudness_max_gain_db', 'tts_ref_normalize'] },
+                { title: '语音识别', keys: ['asr_engine', 'asr_lang', 'asr_base_url', 'asr_dashscope_model', 'asr_local_model_size'] },
+                { title: '防刷屏', keys: ['anti_spam_enabled', 'anti_spam_window_seconds', 'anti_spam_max_in_window'] },
+                { title: '其他', keys: ['hide_gsv_options'] }
+            ] }
         ];
+
+        // 「更多」固定排在最后（多角色配置之后），渲染时单独补上
+        const configTailGroups = configGroups.filter(g => g.title === '更多');
+        const configMainGroups = configGroups.filter(g => g.title !== '更多');
 
         /* 常见模型服务商的 OpenAI 兼容服务地址，LLM 与识图模型的服务地址共用 */
         const LLM_ENDPOINT_PRESETS = [
@@ -4378,8 +4536,13 @@
         }
         /* 二级密码：并发的敏感请求共用同一次解锁，所以同时只弹一个框 */
         let secondPending = null;
+        /* 刚解锁成功的一小段时间里，迟到的 403 都是解锁前就已发出的请求留下的：
+         * 它们的 403 在解锁完成之后才回到页面，再弹一次框只会让用户莫名其妙地
+         * 重输一遍。这时直接当作已解锁，让调用方重放。 */
+        let secondUnlockedAt = 0;
         function askSecondPassword() {
             if (secondPending) return secondPending;
+            if (Date.now() - secondUnlockedAt < 8000) return Promise.resolve(true);
             secondPending = new Promise(resolve => {
                 const m = document.getElementById('second-modal');
                 const inp = document.getElementById('second-pass');
@@ -4400,6 +4563,7 @@
                     okBtn.removeEventListener('click', onOk);
                     cancelBtn.removeEventListener('click', onCancel);
                     inp.removeEventListener('keydown', onKey);
+                    if (ok) secondUnlockedAt = Date.now();
                     secondPending = null;
                     resolve(ok);
                 };
@@ -5020,8 +5184,8 @@
             if (panelId === 'tasks') loadTasksPage();
             if (panelId === 'stats') loadStatsPage();
             if (panelId === 'advanced') loadAdvancedPage();
-            if (panelId === 'plugins') loadPluginsPage();
-            if (panelId === 'installed-plugins') { loadInstalledPlugins(); loadPublishPanel(); }
+            if (panelId === 'plugins') { loadPluginsPage(); loadPublishPanel(); }
+            if (panelId === 'installed-plugins') loadInstalledPlugins();
             if (panelId === 'plugin-history') loadPluginHistoryPage();
             if (panelId === 'plugin-webui') loadPluginWebuiPage();
             if (panelId === 'app-releases') loadReleases(false);
@@ -5458,241 +5622,259 @@
             }
         }
 
-        function renderConfigForm(config, defaults = {}) {
+        /* 单条配置项的字段行：分组与「多角色配置」顶部共用同一套渲染 */
+        function buildConfigRow(key, config, defaults = {}) {
+            if (!(key in configMeta)) return null;
+            const meta = configMeta[key];
+            // 后端没返回该键时回落默认值
+            const value = resolveFieldValue(key, config, defaults);
+            const row = document.createElement('div');
+            row.className = 'form-row';
+            row.dataset.fieldKey = key;
+            const label = document.createElement('label');
+            label.textContent = meta.label;
+            if (meta.required) {
+                const reqMark = document.createElement('span');
+                reqMark.className = 'required-mark';
+                reqMark.textContent = '【必填】';
+                label.appendChild(reqMark);
+            } else {
+                const optMark = document.createElement('span');
+                optMark.className = 'optional-mark';
+                optMark.textContent = '【可选】';
+                label.appendChild(optMark);
+            }
+            row.appendChild(label);
+            const wrapper = document.createElement('div');
+            wrapper.className = 'field-wrapper';
+            if (meta.description) {
+                const desc = document.createElement('div');
+                desc.className = 'field-desc';
+                desc.textContent = meta.description;
+                wrapper.appendChild(desc);
+            }
+            const controlRow = document.createElement('div');
+            controlRow.style.cssText = 'display:flex;align-items:center;gap:6px;flex-wrap:wrap;';
+            if (meta.type === 'boolean') {
+                const checkboxWrapper = document.createElement('label');
+                checkboxWrapper.className = 'checkbox-label enable-card'
+                    + (value ? ' checked' : '');
+                const input = document.createElement('input');
+                input.type = 'checkbox';
+                input.checked = value;
+                input.dataset.key = key;
+                const span = document.createElement('span');
+                span.textContent = value ? '✔ 已开启' : '✘ 已关闭';
+                input.addEventListener('change', () => {
+                    span.textContent = input.checked ? '✔ 已开启' : '✘ 已关闭';
+                    checkboxWrapper.classList.toggle('checked', input.checked);
+                    updateConditionalVisibility();
+                });
+                checkboxWrapper.appendChild(input);
+                checkboxWrapper.appendChild(span);
+                controlRow.appendChild(checkboxWrapper);
+            } else if (meta.presets && meta.presets.length > 0) {
+                const select = document.createElement('select');
+                // 固定宽度：width:auto 会按最长选项撑开，把右侧输入框挤窄
+                select.style.cssText = 'flex:0 0 auto;width:132px;max-width:132px;';
+                const placeholder = document.createElement('option');
+                placeholder.value = '';
+                placeholder.textContent = '选择预设';
+                select.appendChild(placeholder);
+                // p.group 相同的预设归进同一个 optgroup（各家服务商的音色各成一档）
+                let presetGroup = null;
+                let presetGroupName = null;
+                meta.presets.forEach(p => {
+                    if (p.group && p.group !== presetGroupName) {
+                        presetGroupName = p.group;
+                        presetGroup = document.createElement('optgroup');
+                        presetGroup.label = presetGroupName;
+                        select.appendChild(presetGroup);
+                    } else if (!p.group) {
+                        presetGroup = null;
+                        presetGroupName = null;
+                    }
+                    const option = document.createElement('option');
+                    option.value = p.value;
+                    option.textContent = p.label;
+                    (presetGroup || select).appendChild(option);
+                });
+                const input = document.createElement('input');
+                input.type = 'text';
+                input.value = value;
+                input.dataset.key = key;
+                input.style.cssText = 'flex:1 1 auto;width:auto;min-width:220px;';
+                input.addEventListener('change', updateConditionalVisibility);
+                const syncPreset = () => {
+                    const hit = meta.presets.find(p => String(p.value) === String(input.value));
+                    select.value = hit ? hit.value : '';
+                };
+                syncPreset();
+                select.addEventListener('change', () => {
+                    if (!select.value) return;
+                    const hit = meta.presets.find(p => String(p.value) === String(select.value));
+                    input.value = select.value;
+                    // 预设可顺带把配套字段一起填好（如选服务商同时定协议/模型/音色）
+                    Object.entries((hit && hit.also) || {}).forEach(([targetKey, targetValue]) => {
+                        const target = document.querySelector(`[data-key="${targetKey}"]`);
+                        if (!target) return;
+                        target.value = targetValue;
+                        target.dispatchEvent(new Event('change', { bubbles: true }));
+                    });
+                    updateConditionalVisibility();
+                });
+                input.addEventListener('input', syncPreset);
+                input.addEventListener('change', syncPreset);
+                controlRow.appendChild(select);
+                controlRow.appendChild(input);
+                if (meta.voiceDesigner) controlRow.appendChild(makeVoiceDesignButton());
+                if (meta.voiceEnroller) controlRow.appendChild(makeVoiceEnrollButton());
+            } else if (meta.options && meta.options.length > 0) {
+                if (meta.allowCustom) {
+                    const input = document.createElement('input');
+                    input.type = 'text';
+                    input.value = value;
+                    input.dataset.key = key;
+                    input.setAttribute('list', `datalist-${key}`);
+                    input.addEventListener('change', updateConditionalVisibility);
+                    const datalist = document.createElement('datalist');
+                    datalist.id = `datalist-${key}`;
+                    meta.options.forEach(opt => {
+                        const option = document.createElement('option');
+                        option.value = opt;
+                        datalist.appendChild(option);
+                    });
+                    controlRow.appendChild(input);
+                    wrapper.appendChild(datalist);
+                } else {
+                    const select = document.createElement('select');
+                    select.dataset.key = key;
+                    meta.options.forEach(opt => {
+                        const option = document.createElement('option');
+                        option.value = opt;
+                        option.textContent = opt;
+                        if (String(value) === String(opt)) option.selected = true;
+                        select.appendChild(option);
+                    });
+                    select.addEventListener('change', updateConditionalVisibility);
+                    controlRow.appendChild(select);
+                }
+            } else if (meta.type === 'path' || meta.type === 'model_select') {
+                const input = document.createElement('input');
+                input.type = 'text';
+                input.value = value;
+                input.dataset.key = key;
+                input.style.cssText = 'flex:1 1 auto;width:auto;min-width:220px;';
+                input.addEventListener('change', updateConditionalVisibility);
+                controlRow.appendChild(input);
+                controlRow.appendChild(makeBrowseButton(input, meta.type));
+                if (meta.type === 'model_select') {
+                    const svcBtn = document.createElement('button');
+                    svcBtn.type = 'button';
+                    svcBtn.textContent = '🌐 服务列表';
+                    svcBtn.title = '从 llm_base_url 指向的服务获取可用模型 ID 列表（最准确）';
+                    svcBtn.style.cssText = 'flex:0 0 auto;padding:6px 10px;border:1px solid #ccc;'
+                        + 'border-radius:4px;background:#f7f7f7;cursor:pointer;font-size:13px;';
+                    svcBtn.addEventListener('click', async () => {
+                        if (svcBtn.disabled) return;
+                        svcBtn.disabled = true;
+                        try {
+                            await chooseModelFromService(input);
+                        } catch (e) {
+                            alert('操作失败: ' + e);
+                        } finally {
+                            svcBtn.disabled = false;
+                        }
+                    });
+                    controlRow.appendChild(svcBtn);
+                }
+            } else if (meta.type === 'mirrors') {
+                const wrap = document.createElement('div');
+                const area = document.createElement('textarea');
+                area.dataset.key = key;
+                area.value = value;
+                area.rows = 5;
+                area.spellcheck = false;
+                const actions = document.createElement('div');
+                actions.className = 'mirror-actions';
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'btn btn-gray';
+                btn.textContent = '测速并排序';
+                const note = document.createElement('span');
+                note.className = 'muted';
+                const list = document.createElement('div');
+                list.className = 'mirror-list';
+                btn.addEventListener('click', () => testGithubMirrors(area, list, note, btn));
+                actions.append(btn, note);
+                wrap.append(area, actions, list);
+                controlRow.appendChild(wrap);
+            } else if (meta.type === 'text') {
+                const textarea = document.createElement('textarea');
+                textarea.dataset.key = key;
+                textarea.value = value;
+                controlRow.appendChild(textarea);
+            } else {
+                const input = document.createElement('input');
+                if (meta.type === 'int' || meta.type === 'float') {
+                    input.type = 'number';
+                    if (meta.type === 'float') input.step = 'any';
+                } else if (meta.type === 'password') {
+                    input.type = 'password';
+                } else {
+                    input.type = 'text';
+                }
+                input.value = value;
+                input.dataset.key = key;
+                input.addEventListener('change', updateConditionalVisibility);
+                controlRow.appendChild(input);
+            }
+            if (defaults && key in defaults && String(defaults[key]) !== String(value)) {
+                const resetBtn = document.createElement('button');
+                resetBtn.type = 'button';
+                resetBtn.textContent = '↺';
+                resetBtn.title = '恢复默认值：' + defaults[key];
+                resetBtn.style.cssText = 'width:20px;height:20px;min-width:20px;flex:0 0 auto;'
+                    + 'font-size:13px;line-height:1;padding:0;margin-left:auto;cursor:pointer;'
+                    + 'border-radius:50%;border:1px solid #888;background:transparent;color:#888;';
+                resetBtn.addEventListener('click', () => applyFieldValue(key, defaults[key]));
+                controlRow.appendChild(resetBtn);
+            }
+            wrapper.appendChild(controlRow);
+            if (meta.hint) {
+                const hint = document.createElement('div');
+                hint.className = 'field-hint';
+                hint.textContent = meta.hint;
+                wrapper.appendChild(hint);
+            }
+            row.appendChild(wrapper);
+            return row;
+        }
+
+        function renderConfigForm(config, defaults = {}, options = {}) {
             const container = document.getElementById('config-groups');
-            container.innerHTML = '';
-            configGroups.forEach(group => {
+            if (!options.append) container.innerHTML = '';
+            (options.groups || configGroups).forEach(group => {
                 const groupDiv = document.createElement('div');
                 groupDiv.className = 'config-group';
                 const title = document.createElement('h3');
                 title.textContent = group.title;
                 groupDiv.appendChild(title);
-                group.keys.forEach(key => {
-                    if (!(key in configMeta)) return;
-                    const meta = configMeta[key];
-                    // 后端没返回该键时回落默认值
-                    const value = resolveFieldValue(key, config, defaults);
-                    const row = document.createElement('div');
-                    row.className = 'form-row';
-                    row.dataset.fieldKey = key;
-                    const label = document.createElement('label');
-                    label.textContent = meta.label;
-                    if (meta.required) {
-                        const reqMark = document.createElement('span');
-                        reqMark.className = 'required-mark';
-                        reqMark.textContent = '【必填】';
-                        label.appendChild(reqMark);
-                    } else {
-                        const optMark = document.createElement('span');
-                        optMark.className = 'optional-mark';
-                        optMark.textContent = '【可选】';
-                        label.appendChild(optMark);
+                // 分组里的子分组（如「更多」）只用一条小标题分隔，字段行仍是同一套渲染
+                const items = group.children
+                    ? group.children.reduce((all, sub) => all.concat([{ subtitle: sub.title }], sub.keys), [])
+                    : group.keys;
+                items.forEach(item => {
+                    if (typeof item === 'object') {
+                        const subTitle = document.createElement('h4');
+                        subTitle.className = 'config-subtitle';
+                        subTitle.textContent = item.subtitle;
+                        groupDiv.appendChild(subTitle);
+                        return;
                     }
-                    row.appendChild(label);
-                    const wrapper = document.createElement('div');
-                    wrapper.className = 'field-wrapper';
-                    if (meta.description) {
-                        const desc = document.createElement('div');
-                        desc.className = 'field-desc';
-                        desc.textContent = meta.description;
-                        wrapper.appendChild(desc);
-                    }
-                    const controlRow = document.createElement('div');
-                    controlRow.style.cssText = 'display:flex;align-items:center;gap:6px;flex-wrap:wrap;';
-                    if (meta.type === 'boolean') {
-                        const checkboxWrapper = document.createElement('label');
-                        checkboxWrapper.className = 'checkbox-label enable-card'
-                            + (value ? ' checked' : '');
-                        const input = document.createElement('input');
-                        input.type = 'checkbox';
-                        input.checked = value;
-                        input.dataset.key = key;
-                        const span = document.createElement('span');
-                        span.textContent = value ? '✔ 已开启' : '✘ 已关闭';
-                        input.addEventListener('change', () => {
-                            span.textContent = input.checked ? '✔ 已开启' : '✘ 已关闭';
-                            checkboxWrapper.classList.toggle('checked', input.checked);
-                            updateConditionalVisibility();
-                        });
-                        checkboxWrapper.appendChild(input);
-                        checkboxWrapper.appendChild(span);
-                        controlRow.appendChild(checkboxWrapper);
-                    } else if (meta.presets && meta.presets.length > 0) {
-                        const select = document.createElement('select');
-                        // 固定宽度：width:auto 会按最长选项撑开，把右侧输入框挤窄
-                        select.style.cssText = 'flex:0 0 auto;width:132px;max-width:132px;';
-                        const placeholder = document.createElement('option');
-                        placeholder.value = '';
-                        placeholder.textContent = '选择预设';
-                        select.appendChild(placeholder);
-                        // p.group 相同的预设归进同一个 optgroup（各家服务商的音色各成一档）
-                        let presetGroup = null;
-                        let presetGroupName = null;
-                        meta.presets.forEach(p => {
-                            if (p.group && p.group !== presetGroupName) {
-                                presetGroupName = p.group;
-                                presetGroup = document.createElement('optgroup');
-                                presetGroup.label = presetGroupName;
-                                select.appendChild(presetGroup);
-                            } else if (!p.group) {
-                                presetGroup = null;
-                                presetGroupName = null;
-                            }
-                            const option = document.createElement('option');
-                            option.value = p.value;
-                            option.textContent = p.label;
-                            (presetGroup || select).appendChild(option);
-                        });
-                        const input = document.createElement('input');
-                        input.type = 'text';
-                        input.value = value;
-                        input.dataset.key = key;
-                        input.style.cssText = 'flex:1 1 auto;width:auto;min-width:220px;';
-                        input.addEventListener('change', updateConditionalVisibility);
-                        const syncPreset = () => {
-                            const hit = meta.presets.find(p => String(p.value) === String(input.value));
-                            select.value = hit ? hit.value : '';
-                        };
-                        syncPreset();
-                        select.addEventListener('change', () => {
-                            if (!select.value) return;
-                            const hit = meta.presets.find(p => String(p.value) === String(select.value));
-                            input.value = select.value;
-                            // 预设可顺带把配套字段一起填好（如选服务商同时定协议/模型/音色）
-                            Object.entries((hit && hit.also) || {}).forEach(([targetKey, targetValue]) => {
-                                const target = document.querySelector(`[data-key="${targetKey}"]`);
-                                if (!target) return;
-                                target.value = targetValue;
-                                target.dispatchEvent(new Event('change', { bubbles: true }));
-                            });
-                            updateConditionalVisibility();
-                        });
-                        input.addEventListener('input', syncPreset);
-                        input.addEventListener('change', syncPreset);
-                        controlRow.appendChild(select);
-                        controlRow.appendChild(input);
-                        if (meta.voiceDesigner) controlRow.appendChild(makeVoiceDesignButton());
-                        if (meta.voiceEnroller) controlRow.appendChild(makeVoiceEnrollButton());
-                    } else if (meta.options && meta.options.length > 0) {
-                        if (meta.allowCustom) {
-                            const input = document.createElement('input');
-                            input.type = 'text';
-                            input.value = value;
-                            input.dataset.key = key;
-                            input.setAttribute('list', `datalist-${key}`);
-                            input.addEventListener('change', updateConditionalVisibility);
-                            const datalist = document.createElement('datalist');
-                            datalist.id = `datalist-${key}`;
-                            meta.options.forEach(opt => {
-                                const option = document.createElement('option');
-                                option.value = opt;
-                                datalist.appendChild(option);
-                            });
-                            controlRow.appendChild(input);
-                            wrapper.appendChild(datalist);
-                        } else {
-                            const select = document.createElement('select');
-                            select.dataset.key = key;
-                            meta.options.forEach(opt => {
-                                const option = document.createElement('option');
-                                option.value = opt;
-                                option.textContent = opt;
-                                if (String(value) === String(opt)) option.selected = true;
-                                select.appendChild(option);
-                            });
-                            select.addEventListener('change', updateConditionalVisibility);
-                            controlRow.appendChild(select);
-                        }
-                    } else if (meta.type === 'path' || meta.type === 'model_select') {
-                        const input = document.createElement('input');
-                        input.type = 'text';
-                        input.value = value;
-                        input.dataset.key = key;
-                        input.style.cssText = 'flex:1 1 auto;width:auto;min-width:220px;';
-                        input.addEventListener('change', updateConditionalVisibility);
-                        controlRow.appendChild(input);
-                        controlRow.appendChild(makeBrowseButton(input, meta.type));
-                        if (meta.type === 'model_select') {
-                            const svcBtn = document.createElement('button');
-                            svcBtn.type = 'button';
-                            svcBtn.textContent = '🌐 服务列表';
-                            svcBtn.title = '从 llm_base_url 指向的服务获取可用模型 ID 列表（最准确）';
-                            svcBtn.style.cssText = 'flex:0 0 auto;padding:6px 10px;border:1px solid #ccc;'
-                                + 'border-radius:4px;background:#f7f7f7;cursor:pointer;font-size:13px;';
-                            svcBtn.addEventListener('click', async () => {
-                                if (svcBtn.disabled) return;
-                                svcBtn.disabled = true;
-                                try {
-                                    await chooseModelFromService(input);
-                                } catch (e) {
-                                    alert('操作失败: ' + e);
-                                } finally {
-                                    svcBtn.disabled = false;
-                                }
-                            });
-                            controlRow.appendChild(svcBtn);
-                        }
-                    } else if (meta.type === 'mirrors') {
-                        const wrap = document.createElement('div');
-                        const area = document.createElement('textarea');
-                        area.dataset.key = key;
-                        area.value = value;
-                        area.rows = 5;
-                        area.spellcheck = false;
-                        const actions = document.createElement('div');
-                        actions.className = 'mirror-actions';
-                        const btn = document.createElement('button');
-                        btn.type = 'button';
-                        btn.className = 'btn btn-gray';
-                        btn.textContent = '测速并排序';
-                        const note = document.createElement('span');
-                        note.className = 'muted';
-                        const list = document.createElement('div');
-                        list.className = 'mirror-list';
-                        btn.addEventListener('click', () => testGithubMirrors(area, list, note, btn));
-                        actions.append(btn, note);
-                        wrap.append(area, actions, list);
-                        controlRow.appendChild(wrap);
-                    } else if (meta.type === 'text') {
-                        const textarea = document.createElement('textarea');
-                        textarea.dataset.key = key;
-                        textarea.value = value;
-                        controlRow.appendChild(textarea);
-                    } else {
-                        const input = document.createElement('input');
-                        if (meta.type === 'int' || meta.type === 'float') {
-                            input.type = 'number';
-                            if (meta.type === 'float') input.step = 'any';
-                        } else if (meta.type === 'password') {
-                            input.type = 'password';
-                        } else {
-                            input.type = 'text';
-                        }
-                        input.value = value;
-                        input.dataset.key = key;
-                        input.addEventListener('change', updateConditionalVisibility);
-                        controlRow.appendChild(input);
-                    }
-                    if (defaults && key in defaults && String(defaults[key]) !== String(value)) {
-                        const resetBtn = document.createElement('button');
-                        resetBtn.type = 'button';
-                        resetBtn.textContent = '↺';
-                        resetBtn.title = '恢复默认值：' + defaults[key];
-                        resetBtn.style.cssText = 'width:20px;height:20px;min-width:20px;flex:0 0 auto;'
-                            + 'font-size:13px;line-height:1;padding:0;margin-left:auto;cursor:pointer;'
-                            + 'border-radius:50%;border:1px solid #888;background:transparent;color:#888;';
-                        resetBtn.addEventListener('click', () => applyFieldValue(key, defaults[key]));
-                        controlRow.appendChild(resetBtn);
-                    }
-                    wrapper.appendChild(controlRow);
-                    if (meta.hint) {
-                        const hint = document.createElement('div');
-                        hint.className = 'field-hint';
-                        hint.textContent = meta.hint;
-                        wrapper.appendChild(hint);
-                    }
-                    row.appendChild(wrapper);
-                    groupDiv.appendChild(row);
+                    const key = item;
+                    const row = buildConfigRow(key, config, defaults);
+                    if (row) groupDiv.appendChild(row);
                 });
                 container.appendChild(groupDiv);
             });
@@ -5818,6 +6000,12 @@
                 document.getElementById('roles-container').appendChild(roleEl);
                 bindDeleteRole(roleEl);
             });
+
+            // 「当前激活的角色标识符」原本单独占一个分组，现在挪到这一块的最上面
+            const activeRow = buildConfigRow('active_character', config, config.defaults || {});
+            if (activeRow) {
+                container.insertBefore(activeRow, document.getElementById('roles-container'));
+            }
         }
 
         function updateConditionalVisibility() {
@@ -5864,8 +6052,10 @@
             try {
                 const config = await apiGet('api/config');
                 currentConfig = config;
-                renderConfigForm(config, config.defaults || {});
+                const defaults = config.defaults || {};
+                renderConfigForm(config, defaults, { groups: configMainGroups });
                 renderRolesConfig(config);
+                renderConfigForm(config, defaults, { groups: configTailGroups, append: true });
                 updateConditionalVisibility();
                 buildAnchorNav();
                 configDirty = false;
@@ -6132,6 +6322,13 @@
         document.getElementById('preset-tab-import').addEventListener('click', () => switchPresetTab('import'));
         document.getElementById('preset-tab-export').addEventListener('click', () => switchPresetTab('export'));
         document.getElementById('preset-save').addEventListener('click', exportConfigPreset);
+        document.getElementById('preset-open-dir').addEventListener('click', async () => {
+            try {
+                await apiPost('api/config/presets/open_dir', {});
+            } catch (e) {
+                presetMsg('打开文件夹失败: ' + e.message, true);
+            }
+        });
 
         /* ==================== 聊天记录 ==================== */
         const chatMsgDiv = document.getElementById('chat-message');
@@ -6349,6 +6546,20 @@
             return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${hm}`;
         }
 
+        /* 聊天记录里区分不同用户的气泡底色：按发言先后分配 u1…u6，第一个人沿用
+         * 原来的绿色。同一个键（用户 ID，缺失时退回昵称）在同一份记录里颜色一致。 */
+        const CHAT_USER_COLOR_CLASSES = ['u1', 'u2', 'u3', 'u4', 'u5', 'u6'];
+
+        function chatUserColorClass(msg, colors) {
+            const key = String(msg.sender_id || msg.sender_name || '').trim();
+            if (!key) return '';
+            if (!colors.has(key)) {
+                colors.set(key, CHAT_USER_COLOR_CLASSES[colors.size
+                                                    % CHAT_USER_COLOR_CLASSES.length]);
+            }
+            return colors.get(key);
+        }
+
         function renderChatMessages() {
             const body = document.getElementById('modal-body');
             body.innerHTML = '';
@@ -6356,6 +6567,7 @@
             chatMultiMode = false;
             updateMsgToolbar();
             let lastTs = null;
+            const userColors = new Map();
             currentChatHistory.forEach((msg, idx) => {
                 const ts = Number(msg.timestamp) || 0;
                 if (ts > 0 && (lastTs === null || ts - lastTs >= 300)) {
@@ -6370,6 +6582,10 @@
                 if (ts > 0) lastTs = ts;
                 const row = document.createElement('div');
                 row.className = 'msg-row ' + (msg.role === 'user' ? 'user' : 'bot');
+                if (msg.role === 'user') {
+                    const cls = chatUserColorClass(msg, userColors);
+                    if (cls) row.classList.add(cls);
+                }
                 const checkbox = document.createElement('input');
                 checkbox.type = 'checkbox';
                 checkbox.className = 'msg-checkbox';
@@ -8015,8 +8231,8 @@
             }
         }
 
-        async function doInstallRemote(id) {
-            pluginMsg(`正在下载安装 ${id} …`);
+        async function doInstallRemote(id, note = pluginMsg) {
+            note(`正在下载安装 ${id} …`);
             try {
                 const r = await fetchGuarded(`${API_BASE}/api/plugins/install_remote`, {
                     method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -8030,8 +8246,8 @@
                                  (j.report?.risks?.items || []).filter(x => x.level === 'high')
                                      .map(x => '· ' + x.title).join('\n') +
                                  '\n\n确认安装吗？')) {
-                        pluginMsg('已取消安装');
-                        return;
+                        note('已取消安装');
+                        return false;
                     }
                     const r2 = await fetchGuarded(`${API_BASE}/api/plugins/install_remote`, {
                         method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -8044,12 +8260,14 @@
                 } else if (!j.success) {
                     throw new Error(j.error || '安装失败');
                 }
-                pluginMsg(`已安装 ${id}，去「插件」里启用`);
+                note(`已安装 ${id}，去「插件」里启用`);
                 applyPluginTheme();
                 refreshPluginViews();
                 showPluginReadme(result.id || id, result.name || id);
+                return true;
             } catch (e) {
-                pluginMsg('安装失败: ' + e.message, true);
+                note('安装失败: ' + e.message, true);
+                return false;
             }
         }
 
@@ -8338,6 +8556,104 @@
         }
 
         let publishStatus = null;
+
+        /* ==================== 检查插件更新 ====================
+         * 服务端把「已装版本 < 市场版本」的插件挑出来，这里只负责列出与替换：
+         * 替换走同一个 install_remote 接口（覆盖安装会沿用启用状态与插件数据）。
+         */
+        let pluginUpdates = [];
+
+        function pluginUpdateEls() {
+            return {
+                overlay: document.getElementById('plugin-update-modal'),
+                sub: document.getElementById('plugin-update-sub'),
+                list: document.getElementById('plugin-update-list'),
+            };
+        }
+
+        function closePluginUpdateDialog() {
+            const {overlay} = pluginUpdateEls();
+            if (overlay) overlay.classList.remove('active');
+        }
+
+        function pluginUpdateMsg(text, isError) {
+            const {sub} = pluginUpdateEls();
+            if (!sub) return;
+            sub.textContent = text;
+            sub.style.color = isError ? 'var(--danger)' : '';
+        }
+
+        async function openPluginUpdateDialog() {
+            const {overlay, list} = pluginUpdateEls();
+            if (!overlay || !list) return;
+            overlay.classList.add('active');
+            pluginUpdateMsg('正在检查更新…');
+            list.innerHTML = '<div class="plugin-empty">正在从市场核对版本…</div>';
+            try {
+                const data = await apiGet('api/plugins/updates?refresh=1');
+                if (data.success === false) throw new Error(data.error || '检查失败');
+                pluginUpdates = data.plugins || [];
+                renderPluginUpdates();
+            } catch (e) {
+                pluginUpdateMsg('检查更新失败: ' + e.message, true);
+                list.innerHTML = '';
+            }
+        }
+
+        function renderPluginUpdates() {
+            const {list} = pluginUpdateEls();
+            if (!list) return;
+            if (!pluginUpdates.length) {
+                pluginUpdateMsg('所有插件都是最新版本。');
+                list.innerHTML = '';
+                return;
+            }
+            pluginUpdateMsg(`有 ${pluginUpdates.length} 个插件发布了新版本。`);
+            list.innerHTML = pluginUpdates.map(p => `
+                <div class="plugin-card" data-uid="${esc(p.id)}">
+                    <div class="plugin-card-head">
+                        <div style="min-width:0;flex:1;">
+                            <div class="plugin-title">${esc(p.name || p.id)}
+                                <span class="plugin-tag">v${esc(p.installed_version || '?')}
+                                    → v${esc(p.version || '?')}</span>
+                            </div>
+                            <div class="plugin-meta">${esc(p.author || '未知作者')}
+                                ${p.release_tag ? ' · ' + esc(p.release_tag) : ''}</div>
+                        </div>
+                    </div>
+                    <div class="plugin-desc">${esc(p.description || '（这位作者没有写说明）')}</div>
+                    <div class="plugin-actions">
+                        <button class="btn btn-green" data-uact="update" data-id="${esc(p.id)}">
+                            ${icon('importIn')}下载并替换</button>
+                    </div>
+                </div>`).join('');
+            bindIconFallbacks(list);
+            list.querySelectorAll('button[data-uact]').forEach(btn => {
+                btn.addEventListener('click', () => doPluginUpdate(btn.dataset.id, btn));
+            });
+        }
+
+        async function doPluginUpdate(id, btn) {
+            if (btn) btn.disabled = true;
+            const ok = await doInstallRemote(id, pluginUpdateMsg);
+            if (btn) btn.disabled = false;
+            if (!ok) return;
+            pluginUpdates = pluginUpdates.filter(p => p.id !== id);
+            renderPluginUpdates();
+        }
+
+        function bindPluginUpdateDialog() {
+            const {overlay} = pluginUpdateEls();
+            const open = document.getElementById('plugin-update-check-btn');
+            if (open) open.addEventListener('click', openPluginUpdateDialog);
+            const close = document.getElementById('plugin-update-close');
+            if (close) close.addEventListener('click', closePluginUpdateDialog);
+            if (overlay) {
+                overlay.addEventListener('click', ev => {
+                    if (ev.target === overlay) closePluginUpdateDialog();
+                });
+            }
+        }
 
         function publishEls() {
             return {
@@ -9231,6 +9547,102 @@
             e.target.value = '';
         });
 
+        // ---- 表情包「一键识别」----
+        let stickerAutoPicked = [];
+
+        function stickerAutoOpen() {
+            stickerAutoPicked = [];
+            document.getElementById('sticker-auto-picked').textContent = '还没有选择图片或文件夹';
+            document.getElementById('sticker-auto-progress').textContent = '';
+            document.getElementById('sticker-auto-result').innerHTML = '';
+            document.getElementById('sticker-auto-modal').classList.add('active');
+        }
+
+        function stickerAutoPickedText() {
+            const el = document.getElementById('sticker-auto-picked');
+            if (!stickerAutoPicked.length) { el.textContent = '还没有选择图片或文件夹'; return; }
+            el.innerHTML = `已选择 ${stickerAutoPicked.length} 项：<br>`
+                + stickerAutoPicked.map(p => esc(p)).join('<br>');
+        }
+
+        async function stickerAutoPick(what) {
+            const progress = document.getElementById('sticker-auto-progress');
+            progress.textContent = '正在打开选择对话框…';
+            try {
+                if (what === 'folder') {
+                    const picked = await apiPostSoft('api/dialog/pick_folder', {});
+                    if (!picked.ok) { progress.textContent = picked.error || '文件夹选择不可用'; return; }
+                    if (!picked.cancelled && picked.path) stickerAutoPicked = [picked.path];
+                } else {
+                    const picked = await apiPostSoft('api/dialog/pick_file', {
+                        multiple: true, filter: '图片', exts: ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp']
+                    });
+                    if (!picked.ok) { progress.textContent = picked.error || '图片选择不可用'; return; }
+                    if (!picked.cancelled) stickerAutoPicked = picked.paths || [];
+                }
+                progress.textContent = '';
+                stickerAutoPickedText();
+            } catch (e) {
+                progress.textContent = '选择失败: ' + e.message;
+            }
+        }
+
+        async function pollStickerImportJob(jobId, progress) {
+            // 每张图都要过一次识图模型，给足时间；但线程卡死时不能永久轮询
+            const maxPolls = 1200;
+            for (let i = 0; i < maxPolls; i++) {
+                const data = await apiGet(`api/stickers/auto_import/status?job_id=${encodeURIComponent(jobId)}`);
+                const logs = (data.logs || []).slice(-3);
+                progress.innerHTML = esc(`${data.stage}（${data.done}/${data.total}）`)
+                    + (logs.length ? '<br>' + logs.map(esc).join('<br>') : '');
+                if (!data.running) return data;
+                await new Promise(resolve => setTimeout(resolve, 1200));
+            }
+            return { running: false, error: '识别超时（可稍后在表情包页刷新查看结果）' };
+        }
+
+        async function stickerAutoRun() {
+            const progress = document.getElementById('sticker-auto-progress');
+            const result = document.getElementById('sticker-auto-result');
+            if (!stickerAutoPicked.length) { progress.textContent = '先选择图片或文件夹'; return; }
+            const startBtn = document.getElementById('sticker-auto-start');
+            startBtn.disabled = true;
+            progress.textContent = '正在启动识别…';
+            result.innerHTML = '';
+            try {
+                const started = await apiPost('api/stickers/auto_import', { paths: stickerAutoPicked });
+                const final = await pollStickerImportJob(started.job_id, progress);
+                if (final.error) {
+                    progress.textContent = '识别失败：' + final.error;
+                } else {
+                    const r = final.result || {};
+                    progress.textContent = `完成：归档 ${r.saved || 0} 张，重复 ${r.skipped || 0} 张，失败 ${r.failed || 0} 张`;
+                }
+                const items = ((final.result || {}).items || []);
+                const rows = items.map(it => {
+                    const target = it.saved ? esc(it.saved) : (it.error ? esc(it.error) : '');
+                    return `<div>${esc(it.name)} → ${target}</div>`;
+                });
+                const skippedPaths = ((final.result || {}).skipped_paths || []);
+                result.innerHTML = (rows.length ? `<div class="muted" style="margin-top:8px;">逐张结果：</div>${rows.join('')}` : '')
+                    + (skippedPaths.length ? `<div class="muted" style="margin-top:8px;">跳过：</div>${skippedPaths.map(esc).join('<br>')}` : '');
+                loadStickers();
+            } catch (e) {
+                progress.textContent = '识别失败: ' + e.message;
+            } finally {
+                startBtn.disabled = false;
+            }
+        }
+
+        document.getElementById('sticker-auto-btn').addEventListener('click', stickerAutoOpen);
+        document.getElementById('sticker-auto-close').addEventListener('click',
+            () => document.getElementById('sticker-auto-modal').classList.remove('active'));
+        document.getElementById('sticker-auto-pick-folder').addEventListener('click',
+            () => stickerAutoPick('folder'));
+        document.getElementById('sticker-auto-pick-files').addEventListener('click',
+            () => stickerAutoPick('files'));
+        document.getElementById('sticker-auto-start').addEventListener('click', stickerAutoRun);
+
         // ---- 工具调用 ----
         let toolsState = [];
         let editingToolIdx = -1;
@@ -9795,7 +10207,15 @@
             }
             // 启动横幅（块状字符艺术字）单独包一层，只给它加宽 + 倾斜，其余日志保持原样。
             // 逐行转义后再拼 HTML：日志里含用户昵称与消息，不能直接当 HTML 解析。
-            const LOG_BANNER_RE = /[\u2500-\u259f]{2,}/;
+            const LOG_BANNER_RE = /[\u2500-\u259f\u2800-\u28ff]{2,}/;
+            // 级别由后端写进统一前缀 [时:分:秒.毫秒][来源][信息/警告/错误]，
+            // 前端只管照着上色（横幅那几行没有前缀，也不参与上色）。
+            const LOG_PREFIX_RE = /^\[\d{2}:\d{2}:\d{2}\.\d{3}\]\[[^\]]+\]\[(信息|警告|错误)\]\s?/;
+            const LOG_LEVEL_CLASS = { '错误': 'log-err', '警告': 'log-warn' };
+            const logLineClass = (line) => {
+                const m = LOG_PREFIX_RE.exec(line);
+                return (m && LOG_LEVEL_CLASS[m[1]]) || '';
+            };
             const logHtml = (text) => {
                 const out = [];
                 let banner = null;
@@ -9805,7 +10225,8 @@
                         continue;
                     }
                     if (banner) { out.push(`<span class="log-banner">${banner.join('\n')}</span>`); banner = null; }
-                    out.push(esc(line));
+                    const cls = logLineClass(line);
+                    out.push(cls ? `<span class="${cls}">${esc(line)}</span>` : esc(line));
                 }
                 if (banner) out.push(`<span class="log-banner">${banner.join('\n')}</span>`);
                 return out.join('\n');
@@ -9977,6 +10398,7 @@
                     webuiBack.addEventListener('click', closePluginWebui);
                 }
                 bindUninstallDialog();
+                bindPluginUpdateDialog();
                 const relRefresh = document.getElementById('plugin-releases-refresh');
                 if (relRefresh) {
                     relRefresh.addEventListener('click', async () => {

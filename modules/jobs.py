@@ -171,6 +171,11 @@ class ScheduledJobManager:
             "%Y-%m-%d", time.localtime(when if when is not None else time.time()))
         self.save_state()
 
+    def _clear_ran(self, job_id: str):
+        """撤掉"今天已执行"的占位（补发时先占位、发送失败再撤回）。"""
+        if self.run_state.pop(str(job_id), None) is not None:
+            self.save_state()
+
     def _ran_on(self, job_id: str, day: str) -> bool:
         return str(self.run_state.get(str(job_id), "")) == day
 
@@ -295,15 +300,16 @@ class ScheduledJobManager:
             return ""
 
     # ---------------- 执行 ----------------
-    async def _run_job(self, job: dict):
+    async def _run_job(self, job: dict) -> bool:
+        """跑一条任务；返回是否真的发出去了（发出去了才算"今天已执行"）。"""
         target = job.get("target") or {}
         action = job.get("action") or {}
         if self.sender is None or self.sender.client is None:
-            return
+            return False
         targets = self.resolve_targets(target)
         if not targets:
             print(f"[定时任务] {job.get('name') or job.get('id', '')} 没有可用的发送目标，跳过。")
-            return
+            return False
         ctx = (self.ctx_provider() if self.ctx_provider else None) or RoleContext(self.config)
         emotions = (self.emotions_provider() if self.emotions_provider else None) or {}
         mode = action.get("mode", "template")
@@ -312,7 +318,7 @@ class ScheduledJobManager:
             template_text = render_template(str(action.get("template", "")),
                                             character_name=ctx.character_name)
             if not template_text:
-                return
+                return False
         sent_any = False
         composed = 0
         for session_type, session_id in targets:
@@ -351,12 +357,13 @@ class ScheduledJobManager:
                 ok = False
             sent_any = sent_any or bool(ok)
         if not composed:
-            return
+            return False
         if not sent_any:
             # 发送没成功就不能标记"今天已执行"，否则当天不会再重试
             print(f"定时任务 {job.get('id', '')} 发送未成功，本次不标记已执行。")
-            return
+            return False
         self._mark_ran(job.get("id", ""))
+        return True
 
     def _daily_time_passed_today(self, job: dict) -> Optional[float]:
         """返回该每日任务今天应执行的时刻；今天没有该任务的时刻时返回 None。"""
@@ -414,10 +421,17 @@ class ScheduledJobManager:
                 continue
             print(f"[定时任务] 补发今天漏掉的每日任务：{job.get('name', job_id)}"
                   f"（应执行于 {time.strftime('%H:%M', time.localtime(due))}）")
+            # 先占位再发送：发送成功到落盘之间崩溃时，重启后不会把同一条问候再补发一遍；
+            # 真没发出去（含抛异常）再把占位撤掉，当天还能重试
+            self._mark_ran(job_id)
+            sent = False
             try:
-                await self._run_job(job)
-                done += 1
+                sent = await self._run_job(job)
             except Exception as e:
                 print(f"[定时任务] 补发 {job.get('name', job_id)} 失败: "
                       f"{type(e).__name__}: {e}")
+            if sent:
+                done += 1
+            else:
+                self._clear_ran(job_id)
         return done

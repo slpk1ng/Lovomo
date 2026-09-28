@@ -389,12 +389,20 @@ def _readable_chars(text: str) -> int:
     return len(re.sub(r"[\W_]+", "", str(text or ""), flags=re.UNICODE))
 
 
+# 时长下限的绝对下限：判断依据是"有效人声"而不是文件总时长，所以这里要放得很小 ——
+# 「はあ？！」这种两三个字的短句本来就只说得出一瞬间的人声（实测约 0.26 秒），
+# 门槛压到 0.3 秒会把正常短句误判成过短，白白丢掉语音。
+_MIN_VOICED_FLOOR = 0.12
+
+
 def _min_expected_seconds(text: str, config) -> float:
     try:
         per_char = float(config.get("tts_min_seconds_per_char", 0.05) or 0.05)
     except (TypeError, ValueError, AttributeError):
         per_char = 0.05
-    return max(0.3, _readable_chars(text) * per_char)
+    if per_char <= 0:
+        return _MIN_VOICED_FLOOR
+    return max(_MIN_VOICED_FLOOR, _readable_chars(text) * per_char)
 
 
 # 时长上限的绝对下限：短句（大量停顿标点、结巴式重复）本身字数少，
@@ -461,29 +469,62 @@ def _audio_too_long(path, text: str, config) -> bool:
     return True
 
 
+def _voiced_seconds(path) -> float:
+    """这段音频里真正有人声的秒数（掐掉数字静音）。
+
+    只看文件总时长会把「只念了开头、后面全是静音」当成合格：TTS 偶发提前结束
+    推理时就是这样，听感上只念了两三个音，时长却有整句那么长。
+    取不到（非 16bit / 读失败 / 整段静音）时返回 0，调用方退回按总时长判断。
+    """
+    try:
+        with wave.open(str(path), "rb") as wf:
+            rate = wf.getframerate()
+            channels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            frames = wf.readframes(wf.getnframes())
+    except Exception:
+        return 0.0
+    if not rate or sampwidth != 2 or not frames:
+        return 0.0
+    try:
+        audio = np.frombuffer(frames, dtype=np.int16)
+        if channels > 1:
+            audio = audio.reshape(-1, channels)
+            loud = np.abs(audio.astype(np.int64)).max(axis=1) > _SILENCE_LEVEL
+        else:
+            loud = np.abs(audio.astype(np.int64)) > _SILENCE_LEVEL
+        return float(int(np.count_nonzero(loud))) / rate
+    except Exception:
+        return 0.0
+
+
 def _audio_too_short(path, text: str, config) -> bool:
     if not bool(config.get("tts_duration_guard", True)):
         return False
     duration = _wav_duration(path)
     if duration <= 0:
         return True
+    voiced = _voiced_seconds(path)
+    spoken = voiced if voiced > 0 else duration
     expected = _min_expected_seconds(text, config)
-    if duration + 1e-6 >= expected:
+    if spoken + 1e-6 >= expected:
         return False
-    _safe_print(f"TTS 合成音频过短（{duration:.2f}s < 期望 {expected:.2f}s），"
-                f"文本={str(text)[:40]!r}")
+    _safe_print(f"TTS 合成音频过短（有效人声 {spoken:.2f}s / 总时长 {duration:.2f}s < "
+                f"期望 {expected:.2f}s），文本={str(text)[:40]!r}")
     return True
 
 
 async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
                               data_path: Path, stats=None,
-                              mimic: str = "", mimics: dict = None) -> Optional[Path]:
+                              mimic: str = "", mimics: dict = None,
+                              _piece_mode: bool = False) -> Optional[Path]:
     """合成一句话语音，返回 wav 路径；纯标点/空句子返回 None。
 
     参数顺序：config, text(要念的台词), emotion(情绪名), emotions(情绪表)。
     语言按台词实际使用的文字判定（tts_auto_lang），避免拿中文台词配日文语言
-    模型合成出无法辨认的语音；合成结果过短时按备用切分方式重试，
-    仍然拿不到可用音频就返回 None（调用方只发文本），绝不把半截语音发出去。
+    模型合成出无法辨认的语音；合成结果过短时按备用切分方式重试，仍然拿不到
+    合格音频就改成逐小节合成再合并（_piece_mode 的内部递归），
+    全都拿不到就返回 None（调用方只发文本），绝不把半截语音发出去。
 
     tts_backend=cloud 时整句交给 modules.tts_cloud（云端不看参考音频与情绪表）。
 
@@ -566,8 +607,13 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
     base_url = config.get("client_base_url", "http://127.0.0.1:9880")
     timeout = config.get("timeout_seconds", 120)
     split_default = str(config.get("text_split_method", "cut1") or "cut1")
-    variants = ([split_default] + [v for v in ("cut5", "cut0", "cut2", "cut3")
-                                   if v != split_default])[:3]
+    if _piece_mode:
+        # 小节本身只有十来个字，切分方式几乎没有区别：只用默认那种，
+        # 免得一段失败的小节又反复重试，把整句的耗时放大好几倍
+        variants = [split_default]
+    else:
+        variants = ([split_default] + [v for v in ("cut5", "cut0", "cut2", "cut3")
+                                       if v != split_default])[:3]
     attempts = [(variant, True) for variant in variants]
     if mimic_key:
         # 模仿用的参考音频不合规（如时长不在 3~10 秒）时退回纯语气，别让整句丢掉语音
@@ -674,13 +720,25 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
             print(f"TTS 合成失败: {resp.status_code} - {str(resp.text)[:120]} | 文本={clean_text[:60]}")
             break
     if best_path is not None:
-        _safe_print(f"TTS 多次合成都偏短，仍返回其中最长的一段（{best_duration:.2f}s），"
-                    "以免整句语音完全缺失。")
-        if raw_path is not None:
-            raw_path.unlink(missing_ok=True)
-        if stats:
-            stats.record_tts((time.time() - start) * 1000)
-        return best_path
+        # 每种切分方式都短于台词该有的长度：服务端这次多半只念了个开头
+        # （听感上就是"只说了两三个音"）。改成一小节一小节地合成再拼起来，
+        # 每节都要达标；拼不齐就整句不发语音 —— 宁可只发文本，也不能让主人
+        # 听到半句话。内部递归用 _piece_mode 标记，避免来回切分。
+        if not _piece_mode:
+            piece_path = await _synthesize_by_pieces(
+                config, clean_text, emotion, emotions, data_path,
+                mimic=mimic, mimics=mimics)
+            best_path.unlink(missing_ok=True)
+            if raw_path is not None:
+                raw_path.unlink(missing_ok=True)
+            if piece_path is not None:
+                if stats:
+                    stats.record_tts((time.time() - start) * 1000)
+                return piece_path
+        else:
+            best_path.unlink(missing_ok=True)
+        _safe_print(f"TTS 合成时长始终不足（最长 {best_duration:.2f}s），"
+                    f"本句不发送半截语音，只发文本。文本={clean_text[:60]!r}")
     if raw_path is not None:
         if _looks_like_audio(raw_path):
             _safe_print("TTS 返回的不是 wav 容器（如 mp3/ogg），无法按时长校验，原样交给发送层。")
@@ -691,6 +749,47 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
         _safe_print("TTS 返回的内容不是音频（多为服务端报错页），已丢弃，本句改为只发文本。")
     print(f"TTS 合成失败: 未能得到可用音频 | 文本={clean_text[:60]}")
     return None
+
+
+# 整句合不出来时按小节重试：每节字数。自回归 TTS 偶发"只念开头就结束"，
+# 整句重试往往一直失败，切成十来字的小节更可能一次念完。
+_PIECE_MAX_CHARS = 12
+# 小节数量上限：太长的一句切太多节会连着发很多次请求，得不偿失
+_PIECE_MAX_PIECES = 6
+
+
+async def _synthesize_by_pieces(config, text: str, emotion: str, emotions: dict,
+                                data_path: Path, mimic: str = "",
+                                mimics: dict = None) -> Optional[Path]:
+    """把整句切成小节逐段合成再合并，返回合并后的 wav（任何一节不合格就返回 None）。
+
+    每一节都走一次完整的 synthesize_sentence（含它自己的时长校验），所以
+    "拼出来的整句"不会夹着半截小节；拿不到合格小节时整体放弃，
+    由调用方降级为只发文本。
+    """
+    pieces = split_tts_chunks(text, max_chars=max(
+        _PIECE_MAX_CHARS,
+        (len(text) + _PIECE_MAX_PIECES - 1) // _PIECE_MAX_PIECES), config=config)
+    if len(pieces) < 2:
+        return None
+    print(f"整句合成时长始终不足，改按 {len(pieces)} 小节逐段合成后合并。")
+    paths = []
+    try:
+        for piece in pieces:
+            wav = await synthesize_sentence(config, piece, emotion, emotions, data_path,
+                                            mimic=mimic, mimics=mimics, _piece_mode=True)
+            if not wav:
+                return None
+            paths.append(wav)
+        merged = merge_wavs(paths, config, data_path) or simple_concat_wavs(paths, data_path)
+        if merged is None:
+            _safe_print("逐段合成后合并失败，本句只发文本。")
+        else:
+            print(f"逐段合成完成：{len(paths)} 小节已合并为一条语音。")
+        return merged
+    finally:
+        for path in paths:
+            path.unlink(missing_ok=True)
 
 
 _STAMP_SEQ = 0

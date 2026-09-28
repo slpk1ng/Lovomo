@@ -198,6 +198,7 @@ from modules.database import DatabaseManager
 from modules.scheduler import get_scheduler, SchedulerManager
 from modules.stats import StatsManager
 from modules.stickers import (StickerManager, IMAGE_EXTS, MIME_BY_EXT, safe_sticker_name,
+                              collect_import_images, start_import_job, get_import_job,
                               DEFAULT_CAPTURE_PROMPT)
 from modules.audio_level import (SPEECH_MIN_RATIO, measure as measure_audio,
                                  pitch_note, quality_notes as audio_quality_notes)
@@ -283,7 +284,10 @@ from modules.llm_helpers import (RoleContext, build_chat_messages, chat_once,
                                 stream_chat, extract_json,
                                 SentenceStreamParser, get_image_reply, download_image,
                                 sniff_image_mime, repair_sentence_lang, strip_quote_note,
-                                segment_for_tts, speaker_labeled_lines,
+                                segment_for_tts, speaker_labeled_lines, build_speaker_labels,
+                                identity_note, recent_user_ids, wants_mention_request,
+                                wants_quote_request, MENTION_PLACEHOLDER,
+                                strip_mention_placeholder,
                                 text_needs_tools, tool_flow_can_skip,
                                 image_self_claim, image_identity_note,
                                 IMAGE_CLAIM_WARNING, sent_links, record_sent_links,
@@ -302,13 +306,125 @@ from modules.tts_cloud import cloud_emotion_names, is_cloud_tts
 from modules.config_presets import (delete_preset as delete_config_preset,
                                     list_presets as list_config_presets,
                                     load_preset as load_config_preset,
+                                    preset_dir as config_preset_dir,
                                     save_preset as save_config_preset,
                                     update_note as update_config_preset_note)
 
 LOG_MAX_SIZE_MB_DEFAULT = 5
-_LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
+# 每条日志的前缀统一是 [时:分:秒.毫秒][来源][级别]，来源只有主程序与插件两种
+LOG_SOURCE_MAIN = "Lovomo"
+LOG_SOURCE_PLUGIN = "插件"
+LOG_LEVEL_INFO = "信息"
+LOG_LEVEL_WARN = "警告"
+LOG_LEVEL_ERROR = "错误"
 # 裁剪时保留的比例：留出余量，否则每写一行都要重写一次整个日志文件
 _LOG_TRIM_KEEP_RATIO = 0.8
+
+_LOG_PREFIX_RE = re.compile(
+    r"^\[\d{2}:\d{2}:\d{2}\.\d{3}\]\[[^\]]+\]\[(?:%s)\] ?"
+    % "|".join((LOG_LEVEL_INFO, LOG_LEVEL_WARN, LOG_LEVEL_ERROR)))
+# print() 出来的行没有级别字段，只能按内容判定（先报错后警告）。
+# 判定只看冒号/箭头之前的正文：后面跟的是话题、用户消息、工具输出等自由文本，
+# 里面出现「失败/拒绝」等词并不代表这条日志本身出错。
+_LOG_ERROR_RE = re.compile(
+    r"失败|出错|错误|异常|无法|拒绝|超时|未找到|崩溃|Traceback|Error\b|Exception\b|failed|ok=False",
+    re.I)
+_LOG_WARN_RE = re.compile(r"警告|跳过|降级|忽略|未配置|未启用|重试|熔断", re.I)
+_LOG_ARROW_RE = re.compile(r"\s→\s")
+# 启动横幅是块状字符画（方块 + 盲文点阵），加前缀会把画面割裂，
+# 界面对这些行也单独排版
+_LOG_BANNER_RE = re.compile(r"[\u2500-\u259f\u2800-\u28ff]{2,}")
+# 行首已有的标记直接并入前缀：级别标记与 [窗口] 丢掉，[插件] 决定来源
+_CONSOLE_LEVEL_MARK_RE = re.compile(r"^\[(%s)\] *"
+                                    % "|".join((LOG_LEVEL_INFO, LOG_LEVEL_WARN,
+                                                LOG_LEVEL_ERROR)))
+_CONSOLE_WARN_SIGN_RE = re.compile(r"^⚠️? *")
+_CONSOLE_WINDOW_MARK_RE = re.compile(r"^\[窗口\] *")
+_CONSOLE_PLUGIN_MARK_RE = re.compile(r"^\[插件(?::[^\]]*)?\] *")
+_LOG_LEVEL_NAMES = {logging.DEBUG: LOG_LEVEL_INFO, logging.INFO: LOG_LEVEL_INFO,
+                    logging.WARNING: LOG_LEVEL_WARN, logging.ERROR: LOG_LEVEL_ERROR,
+                    logging.CRITICAL: LOG_LEVEL_ERROR}
+
+
+def log_stamp(when: float = None) -> str:
+    """日志前缀里的时间：时:分:秒.毫秒。"""
+    now = time.time() if when is None else float(when)
+    return time.strftime("%H:%M:%S", time.localtime(now)) + f".{int(now * 1000) % 1000:03d}"
+
+
+def log_prefix(level: str, source: str = LOG_SOURCE_MAIN, when: float = None) -> str:
+    return f"[{log_stamp(when)}][{source}][{level}] "
+
+
+def _log_head(text: str) -> str:
+    """判定级别时只看冒号/箭头之前的正文。
+
+    方括号标记里的冒号不算分隔符，否则 [插件:名字] 会被从中间截断，
+    后面那句「入口执行失败」就判不出来了。
+    """
+    depth = 0
+    for index, char in enumerate(text):
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth = max(0, depth - 1)
+        elif depth == 0 and char in "：:":
+            return text[:index]
+    sep = _LOG_ARROW_RE.search(text)
+    return text[:sep.start()] if sep else text
+
+
+def console_log_level(text: str) -> str:
+    """按正文判定 print 出来的这一行是信息、警告还是错误。"""
+    head = _log_head(text)
+    if _LOG_ERROR_RE.search(head):
+        return LOG_LEVEL_ERROR
+    if _LOG_WARN_RE.search(head):
+        return LOG_LEVEL_WARN
+    return LOG_LEVEL_INFO
+
+
+def console_log_line(line: str) -> str:
+    """给界面日志的一行补上统一前缀；横幅与已有前缀的行原样返回。"""
+    if not line.strip() or _LOG_BANNER_RE.search(line) or _LOG_PREFIX_RE.match(line):
+        return line
+    source = LOG_SOURCE_MAIN
+    mark = _CONSOLE_PLUGIN_MARK_RE.match(line)
+    if mark:
+        source = LOG_SOURCE_PLUGIN
+        # 裸 [插件] 与来源栏重复，去掉；[插件:名字] 带着插件名，保留在正文里
+        if mark.group(0).strip() == "[插件]":
+            line = line[mark.end():]
+    explicit = _CONSOLE_LEVEL_MARK_RE.match(line)
+    if explicit:
+        # 行首写明的级别优先于正文推断：作者已经标了「警告」就别再按字面改判
+        level = explicit.group(1)
+        line = line[explicit.end():]
+    elif _CONSOLE_WARN_SIGN_RE.match(line):
+        level = LOG_LEVEL_WARN
+        line = _CONSOLE_WARN_SIGN_RE.sub("", line)
+    else:
+        line = _CONSOLE_WINDOW_MARK_RE.sub("", line)
+        level = console_log_level(line)
+    return log_prefix(level, source) + line
+
+
+class _LogFormatter(logging.Formatter):
+    """app.log 的每一行也走同一套前缀：[时:分:秒.毫秒][来源][级别] 正文。"""
+
+    def __init__(self, source: str = LOG_SOURCE_MAIN):
+        super().__init__()
+        self.source = source
+
+    def formatTime(self, record, datefmt=None):
+        return log_stamp(record.created)
+
+    def format(self, record):
+        # 换掉级别名不能改 record 本身：同一个记录还会被别的处理器格式化
+        clone = logging.makeLogRecord(record.__dict__)
+        clone.levelname = _LOG_LEVEL_NAMES.get(record.levelno, record.levelname)
+        return log_prefix(clone.levelname, self.source, record.created) \
+            + super().format(clone)
 
 
 class _CappedFileHandler(logging.FileHandler):
@@ -353,7 +469,7 @@ def apply_log_max_size(config) -> None:
                 root.removeHandler(handler)
                 handler.close()
         handler = _CappedFileHandler(log_path, max(1, max_mb) * 1024 * 1024)
-        handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+        handler.setFormatter(_LogFormatter())
         root.addHandler(handler)
         root.setLevel(logging.INFO)
     except Exception as e:
@@ -362,9 +478,11 @@ def apply_log_max_size(config) -> None:
 
 try:
     logging.basicConfig(filename=str(runtime_path("app.log")), encoding="utf-8",
-                        level=logging.INFO, format=_LOG_FORMAT)
+                        level=logging.INFO)
 except Exception:
-    logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT)
+    logging.basicConfig(level=logging.INFO)
+for _handler in logging.getLogger().handlers:
+    _handler.setFormatter(_LogFormatter())
 
 last_proactive_sent: Dict[str, float] = {}
 
@@ -524,8 +642,8 @@ def _start_instance_show_waiter(on_show) -> None:
                     k32.ResetEvent(handle)
                     try:
                         on_show()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log_window_event(f"唤醒窗口失败：{type(e).__name__}: {e}")
 
         threading.Thread(target=_loop, daemon=True).start()
     except Exception:
@@ -744,6 +862,23 @@ def _window_visible(window) -> bool:
         return True
 
 
+def _window_hide(window) -> bool:
+    """在 UI 线程把 WinForms 窗体隐藏（form.Hide），并同步原生可见性。
+
+    直接 ShowWindow(SW_HIDE) 只改了原生窗口，WinForms 的 Form.Visible 仍是
+    True，下一个重绘/焦点消息就会把窗口又拉回来 —— 这正是「点一次没藏住、
+    还得再点一次」的根因。必须让 WinForms 自己把 Visible 置 False，原生层
+    才会一致。
+    """
+    form = _webview2_form(window)
+    if form is None:
+        return False
+    box = _webview2_on_ui(form, lambda: (form.Hide(), True)[1])
+    if "err" in box:
+        return False
+    return not _window_visible(window)
+
+
 def _normal_rect(window) -> dict:
     """「还原后」该占的矩形（物理像素），即 GetWindowPlacement 的
     rcNormalPosition —— 最大化/最小化时它仍保留着 Normal 尺寸，正是我们要的。
@@ -878,7 +1013,8 @@ def _schedule_geometry_save(delay: float = 1.2) -> None:
         global _geometry_save_timer
         with _geometry_lock:
             _geometry_save_timer = None
-        _save_window_geometry()
+            # 落盘也在锁里：退出时的同步保存可能与这里并发，两份快照会互相覆盖
+            _save_window_geometry()
 
     with _geometry_lock:
         if _geometry_save_timer is not None:
@@ -905,7 +1041,8 @@ def _finish_geometry_save() -> None:
             except Exception:
                 pass
             _geometry_save_timer = None
-    _save_window_geometry()
+        # 与延迟定时器的保存串行：否则最后写盘的可能是一份更早的快照
+        _save_window_geometry()
 
 
 def _is_geometry_valid(geom: dict) -> bool:
@@ -1435,7 +1572,7 @@ class StdoutRedirector:
             for line in lines:
                 # 只删行尾换行，别用 strip()：行首缩进是日志的一部分。
                 # \r 也一起去掉，否则 Windows 下每行都留一个裸 \r。
-                global_log_buffer.append(line.rstrip('\r\n'))
+                global_log_buffer.append(console_log_line(line.rstrip('\r\n')))
                 if len(global_log_buffer) > buffer_cap:
                     del global_log_buffer[:len(global_log_buffer) - buffer_cap]
 
@@ -1465,7 +1602,7 @@ _SECOND_PASSWORD_PATHS = frozenset({
     "/api/profiles/save", "/api/profiles/delete",
     "/api/lexicon/save", "/api/lexicon/delete",
     "/api/lexicon/confirm", "/api/lexicon/reject",
-    "/api/stickers/upload", "/api/stickers/delete",
+    "/api/stickers/upload", "/api/stickers/delete", "/api/stickers/auto_import",
     "/api/emotions/upload", "/api/emotions/create", "/api/emotions/delete",
     "/api/rag/upload", "/api/rag/delete",
     "/api/plugins/upload", "/api/plugins/install_remote", "/api/plugins/delete",
@@ -1482,6 +1619,12 @@ _SECOND_PASSWORD_PREFIXES = ("/api/memory/",)
 
 def _needs_second_password(path: str) -> bool:
     return path in _SECOND_PASSWORD_PATHS or path.startswith(_SECOND_PASSWORD_PREFIXES)
+
+
+def _password_matches(given, expected) -> bool:
+    """密码比较走定时安全比较：用 == 逐字符比较会按相同前缀的长度产生时间差。"""
+    return hmac.compare_digest(str(given or "").encode("utf-8"),
+                               str(expected or "").encode("utf-8"))
 
 
 # 本机「已推送 / 已下架」记录的有效期：够撑过市场镜像与索引的缓存，
@@ -2184,7 +2327,7 @@ class ConfigLoader:
             "proactive_wait_reply": True,
             "proactive_quiet_start": "23:00",
             "proactive_quiet_end": "08:00",
-            "proactive_prompt": "主人已经有一段时间没有和你说话了，主动找个自然的话题关心一下主人吧。",
+            "proactive_prompt": "已经有一段时间没有新的对话了，根据最近的聊天记录找个合适的话题切入吧。",
             "proactive_text_max_chars": 120,
             "proactive_voice": False,
             "proactive_sticker": False,
@@ -3314,8 +3457,12 @@ def _parse_jitter_minutes(value) -> tuple:
 class SentenceSink:
     """流式回复的逐句发送器：句子入队，后台工作线程按顺序合成+发送。"""
 
-    def __init__(self, session_type, target_id, emotions, ctx, last_reply="", user_text=""):
+    def __init__(self, session_type, target_id, emotions, ctx, last_reply="", user_text="",
+                 reply_id=None, allowed_at_ids=None):
         self.session_type = session_type
+        self.reply_id = reply_id
+        self.allowed_at_ids = {str(q) for q in (allowed_at_ids or [])}
+        self.actions_pending = True
         self.target_id = target_id
         self.emotions = emotions
         self.ctx = ctx
@@ -3327,6 +3474,7 @@ class SentenceSink:
         self.worker: Optional[asyncio.Task] = None
         self.sent = 0
         self.sent_sentences: List[dict] = []  # 已成功发送的句子（流式中断时用于入库）
+        self.sent_texts: List[str] = []       # 逐条发出去的文本（聊天记录按它拆条）
         self._tts_ok: Optional[bool] = None
         self.tts_ms = 0.0
         self.tts_calls = 0
@@ -3411,13 +3559,14 @@ class SentenceSink:
         target = str((self.ctx.get("text_lang", "") if self.ctx else "") or "").strip().lower()
         if not target or target == "auto" or not lang_text_broken(text, target):
             return text
-        source = str(sentence.get("zh") or "").strip() or text
+        source = strip_mention_placeholder(str(sentence.get("zh") or "").strip() or text)
         try:
             fixed = await asyncio.wait_for(translate_to_lang(self.ctx, source, target),
                                            timeout=30)
         except Exception as e:
             print(f"流式台词语言修复失败（忽略）: {type(e).__name__}: {e}")
             fixed = ""
+        fixed = strip_mention_placeholder(fixed)
         if fixed:
             print(f"流式台词语言修复：该句不是{target}，已重译为 {fixed[:40]!r}")
             return fixed
@@ -3444,20 +3593,33 @@ class SentenceSink:
             if wav:
                 self.tts_calls += 1
         shown = str(sentence.get("display") or sentence.get("zh") or "")
+        mentions = [str(q) for q in sentence.get("mention_ids", [])
+                    if str(q) in self.allowed_at_ids]
+        reply_to = sentence.get("reply_to") is True and self.reply_id is not None
         if wav:
             try:
                 # 节奏器只在"还有下一条语音要发"时才真正等：最后一句发完立刻返回，
                 # 否则这一段播放等待会一直占着会话锁，拖住排队的下一条消息
                 await self.pacer.wait()
-                await sender.send_text(self.session_type, self.target_id, shown)
+                await sender.send_text(
+                    self.session_type, self.target_id, shown,
+                    reply_id=self.reply_id if self.actions_pending and reply_to else None,
+                    at_ids=mentions if self.actions_pending else None)
+                self.actions_pending = False
                 await sender.send_voice(self.session_type, self.target_id, wav)
                 await self.pacer.hold_voice(wav)
             finally:
                 Path(wav).unlink(missing_ok=True)
         else:
-            await sender.send_text(self.session_type, self.target_id, shown)
+            await sender.send_text(
+                self.session_type, self.target_id, shown,
+                reply_id=self.reply_id if self.actions_pending and reply_to else None,
+                at_ids=mentions if self.actions_pending else None)
+            self.actions_pending = False
         self.sent += 1
         self.sent_sentences.append(sentence)
+        # 逐条发出去的文本对应哪句台词：聊天记录据此跟着拆成多条
+        self.sent_texts.append(str(sentence.get("zh") or shown))
 
     async def _send_pending_sticker(self):
         if self.sticker_sent or not self.pending_sticker_emotion or sticker_mgr is None:
@@ -3770,18 +3932,22 @@ async def _sticker_judgement_from_llm(ctx: RoleContext, image_result: dict) -> O
 async def generate_reply(ctx: RoleContext, emotions: dict, user_text: str, history: list,
                          images: Optional[list], extra_parts: List[str],
                          user_id: str = "", on_sentence=None,
-                         session_id: str = "", describe_only: bool = False) -> Optional[dict]:
+                         session_id: str = "", describe_only: bool = False,
+                         speaker_labels: Optional[dict] = None) -> Optional[dict]:
     """生成回复：识图 / 工具调用 / 流式 / 普通四种路径统一入口。
 
     describe_only=True 只用于「本轮不发消息、但要把图看进历史」的场景：
     识图只出画面描述与收藏判定，不产出台词，也不会降级成文本回复。
+    speaker_labels 是**完整历史**的说话人编号表：history 在开了摘要时只是尾部窗口，
+    编号必须沿用完整历史，否则 [用户N] 会和系统提示词里的当前发言者对不上。
     """
     if images is not None and not str(user_text or "").strip():
         user_text = "[图片]"
     if images is not None:
         result = await get_image_reply(ctx, user_text, history, emotions, images,
                                        extra_parts=extra_parts, stats=stats_mgr,
-                                       describe_only=describe_only)
+                                       describe_only=describe_only,
+                                       speaker_labels=speaker_labels)
         if result is not None:
             out = {"sentences": result.get("sentences", []), "llm_ms": result.get("ms", 0),
                    "tool_trace": []}
@@ -3801,7 +3967,8 @@ async def generate_reply(ctx: RoleContext, emotions: dict, user_text: str, histo
                                    trailing_notes=([image_identity_note(ctx)]
                                                    if images is not None
                                                    and global_config.get("image_identity_guard_enabled", True)
-                                                   else None))
+                                                   else None),
+                                   speaker_labels=speaker_labels)
 
     # 工具调用路径（非流式，保证 tool_calls 正确处理）：无明确工具需求时走普通回复，避免误调
     if tool_registry and global_config.get("tools_enabled", False) \
@@ -4158,13 +4325,13 @@ def _spawn_sticker_capture(ctx: RoleContext, reply: Optional[dict], image_source
                                     args["image_result"]))
 
 
-def pick_image_source(seg) -> Optional[str]:
-    """从图片消息段里挑一个可用的图片来源。
+def pick_media_source(seg, kind: str = "图片") -> Optional[str]:
+    """从图片/语音消息段里挑一个可用的来源。
 
     优先级：本地缓存文件 > 网络 URL > 原始 file 标识。
     最后一项是"裸文件名"（如 1E4D5FAB.image，文件并不在本地也不是 URL）：
-    此时不能返回 None，否则调用方既拿不到图、日志里也看不出是哪张图出了问题；
-    保留原值可以让后续 download/日志明确指出问题来源，再由识图链路自行跳过。
+    此时不能返回 None，否则调用方既拿不到文件、日志里也看不出是哪一个出了问题；
+    保留原值可以让后续 download/日志明确指出问题来源，再由调用方自行跳过。
     """
     # 优先使用本地缓存文件（如果有）
     local_path = getattr(seg, "path", None) or getattr(seg, "file", None)
@@ -4176,7 +4343,7 @@ def pick_image_source(seg) -> Optional[str]:
         return str(url)
     raw_id = getattr(seg, "file", None) or getattr(seg, "path", None)
     if raw_id:
-        print(f"图片来源无法解析（本地文件不存在且无 URL），保留原值便于排查: {str(raw_id)[:120]}")
+        print(f"{kind}来源无法解析（本地文件不存在且无 URL），保留原值便于排查: {str(raw_id)[:120]}")
         return str(raw_id)
     return None
 
@@ -4218,6 +4385,9 @@ async def refresh_image_urls(client, image_urls: list, file_ids: dict) -> list:
 
 _IMAGE_EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
               "image/bmp": ".bmp", "image/webp": ".webp"}
+# 让 OneBot 把用户语音转成 wav：本地 ASR 脚本与线上接口都吃这个格式
+VOICE_OUT_FORMAT = "wav"
+VOICE_FALLBACK_SUFFIX = ".wav"
 
 
 # ============================================================================
@@ -4315,6 +4485,79 @@ async def _download_image_to_cache(url: str) -> Optional[str]:
         return None
 
 
+async def _download_audio_to_temp(url: str) -> Optional[str]:
+    """把语音直链下载到 data 目录下，返回本地路径（失败返回 None）。"""
+    if memory_manager is None:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True, trust_env=False,
+                                     verify=verified_context()) as client:
+            resp = await client.get(str(url))
+            resp.raise_for_status()
+            data = resp.content
+    except Exception as e:
+        print(f"下载语音失败: {type(e).__name__}: {e}")
+        return None
+    suffix = Path(urlsplit(str(url)).path).suffix.lower()
+    if suffix not in AUDIO_MIMES:
+        suffix = VOICE_FALLBACK_SUFFIX
+    try:
+        target = memory_manager.data_path / f"temp_voice_{time.time()}{suffix}"
+        target.write_bytes(data)
+        return str(target)
+    except Exception as e:
+        print(f"缓存语音失败: {type(e).__name__}: {e}")
+        return None
+
+
+async def transcribe_voice_message(client, sources: list, file_ids: dict) -> str:
+    """用户发来的语音转文字，取「语音识别」那几项配置（识别不出来返回空串）。
+
+    QQ 里的语音常是 silk/amr 这类识别脚本啃不动的格式，先让 OneBot 转成 wav
+    并落到本地；转不了就退回直接下载直链。多段语音只取第一段识别出文字的。
+    """
+    from modules.asr import transcribe_file
+    getter = getattr(client, "get_record", None)
+    temp_files = []
+    try:
+        for src in sources:
+            path = str(src) if os.path.isfile(str(src)) else ""
+            if not path:
+                url = str(src)
+                if getter is not None:
+                    try:
+                        got = await getter(file=str((file_ids or {}).get(str(src)) or src),
+                                           out_format=VOICE_OUT_FORMAT)
+                        if isinstance(got, dict):
+                            local = str(got.get("file") or "")
+                            if local and os.path.isfile(local):
+                                path = local
+                            else:
+                                url = str(got.get("url") or url)
+                    except Exception as e:
+                        print(f"语音转码失败（改用直链）: {type(e).__name__}: {e}")
+                if not path and url.startswith(("http://", "https://")):
+                    path = await _download_audio_to_temp(url) or ""
+                    if path:
+                        temp_files.append(path)
+            if not path:
+                continue
+            try:
+                text = await transcribe_file(global_config, path)
+            except Exception as e:
+                print(f"语音识别失败: {type(e).__name__}: {e}")
+                continue
+            if text:
+                return text
+        return ""
+    finally:
+        for item in temp_files:
+            try:
+                Path(item).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 async def fetch_quoted_context(client, reply_seg) -> Optional[dict]:
     """回查被引用消息的内容与发送者。"""
     getter = getattr(client, "get_msg", None)
@@ -4388,6 +4631,9 @@ def _extract_event_info(event, client) -> Optional[dict]:
     has_image = False
     image_urls = []
     image_file_ids = {}
+    has_voice = False
+    voice_sources = []
+    voice_file_ids = {}
     at_ids = []
     at_bot = False
     reply_seg = None
@@ -4396,12 +4642,20 @@ def _extract_event_info(event, client) -> Optional[dict]:
             user_text += seg.text
         elif isinstance(seg, Image):
             has_image = True
-            chosen = pick_image_source(seg)
+            chosen = pick_media_source(seg)
             if chosen and chosen not in image_urls:
                 image_urls.append(chosen)
                 fid = getattr(seg, "file", None)
                 if fid:
                     image_file_ids[chosen] = str(fid)
+        elif isinstance(seg, Record):
+            has_voice = True
+            chosen = pick_media_source(seg, "语音")
+            if chosen and chosen not in voice_sources:
+                voice_sources.append(chosen)
+                fid = getattr(seg, "file", None)
+                if fid:
+                    voice_file_ids[chosen] = str(fid)
         elif isinstance(seg, At):
             qq = str(seg.qq)
             at_ids.append(qq)
@@ -4431,12 +4685,15 @@ def _extract_event_info(event, client) -> Optional[dict]:
             # 没被@的群消息不回复，但仍要记进历史：模型下一条被@时才有上下文，
             # 聊天记录页也要能看到这些消息。
             silent = bool(global_config.get("group_need_at", True))
-    if not user_text and not has_image:
+    if not user_text and not has_image and not has_voice:
         return None
     return {"session_id": session_id, "event": event, "client": client,
             "text": user_text, "has_image": has_image, "image_urls": image_urls,
-            "image_file_ids": image_file_ids, "at_ids": at_ids,
-            "at_bot": at_bot, "reply_seg": reply_seg, "silent": silent}
+            "image_file_ids": image_file_ids, "has_voice": has_voice,
+            "voice_sources": voice_sources, "voice_file_ids": voice_file_ids,
+            "at_ids": at_ids,
+            "at_bot": at_bot, "reply_seg": reply_seg, "silent": silent,
+            "sender_id": str(getattr(event, "user_id", "") or "")}
 
 
 def _merge_event_info(pending: dict, info: dict) -> dict:
@@ -4447,6 +4704,12 @@ def _merge_event_info(pending: dict, info: dict) -> dict:
             urls.append(u)
     fids = dict(pending.get("image_file_ids", {}))
     fids.update(info.get("image_file_ids", {}))
+    voices = list(pending.get("voice_sources", []))
+    for v in info.get("voice_sources", []):
+        if v not in voices:
+            voices.append(v)
+    vfids = dict(pending.get("voice_file_ids", {}))
+    vfids.update(info.get("voice_file_ids", {}))
     at_ids = list(pending.get("at_ids", []))
     for q in info.get("at_ids", []):
         if q not in at_ids:
@@ -4454,16 +4717,22 @@ def _merge_event_info(pending: dict, info: dict) -> dict:
     return {"session_id": info["session_id"], "event": info["event"], "client": info["client"],
             "text": "\n".join(texts),
             "has_image": bool(pending.get("has_image") or info.get("has_image") or urls),
-            "image_urls": urls, "image_file_ids": fids, "at_ids": at_ids,
+            "image_urls": urls, "image_file_ids": fids,
+            "has_voice": bool(pending.get("has_voice") or info.get("has_voice") or voices),
+            "voice_sources": voices, "voice_file_ids": vfids, "at_ids": at_ids,
             "at_bot": bool(pending.get("at_bot") or info.get("at_bot")),
-            "reply_seg": info.get("reply_seg") or pending.get("reply_seg")}
+            "reply_seg": info.get("reply_seg") or pending.get("reply_seg"),
+            "sender_id": info.get("sender_id") or pending.get("sender_id")}
 
 
 def _merged_payload(pending: dict) -> dict:
     return {"text": pending["text"], "has_image": pending["has_image"],
             "image_urls": pending["image_urls"], "image_file_ids": pending["image_file_ids"],
+            "has_voice": pending.get("has_voice", False),
+            "voice_sources": pending.get("voice_sources", []),
+            "voice_file_ids": pending.get("voice_file_ids", {}),
             "at_ids": pending["at_ids"], "at_bot": pending["at_bot"],
-            "reply_seg": pending["reply_seg"]}
+            "reply_seg": pending["reply_seg"], "sender_id": pending.get("sender_id", "")}
 
 
 def _spawn_drainer(session_id: str, lock: asyncio.Lock):
@@ -4485,14 +4754,20 @@ def _spawn_drainer(session_id: str, lock: asyncio.Lock):
 
 
 def _remember_unaddressed_message(session_id: str, text: str, has_image: bool,
-                                  sender_id: str, sender_name: str) -> None:
+                                  sender_id: str, sender_name: str,
+                                  has_voice: bool = False) -> None:
     """群聊里没被@的消息：不回复，但落进历史。
 
     开启「回复需要@」后这类消息以前会被整条丢掉，模型下一条被@时看不到群里
     刚聊了什么，聊天记录页也完全不显示。这里只补记历史，不碰主动消息的闲置
     计时、也不消耗防刷屏额度。
+    语音不在这条链路上转文字（反正不回复），只留一个 [语音] 占位。
     """
-    content = (f"{text} [图片]".strip() if has_image else str(text or "").strip())
+    content = str(text or "").strip()
+    if has_image:
+        content = f"{content} [图片]".strip()
+    if has_voice:
+        content = f"{content} [语音]".strip()
     if not session_id or not content or memory_manager is None:
         return
     if not _session_whitelisted(session_id):
@@ -4517,13 +4792,14 @@ def _remember_unaddressed_message(session_id: str, text: str, has_image: bool,
 
 
 def _queue_unaddressed_message(session_id: str, text: str, has_image: bool,
-                               sender_id: str, sender_name: str) -> None:
+                               sender_id: str, sender_name: str,
+                               has_voice: bool = False) -> None:
     """等会话锁释放后再补记没被@的群消息（该会话正在生成回复时走这条）。"""
     async def run():
         lock = _SESSION_LOCKS.setdefault(session_id, asyncio.Lock())
         async with lock:
             _remember_unaddressed_message(session_id, text, has_image,
-                                          sender_id, sender_name)
+                                          sender_id, sender_name, has_voice)
     try:
         asyncio.get_running_loop().create_task(run())
     except RuntimeError:
@@ -4546,11 +4822,13 @@ async def handle_message_event(event, client):
             # 这条没被@的消息就永久消失了，所以等锁释放后再补记
             _queue_unaddressed_message(silent_session, info.get("text", ""),
                                        bool(info.get("has_image")),
-                                       silent_sender, silent_name)
+                                       silent_sender, silent_name,
+                                       bool(info.get("has_voice")))
         else:
             _remember_unaddressed_message(silent_session, info.get("text", ""),
                                           bool(info.get("has_image")),
-                                          silent_sender, silent_name)
+                                          silent_sender, silent_name,
+                                          bool(info.get("has_voice")))
         return
     session_id = info["session_id"]
     lock = _SESSION_LOCKS.setdefault(session_id, asyncio.Lock())
@@ -4559,9 +4837,16 @@ async def handle_message_event(event, client):
         if pending is None:
             _SESSION_PENDING[session_id] = info
             print(f"会话 {session_id} 正在处理上一条消息，本条已排队，处理完后立即跟进。")
-        else:
+        elif pending.get("sender_id") == info.get("sender_id"):
             _SESSION_PENDING[session_id] = _merge_event_info(pending, info)
             print(f"会话 {session_id} 连发消息，已合并待处理内容。")
+        else:
+            async def process_after_current():
+                async with lock:
+                    await _process_message_event(info["event"], info["client"],
+                                                 _merged_payload(info))
+            asyncio.create_task(process_after_current())
+            return
         _spawn_drainer(session_id, lock)
         return
     async with lock:
@@ -4601,10 +4886,17 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
             session_id = f"group_{group_id}_{sender_id}"
 
     sender_name = getattr(event.sender, "nickname", None) or str(sender_id)
+    # 用户画像的昵称默认就是对方的 QQ 昵称：只在还没有昵称时补上，之后不会被自动改写
+    if profile_mgr is not None and global_config.get("profiles_enabled", False):
+        profile_mgr.remember_nickname(sender_id, getattr(event.sender, "nickname", ""))
+    incoming_message_id = getattr(event, "message_id", None)
     user_text = ""
     has_image = False
     image_urls = []
     image_file_ids = {}
+    has_voice = False
+    voice_sources = []
+    voice_file_ids = {}
     at_bot = False
     at_ids = []
     at_names = {}
@@ -4614,6 +4906,9 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
         has_image = merged.get("has_image", False)
         image_urls = list(merged.get("image_urls", []))
         image_file_ids = dict(merged.get("image_file_ids", {}))
+        has_voice = bool(merged.get("has_voice", False))
+        voice_sources = list(merged.get("voice_sources", []))
+        voice_file_ids = dict(merged.get("voice_file_ids", {}))
         at_ids = list(merged.get("at_ids", []))
         at_bot = merged.get("at_bot", False)
         reply_seg = merged.get("reply_seg")
@@ -4623,13 +4918,21 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                 user_text += seg.text
             elif isinstance(seg, Image):
                 has_image = True
-                chosen = pick_image_source(seg)
+                chosen = pick_media_source(seg)
                 if chosen and chosen not in image_urls:
                     # 直接将图片 URL 加入，不下载
                     image_urls.append(chosen)
                     fid = getattr(seg, "file", None)
                     if fid:
                         image_file_ids[chosen] = str(fid)
+            elif isinstance(seg, Record):
+                has_voice = True
+                chosen = pick_media_source(seg, "语音")
+                if chosen and chosen not in voice_sources:
+                    voice_sources.append(chosen)
+                    fid = getattr(seg, "file", None)
+                    if fid:
+                        voice_file_ids[chosen] = str(fid)
             elif isinstance(seg, At):
                 qq = str(seg.qq)
                 at_ids.append(qq)
@@ -4673,9 +4976,9 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
         if global_config.get("group_need_at", True):
             # 引用他人消息、又没@机器人：不回复，但消息要记进历史
             _remember_unaddressed_message(session_id, user_text, has_image,
-                                          sender_id, sender_name)
+                                          sender_id, sender_name, has_voice)
             return
-    if not user_text and not has_image:
+    if not user_text and not has_image and not has_voice:
         return
     if not _session_whitelisted(target_id):
         print(f"白名单：会话 {session_id}（{target_id}）不在白名单内，已忽略。")
@@ -4683,6 +4986,16 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
     if not _allow_message(session_id):
         print(f"防刷屏：会话 {session_id} 短时间内消息过多，本条已忽略（可在配置中调整 anti_spam_*）。")
         return
+
+    if has_voice:
+        # 语音识别只在「这条消息真的要处理」之后才跑：转写要几秒甚至更久
+        voice_text = await transcribe_voice_message(client, voice_sources, voice_file_ids)
+        if voice_text:
+            user_text = f"{user_text} {voice_text}".strip()
+        else:
+            print(f"会话 {session_id}：这条语音没转出文字（可在「配置文件 → 更多 → 语音识别」换识别通道）。")
+            if not user_text and not has_image:
+                return
 
     print(f"收到{'私聊' if is_private else '群聊'} [{target_id}] 来自 [{sender_id}]: {user_text}")
     last_interaction[session_id] = time.time()
@@ -4799,7 +5112,21 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
             emotions = get_role_emotions(role)
             # 先备好上下文与图片：审判判定"不回复"时也要能补记画面描述（见下）
             extra_parts = []
+            allowed_at_ids = set() if is_private \
+                else {q for q in at_ids if q != str(client.self_id)}
+            # 编号表按完整历史算一次，供提示词、历史窗口与@候选共用：
+            # 历史窗口开了摘要后只是尾部几条，若在窗口里重新编号，同一标签会指向不同的人
+            speaker_labels = build_speaker_labels(history)
             if not is_private:
+                current_label = speaker_labels.get(str(sender_id), "")
+                extra_parts.append(
+                    f"【当前发言者】{current_label or '本轮用户'}（QQ:{sender_id}）；"
+                    f"本轮消息正文是此人的话。昵称仅作展示，不用于推断身份；"
+                    f"历史中其他用户标签（除 {current_label or '本轮用户'} 外）代表不同群成员，"
+                    "不得把他们说过的话、身份、关系、称呼或观点归给当前发言者。"
+                    "群聊摘要与话题只作背景参考，不能据此判断当前发言者的身份或关系。"
+                    "问题里的预设指代若无法由带标签的原始消息确认，先向当前发言者澄清，不要顺着说。"
+                    "引用内容只属于引用消息的发送者；被@成员也不等于当前发言者。")
                 mention_parts = []
                 for q in at_ids:
                     nm = at_names.get(q)
@@ -4815,6 +5142,25 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                         f"【@对象】本条消息@了：{who}（都不是你）。"
                         "被@的是其他群成员，不是你本人，也不是给你发消息的用户；"
                         "只有消息明确提到你的名字时才由你回应，不要替其他被@的人作答。")
+                ident = identity_note(history, sender_id)
+                if ident:
+                    extra_parts.append(ident)
+                    print("身份记录：已重申本会话确立的关系。")
+                if wants_mention_request(user_text):
+                    targets = recent_user_ids(history, exclude=str(client.self_id))
+                    listed = "、".join(f"{speaker_labels.get(q) or '群成员'}(QQ:{q})"
+                                       for q in targets)
+                    extra_parts.append(
+                        f"【可@成员】{listed or '无'}。用户本条消息明确要求你@人："
+                        "请在第一个句子对象里填 mention_ids 数组、原样写要叫的那个人的 QQ 号，"
+                        f"并在正文里想@他的那个位置写一个 {MENTION_PLACEHOLDER} 占位符，"
+                        "由系统在该位置真正@他，不要一律写在正文最前面；"
+                        "不要用「那个家伙」「刚才那位」之类的描述代替。")
+                    allowed_at_ids.update(targets)
+                if wants_quote_request(user_text):
+                    extra_parts.append(
+                        "【引用要求】用户本条消息明确要求引用消息：请在第一个句子对象里加 "
+                        "reply_to: true，由系统引用本条消息，不要只在台词里口头答应。")
             use_history = history
             if global_config.get("summary_enabled", False) and meta.get("summary"):
                 try:
@@ -4895,7 +5241,8 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                             pending_reply = await asyncio.wait_for(
                                 generate_reply(ctx, emotions, trigger_text, use_history,
                                                image_sources, list(extra_parts), sender_id,
-                                               session_id=session_id, describe_only=True),
+                                               session_id=session_id, describe_only=True,
+                                               speaker_labels=speaker_labels),
                                 timeout=gen_budget)
                         except Exception as e:
                             pending_reply = None
@@ -4923,8 +5270,11 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
 
             sink = None
             if global_config.get("streaming_enabled", False) and not first_reply_done:
-                sink = SentenceSink(session_type, target_id, emotions, ctx, recent_replies,
-                                    "" if has_image else user_text)
+                sink = SentenceSink(
+                    session_type, target_id, emotions, ctx, recent_replies,
+                    "" if has_image else user_text,
+                    reply_id=incoming_message_id if not is_private else None,
+                    allowed_at_ids=list(allowed_at_ids) if not is_private else [])
 
             reply_started = time.time()
             timed_out = False
@@ -4934,7 +5284,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                                    image_sources if has_image else None,
                                    extra_parts, sender_id,
                                    on_sentence=sink.on_sentence if sink else None,
-                                   session_id=session_id),
+                                   session_id=session_id, speaker_labels=speaker_labels),
                     timeout=gen_budget)
             except asyncio.TimeoutError:
                 timed_out = True
@@ -5016,7 +5366,8 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                             generate_reply(retry_ctx, emotions, trigger_text, retry_hist,
                                            image_sources if has_image else None,
                                            retry_parts, sender_id, on_sentence=None,
-                                           session_id=session_id),
+                                           session_id=session_id,
+                                           speaker_labels=speaker_labels),
                             timeout=gen_budget)
                     except asyncio.TimeoutError:
                         print("重生成超预算，保留原回复。")
@@ -5052,7 +5403,8 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                             generate_reply(ctx, emotions, trigger_text, use_history,
                                            image_sources if has_image else None,
                                            claim_parts, sender_id, on_sentence=None,
-                                           session_id=session_id),
+                                           session_id=session_id,
+                                           speaker_labels=speaker_labels),
                             timeout=gen_budget)
                     except asyncio.TimeoutError:
                         print("图片身份重生成超预算，保留原回复。")
@@ -5080,18 +5432,28 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
             # ========================================================
 
             tts_calls_result = sink.tts_calls if sink is not None else 0
+            send_result = {}
+            send_options = {
+                "reply_id": incoming_message_id if not is_private else None,
+                "allowed_at_ids": list(allowed_at_ids) if not is_private else [],
+            }
             if sink is not None:
                 if sink.sent == 0:
-                    send_result = await sender.send_reply(session_type, target_id, reply["sentences"],
-                                                          emotions, ctx,
-                                                          use_voice=global_config.get("tts_reply_enabled", True))
+                    send_result = await sender.send_reply(
+                        session_type, target_id, reply["sentences"], emotions, ctx,
+                        use_voice=global_config.get("tts_reply_enabled", True),
+                        **send_options)
                     tts_calls_result += send_result.get("tts_calls", 0)
             else:
-                send_result = await sender.send_reply(session_type, target_id, reply["sentences"],
-                                                      emotions, ctx,
-                                                      use_voice=global_config.get("tts_reply_enabled", True))
+                send_result = await sender.send_reply(
+                    session_type, target_id, reply["sentences"], emotions, ctx,
+                    use_voice=global_config.get("tts_reply_enabled", True),
+                    **send_options)
                 tts_ms = send_result.get("tts_ms", 0.0)
                 tts_calls_result = send_result.get("tts_calls", 0)
+            # 流式路径逐句发、批量路径按分开发送逐条发：两种都从实际发出的文本取
+            sent_texts = (sink.sent_texts if sink is not None and sink.sent
+                          else send_result.get("sent_texts") or [])
 
             sent_now = urls_in_text("".join(str(s.get("display", "") or "")
                                             for s in reply["sentences"]))
@@ -5118,16 +5480,25 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
             })
 
             # 流式路径补出来的句子可能只有 display 没有 zh，取不到时退回展示文本
-            zh_text = "".join(str(s.get("zh") or s.get("display") or "")
-                              for s in reply["sentences"])
+            # @ 占位符只是发送时的定位标记，不进历史（否则下一轮会当成正文）
+            zh_text = strip_mention_placeholder(
+                "".join(str(s.get("zh") or s.get("display") or "")
+                        for s in reply["sentences"]))
             speaker = role.get("character_name", ctx.character_key)
-            entry = {"role": "assistant", "content": zh_text, "timestamp": time.time(),
-                     "speaker": speaker,
-                     "emotion": reply["sentences"][0].get("emotion", "")}
+            # 分开发送时 QQ 里是好几条消息，聊天记录也要一条一条记：
+            # 只写成一整段的话，记录页看到的样子和实际收到的对不上
+            parts = [strip_mention_placeholder(t) for t in sent_texts]
+            parts = [t for t in parts if t.strip()]
+            if len(parts) <= 1:
+                parts = [zh_text]
             tool_notes = _tool_notes_from_trace(reply.get("tool_trace"))
-            if tool_notes:
-                entry["tool_notes"] = tool_notes
-            history.append(entry)
+            for index, part in enumerate(parts):
+                entry = {"role": "assistant", "content": part, "timestamp": time.time(),
+                         "speaker": speaker,
+                         "emotion": reply["sentences"][0].get("emotion", "")}
+                if tool_notes and index == len(parts) - 1:
+                    entry["tool_notes"] = tool_notes
+                history.append(entry)
             data["history"] = history
             data["meta"] = meta
             memory_manager.save_session_data(session_id, data)
@@ -5222,7 +5593,10 @@ async def post_reply_context_tasks(session_id: str, ctx: RoleContext):
                 existing = meta.get("summary", "")
                 lines = speaker_labeled_lines(old_msgs, limit=40)
                 prompt = (f"{global_config.get('summary_prompt', '')}\n\n"
-                          f"{'已有摘要（请合并）：' + existing if existing else ''}\n\n对话：\n" + "\n".join(lines))
+                          "按每行开头的用户序号区分群成员，摘要中的事实、关系、称呼、情绪和观点必须保留对应说话人；"
+                          "不要把不同用户合并为同一个人，也不要把角色台词当作用户事实。\n"
+                          f"{'已有摘要（请合并并保留说话人归属）：' + existing if existing else ''}\n\n对话：\n"
+                          + "\n".join(lines))
                 summary = await generate_proactive_text(ctx, prompt)
                 if summary:
                     meta["summary"] = summary[:800]
@@ -5241,7 +5615,9 @@ async def post_reply_context_tasks(session_id: str, ctx: RoleContext):
             if user_msg_count % every == 0:
                 recent = history[-10:]
                 lines = speaker_labeled_lines(recent, max_chars=120)
-                prompt = (f"{global_config.get('topic_summary_prompt', '')}\n\n" + "\n".join(lines))
+                prompt = (f"{global_config.get('topic_summary_prompt', '')}\n\n"
+                          "按行首用户序号区分群成员；若话题或立场只属于某位成员，保留其用户序号，不要推广为所有人的共同观点。\n"
+                          + "\n".join(lines))
                 topic = await generate_proactive_text(ctx, prompt)
                 if topic:
                     meta["topic"] = topic[:200]
@@ -6082,7 +6458,7 @@ class WebUIServer:
             payload = await request.json()
         except Exception:
             return web.json_response({"success": False, "error": "参数错误"}, status=400)
-        if str(payload.get("password", "") or "") == self._password:
+        if _password_matches(payload.get("password", ""), self._password):
             try:
                 raw = payload.get("remember_minutes")
                 if raw is None or raw == "":
@@ -6108,7 +6484,7 @@ class WebUIServer:
             payload = await request.json()
         except Exception:
             return web.json_response({"success": False, "error": "参数错误"}, status=400)
-        if str(payload.get("password", "") or "") != self._second_password:
+        if not _password_matches(payload.get("password", ""), self._second_password):
             return web.json_response({"success": False, "error": "二级密码错误"}, status=401)
         try:
             raw = payload.get("minutes")
@@ -6469,6 +6845,7 @@ class WebUIServer:
         r.add_post("/api/config/presets/note", self.handle_config_presets_note)
         r.add_post("/api/config/presets/apply", self.handle_config_presets_apply)
         r.add_post("/api/config/presets/delete", self.handle_config_presets_delete)
+        r.add_post("/api/config/presets/open_dir", self.handle_config_presets_open_dir)
         # 插件系统
         r.add_get("/api/plugins/list", self.handle_plugins_list)
         r.add_post("/api/plugins/upload", self.handle_plugins_upload)
@@ -6492,6 +6869,7 @@ class WebUIServer:
         r.add_post("/api/plugins/publish", self.handle_plugins_publish)
         r.add_post("/api/plugins/unpublish", self.handle_plugins_unpublish)
         r.add_get("/api/plugins/market", self.handle_plugins_market)
+        r.add_get("/api/plugins/updates", self.handle_plugins_updates)
         r.add_post("/api/plugins/market_sources", self.handle_plugins_market_sources)
         r.add_get("/api/plugins/readme", self.handle_plugins_readme)
         r.add_get("/api/releases", self.handle_releases)
@@ -6570,6 +6948,9 @@ class WebUIServer:
         # 表情包
         r.add_get("/api/stickers/list", self.handle_stickers_list)
         r.add_post("/api/stickers/upload", self.handle_stickers_upload)
+        r.add_post("/api/stickers/auto_import", self.handle_stickers_auto_import)
+        r.add_get("/api/stickers/auto_import/status",
+                  self.handle_stickers_auto_import_status)
         r.add_post("/api/stickers/delete", self.handle_stickers_delete)
         r.add_get("/api/stickers/file", self.handle_stickers_file)
         r.add_get("/favicon.ico", self.handle_favicon)
@@ -6791,6 +7172,17 @@ class WebUIServer:
             payload = await request.json()
             preset_id = delete_config_preset(self._config_preset_dir(), payload.get("id", ""))
             return web.json_response({"success": True, "id": preset_id})
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_config_presets_open_dir(self, request):
+        """在资源管理器里打开预设目录，方便用户直接看/备份这些 JSON。"""
+        try:
+            work = config_preset_dir(self._config_preset_dir())
+            work.mkdir(parents=True, exist_ok=True)
+            if os.name == "nt":
+                os.startfile(str(work))  # noqa: S606
+            return web.json_response({"success": True, "path": str(work)})
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
@@ -7616,6 +8008,65 @@ class WebUIServer:
         return web.json_response(
             await self._plugins_market_payload(force, sort, market))
 
+    async def _plugins_updates_payload(self, force: bool = False) -> dict:
+        """已安装插件里，市场上有更新版本的那些。
+
+        版本号按版本段比较（modules.updater.is_newer），市场里同一个插件出现
+        在多条来源时取版本最高的那一条。
+        """
+        from modules.updater import is_newer
+        installed = self.plugin_manager.list_plugins()
+        found = {}
+        warnings = []
+        errors = []
+        for kind in ("official", "thirdparty"):
+            market = await self._plugins_market_payload(force=force, market=kind)
+            warnings.extend(market.get("warnings") or [])
+            if market.get("error"):
+                errors.append(str(market["error"]))
+            for entry in market.get("plugins") or []:
+                pid = str(entry.get("id") or "")
+                if not pid:
+                    continue
+                entry = dict(entry, market_kind=kind)
+                best = found.get(pid)
+                if best is None or is_newer(entry.get("version"), best.get("version")):
+                    found[pid] = entry
+        updates = []
+        for cur in installed:
+            pid = str(cur.get("id") or "")
+            entry = found.get(pid)
+            if not entry or not is_newer(entry.get("version"), cur.get("version")):
+                continue
+            updates.append({
+                "id": pid,
+                "name": entry.get("name") or cur.get("name") or pid,
+                "installed_version": str(cur.get("version") or ""),
+                "version": str(entry.get("version") or ""),
+                "description": str(entry.get("description") or ""),
+                "author": str(entry.get("author") or ""),
+                "market": entry.get("market_kind") or "official",
+                "download": str(entry.get("download") or ""),
+                "release_tag": str(entry.get("release_tag") or ""),
+                "enabled": bool(cur.get("enabled")),
+            })
+        result = {"success": True, "count": len(updates), "plugins": updates,
+                  "warnings": warnings}
+        if errors and not updates:
+            # 市场都没拉到就别报「全部最新」：那会让用户以为已经检查过了
+            result["success"] = False
+            result["error"] = "；".join(errors[:2])
+        return result
+
+    async def handle_plugins_updates(self, request):
+        force = str(request.query.get("refresh") or "") in ("1", "true")
+        try:
+            return web.json_response(await self._plugins_updates_payload(force))
+        except Exception as e:
+            return web.json_response(
+                {"success": False, "plugins": [], "count": 0,
+                 "error": f"检查插件更新失败：{type(e).__name__}: {e}"}, status=400)
+
     async def handle_plugins_market_sources(self, request):
         """保存第三方市场地址（每行一个「用户名/仓库名」）。"""
         try:
@@ -8227,10 +8678,11 @@ class WebUIServer:
         hot_reload_managers()
 
     # ---------------- 文件夹选择 / 模型列表 ----------------
-    async def _pick_dialog(self, dialog_kind, file_types=None):
+    async def _pick_dialog(self, dialog_kind, file_types=None, allow_multiple=False):
         """弹出系统选择对话框，返回 (ok, path_or_error)。
 
         对话框是阻塞调用，丢进线程池避免卡住 WebUI 事件循环。
+        allow_multiple=True 时按 pywebview 的约定返回多条路径（用 \n 连接）。
         """
         try:
             import webview
@@ -8243,13 +8695,17 @@ class WebUIServer:
         kwargs = {}
         if file_types:
             kwargs["file_types"] = tuple(file_types)
+        if allow_multiple:
+            kwargs["allow_multiple"] = True
         try:
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
                 None, lambda: window.create_file_dialog(kind, **kwargs))
         except Exception as e:
             return False, f"打开选择对话框失败: {e}"
-        return True, (str(result[0]) if result else "")
+        if isinstance(result, (list, tuple)):
+            return True, "\n".join(str(item) for item in result if item)
+        return True, (str(result) if result else "")
 
     async def handle_pick_folder(self, request):
         """弹出系统"选择文件夹"对话框；仅在 Lovomo 桌面窗口模式下可用。"""
@@ -8264,6 +8720,7 @@ class WebUIServer:
         payload:
             filter    "图片 (*.png;*.jpg)" 这类过滤器描述，可选
             exts      允许的扩展名列表（不含点），可选
+            multiple  true 时允许多选，返回 paths（换行分隔的绝对路径列表）
             plugin_id 给了就把文件复制进该插件 data 目录，返回相对文件名
         """
         try:
@@ -8275,9 +8732,20 @@ class WebUIServer:
         file_types = (f"{desc} ({';'.join('*.' + e for e in exts)})",)
         if exts:
             file_types += ("所有文件 (*.*)",)
-        ok, path = await self._pick_dialog("OPEN_DIALOG", file_types)
+        multiple = bool(payload.get("multiple"))
+        ok, path = await self._pick_dialog("OPEN_DIALOG", file_types,
+                                           allow_multiple=multiple)
         if not ok:
             return web.json_response({"ok": False, "error": path}, status=400)
+        if multiple and not str(payload.get("plugin_id") or "").strip():
+            paths = [p for p in str(path or "").split("\n") if p.strip()]
+            bad = [p for p in paths
+                   if exts and Path(p).suffix.lower().lstrip(".") not in exts]
+            if bad:
+                return web.json_response(
+                    {"ok": False, "error": f"只支持这些格式：{', '.join(exts)}"}, status=400)
+            return web.json_response({"ok": True, "paths": paths,
+                                      "cancelled": not paths})
         if not path:
             return web.json_response({"ok": False, "path": "", "cancelled": True})
         src = Path(path)
@@ -9573,6 +10041,33 @@ class WebUIServer:
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
+    async def handle_stickers_auto_import(self, request):
+        """「一键识别」：把选中的图片/文件夹交给识图模型分类命名后归档。"""
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"success": False, "error": "请求体不是 JSON"}, status=400)
+        paths = payload.get("paths") or []
+        if isinstance(paths, str):
+            paths = [paths]
+        paths = [str(p) for p in paths if str(p or "").strip()]
+        if not paths:
+            return web.json_response({"success": False, "error": "先选择图片或文件夹"}, status=400)
+        if sticker_mgr is None:
+            return web.json_response({"success": False, "error": "表情包管理器不可用"}, status=400)
+        images, skipped = collect_import_images(paths, library=sticker_mgr.dir)
+        if not images:
+            reason = "；".join(skipped[:3]) or "选中的内容里没有图片"
+            return web.json_response({"success": False, "error": reason}, status=400)
+        job = start_import_job(global_config, sticker_mgr, paths)
+        return web.json_response({"success": True, **job.snapshot()})
+
+    async def handle_stickers_auto_import_status(self, request):
+        job = get_import_job(request.query.get("job_id", ""))
+        if job is None:
+            return web.json_response({"success": False, "error": "任务不存在"}, status=404)
+        return web.json_response({"success": True, **job.snapshot()})
+
     async def handle_stickers_delete(self, request):
         try:
             payload = await request.json()
@@ -9726,7 +10221,7 @@ def _webview2_release(window) -> bool:
         return True  # 已经拆过了
     box = _webview2_on_ui(form, ctrl.Dispose)
     if "err" in box:
-        print(f"释放 WebView2 失败: {box['err']}")
+        log_window_event(f"释放界面进程失败：{box['err']}")
         return False
     return True
 
@@ -9745,7 +10240,7 @@ def _webview2_rebuild(window, url: str, profile_dir: str) -> bool:
         from Microsoft.Web.WebView2.WinForms import (
             CoreWebView2CreationProperties, WebView2)
     except Exception as e:
-        print(f"重建 WebView2 失败（WebView2 组件不可用）: {e}")
+        log_window_event(f"重建界面失败（WebView2 组件不可用）：{e}")
         return False
 
     def _create():
@@ -9756,6 +10251,31 @@ def _webview2_rebuild(window, url: str, profile_dir: str) -> bool:
         props.AdditionalBrowserArguments = "--disable-features=ElasticOverscroll"
         ctrl = WebView2()
         ctrl.CreationProperties = props
+        # pywebview 手里还拿着旧控件：先换掉，否则下面接回它的初始化时，
+        # 它内部 load_url 会落到已经释放的控件上，整段初始化就断在半路
+        browser = getattr(form, "browser", None)
+        if browser is not None:
+            browser.webview = ctrl
+        form.webview = ctrl
+        # 接回 pywebview 自己的初始化：设置项（右键菜单 / F12 / 快捷键）、
+        # NewWindowRequested（没它的话外链会被 WebView2 弹成一个自带标签页的
+        # 浏览器窗口）、下载与证书处理全在里面
+        ready = getattr(browser, "on_webview_ready", None)
+        if ready is not None:
+            def _on_ready(sender, args):
+                try:
+                    ready(sender, args)
+                except Exception as e:
+                    log_window_event(
+                        f"接回界面初始化失败（界面仍可重建）：{type(e).__name__}: {e}")
+            ctrl.CoreWebView2InitializationCompleted += _on_ready
+        # 先清掉窗体上残留的 WebView2 控件：以前没清，反复重建会在同一个窗体上
+        # 叠出多个控件，界面就可能停在某个已经没人用的旧控件上
+        try:
+            for old in [c for c in form.Controls if isinstance(c, WebView2)]:
+                form.Controls.Remove(old)
+        except Exception:
+            pass
         form.Controls.Add(ctrl)
         ctrl.Dock = WinForms.DockStyle.Fill
         ctrl.EnsureCoreWebView2Async(None)
@@ -9764,22 +10284,25 @@ def _webview2_rebuild(window, url: str, profile_dir: str) -> bool:
     box = _webview2_on_ui(form, _create)
     ctrl = box.get("value")
     if ctrl is None:
-        print(f"重建 WebView2 失败: {box.get('err')}")
+        log_window_event(f"重建界面失败：{box.get('err')}")
         return False
+    # 等 CoreWebView2 真正初始化出来再继续。初始化失败（内核起不来、
+    # 用户数据目录被占用等）时 CoreWebView2 会一直是 None —— 那时绝不能
+    # 返回 True 假装成功，否则窗口会被当成"已重建"拉出来，结果一片空白。
     deadline = time.time() + 10
+    ready = False
     while time.time() < deadline:
         if _webview2_on_ui(form, lambda: ctrl.CoreWebView2 is not None).get("value"):
+            ready = True
             break
-        time.sleep(0.1)
-    _webview2_on_ui(form, lambda: ctrl.CoreWebView2.Navigate(url))
-    try:
-        # pywebview 内部还拿着旧控件，换成新的，免得它的接口落到已释放的对象上
-        browser = getattr(form, "browser", None)
-        if browser is not None:
-            browser.webview = ctrl
-        form.webview = ctrl
-    except Exception:
-        pass
+        time.sleep(0.05)
+    if not ready:
+        log_window_event("重建界面超时：内核未初始化完成")
+        return False
+    # 导航交给 on_webview_ready（上面 _create 已接回）：它会用窗口原来的
+    # real_url 重新 load_url，走 pywebview 完整路径，不再重复 Navigate。
+    _WEBVIEW_PROCESS_DEAD["flag"] = False
+    attach_process_failed_watch(window)
     return True
 
 
@@ -9887,6 +10410,59 @@ def webview2_control_alive(window) -> bool:
     return bool(_webview2_on_ui(form, lambda: not bool(ctrl.IsDisposed)).get("value"))
 
 
+# WebView2 的内核进程被外部结束（任务管理器里那组显示成「浏览器」的
+# msedgewebview2）或崩溃时置位。控件本身不会被 Dispose，光看 IsDisposed 看不出来，
+# 所以单独记一笔，唤醒路径据此重建界面。
+_WEBVIEW_PROCESS_DEAD = {"flag": False}
+_FAILED_WATCHED = {"ctrl": None}
+
+
+def attach_process_failed_watch(window) -> bool:
+    """给界面进程挂上「内核挂了」的监听（同一个控件只挂一次）。"""
+    form = _webview2_form(window)
+    ctrl = getattr(form, "webview", None) if form is not None else None
+    if ctrl is None:
+        return False
+
+    def _hook():
+        core = getattr(ctrl, "CoreWebView2", None)
+        if core is None:
+            return False
+        if _FAILED_WATCHED["ctrl"] is ctrl:
+            return True
+
+        def on_failed(sender, args):
+            try:
+                kind = str(getattr(args, "ProcessFailedKind", "") or "")
+            except Exception:
+                kind = ""
+            _WEBVIEW_PROCESS_DEAD["flag"] = True
+            log_window_event(f"界面进程异常退出（{kind}）；下次打开窗口会自动重建")
+
+        core.ProcessFailed += on_failed
+        _FAILED_WATCHED["ctrl"] = ctrl
+        return True
+
+    return bool(_webview2_on_ui(form, _hook).get("value"))
+
+
+def log_window_event(message: str) -> None:
+    """窗口生命周期事件：既进界面日志，也写进 app.log。
+
+    「进程莫名消失」这类问题只能事后看日志，而界面日志只在内存里（程序一退就
+    没了），所以这里同时交给 logging（落 app.log）。
+    """
+    print(message)
+    try:
+        logging.getLogger("lovomo.window").info(message)
+    except Exception:
+        pass
+
+
+# 重建界面的锁：托盘/任务栏唤醒与「清理界面缓存」按钮可能同时动手
+_WEBVIEW_LOCK = threading.Lock()
+
+
 def clear_webview_cache_and_reload(window, url: str) -> dict:
     """「清理界面缓存」按钮的实体：拆界面进程 → 删缓存 → 重建界面。
 
@@ -9894,13 +10470,26 @@ def clear_webview_cache_and_reload(window, url: str) -> dict:
     拆掉（进程全退、句柄放开）再删，最后重建 —— 用户看到的就是界面重新加载了
     一次。没有界面进程（浏览器访问）时只清缓存，由页面自己刷新。
     """
-    alive = webview2_control_alive(window) if window is not None else False
-    if alive:
-        _webview2_release(window)
-        time.sleep(0.4)          # 等 WebView2 的进程把文件句柄放开
-    freed = purge_webview_cache(force=True)
-    rebuilt = bool(alive and url
-                   and _webview2_rebuild(window, url, _webview_profile_dir()))
+    with _WEBVIEW_LOCK:
+        alive = webview2_control_alive(window) if window is not None else False
+        if alive:
+            _webview2_release(window)
+            time.sleep(0.4)      # 等 WebView2 的进程把文件句柄放开
+        freed = purge_webview_cache(force=True)
+        rebuilt = bool(alive and url
+                       and _webview2_rebuild(window, url, _webview_profile_dir()))
+    if alive and not rebuilt:
+        # 拆了却没装回来：先把窗口藏掉（别让用户盯着白屏），再重启一次程序
+        log_window_event("清理缓存后界面没重建起来：先隐藏窗口，再重启一次程序")
+        try:
+            window.hide()
+        except Exception:
+            pass
+        hook = _APP_HOOKS.get("relaunch")
+        if hook is not None:
+            hook()
+        else:
+            log_window_event("没有可用的重启入口，请手动退出后重开")
     return {"released": alive, "rebuilt": rebuilt, "freed": freed}
 
 
@@ -9918,7 +10507,7 @@ _UPDATE_LOCK = threading.Lock()
 # main() 里注册的「安装并退出」入口：WebUI 线程不能直接调窗口那边的局部函数
 _APP_HOOKS = {"install_update": None}
 # 进度日志固定替换同一行，免得日志面板被百分比刷满
-_PROGRESS_LINE = {"index": -1, "text": ""}
+_PROGRESS_LINE = {"index": -1, "text": "", "head": ""}
 _APP_RELEASE_REPO = "slpk1ng/Lovomo"
 
 
@@ -9996,11 +10585,14 @@ def log_progress(text: str) -> None:
     with log_lock:
         index = _PROGRESS_LINE["index"]
         if index == len(global_log_buffer) - 1 and index >= 0 \
-                and global_log_buffer[index] == _PROGRESS_LINE["text"]:
-            global_log_buffer[index] = text
+                and global_log_buffer[index] == _PROGRESS_LINE["head"] + _PROGRESS_LINE["text"]:
+            global_log_buffer[index] = _PROGRESS_LINE["head"] + text
         else:
-            global_log_buffer.append(text)
+            # 时间戳只在起一行时取一次：原地刷新时它不该跟着跳
+            head = log_prefix(console_log_level(text))
+            global_log_buffer.append(head + text)
             _PROGRESS_LINE["index"] = len(global_log_buffer) - 1
+            _PROGRESS_LINE["head"] = head
         _PROGRESS_LINE["text"] = text
     # 源码运行时还有真控制台：那边也用同一行滚动
     stream = getattr(sys.stdout, "original_stream", None)
@@ -10397,8 +10989,14 @@ if __name__ == "__main__":
         try:
             target_pid = int(wait_pid)
             print(f"等待旧进程({target_pid})退出后启动…")
-            while _pid_alive(target_pid):
+            deadline = time.time() + 20.0
+            while _pid_alive(target_pid) and time.time() < deadline:
                 time.sleep(0.3)
+            if _pid_alive(target_pid):
+                # 旧进程一直不退：宁可放弃这次重启/安装，也绝不能变成第二个实例
+                print(f"旧进程({target_pid}) 20 秒仍未退出，放弃本次"
+                      f"{'安装' if run_exe else '重启'}（不会启动第二个实例）")
+                sys.exit(0)
         except Exception:
             pass
     if run_exe:
@@ -10415,7 +11013,18 @@ if __name__ == "__main__":
 
     # 单实例判定放在等待之后：「重启 Lovomo」是旧进程退出、新进程才启动，
     # 那时名额已经释放，不会被自己的上一世挡在门外。
-    if not _acquire_single_instance():
+    acquired = _acquire_single_instance()
+    if not acquired and wait_pid:
+        # 重启/安装派生出来的这个进程可能正好撞上「上一个实例已经退出、名额还
+        # 没交还」的一瞬间。直接放弃的话这次重启会无声落空 —— 旧进程已走、新
+        # 进程也没起，用户看到的就是程序整个消失。多试几拍再认输。
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            time.sleep(0.25)
+            acquired = _acquire_single_instance()
+            if acquired:
+                break
+    if not acquired:
         if _signal_existing_instance():
             print("Lovomo 已在运行，已把它的窗口唤到前台。")
         else:
@@ -10453,8 +11062,11 @@ if __name__ == "__main__":
     webui_port = int(config.get("webui_port", 11500))
 
     holder = {"window": None}
-    close_state = {"hidden": False, "quitting": False}
+    close_state = {"hidden": False, "quitting": False, "quitting_at": 0.0}
     tray_state = {"icon": None}
+    # 重启/安装只会安排一次：重建失败、托盘「重启」、安装更新可能在极短时间
+    # 内接连触发，各自 spawn 一个新进程就会变成多实例。
+    relaunch_pending = {"flag": False}
     # 唤醒（托盘/任务栏点开）期间暂停几何记录：这段窗口连续做
     # show/maximize/move/resize，事件回调读到的都是过渡态。
     _geometry_paused = [0]
@@ -10469,35 +11081,59 @@ if __name__ == "__main__":
 
         threading.Thread(target=_release, daemon=True).start()
 
-    # 窗口一收进托盘就拆掉 WebView2：界面进程全退、内存立刻交还系统，重新打开时
-    # 重建（约 0.2 秒）。代价是重开等于重新加载界面 —— 关掉马上又点开的话，面板
-    # 会回到默认页。
-    webview_state = {"released": False}
-    webview_lock = threading.Lock()
-
     def _release_webview_now() -> None:
         """收进托盘后立刻释放 WebView2（跑在隐藏线程里，不占 UI 线程）。"""
-        with webview_lock:
-            # 「关窗」和「点托盘打开」可能撞在一起，抢到锁后要再确认一眼状态
+        with _WEBVIEW_LOCK:
+            # 「关窗」和「点托盘打开」可能撞在一起，抢到锁后要再确认一眼状态；
+            # 而且必须确认窗口**确实已经藏住** —— 拆掉一个还看得见的界面，
+            # 屏幕上就只剩一个白屏窗口了。
             if not close_state.get("hidden"):
                 return
             window = holder["window"]
-            if window is None or not _webview2_release(window):
+            if window is None:
                 return
-            webview_state["released"] = True
-            print("[窗口] 已释放 WebView2，界面进程退出（重新打开时自动重建）")
+            if _window_visible(window):
+                log_window_event("窗口仍在屏幕上，跳过释放（避免白屏）")
+                return
+            if not _webview2_release(window):
+                log_window_event("释放界面进程失败：保持原样，下次打开时再重建")
+                return
 
     def _ensure_webview_alive() -> None:
-        """唤醒前先确保界面还在：释放过就重建，让窗口带着页面一起显示。"""
-        if not webview_state.get("released"):
+        """唤醒前先确保界面还在，不在就重建，让窗口带着页面一起回来。
+
+        「不在」有两种：被外部结束的（任务管理器里结束那组 msedgewebview2 ——
+        它在任务管理器里显示成「浏览器」）、以及内核崩溃的。只能看控件的真实
+        状态和内核失败标记，否则窗口会被拉出来却是一片空白，再也恢复不了。
+        重建不出来就先藏窗口再重启一次程序，绝不把白屏窗口留给用户。
+        """
+        window = holder["window"]
+        if window is None:
             return
-        with webview_lock:
-            if not webview_state.get("released"):
+        need = (bool(_WEBVIEW_PROCESS_DEAD["flag"])
+                or not webview2_control_alive(window))
+        if not need:
+            return
+        with _WEBVIEW_LOCK:
+            need = (bool(_WEBVIEW_PROCESS_DEAD["flag"])
+                    or not webview2_control_alive(window))
+            if not need:
                 return
-            if _webview2_rebuild(holder["window"],
-                                 f"http://127.0.0.1:{webui_port}",
+            if _webview2_rebuild(window, f"http://127.0.0.1:{webui_port}",
                                  _webview_profile_dir()):
-                webview_state["released"] = False
+                _WEBVIEW_PROCESS_DEAD["flag"] = False
+            else:
+                # 重建不出来就别把白屏窗口摆给用户：藏起来，重启一次程序
+                log_window_event("打开窗口时界面没重建起来：先隐藏窗口，再重启一次程序")
+                try:
+                    window.hide()
+                except Exception:
+                    pass
+                hook = _APP_HOOKS.get("relaunch")
+                if hook is not None:
+                    hook()
+                else:
+                    log_window_event("没有可用的重启入口，请手动退出后重开")
 
     def open_console():
         """托盘/任务栏「打开 Lovomo」：把窗口唤醒到前台，并保持上次的几何。
@@ -10562,6 +11198,7 @@ if __name__ == "__main__":
         就直接放行、不再取消关闭），再走唯一的 quit_app()。
         """
         close_state["quitting"] = True
+        close_state["quitting_at"] = time.time()
         quit_app()
 
     def _force_quit(delay: float = 1.2):
@@ -10572,6 +11209,7 @@ if __name__ == "__main__":
         """
         def _run():
             time.sleep(max(0.0, delay))
+            log_window_event("进程正在退出（硬退出兜底到点）")
             try:
                 # 先立起"正在退出"：此后任何一处都不许再拉起新的子进程，
                 # 否则会留下"父进程已经没了、子进程还在跑"的独立进程。
@@ -10620,31 +11258,68 @@ if __name__ == "__main__":
         return args[0], args[1:]
 
     def relaunch_console():
+        # 只安排一次重启：重建失败、托盘「重启」可能接连触发，重复 spawn 会
+        # 变成多个实例。已经安排过就直接返回，让正在进行的退出流程收尾。
+        if relaunch_pending["flag"]:
+            log_window_event("重启已在进行，忽略重复的重启请求")
+            return
+        relaunch_pending["flag"] = True
         close_state["quitting"] = True
+        close_state["quitting_at"] = time.time()
+        # 重活放到独立线程：destroy 走 Invoke 会阻塞当前线程（这里是 pystray
+        # 的托盘回调线程），堵住消息循环后旧进程的退出会被拖住，跟新进程并存。
+        threading.Thread(target=_do_relaunch, daemon=True).start()
+
+    def _do_relaunch():
         stop_tray_icon()
         w = holder["window"]
         if w is not None:
             _capture_geometry(w)
             _finalize_geometry(w)
             _finish_geometry_save()
-            try:
-                w.destroy()
-            except Exception:
-                pass
+        # 先把新进程拉起来，成功了再拆窗口。反过来的话，spawn 失败就会留下
+        # 「旧界面已经没了、新程序又没起来」的空档，用户看到的是程序整个消失。
+        # 新进程带 LOVOMO_WAIT_PID，会等本进程退干净才开始，不怕端口冲突。
         try:
             exe, extra = _resolve_spawn_exe()
             env = dict(os.environ)
             env["LOVOMO_WAIT_PID"] = str(os.getpid())
             _spawn_detached([exe, *extra], env)
-            print("已安排重启：新实例将等待本进程完全退出后启动，避免端口占用/重复进程。")
+            log_window_event("已安排重启：新实例等待本进程退出后启动")
         except Exception as e:
-            print(f"重启 Lovomo 控制台失败: {e}")
+            # 新进程没起来就别退：回滚退出状态，把界面还给用户，这次重启当失败。
+            log_window_event(f"重启失败，继续使用当前进程：{type(e).__name__}: {e}")
+            relaunch_pending["flag"] = False
+            close_state["quitting"] = False
+            close_state["quitting_at"] = 0.0
+            if w is not None and not webview2_control_alive(w):
+                _webview2_rebuild(w, f"http://127.0.0.1:{webui_port}",
+                                  _webview_profile_dir())
+            if w is not None:
+                try:
+                    w.show()
+                except Exception:
+                    pass
+            return
+        if w is not None:
+            # 先释放 WebView2：Form.Close 会同步 Dispose 界面控件，内核进程
+            # 卡住时 Close 可能一直不返回，导致旧进程迟迟不退、和新进程并存。
+            # 先主动拆掉界面进程，Close 就只剩一个空窗体，能立刻走完退出。
+            try:
+                _webview2_release(w)
+            except Exception:
+                pass
+            try:
+                w.destroy()
+            except Exception:
+                pass
         stop_event.set()
         _force_quit(1.5)
 
     def quit_app():
         # 立起 quitting：此后 on_closing 一律放行，destroy 才能真正关掉窗口。
         close_state["quitting"] = True
+        close_state["quitting_at"] = time.time()
         stop_event.set()
         # 先启动硬退出计时：托盘线程里调用窗口销毁可能阻塞数秒，
         # 计时器必须先跑起来，退出耗时才不受销毁速度影响。
@@ -10660,6 +11335,11 @@ if __name__ == "__main__":
             _capture_geometry(w)
             _finalize_geometry(w)
             _finish_geometry_save()
+            # 先释放 WebView2，避免 Form.Close 卡在界面进程清理上、退出拖很久
+            try:
+                _webview2_release(w)
+            except Exception:
+                pass
             try:
                 w.destroy()
             except Exception:
@@ -10675,6 +11355,11 @@ if __name__ == "__main__":
         path = Path(str(installer_path or ""))
         if not path.is_file():
             return "安装包不存在或已被删除"
+        # 已经安排过安装/重启就不再重复起助手：重复 spawn 会拉起多个安装包
+        if relaunch_pending["flag"]:
+            print("安装已在进行，跳过重复的安装请求。")
+            return ""
+        relaunch_pending["flag"] = True
         try:
             exe, extra = _resolve_spawn_exe()
             env = dict(os.environ)
@@ -10688,6 +11373,7 @@ if __name__ == "__main__":
         return ""
 
     _APP_HOOKS["install_update"] = install_update_package
+    _APP_HOOKS["relaunch"] = relaunch_console
 
     def try_start_tray() -> bool:
         if tray_state.get("icon") is not None:
@@ -10740,16 +11426,20 @@ if __name__ == "__main__":
 
         def _do():
             if tray_ok:
-                # 藏完还要校验一次：隐藏可能被系统动画或并发的唤醒动作吞掉，
-                # 没藏住就再补一次。
-                for _ in range(2):
+                # 在 UI 线程调 form.Hide()：同步 WinForms 的 Visible 状态。但
+                # FormClosing 被 Cancel 后，WinForms 会在 UI 线程里把窗口恢复
+                # 到关闭前的状态 —— 那一步是异步的，可能落在我们隐藏之后又把
+                # 窗口拉回屏幕。所以这里多等几拍、反复确认，直到窗口真的藏住。
+                for _ in range(5):
                     try:
-                        w.hide()
+                        _window_hide(w)
                     except Exception:
                         pass
-                    time.sleep(0.05)
+                    time.sleep(0.1)
                     if not _window_visible(w):
                         break
+                if _window_visible(w):
+                    log_window_event("窗口没能藏住（仍在屏幕上）：后续不会释放界面进程")
             else:
                 try:
                     w.minimize()
@@ -10759,7 +11449,8 @@ if __name__ == "__main__":
                 _finish_geometry_save()
             except Exception:
                 pass
-            # 藏好了立刻释放界面进程：内存现在就拿回来
+            # 藏好了立刻释放界面进程：内存现在就拿回来。释放函数内部还会再确认一次
+            # 「窗口确实不可见」 —— 没藏住就跳过，绝不会把可见的界面拆成白屏。
             _release_webview_now()
 
         threading.Thread(target=_do, daemon=True).start()
@@ -10781,8 +11472,14 @@ if __name__ == "__main__":
         退出本身一律走 request_quit()（托盘菜单）或 quit_app()，它们在
         destroy 之前会先把 quitting 立起来，所以不会在这里被拦下。
         """
-        if close_state.get("quitting"):
+        if close_state.get("quitting") and time.time() - close_state.get("quitting_at", 0) < 15:
             return None
+        if close_state.get("quitting"):
+            # 上一次退出流程没走完，标记却被留下了：不清掉的话，这次「关闭到托盘」
+            # 会被当成真退出 —— 窗口直接销毁、程序跟着没了。
+            log_window_event("上一次退出流程没有完成，已重置退出标记（本次仍收进托盘）")
+            close_state["quitting"] = False
+            close_state["quitting_at"] = 0.0
         w = holder["window"]
         # 窗口一旦隐藏/销毁就读不到几何了，先抓一次再动手。
         if w is not None:
@@ -10978,6 +11675,11 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"绑定窗口关闭事件失败，关闭将直接退出: {e}")
         _bind_geometry_events(w)
+        try:
+            # 界面进程被外部结束后要能被发现（页面加载完成时控件已就绪）
+            w.events.loaded += lambda: attach_process_failed_watch(w)
+        except Exception:
+            pass
 
         def _wake_from_system():
             """窗口被系统激活（点任务栏图标 / 从任务栏还原）时补一次抢前台。
@@ -10998,10 +11700,8 @@ if __name__ == "__main__":
             """
             def _do():
                 time.sleep(0.3)
-                ok = _install_taskbar_activate_hook(
+                _install_taskbar_activate_hook(
                     w, on_activate=lambda win: _wake_from_system())
-                if ok:
-                    print("[窗口] 已启用任务栏唤醒置顶")
             threading.Thread(target=_do, daemon=True).start()
 
         try:

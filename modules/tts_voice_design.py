@@ -20,6 +20,8 @@ LANGUAGES = ("zh", "en", "de", "it", "pt", "es", "ja", "ko", "fr", "ru")
 DEFAULT_LANGUAGE = "zh"
 
 _NAME_RE = re.compile(r"[0-9A-Za-z_]{1,16}\Z")
+# 预览音频是 Base64 字符串：正常只有几十 KB，给足余量后仍然设个上限
+MAX_PREVIEW_BASE64_CHARS = 2_000_000
 
 
 class VoiceDesignError(Exception):
@@ -50,6 +52,10 @@ async def _call(config, body: dict) -> dict:
 def _preview_bytes(out: dict) -> bytes:
     data = str((out.get("preview_audio") or {}).get("data") or "")
     if not data:
+        return b""
+    if len(data) > MAX_PREVIEW_BASE64_CHARS:
+        # 预览只是给用户试听，异常大的响应直接丢掉，别把内存吃光
+        print(f"云 TTS 预览音频过大（{len(data)} 字符），已忽略。")
         return b""
     try:
         return base64.b64decode(data)

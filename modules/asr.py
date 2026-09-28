@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 from collections import deque
 from pathlib import Path
@@ -29,6 +30,17 @@ LOCAL_SCRIPTS = {"funasr": "tools/asr/funasr_asr.py",
                  "whisper": "tools/asr/fasterwhisper_asr.py"}
 WHISPER_MODEL_SIZES = ("medium", "medium.en", "large-v2", "large-v3", "large-v3-turbo")
 DEFAULT_WHISPER_SIZE = "medium"
+# GPT-SoVITS 的 runtime 是 embeddable Python：目录里的 python39._pth 会让解释器忽略
+# PYTHONPATH，也不会把脚本所在目录放进 sys.path。Faster Whisper 脚本要 import
+# tools.*，直接运行必然 ModuleNotFoundError（达摩脚本只 import 第三方库，所以
+# 中文那条路看不出问题）。用一段引导代码把根目录塞进 sys.path 再跑脚本。
+SCRIPT_BOOTSTRAP = (
+    "import runpy, sys;"
+    "sys.path.insert(0, sys.argv.pop(1));"
+    "script = sys.argv.pop(1);"
+    "sys.argv[0] = script;"
+    "runpy.run_path(script, run_name='__main__')"
+)
 DEFAULT_DASHSCOPE_MODEL = "qwen3-asr-flash"
 # DashScope 兼容接口单次音频上限 10MB（base64 之后），留出编码膨胀的余量
 DASHSCOPE_MAX_AUDIO_BYTES = 7 * 1024 * 1024
@@ -102,7 +114,7 @@ def transcribe_local(config, targets: List[Tuple[str, Path]], lang: str,
             name = f"{index}_{Path(audio).name}"
             shutil.copyfile(audio, tmp_dir / name)
             mapping[name] = key
-        cmd = [str(python_exe), str(script_path),
+        cmd = [str(python_exe), "-c", SCRIPT_BOOTSTRAP, str(root), str(script_path),
                "-i", str(tmp_dir), "-o", str(tmp_dir), "-l", script_lang]
         if script == LOCAL_SCRIPTS["whisper"]:
             cmd += ["-s", whisper_model_size(config)]
@@ -114,8 +126,10 @@ def transcribe_local(config, targets: List[Tuple[str, Path]], lang: str,
         watchdog = threading.Timer(LOCAL_TIMEOUT_SECONDS, proc.kill)
         watchdog.daemon = True
         watchdog.start()
+        tail = deque(maxlen=8)
         try:
             for line in proc.stdout:
+                tail.append(line.rstrip())
                 if log:
                     log(line)
             proc.wait(timeout=LOCAL_TIMEOUT_SECONDS)
@@ -132,9 +146,30 @@ def transcribe_local(config, targets: List[Tuple[str, Path]], lang: str,
             text = parts[3].strip()
             if key and text:
                 results[key] = text
+        if not results:
+            # 一条都没认出来：脚本退出码/最后几行才是真正的原因（模型没下好、参数被拒、
+            # 缺依赖…），只回一句"未识别出文字"等于把问题藏起来
+            detail = " / ".join(x for x in tail if x.strip())[:400]
+            raise RuntimeError(f"ASR 脚本没有产出结果（退出码 {proc.returncode}）"
+                               + (f"：{detail}" if detail else ""))
         return results
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        _cleanup_tmp_dir(tmp_dir)
+
+
+def _cleanup_tmp_dir(tmp_dir: Path) -> None:
+    """删掉识别用的临时目录。
+
+    文件被杀软/索引器占着时 rmtree 会静默失败（ignore_errors=True），
+    目录就此留在临时区；这里再试一次，仍然删不掉就把位置打出来。
+    """
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    if not tmp_dir.exists():
+        return
+    time.sleep(0.2)
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    if tmp_dir.exists():
+        print(f"ASR 临时目录未能删除（可能被杀软占用），已留下：{tmp_dir}")
 
 
 def _read_list_file(tmp_dir: Path) -> str:
@@ -180,6 +215,22 @@ async def transcribe_dashscope(config, audio: Path, lang: str) -> str:
     if not choices:
         raise RuntimeError(f"返回内容异常：{str(resp.json())[:200]}")
     return str((choices[0].get("message") or {}).get("content") or "").strip()
+
+
+async def transcribe_file(config, audio, lang=None) -> str:
+    """识别单个音频文件，返回文字（识别不出来返回空串）。
+
+    语种与引擎都取「语音识别」那几项配置；调用方（用户发来的语音）不留文件，
+    所以本地通道也走临时目录那套批量脚本，只是只放一个文件进去。
+    """
+    path = Path(audio)
+    use_lang = normalize_lang(lang if lang is not None
+                              else config.get("asr_lang", "auto"))
+    if normalize_engine(config.get("asr_engine", "local")) == "dashscope":
+        return (await transcribe_dashscope(config, path, use_lang)).strip()
+    key = str(path)
+    texts = await asyncio.to_thread(transcribe_local, config, [(key, path)], use_lang)
+    return str(texts.get(key, "") or "").strip()
 
 
 class AsrJob:

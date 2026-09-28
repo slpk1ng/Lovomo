@@ -30,7 +30,7 @@ class LovomoContext:
 
     def __init__(self, plugin_id: str, plugin_name: str, manager,
                  logger=None, config_getter=None, sender=None,
-                 voice_sender=None, emotions_getter=None):
+                 voice_sender=None, emotions_getter=None, runtime=None):
         self.plugin_id = plugin_id
         self.plugin_name = plugin_name
         self.manager = manager
@@ -39,6 +39,7 @@ class LovomoContext:
         self._sender = sender
         self._voice_sender = voice_sender
         self._emotions_getter = emotions_getter
+        self._runtime = runtime
         self.commands = {}          # 插件可注册的指令：name -> callable
 
     # --- 日志 ---------------------------------------------------------
@@ -133,8 +134,21 @@ class LovomoContext:
         name = str(name or "").strip().lstrip("/").lstrip("#")
         if not name or not callable(handler):
             return False
+        # 同名指令由先加载的插件先用（dispatch_command 取第一个命中的）：
+        # 后来者注册得上却永远轮不到，这里说一声，免得作者以为它在生效
+        owner = self._command_owner(name)
+        if owner:
+            self.log(f"指令 {name} 已由插件「{owner}」注册，本次注册不会生效。")
         self.commands[name] = handler
         return True
+
+    def _command_owner(self, name: str) -> str:
+        if self._runtime is None:
+            return ""
+        try:
+            return self._runtime.command_owner(name, self.plugin_id)
+        except Exception:
+            return ""
 
     # --- 数据目录 -----------------------------------------------------
     def data_dir(self) -> Path:
@@ -204,7 +218,8 @@ class PluginRuntime:
                                 config_getter=self._config_getter,
                                 sender=self._sender,
                                 voice_sender=self._voice_sender,
-                                emotions_getter=self._emotions_getter)
+                                emotions_getter=self._emotions_getter,
+                                runtime=self)
             record = {"info": info, "module": None, "ctx": ctx, "hooks": {},
                       "sys_path": ""}
             if not entry.is_file():
@@ -332,6 +347,19 @@ class PluginRuntime:
             self._call_record(record, "on_reply_done", info)
             done += 1
         return done
+
+    def command_owner(self, name: str, exclude_pid: str = "") -> str:
+        """哪个已加载插件注册了这个指令名（没有就返回空串）。"""
+        name = str(name or "").strip().lstrip("/").lstrip("#")
+        if not name:
+            return ""
+        for pid, record in list(self.loaded.items()):
+            if pid == exclude_pid:
+                continue
+            ctx = record.get("ctx")
+            if ctx is not None and callable(getattr(ctx, "commands", {}).get(name)):
+                return str((record.get("info") or {}).get("name") or pid)
+        return ""
 
     def dispatch_command(self, name: str, args, event):
         """把一条指令交给注册了它的插件。返回第一个非 None 的结果。

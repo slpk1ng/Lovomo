@@ -2,11 +2,12 @@
 import asyncio
 import contextlib
 import contextvars
+import re
 import time
 from pathlib import Path
 from typing import List, Optional
 
-from .llm_helpers import (RoleContext, segment_for_tts, lang_text_broken,
+from .llm_helpers import (MENTION_PLACEHOLDER, RoleContext, segment_for_tts, lang_text_broken,
                           translate_to_lang, available_mimics)
 from .tts import synthesize_sentence, merge_wavs, get_audio_duration
 from .tts_service import check_tts_service
@@ -149,13 +150,42 @@ class MessageSender:
                 await asyncio.sleep(delay)
 
     async def send_text(self, session_type: str, target_id, text: str,
-                        sticker=None) -> bool:
-        from napcat import Text, Image
+                        sticker=None, reply_id=None, at_ids=None) -> bool:
+        from napcat import Text, Image, At, Reply
+        normalized_type, _ = _normalize_target(session_type, target_id)
+        text = "" if text is None else str(text)
+        mentions = []
+        if normalized_type == "group":
+            seen_at = set()
+            for qq in at_ids or []:
+                value = str(qq or "").strip()
+                if value and value not in seen_at:
+                    mentions.append(At(qq=value))
+                    seen_at.add(value)
+        # @ 的位置由正文里的占位符决定（模型把它写在想@人的地方）；
+        # 没有占位符时退回把@放在消息开头，正文里残留的占位符一律清掉。
+        body = []
+        if mentions and MENTION_PLACEHOLDER in text:
+            head, _, tail = text.partition(MENTION_PLACEHOLDER)
+            tail = tail.replace(MENTION_PLACEHOLDER, "")
+            if head.strip():
+                body.append(Text(text=head))
+            body.extend(mentions)
+            if tail.strip():
+                body.append(Text(text=tail))
+        else:
+            if MENTION_PLACEHOLDER in text:
+                text = re.sub(r"[ \t]{2,}", " ",
+                              text.replace(MENTION_PLACEHOLDER, "")).strip(" \t")
+            body.extend(mentions)
+            # 只在有文本时才加 Text 段：带表情包但不带文字时若塞入空 Text，
+            # 消息段列表会出现一个空文本段（部分客户端会显示空白气泡）。
+            if text.strip():
+                body.append(Text(text=text))
         segments = []
-        # 只在有文本时才加 Text 段：带表情包但不带文字时若塞入空 Text，
-        # 消息段列表会出现一个空文本段（部分客户端会显示空白气泡）。
-        if text and str(text).strip():
-            segments.append(Text(text=text))
+        if normalized_type == "group" and reply_id is not None:
+            segments.append(Reply(id=str(reply_id)))
+        segments.extend(body)
         temp_sticker = None
         if sticker is not None:
             try:
@@ -181,14 +211,38 @@ class MessageSender:
 
     # ---------------- 回复合送（保持原有分合逻辑 + 表情包） ----------------
     async def send_reply(self, session_type: str, target_id: str, sentences: List[dict],
-                        emotions: dict, ctx: RoleContext, use_voice: bool = True) -> dict:
+                        emotions: dict, ctx: RoleContext, use_voice: bool = True,
+                        reply_id=None, allowed_at_ids=None) -> dict:
         """按配置发送整组句子（文本+语音），返回 {tts_ms, voice_ok}。
 
         sentences: [{zh, lang, display, emotion}]
         """
-        result = {"tts_ms": 0.0, "voice_ok": False, "tts_calls": 0}
+        result = {"tts_ms": 0.0, "voice_ok": False, "tts_calls": 0, "sent_texts": []}
         if not sentences:
             return result
+        session_type, target_id = _normalize_target(session_type, target_id)
+        action_sentence = next((s for s in sentences
+                                if s.get("reply_to") or s.get("mention_ids")), {})
+        selected_mentions = [str(q) for q in action_sentence.get("mention_ids", [])
+                             if str(q) in {str(x) for x in (allowed_at_ids or [])}]
+        action_reply_id = reply_id if action_sentence.get("reply_to") else None
+        actions_pending = bool(action_reply_id is not None or selected_mentions)
+
+        # 真的逐条发出去的文本（合并发送时只有一条）：调用方据此决定聊天记录
+        # 要不要跟着拆成多条，免得界面上看到的是"一整段"，和 QQ 里的样子对不上
+        sent_texts: List[str] = []
+
+        async def _send_text(text, sticker=None, zh=None):
+            nonlocal actions_pending
+            ok = await self.send_text(
+                session_type, target_id, text, sticker=sticker,
+                reply_id=action_reply_id if actions_pending else None,
+                at_ids=selected_mentions if actions_pending else None)
+            if ok:
+                actions_pending = False
+                sent_texts.append(str(text if zh is None else zh))
+            return ok
+
         data_path = self.memory_manager.data_path
         separate_send = self.config.get("separate_send", False)
         send_voice_separately = self.config.get("send_voice_separately", False)
@@ -267,7 +321,7 @@ class MessageSender:
                 # ② 逐句发送文本 + 对应语音（等上一条播完，用的是上一条自己的时长）
                 await pacer.wait()
                 if sentence_text:
-                    await self.send_text(session_type, target_id, sentence_text)
+                    await _send_text(sentence_text, zh=sentences[idx].get("zh"))
                 await self.send_voice(session_type, target_id, wav)
                 await pacer.hold_voice(wav)
                 wav.unlink(missing_ok=True)
@@ -277,14 +331,13 @@ class MessageSender:
 
             # ③ 如果所有语音都失败，降级发送合并文本
             if not valid_wavs:
-                await self.send_text(session_type, target_id,
-                                    "".join(s["display"] for s in sentences))
+                await _send_text("".join(s["display"] for s in sentences))
             else:
                 # ④ 处理语音失败的句子（补发文本，只发一次）
                 for idx in missing:
                     text = sentences[idx]["display"]
                     if text:
-                        await self.send_text(session_type, target_id, text)
+                        await _send_text(text, zh=sentences[idx].get("zh"))
 
             # ⑤ 最后统一发送表情包
             for sticker_path in done_stickers:
@@ -311,14 +364,14 @@ class MessageSender:
                 if separate_send and text_separate:
                     await self.send_voice(session_type, target_id, combined_audio)
                     for i, s in enumerate(sentences):
-                        await self.send_text(session_type, target_id, s["display"])
+                        await _send_text(s["display"], zh=s.get("zh"))
                         # 文字之间采用固定间隔（如果希望基于语音时长，可改为语音时长）
                         await asyncio.sleep(0.2)
                 else:
                     # 正常合并发送：文字+语音一起发。
                     # 这条语音是本轮的最后一条，后面没有要发的语音，
                     # 再等它播完只会把整条会话锁住、拖慢排队的下一条消息
-                    await self.send_text(session_type, target_id, combined_text)
+                    await _send_text(combined_text)
                     await self.send_voice(session_type, target_id, combined_audio)
 
                 # 清理临时文件
@@ -328,7 +381,7 @@ class MessageSender:
             else:
                 # 语音合成失败，降级纯文本
                 print("TTS 合成失败或未启用，降级为纯文本。")
-                await self.send_text(session_type, target_id, combined_text)
+                await _send_text(combined_text)
                 for w in valid_wavs:
                     w.unlink(missing_ok=True)
 
@@ -339,6 +392,7 @@ class MessageSender:
 
         await asyncio.to_thread(self.memory_manager.cleanup_voice_cache,
                                 self.config.get("max_voice_cache", 20))
+        result["sent_texts"] = sent_texts
         return result
 
     # ---------------- 主动消息（定时/提醒/问候） ----------------

@@ -1,14 +1,19 @@
 """表情包管理：按情绪目录扫描本地表情图片，回复时按概率附加。"""
+import asyncio
 import hashlib
 import json
 import os
 import random
 import re
 import tempfile
+import threading
 import time
+import uuid
+from collections import deque
 from pathlib import Path
+from typing import Optional
 
-from .llm_helpers import resolve_emotion_key, sniff_image_mime
+from .llm_helpers import RoleContext, resolve_emotion_key, sniff_image_mime
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 _MIME_EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
@@ -471,6 +476,65 @@ def _sync_index_digests(root: Path, index: dict) -> int:
     return added
 
 
+def resolve_capture_category(root, category_hint) -> str:
+    """把模型给的分类名对到表情库里真实的文件夹名（必要时建一个内置分类目录）。
+
+    分类名由用户自己命名（可以是中文），大小写不敏感地匹配；模型给中文/英文
+    说法时先翻成内置分类，再对回用户那个目录，避免同一种情绪被拆成两个文件夹。
+    认不出来的词一律落到 wuyu，绝不新建 default/any 之外的怪目录 ——
+    "文件夹命名不能乱命名"这条约束就靠这里兜住。
+    """
+    cat = normalize_capture_category(category_hint)
+    # 文件夹名 → 原名；空目录不算分类，否则模型会选中一个用户看不见的目录
+    on_disk = _category_dirs(root)
+    # 内置拼音分类 → 磁盘上的真实目录名
+    pinyin_alias = {}
+    for low, real in on_disk.items():
+        builtin = _COMMON_EMOTION_MAP.get(low, "")
+        if builtin:
+            pinyin_alias.setdefault(builtin, real)
+
+    print(f"【表情分类】模型提供的原始分类 hint: '{category_hint}'")
+
+    # 1. 先认表情库里已有的文件夹：分类名由用户命名，绕过它去查内置拼音表
+    #    会按拼音另建一个目录，把同一种情绪拆成两个文件夹
+    if cat.lower() in on_disk:
+        cat = on_disk[cat.lower()]
+        print(f"【表情分类-命中已有分类】'{category_hint}' -> '{cat}'")
+    else:
+        cat = cat.lower()
+        # 2. 翻译：模型说中文/英文，转成内置分类名
+        mapped_cat = _COMMON_EMOTION_MAP.get(cat, "") or _COMMON_EMOTION_MAP.get(str(category_hint or "").lower(), "")
+        if mapped_cat:
+            cat = mapped_cat
+            print(f"【表情分类-映射成功】'{category_hint}' -> '{cat}'")
+        elif cat in STRICT_ALLOWED:
+            # 模型直接给了内置分类名：本来就合法，别打印成"映射失败"，会被误读成分类被拒
+            print(f"【表情分类-分类合法】'{cat}' 已是内置分类，无需映射")
+        else:
+            print(f"【表情分类-映射失败】'{category_hint}' 未找到对应分类，进入兜底校验")
+
+        # 3. 兜底校验：绝对不进 any / default，不认识的词全部强制扔进 wuyu
+        if cat not in STRICT_ALLOWED:
+            print(f"【表情分类-兜底拦截】'{cat}' 不是已有分类，强制改为 'wuyu'")
+            cat = "wuyu"
+        else:
+            print(f"【表情分类-最终归类】图片将保存到: '{cat}' 文件夹")
+
+        # 4. 收敛到内置分类名之后，再对一次磁盘上的原名
+        if cat.lower() not in on_disk and cat in pinyin_alias:
+            print(f"【表情分类-对回已有目录】'{cat}' -> '{pinyin_alias[cat]}'")
+            cat = pinyin_alias[cat]
+
+    if cat.lower() not in on_disk:
+        try:
+            (root / cat).mkdir(parents=True, exist_ok=True)
+            print(f"[表情分类] 已自动创建分类文件夹: {cat}")
+        except OSError as e:
+            print(f"[表情分类] 创建分类文件夹失败（{cat}）: {e}")
+    return cat
+
+
 async def auto_capture_image(config, sticker_manager, source, category_hint="",
                              image_data=None, reason="") -> bool:
     """把一张图收藏进表情库。
@@ -543,56 +607,7 @@ async def auto_capture_image(config, sticker_manager, source, category_hint="",
         index.pop(hit, None)
 
     # --- 核心分类逻辑 ---
-    cat = normalize_capture_category(category_hint)
-    # 文件夹名 → 原名，分类名由用户自己命名（可以是中文），大小写不敏感地匹配；
-    # 空目录不算分类，否则模型会选中一个用户看不见的目录
-    on_disk = _category_dirs(root)
-    # 内置拼音分类 → 磁盘上的真实目录名：模型给拼音（或中文被翻译成拼音）时
-    # 对回用户自己命名的那个文件夹，否则同一种情绪会被拆成两个目录
-    pinyin_alias = {}
-    for low, real in on_disk.items():
-        builtin = _COMMON_EMOTION_MAP.get(low, "")
-        if builtin:
-            pinyin_alias.setdefault(builtin, real)
-
-    # 打印模型原本给的是什么
-    print(f"【表情收藏-进入保存】模型提供的原始分类 hint: '{category_hint}'")
-
-    # 1. 先认表情库里已有的文件夹：分类名由用户命名，绕过它去查内置拼音表
-    #    会按拼音另建一个目录，把同一种情绪拆成两个文件夹
-    if cat.lower() in on_disk:
-        cat = on_disk[cat.lower()]
-        print(f"【表情收藏-命中已有分类】'{category_hint}' -> '{cat}'")
-    else:
-        cat = cat.lower()
-        # 2. 翻译：模型说中文/英文，转成内置分类名
-        mapped_cat = _COMMON_EMOTION_MAP.get(cat, "") or _COMMON_EMOTION_MAP.get(str(category_hint or "").lower(), "")
-        if mapped_cat:
-            cat = mapped_cat
-            print(f"【表情收藏-映射成功】'{category_hint}' -> '{cat}'")
-        elif cat in STRICT_ALLOWED:
-            # 模型直接给了内置分类名：本来就合法，别打印成"映射失败"，会被误读成分类被拒
-            print(f"【表情收藏-分类合法】'{cat}' 已是内置分类，无需映射")
-        else:
-            print(f"【表情收藏-映射失败】'{category_hint}' 未找到对应分类，进入兜底校验")
-
-        # 3. 兜底校验：绝对不进 any / default，不认识的词全部强制扔进 wuyu
-        if cat not in STRICT_ALLOWED:
-            print(f"【表情收藏-兜底拦截】'{cat}' 不是已有分类，强制改为 'wuyu'")
-            cat = "wuyu"
-        else:
-            print(f"【表情收藏-最终归类】图片将保存到: '{cat}' 文件夹")
-
-        # 4. 收敛到内置分类名之后，再对一次磁盘上的原名
-        if cat.lower() not in on_disk and cat in pinyin_alias:
-            print(f"【表情收藏-对回已有目录】'{cat}' -> '{pinyin_alias[cat]}'")
-            cat = pinyin_alias[cat]
-
-    if cat.lower() not in on_disk:
-        try:
-            (root / cat).mkdir(parents=True, exist_ok=True)
-            print(f"[表情收藏] 已自动创建分类文件夹: {cat}")
-        except Exception: pass
+    cat = resolve_capture_category(root, category_hint)
 
     dirs = [cat]
     # 同时放一份进 any 池：情绪分类目录是"这个表情适合什么情绪"，
@@ -753,3 +768,273 @@ class StickerManager:
             return None
         path = self.dir / items[index][0]
         return path if path.exists() else None
+
+
+# ===========================================================================
+# 一键识别：把选中的图片/文件夹交给识图模型，自动归档到「表情包目录」
+# ===========================================================================
+
+# 一次最多识别多少张：每张都要过一次识图模型，条数失控时会烧掉大量额度
+IMPORT_MAX_IMAGES = 300
+IMPORT_JOB_LOG_LINES = 40
+_IMPORT_JOBS = {}
+_IMPORT_JOBS_LOCK = threading.Lock()
+IMPORT_JOBS_KEPT = 10
+
+
+def collect_import_images(paths, library=None) -> tuple:
+    """把用户选的文件/文件夹展开成待识别的图片清单。
+
+    返回 (图片列表, 跳过原因列表)：文件夹会递归找图片；文件夹里的非图片杂物
+    直接跳过（一个文件夹里什么都可能有，逐条报出来只会刷屏），单独选中的
+    非图片文件、不存在的路径、表情库自己目录里的文件、重复项都会写明原因；
+    超过上限时截断并提示。
+    """
+    images, skipped, seen = [], [], set()
+    roots = []
+    for raw in paths or []:
+        text = str(raw or "").strip().strip('"')
+        if not text:
+            continue
+        path = Path(text)
+        if path.is_dir():
+            roots.append(path.resolve())
+        elif path.is_file():
+            roots.append(path)
+        else:
+            skipped.append(f"{text}：路径不存在")
+    try:
+        library = Path(library).resolve() if library else None
+    except OSError:
+        library = None
+    for path in roots:
+        try:
+            if path.is_dir():
+                candidates = sorted(p for p in path.rglob("*") if p.is_file())
+            else:
+                candidates = [path]
+        except OSError as e:
+            skipped.append(f"{path}：读取失败（{e}）")
+            continue
+        for item in candidates:
+            if item.suffix.lower() not in IMAGE_EXTS:
+                if len(candidates) == 1:
+                    skipped.append(f"{item.name}：不是支持的图片格式")
+                continue
+            key = str(item.resolve()).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if library is not None and library in item.resolve().parents:
+                skipped.append(f"{item.name}：已在表情包目录里，跳过")
+                continue
+            images.append(item)
+    if len(images) > IMPORT_MAX_IMAGES:
+        skipped.append(f"一次最多识别 {IMPORT_MAX_IMAGES} 张，其余 {len(images) - IMPORT_MAX_IMAGES} 张未处理")
+        images = images[:IMPORT_MAX_IMAGES]
+    return images, skipped
+
+
+def _import_prompt(candidates_text: str) -> str:
+    """一键识别的识图指令：只要分类与命名，不要台词、不要画面描述。"""
+    return (
+        "看这张图，判断它以后当表情包发出去时该放进哪个情绪文件夹，"
+        "并给它起一个通用名字。\n"
+        "只输出一个 JSON 对象，格式：{\"category\": \"分类名\", \"name\": \"通用用途名\"}；"
+        "不要输出台词、画面描述、解释或其他字段。\n"
+        "category 只能从下面这份清单里挑一个，并把名称原样照抄"
+        "（清单取自表情包目录下实际存在的文件夹，不要自己新造，也不要换成拼音或译文）：\n"
+        f"{candidates_text}\n"
+        f"{CATEGORY_DISAMBIGUATION}\n"
+        "name 是这张表情以后反复使用时的名字：只写它适合表达的情绪与互动用途，"
+        "不写画面里是谁、也不写是给谁用的；严禁出现任何角色名、人名、作品名；"
+        "简短（4~12 个字），不能写成句子，也不能是“好看”“有趣”“可爱”这类空话。"
+    )
+
+
+async def classify_sticker_image(ctx, source: str, data: bytes, mime: str) -> dict:
+    """让识图模型看一眼这张图，返回 {category, name}（拿不到就返回空字典）。"""
+    from .llm_helpers import base64_b64, extract_json_objects, vision_chat_once
+    prompt = _import_prompt(category_candidates_text(ctx))
+    content, _ms = await vision_chat_once(
+        ctx, prompt, [(str(source), mime, base64_b64(data))], max_tokens=256)
+    for obj in extract_json_objects(content or ""):
+        if isinstance(obj, dict) and ("category" in obj or "name" in obj):
+            return obj
+    print(f"【表情一键识别】模型没给出可用的分类与命名（{str(content or '')[:80]!r}）")
+    return {}
+
+
+async def import_sticker_images(config, sticker_manager, paths, log=None) -> dict:
+    """识别并归档一批图片，返回 {total, saved, skipped, failed, items, skipped_paths}。
+
+    每张图都过一次识图模型（只要分类与命名），再按「表情包目录」里已有的
+    分类文件夹归档；分类名清洗与新建目录都走 resolve_capture_category，
+    所以文件夹不会被乱命名。
+    """
+    emit = log or (lambda line: None)
+    root = sticker_manager.dir if sticker_manager is not None else None
+    images, skipped_paths = collect_import_images(paths, library=root)
+    result = {"total": len(images), "saved": 0, "skipped": 0, "failed": 0,
+              "items": [], "skipped_paths": skipped_paths}
+    for reason in skipped_paths:
+        print(f"【表情一键识别】跳过 {reason}")
+    if not images:
+        return result
+    if sticker_manager is None:
+        raise RuntimeError("表情包管理器不可用")
+    ctx = RoleContext(config)
+    role_names = role_names_from_config(config)
+    index = _load_index(root)
+    if _sync_index_digests(root, index):
+        _save_index(root, index)
+    known = {_entry_path(entry) for entry in index.values()}
+
+    for position, image in enumerate(images, start=1):
+        emit(f"[{position}/{len(images)}] 识别 {image.name} …")
+        item = {"path": str(image), "name": image.name, "category": "", "saved": "",
+                "error": ""}
+        try:
+            data = image.read_bytes()
+        except OSError as e:
+            item["error"] = f"读取失败：{e}"
+            result["failed"] += 1
+            result["items"].append(item)
+            continue
+        if not data:
+            item["error"] = "文件为空"
+            result["failed"] += 1
+            result["items"].append(item)
+            continue
+        mime = sniff_image_mime(data)
+        ext = _ext_for_bytes(data, str(image))
+        if not mime or not ext:
+            item["error"] = "无法识别的图片格式"
+            result["failed"] += 1
+            result["items"].append(item)
+            continue
+        raw_digest = hashlib.sha1(data).hexdigest()
+        try:
+            verdict = await classify_sticker_image(ctx, str(image), data, mime)
+        except Exception as e:
+            item["error"] = f"识图失败：{type(e).__name__}: {e}"
+            result["failed"] += 1
+            result["items"].append(item)
+            continue
+        if not verdict:
+            item["error"] = "识图模型没有给出分类与命名"
+            result["failed"] += 1
+            result["items"].append(item)
+            continue
+        category = resolve_capture_category(root, verdict.get("category", ""))
+        item["category"] = category
+        stored = data
+        if ext not in _preserve_formats(config):
+            stored, ext = _reencode_for_sticker(data, ext, config)
+        digest = hashlib.sha1(stored).hexdigest()
+        existing = index.get(digest) or index.get(raw_digest)
+        if existing:
+            rel = _entry_path(existing)
+            if rel and rel not in known and (root / rel).exists():
+                known.add(rel)
+            item["saved"] = rel
+            item["error"] = "表情库里已有同一张图"
+            result["skipped"] += 1
+            result["items"].append(item)
+            continue
+        base = sticker_name_from_reason(
+            drop_role_names(verdict.get("name", ""), role_names), "") \
+            or sticker_name_from_reason(verdict.get("name", ""), "") \
+            or f"sticker_{int(time.time() * 1000)}"
+        try:
+            folder = root / category
+            folder.mkdir(parents=True, exist_ok=True)
+            target = _unique_path(folder, base, ext)
+            target.write_bytes(stored)
+        except OSError as e:
+            item["error"] = f"写入失败：{e}"
+            result["failed"] += 1
+            result["items"].append(item)
+            continue
+        rel = f"{category}/{target.name}"
+        item["saved"] = rel
+        index[digest] = {"path": rel, "reason": str(verdict.get("name") or "").strip(),
+                         "category": category}
+        _save_index(root, index)
+        known.add(rel)
+        result["saved"] += 1
+        result["items"].append(item)
+        emit(f"[{position}/{len(images)}] {image.name} → {rel}")
+    if result["saved"]:
+        try:
+            sticker_manager.rescan()
+        except Exception as e:
+            print(f"【表情一键识别】归档后重扫失败: {type(e).__name__}: {e}")
+    return result
+
+
+class StickerImportJob:
+    """一次「一键识别」任务：后台线程跑识图与归档，前端轮询进度。"""
+
+    def __init__(self, config, sticker_manager, paths):
+        self.id = uuid.uuid4().hex
+        self.total = len(paths or [])
+        self.done = 0
+        self.stage = "准备中"
+        self.running = True
+        self.error = ""
+        self.result = None
+        self._logs = deque(maxlen=IMPORT_JOB_LOG_LINES)
+        self._config = config
+        self._manager = sticker_manager
+        self._paths = list(paths or [])
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def log(self, line):
+        text = str(line or "").strip()
+        if text:
+            with self._lock:
+                self._logs.append(text)
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            logs = list(self._logs)
+        return {"job_id": self.id, "running": self.running, "done": self.done,
+                "total": self.total, "stage": self.stage, "error": self.error,
+                "logs": logs, "result": self.result}
+
+    def _run(self):
+        try:
+            self.stage = "识别中"
+            result = asyncio.run(import_sticker_images(
+                self._config, self._manager, self._paths, log=self.log))
+            self.result = result
+            self.total = int(result.get("total") or 0)
+            self.done = self.total
+            self.stage = (f"完成：归档 {result['saved']} 张，重复 {result['skipped']} 张，"
+                          f"失败 {result['failed']} 张")
+        except Exception as e:
+            self.error = f"{type(e).__name__}: {e}"
+            self.log(f"识别失败：{self.error}")
+            self.stage = "失败"
+        finally:
+            self.running = False
+
+
+def start_import_job(config, sticker_manager, paths) -> StickerImportJob:
+    job = StickerImportJob(config, sticker_manager, paths)
+    with _IMPORT_JOBS_LOCK:
+        _IMPORT_JOBS[job.id] = job
+        while len(_IMPORT_JOBS) > IMPORT_JOBS_KEPT:
+            _IMPORT_JOBS.pop(next(iter(_IMPORT_JOBS)), None)
+    return job.start()
+
+
+def get_import_job(job_id) -> Optional[StickerImportJob]:
+    with _IMPORT_JOBS_LOCK:
+        return _IMPORT_JOBS.get(str(job_id or ""))

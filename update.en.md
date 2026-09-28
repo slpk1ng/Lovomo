@@ -1,5 +1,58 @@
 [简体中文](update.md) · English
 
+### v1.2.3.0
+
+
+
+#### ✨ Added
+
+- Plugins: a new “Check for plugin updates” lists the plugins that have a newer release in the market, and each one can be downloaded and replaced right in the dialog (an overwrite install that keeps the enabled state and the plugin's data).
+- Speech recognition: voice messages from users are transcribed with the settings under “Configuration → More → Speech Recognition” before the character answers.
+- Configuration: a new “More” group collects statistics, software updates, the plugin system, volume normalisation and speech recognition; the preset dialog gained “Open Folder”, which opens the preset directory directly.
+- Chat history: each person's bubbles are coloured differently.
+- Stickers: a new “Auto-recognize” button takes a batch of images or a folder, lets the vision model decide the emotion folder and a generic name for each one, and files them into the matching folder under the sticker directory (folder names go through the same sanitising rules as auto-capture, so no junk folders are created).
+
+
+
+#### 🛠 Fixed
+
+- Speech recognition: fixed ModuleNotFoundError when the audio language is “Auto-detect” (and for Japanese/English/Korean) — the GPT-SoVITS runtime ignores PYTHONPATH, so the script now gets the project root through a bootstrap; a script that produces nothing now reports its exit code and reason instead of a bare “no text recognised”.
+- Speech synthesis: fixed a sentence that was only spoken up to its first few mora being sent as the whole line — when the voiced length is too short the line is re-synthesised piece by piece and merged, and if that still fails only the text is sent instead of half a sentence.
+
+
+
+#### 🛠 Fixed
+
+- Window close/restart: fixed duplicate processes after repeated open/close, slow UI rebuild, occasionally needing to click twice to minimize to tray, and the process disappearing when reopening from tray after stopping local TTS.
+- Second password: fixed cases where it still asked for the password again after unlocking.
+- Group identity: fixed the character forgetting an already established form of address after a long conversation.
+- Group speaker mix-up: fixed speaker labels being renumbered inside the truncated history window when the automatic conversation summary is on, so the label no longer disagreed with the current speaker in the prompt.
+- User profiles: the nickname now defaults to the person's QQ nickname.
+- Self-learning: fixed learned meanings being tied to one character so they were unusable after switching characters; fixed a term you approved on the page dropping back into “Pending” after a restart.
+- Chat history: fixed a reply sent as several separate messages being merged into a single record.
+- Statistics: fixed the user column of “Most Active Sessions TOP10” being empty.
+- Scheduled tasks: fixed the catch-up of a missed daily greeting being sent twice.
+- Reasoning output: fixed the full-width thinking markers of R1-style models not being recognised, so reasoning could be spoken as dialogue.
+- User profiles: fixed raw user text being executed as an instruction by the extraction prompt.
+- Cloud TTS: fixed an abnormally large preview audio being decoded in full and eating memory.
+- Speech recognition: fixed a temp directory that could not be deleted being left behind silently.
+- Window: fixed the exit-time save and the delayed save overwriting each other.
+- Password check: the login password and the second password now use a timing-safe comparison.
+- Plugins: a duplicate command name shadowed by a later plugin is now reported in the log.
+- Installer: installing or uninstalling now closes a running Lovomo first (it asks for a normal exit, then terminates the process if that does not happen within a few seconds), so a locked exe or log file can no longer make an install fail or delete only half of the program; the in-app guide was refreshed accordingly.
+
+
+
+#### ⚡ Improved
+
+- Logs: every line now carries the uniform `[hh:mm:ss.mmm][Lovomo/插件][信息/警告/错误]` prefix (plugin-originated lines show `[插件]`).
+- Logs: log lines are coloured by level — white for normal output, yellow for warnings, red for errors.
+- Configuration page: the active character identifier moved to the top of “Multi-role Configuration”; “Hide advanced GSV parameters” and flood control moved into “More”, which now always sits at the bottom of the page.
+
+
+
+
+
 ### v1.2.2.0
 
 
@@ -35,7 +88,6 @@
 - Chat history: with "By character (newest in group)" selected, the character groups themselves are now ordered by their newest conversation, so the character you talked to most recently comes first.
 
 - The interface could still be the old one after an update: the page is no longer kept in the cache, and the WebView2 cache directory is cleared automatically when the version or the interface file changes (clearing the system browser's cache has no effect on it).
-
 
 
 #### ⚡ Improved
