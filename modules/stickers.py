@@ -117,7 +117,7 @@ DEFAULT_CAPTURE_PROMPT = (
     "\"reason\": \"通用用途名（6~12字，不含角色名）\"}。"
     "category 必须照抄【表情包收藏判定】里给出的分类清单中的名称，"
     "禁止自己新造分类，禁止填 default 或 any。"
-    "如果拿不准，直接输出 {\"sticker_capture\": false}。"
+    "不适合当表情包的图片一律不要收藏，直接输出 {\"sticker_capture\": false}。"
 )
 
 # 完整映射表：模型说中文/英文，自动翻译成白名单里的拼音
@@ -610,11 +610,6 @@ async def auto_capture_image(config, sticker_manager, source, category_hint="",
     cat = resolve_capture_category(root, category_hint)
 
     dirs = [cat]
-    # 同时放一份进 any 池：情绪分类目录是"这个表情适合什么情绪"，
-    # any 池是"任意情绪都可用的通用池"。只存情绪目录的话，
-    # 其他情绪回复时 any_pool 里看不到这张图，收藏等于白收。
-    if config.get("sticker_capture_any_pool", True) and cat != "any":
-        dirs.append("any")
 
     # 表情名与说明都按用途来：带上角色名的话，换了角色这套名字就不好用了
     reason = drop_role_names(reason, role_names_from_config(config))

@@ -138,11 +138,16 @@ class RAGManager:
                     return np.array(vecs, dtype=np.float32)
         except Exception as e:
             target = (f"{base_url}/api/embed（或 /api/embeddings）" if backend == "ollama"
-                      else f"{base_url}/v1/embeddings")
+                      else (embedding_url or f"{base_url}/embeddings"))
             model_hint = ("rag_embedding_model" if backend == "ollama" else "llm_embedding_model")
+            extra = ""
+            if backend != "ollama" and not embedding_url:
+                extra = ("；「Embedding 端点」留空时会拼在 llm_base_url 后面，"
+                         "嵌入服务不在同一个地址就把它填成完整地址"
+                         "（例如 http://127.0.0.1:1234/v1/embeddings）")
             print(f"RAG 嵌入失败: {type(e).__name__}: {e}\n"
-                  f"（目标服务：{target}，嵌入模型：{model}。"
-                  f"请确认 LLM/嵌入服务已启动，且 {model_hint} 配置正确。）")
+                  f"（目标端点：{target}，嵌入模型：{model}。"
+                  f"请确认该端点可达，且 {model_hint} 配置正确{extra}。）")
             return None
 
     # ---------------- 分块 ----------------
@@ -205,7 +210,8 @@ class RAGManager:
         return True
 
     # ---------------- 检索 ----------------
-    async def search(self, query: str, top_k: int = None, min_sim: float = None) -> List[dict]:
+    async def search(self, query: str, top_k: int = None, min_sim: float = None,
+                     verbose: bool = False) -> List[dict]:
         if not self.index:
             return []
         top_k = int(top_k or self.config.get("rag_top_k", 3))
@@ -215,6 +221,7 @@ class RAGManager:
             return []
         q = _normalize(qvec)[0]
         hits = []
+        best_sim = 0.0
         for doc in self.index:
             try:
                 mat = np.load(self.docs_dir / f"{doc['id']}.npy")
@@ -231,9 +238,16 @@ class RAGManager:
             order = np.argsort(-sims)[:top_k]
             for idx in order:
                 sim = float(sims[idx])
+                best_sim = max(best_sim, sim)
                 if sim >= min_sim:
                     text = chunks[int(idx)] if int(idx) < len(chunks) else ""
                     hits.append({"doc": doc.get("name", ""), "sim": round(sim, 3), "text": text})
+        if not hits and best_sim > 0 and verbose:
+            # 「没找到」时把最接近的分数打出来：只看"无结果"分不清是差一点还是完全不相干，
+            # 调 rag_min_similarity 就成了盲调。只在手动检索测试时打，自动注入那一路不打，
+            # 否则知识库与话题无关的每一轮都会刷一行
+            print(f"RAG 检索：没有片段达到相似度下限 {min_sim}（最接近的一段 {best_sim:.3f}）。"
+                  f"查询越短越泛分数越低，想更宽松可调小 rag_min_similarity。")
         hits.sort(key=lambda h: -h["sim"])
         return hits[:top_k]
 

@@ -4,6 +4,7 @@
   { "10001": {"nickname": "小明", "birthday": "05-20", "likes": [...], "notes": [...], "updated_at": ts} }
 """
 import json
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -23,7 +24,8 @@ DEFAULT_EXTRACT_PROMPT = (
     "4. 拿不准就不存，宁可少存不可错存；没有可提取内容时输出空对象。\n"
     "5. 若用户明确表示旧画像信息已过时或改口（如“我现在不喜欢猫了”“别再说我爱吃辣”），"
     "请输出对应移除字段（likes_remove / dislikes_remove / notes_remove 数组列出要删的旧条目），"
-    "整类清空可用 clear_likes=true 等，程序会据此替换或删除旧内容。\n"
+    "整类清空可用 clear_likes=true 等；为避免一次误判把画像整个清掉，"
+    "程序单次最多只会删掉该类的一半，清空得分几次来。\n"
     "只输出JSON，格式："
     '{"nickname": "称呼/昵称(可选)", "birthday": "MM-DD(可选)", "likes": ["用户本人喜好"], '
     '"dislikes": ["用户本人厌恶"], "notes": ["重要事项"], '
@@ -116,6 +118,30 @@ def _strip_assistant_leak(data: dict, user_text: str, reply_text: str) -> dict:
     return out
 
 
+# 条目比较前先归一化：模型改写旧条目时，标点与空白的差异不该让删除失效
+_COMPARE_STRIP_RE = re.compile(r"[\s，。！？、,.!?;；:：\"'“”‘’（）()【】\[\]…~～·—\-]+")
+
+
+def _compare_key(text) -> str:
+    return _COMPARE_STRIP_RE.sub("", str(text or "")).lower()
+
+
+def _remove_items(bucket: list, remove) -> list:
+    """按归一化文本删除旧条目；互相包含且足够长也算命中，容错模型改写的近义说法。"""
+    if not isinstance(remove, list):
+        return list(bucket or [])
+    keys = [k for k in (_compare_key(x) for x in remove) if k]
+    if not keys:
+        return list(bucket or [])
+    kept = []
+    for item in bucket or []:
+        key = _compare_key(item)
+        if key and any(key == k or (len(k) >= 6 and (k in key or key in k)) for k in keys):
+            continue
+        kept.append(item)
+    return kept
+
+
 class UserProfileManager:
     def __init__(self, config, data_path: Path):
         self.config = config
@@ -175,26 +201,30 @@ class UserProfileManager:
             val = str(data.get(key, "") or "").strip()
             if val:
                 profile[key] = val
+        # 删除类字段只在「用户明确改口」时才有意义，一次只会删一两条。模型（上下文里
+        # 只剩一条乱码消息时尤其）容易把整类判成过时，一次删空会让画像整个消失，
+        # 所以单次最多删掉该类的一半，真要清空得分几次来。
         for key in ("likes", "dislikes", "notes"):
-            remove = data.get(key + "_remove")
-            if isinstance(remove, list):
-                bucket = profile.get(key, [])
-                for item in remove:
-                    item = str(item).strip()
-                    if item:
-                        bucket = [x for x in bucket if x != item]
-                # 纯删除不做截断：已存的条目超过上限时，删一条不该顺带丢掉最老的几条
-                profile[key] = bucket
+            bucket = [str(x).strip() for x in (profile.get(key) or []) if str(x).strip()]
+            if not bucket:
+                continue
+            limit = max(1, len(bucket) // 2)
             if data.get("clear_" + key):
-                profile.pop(key, None)
+                profile[key] = bucket[limit:]
+            elif isinstance(data.get(key + "_remove"), list):
+                # 纯删除不做截断：已存的条目超过上限时，删一条不该顺带丢掉最老的几条
+                profile[key] = _remove_items(bucket, data[key + "_remove"][:limit])
         for key in ("likes", "dislikes", "notes"):
             items = data.get(key)
             if isinstance(items, list):
                 bucket = profile.setdefault(key, [])
+                known = {_compare_key(x) for x in bucket}
                 for item in items:
                     item = str(item).strip()
-                    if item and item not in bucket:
+                    norm = _compare_key(item)
+                    if item and norm and norm not in known:
                         bucket.append(item)
+                        known.add(norm)
                 profile[key] = bucket[-50:]
                 if not profile[key]:
                     profile.pop(key, None)
@@ -230,8 +260,12 @@ class UserProfileManager:
 
     # ---------------- LLM 自动提取 ----------------
     async def extract_from_dialog(self, ctx: RoleContext, user_text: str, reply_text: str,
-                                  user_id: str):
-        """对话后异步提取用户信息（失败静默）。"""
+                                  user_id: str, only_missing: bool = False):
+        """对话后异步提取用户信息（失败静默）。
+
+        only_missing 用于摘要更新后的复核：只补原有画像里还没写到的字段，
+        已有内容一律不动（复核拿到的是整段对话，改写旧信息的风险更高）。
+        """
         if not str(user_text or "").strip():
             return
         prompt = str(self.config.get("profiles_extract_prompt", "") or DEFAULT_EXTRACT_PROMPT)
@@ -247,7 +281,10 @@ class UserProfileManager:
                        f"【用户说】\n<<<\n{user_text}\n>>>\n"
                        f"【角色回复】\n<<<\n{reply_text}\n>>>\n"
                        "依据只允许来自【用户说】的内容；【角色回复】中角色的自称、喜好、转述、"
-                       "客套等一律不得写进用户画像。")
+                       "客套等一律不得写进用户画像。\n"
+                       "另外请对照已有画像里的 notes 复核一遍：已经过期、只针对某一次对话、"
+                       "或与其它条目重复的，照抄原条目原文列进 notes_remove（不要改写措辞），"
+                       "仍然有效的保持不动；新出现的重要事项照常写进 notes。")
         try:
             data = await generate_json_reply(ctx, system, user_prompt, max_tokens=256)
         except Exception as e:
@@ -263,7 +300,28 @@ class UserProfileManager:
             data["nickname"] = asked
         else:
             data.pop("nickname", None)
+        if only_missing:
+            self._drop_known_fields(data, user_id)
         self.update(user_id, data)
+
+    def _drop_known_fields(self, data: dict, user_id: str):
+        """把画像里已有的字段从提取结果里去掉：复核只补空缺，不改写旧内容。"""
+        profile = self.profiles.get(str(user_id)) or {}
+        for key in ("birthday",):
+            if str(profile.get(key) or "").strip():
+                data.pop(key, None)
+        for key in ("likes", "dislikes", "notes"):
+            data.pop(key + "_remove", None)
+            data.pop("clear_" + key, None)
+            known = {str(x).strip() for x in (profile.get(key) or [])}
+            items = data.get(key)
+            if not isinstance(items, list):
+                continue
+            kept = [i for i in items if str(i).strip() and str(i).strip() not in known]
+            if kept:
+                data[key] = kept
+            else:
+                data.pop(key, None)
 
     # ---------------- 注入提示词 ----------------
     def build_injection(self, user_id: str) -> str:

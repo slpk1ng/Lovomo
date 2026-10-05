@@ -2,20 +2,127 @@
 import asyncio
 import contextlib
 import contextvars
+import json
+import random
 import re
 import time
 from pathlib import Path
 from typing import List, Optional
 
 from .llm_helpers import (MENTION_PLACEHOLDER, RoleContext, segment_for_tts, lang_text_broken,
-                          translate_to_lang, available_mimics)
+                          translate_to_lang, available_mimics, apply_literal_mention,
+                          DELIVERY_CHARS, DELIVERY_MODES)
 from .tts import synthesize_sentence, merge_wavs, get_audio_duration
 from .tts_service import check_tts_service
 from .stickers import resize_for_output
+from .adapters import client_supports
 
 
 # 本次发送使用的 NapCat 连接（多账号时按角色临时切换；未设置则用默认连接）
 _CURRENT_CLIENT = contextvars.ContextVar("lovomo_send_client", default=None)
+
+# 语音合成一次只服务一条消息：主动消息/问候/提醒可能同时开火，一起挤进 TTS
+# 会把服务占满、大部分请求超时后降级成纯文本。这里按事件循环排队，
+# 让每条消息都能等到自己的语音（同一条消息内部仍可并发合成多句）。
+_VOICE_LOCKS: dict = {}
+
+# 只能发文字的接入方式（微信 ClawBot / QQ 官方）两条消息之间的最小间隔与随机抖动。
+# 一条回复按句发好几条，句间隔只有几百毫秒——端上看到的正常节奏是 1.5 秒上下一条。
+TEXT_ONLY_SEND_MIN_GAP = 1.5
+TEXT_ONLY_SEND_GAP_JITTER = 1.0
+
+# 撤回：模型要求把这条回复发出去之后再撤掉（说错了想收回，或故意让主人看一眼）。
+# 延迟夹在上下限之间，免得模型填出「等一小时」这种离谱的秒数。
+RECALL_MIN_DELAY_SECONDS = 1.0
+RECALL_MAX_DELAY_SECONDS = 60.0
+DEFAULT_RECALL_DELAY_SECONDS = 3.0
+# 主人要求撤回的那条不是她发的消息：系统撤不了，这时也不能让她把刚发的这条撤掉，
+# 否则撤掉的是她自己的话，看着像撤错了对象
+RECALL_DENY = "deny"
+# 撤回别人的消息要靠管理员权限：QQ 只有管理员和群主能删别人的消息
+GROUP_ADMIN_ROLES = ("owner", "admin")
+
+# 主人说「撤回刚才那条」时要撤的是已经发出去的消息：每个会话留最近几条的 id 备查，
+# 超时或超过条数的丢掉，不落盘（重启后本来也无从撤回）。
+# 条数要留够：主人引用一条几分钟前的消息让撤回时，得能在那条 id 上找到同一句话的
+# 其它消息，只留十条的话早就被挤出去了。
+RECENT_SENT_MAX = 200
+RECENT_SENT_TTL_SECONDS = 600.0
+
+# 逐字发送的条数与节奏：模型要求「一个字一个字说话」时才会走到这条路，
+# 拆得太碎会把会话刷屏（条数封顶），每条之间留一点打字间隔才像真人。
+DELIVERY_MAX_MESSAGES = 20
+DELIVERY_CHAR_GAP_SECONDS = 0.2
+
+
+def _action_receipt(action: str, ok: bool, **extra) -> dict:
+    """动作执行回执。
+
+    动作是"模型声明、发送层执行"的：只有回执能说清它到底做了没有。
+    失败也要带原因（unsupported / no_client / error / …），
+    上层据此判定，并把结果回灌给模型，而不是让它以为做过。
+    """
+    receipt = {"action": action, "ok": bool(ok), "at": time.time()}
+    receipt.update({key: value for key, value in extra.items() if value is not None})
+    return receipt
+
+
+def _char_pieces(text) -> List[str]:
+    """逐字发送：把台词拆成单字，空白丢掉。
+
+    标点必须保留——「！」「？」「@」都是角色有意写出来的，丢掉会让句子读起来变味
+    （以前的判据按「纯标点」整字过滤，单个 @ 或单个感叹号会凭空消失）。
+    @ 占位符不是台词，要整块留着交给发送层换成真正的@，不能拆成「a」「t」发出去。
+    """
+    rest = str(text or "")
+    pieces: List[str] = []
+    while rest:
+        idx = rest.find(MENTION_PLACEHOLDER)
+        if idx < 0:
+            pieces.extend(ch for ch in rest if ch.strip())
+            break
+        pieces.extend(ch for ch in rest[:idx] if ch.strip())
+        pieces.append(MENTION_PLACEHOLDER)
+        rest = rest[idx + len(MENTION_PLACEHOLDER):]
+    return pieces
+
+# 选择性发送语音：不是每条回复都值得配一段语音（又慢又机械），
+# 由「语音发送方式」决定——总是发 / 按概率 / 只在私聊发。
+VOICE_MODE_ALWAYS = "always"
+VOICE_MODE_CHANCE = "chance"
+VOICE_MODE_PRIVATE = "private"
+VOICE_MODES = (VOICE_MODE_ALWAYS, VOICE_MODE_CHANCE, VOICE_MODE_PRIVATE)
+DEFAULT_VOICE_CHANCE = 0.3
+
+
+def voice_enabled_for(config, session_type: str) -> bool:
+    """这条回复要不要带语音。
+
+    always：每条都发（默认，保持原有行为）；chance：按 reply_voice_chance 掷一次；
+    private：只在私聊发语音，群聊只发文字。整条回复只该调用一次（概率模式按条掷）。
+    """
+    mode = str((config or {}).get("reply_voice_mode") or VOICE_MODE_ALWAYS).strip().lower()
+    if mode not in VOICE_MODES:
+        mode = VOICE_MODE_ALWAYS
+    if mode == VOICE_MODE_PRIVATE:
+        return str(session_type or "") == "private"
+    if mode == VOICE_MODE_CHANCE:
+        try:
+            chance = float((config or {}).get("reply_voice_chance", DEFAULT_VOICE_CHANCE))
+        except (TypeError, ValueError):
+            chance = DEFAULT_VOICE_CHANCE
+        return random.random() < max(0.0, min(1.0, chance))
+    return True
+
+
+def voice_lock() -> asyncio.Lock:
+    """当前事件循环上的语音合成排队锁（不同循环各有一把，测试里反复起循环也安全）。"""
+    loop = asyncio.get_running_loop()
+    lock = _VOICE_LOCKS.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _VOICE_LOCKS[loop] = lock
+    return lock
 
 
 def _normalize_target(session_type: str, target_id) -> tuple:
@@ -27,6 +134,70 @@ def _normalize_target(session_type: str, target_id) -> tuple:
     if s.startswith("group_"):
         return "group", s.split("_", 1)[1].split("_")[0]
     return session_type, target_id
+
+
+def _as_target(target_id):
+    """NapCat（OneBot）要数字号码，微信 ClawBot / QQ 官方给的是字符串 ID。
+
+    数字就转成 int（保持原有行为），否则原样传下去。
+    """
+    s = str(target_id)
+    return int(s) if s.lstrip("-").isdigit() else s
+
+
+def _extract_message_id(result) -> str:
+    """从发送接口的返回值里取刚发出去那条消息的 id（各接入方式字段名不同）。
+
+    撤回要用它，取不到就当这条消息没法撤回。
+    """
+    if isinstance(result, dict):
+        for key in ("message_id", "msg_id", "id"):
+            value = result.get(key)
+            if value not in (None, "", 0):
+                return str(value)
+    return ""
+
+
+def recall_delay_of(sentence) -> float:
+    """这次撤回等多少秒：模型没填就用默认值，超出范围夹到上下限。"""
+    raw = sentence.get("recall_delay") if isinstance(sentence, dict) else None
+    try:
+        delay = float(raw)
+    except (TypeError, ValueError):
+        delay = DEFAULT_RECALL_DELAY_SECONDS
+    return max(RECALL_MIN_DELAY_SECONDS, min(RECALL_MAX_DELAY_SECONDS, delay))
+
+
+async def group_member_role(client, group_id, user_id) -> str:
+    """查群成员角色（owner / admin / member）；查不到返回空串。
+
+    撤回别人的消息要靠它判权限。只发文字的接入方式没有这个接口，取不到就当没权限。
+    """
+    getter = getattr(client, "get_group_member_info", None)
+    if getter is None or not group_id or not user_id:
+        return ""
+    try:
+        resp = await getter(group_id=_as_target(group_id), user_id=_as_target(user_id))
+    except Exception as e:
+        print(f"查群成员角色失败 ({group_id}/{user_id}): {type(e).__name__}: {e}")
+        return ""
+    data = resp.get("data") if isinstance(resp, dict) else None
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("role") or "")
+
+
+async def can_recall_others(client, group_id, requester_id, requester_role="") -> bool:
+    """请求撤回的人与机器人自己都是管理员或群主时，才允许撤别人的消息。"""
+    if not group_id or not requester_id:
+        return False
+    role = str(requester_role or "").lower()
+    if role not in GROUP_ADMIN_ROLES:
+        role = (await group_member_role(client, group_id, requester_id)).lower()
+    if role not in GROUP_ADMIN_ROLES:
+        return False
+    bot_role = await group_member_role(client, group_id, getattr(client, "self_id", ""))
+    return bot_role.lower() in GROUP_ADMIN_ROLES
 
 
 _VOICE_GAP_LEAD = 0.5     # 语音播完后额外留的间隔
@@ -78,9 +249,147 @@ class MessageSender:
         self.config = config
         self.memory_manager = memory_manager
         self.sticker_manager = sticker_manager
+        # 最近一次发出的表情包（键=会话，值=路径）：聊天记录把真实图片记进历史用，
+        # 主流程取用后置空。只保留最后一条，避免跨会话误记。
+        self.last_sent_sticker = None
         self.stats = stats
         self.client = None  # NapCatClient，主循环连接后注入
         self.role_clients = {}  # 角色标识符 -> 该角色独立的 NapCatClient
+        # 会话 -> 收到该会话消息的那条连接：主动消息/提醒要知道该往哪条接入方式发
+        self.session_clients = {}
+        # 接入方式 id -> 客户端：重启后靠它把上次记下的"会话属于哪条接入方式"接回来
+        self.channel_clients = {}
+        self._session_channels = {}
+        self._session_channels_loaded = False
+        # 只能发文字的接入方式：每条会话上次发出去的时刻，用来拉开两条消息的间隔
+        self._text_only_last_sent = {}
+        # 最近一次戳一戳的回执（失败带原因），供上层判断动作到底做了没有
+        self.last_poke_receipt: Optional[dict] = None
+        # 刚发出去那条消息的 id（撤回要用，发送后立刻取，别的协程插不进来）
+        self.last_message_id = ""
+        # 挂在后台等待撤回的任务，留着引用免得被回收
+        self._recall_tasks = set()
+        # 会话 -> 最近发出去的消息 [(时刻, id, 组号)]，主人说「撤回刚才那条」时按它找
+        self._recent_sent = {}
+        # 同一句话拆成多条消息（文字 + 语音）时共用一个组号：撤回要整组一起撤，
+        # 只撤掉其中一条会剩下半截。没指定组号的消息各自成组。
+        self._sent_group = 0
+
+    # ---- 会话属于哪条接入方式（要跨重启记住，否则主动消息会落到默认连接）----
+    def _session_channels_path(self) -> Optional[Path]:
+        data_path = getattr(self.memory_manager, "data_path", None)
+        return Path(data_path) / "session_channels.json" if data_path else None
+
+    def _load_session_channels(self) -> None:
+        if self._session_channels_loaded:
+            return
+        self._session_channels_loaded = True
+        path = self._session_channels_path()
+        if path is None or not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"会话接入方式映射读取失败（按空处理）: {type(e).__name__}: {e}")
+            return
+        if isinstance(data, dict):
+            self._session_channels = {str(k): str(v) for k, v in data.items() if v}
+
+    def _save_session_channels(self) -> None:
+        path = self._session_channels_path()
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(self._session_channels, ensure_ascii=False, indent=1),
+                            encoding="utf-8")
+        except OSError as e:
+            print(f"会话接入方式映射保存失败（忽略）: {type(e).__name__}: {e}")
+
+    def set_channel_client(self, channel_key: str, client) -> None:
+        """登记/注销"接入方式 id → 客户端"，连接建立与断开时各调一次。"""
+        key = str(channel_key or "").strip()
+        if not key:
+            return
+        if client is None:
+            self.channel_clients.pop(key, None)
+        else:
+            self.channel_clients[key] = client
+
+    def channel_key_of(self, client) -> str:
+        """这条客户端对应的接入方式 id：优先问连接自己，其次按登记表反查。"""
+        if client is None:
+            return ""
+        conn = getattr(client, "connection", None)
+        if isinstance(conn, dict) and str(conn.get("id") or "").strip():
+            return str(conn["id"]).strip()
+        for key, value in self.channel_clients.items():
+            if value is client:
+                return key
+        return ""
+
+    def remember_session(self, session_id: str, client) -> None:
+        """记下这条会话是从哪条接入方式来的（落盘，重启后仍然算数）。"""
+        sid = str(session_id or "")
+        if not sid or client is None:
+            return
+        self.session_clients[sid] = client
+        key = self.channel_key_of(client)
+        if key and self._session_channels.get(sid) != key:
+            self._load_session_channels()
+            self._session_channels[sid] = key
+            self._save_session_channels()
+
+    # 会话 ID 里带这些标记的目标一定来自微信 ClawBot：私聊是 openid（…@im.wechat），
+    # 群聊是 …@chatroom，机器人自己是 …@im.bot。QQ 号是纯数字，看不出是哪条 QQ 连接。
+    # 带下划线的写法是记忆文件名净化过的（@ 与 . 都变成 _），两种都要认。
+    _WECHAT_TARGET_MARKERS = ("@im.wechat", "@chatroom", "@im.bot",
+                              "_im_wechat", "_chatroom", "_im_bot")
+
+    @classmethod
+    def platform_of_session(cls, session_id: str) -> str:
+        """按会话 ID 判断它属于哪类接入方式（判断不了返回空串）。"""
+        raw = str(session_id or "")
+        target = raw.split("_", 1)[1] if raw.startswith(("private_", "group_")) else raw
+        if any(marker in target for marker in cls._WECHAT_TARGET_MARKERS):
+            return "wechat_clawbot"
+        return ""
+
+    def _client_for_platform(self, platform: str):
+        """已登记的接入方式里挑一条该平台的连接（多条时按 id 取第一条，行为稳定）。"""
+        if not platform:
+            return None
+        matches = sorted((key, client) for key, client in self.channel_clients.items()
+                         if str(getattr(type(client), "platform", "") or "") == platform)
+        return matches[0][1] if matches else None
+
+    def session_client(self, session_id: str):
+        """这条会话该走哪条连接（找不到返回 None，由调用方决定回落）。
+
+        不这么做的话，微信会话的提醒会走默认的 NapCat，报「无法获取用户信息」。
+        重启后内存里没有映射，就按落盘的"会话 → 接入方式 id"找回来；连映射都没有
+        （老会话、换过接入方式）时按目标格式判断平台再挑连接 —— 只有默认连接可用
+        时才回落，否则微信会话的提醒/日记照样发不出去。
+        """
+        sid = str(session_id or "")
+        client = self.session_clients.get(sid)
+        if client is None:
+            self._load_session_channels()
+            key = self._session_channels.get(sid, "")
+            client = self.channel_clients.get(key) if key else None
+        if client is None:
+            platform = self.platform_of_session(sid)
+            client = self._client_for_platform(platform)
+            if client is not None:
+                print(f"会话 {sid} 没有接入方式记录，按 ID 判断走「{platform}」这条连接。")
+                self.remember_session(sid, client)
+        return client
+
+    @contextlib.contextmanager
+    def for_session(self, session_id: str):
+        """按会话自动选连接：消息从哪条接入方式来，主动消息就往哪条发。"""
+        with self.using_client(self.session_client(session_id)):
+            yield
 
     # ---------------- 连接选择 ----------------
     def set_role_client(self, role_key: str, client) -> None:
@@ -94,10 +403,10 @@ class MessageSender:
             self.role_clients[key] = client
 
     def client_for(self, role) -> object:
-        """取某个角色发送时该用的连接：配了独占连接就用它，否则用默认连接。"""
+        """取某个角色发送时该用的连接：绑了接入方式就用它，否则用默认连接。"""
         role = role or {}
         key = str(role.get("character_key", "") or "").strip()
-        if key and str(role.get("napcat_ws_url") or "").strip():
+        if key and str(role.get("connection_id") or "").strip():
             client = self.role_clients.get(key)
             if client is not None:
                 return client
@@ -116,18 +425,44 @@ class MessageSender:
         return _CURRENT_CLIENT.get() or self.client
 
     # ---------------- 基础发送 ----------------
-    async def send_segments(self, session_type: str, target_id, segments: list) -> bool:
+    async def send_segments(self, session_type: str, target_id, segments: list,
+                            group=None) -> bool:
         client = self._active_client()
         if client is None:
             print("发送失败：NapCat 客户端尚未连接")
             return False
         session_type, target_id = _normalize_target(session_type, target_id)
+        self.last_message_id = ""
         try:
-            await self._send_with_retry(session_type, target_id, segments)
+            result = await self._send_with_retry(session_type, target_id, segments)
+            self.last_message_id = _extract_message_id(result)
+            self._remember_sent(session_type, target_id, self.last_message_id, group)
             return True
         except Exception as e:
             print(f"发送消息失败 ({session_type} {target_id}): {type(e).__name__}: {e}")
             return False
+
+    def new_message_group(self) -> int:
+        """开一个新的消息组，返回组号。
+
+        同一句话会拆成文字与语音两条消息，撤回时要整组一起撤；把组号传给这几次
+        发送即可。不传组号的消息各自成组（纯文字通道每句话本来就只有一条）。
+        """
+        self._sent_group += 1
+        return self._sent_group
+
+    def _remember_sent(self, session_type: str, target_id, message_id: str,
+                       group=None) -> None:
+        """记下这个会话最近发出去的消息 id（撤回刚才那条时按它找）。"""
+        mid = str(message_id or "").strip()
+        if not mid:
+            return
+        key = f"{session_type}|{target_id}"
+        now = time.monotonic()
+        items = [(t, m, g) for t, m, g in self._recent_sent.get(key, [])
+                 if now - t < RECENT_SENT_TTL_SECONDS]
+        items.append((now, mid, self.new_message_group() if group is None else group))
+        self._recent_sent[key] = items[-RECENT_SENT_MAX:]
 
     async def _send_with_retry(self, session_type: str, target_id, segments: list):
         """NTQQ 的 sendMsg 偶发等不到消息列表更新确认（NapCat 报 NTEvent Timeout），
@@ -137,10 +472,10 @@ class MessageSender:
         for attempt in range(retries + 1):
             try:
                 if session_type == "private":
-                    await client.send_private_msg(user_id=int(target_id), message=segments)
-                else:
-                    await client.send_group_msg(group_id=int(target_id), message=segments)
-                return
+                    return await client.send_private_msg(user_id=_as_target(target_id),
+                                                         message=segments)
+                return await client.send_group_msg(group_id=_as_target(target_id),
+                                                   message=segments)
             except (asyncio.TimeoutError, TimeoutError):
                 if attempt >= retries:
                     raise
@@ -150,10 +485,13 @@ class MessageSender:
                 await asyncio.sleep(delay)
 
     async def send_text(self, session_type: str, target_id, text: str,
-                        sticker=None, reply_id=None, at_ids=None) -> bool:
+                        sticker=None, reply_id=None, at_ids=None, group=None) -> bool:
         from napcat import Text, Image, At, Reply
         normalized_type, _ = _normalize_target(session_type, target_id)
         text = "" if text is None else str(text)
+        # 这条消息实际发出去之后才有 id：没走到发送那一步就保持为空，
+        # 免得撤回拿到上一条消息的 id
+        self.last_message_id = ""
         mentions = []
         if normalized_type == "group":
             seen_at = set()
@@ -171,13 +509,19 @@ class MessageSender:
             if head.strip():
                 body.append(Text(text=head))
             body.extend(mentions)
-            if tail.strip():
-                body.append(Text(text=tail))
+            # @ 段与后面的正文之间留一个空格：客户端不会自动补，
+            # 不补的话「@某人」和紧接着的字会粘成一句
+            tail = tail.lstrip(" \t")
+            if tail:
+                body.append(Text(text=" " + tail))
         else:
             if MENTION_PLACEHOLDER in text:
                 text = re.sub(r"[ \t]{2,}", " ",
                               text.replace(MENTION_PLACEHOLDER, "")).strip(" \t")
             body.extend(mentions)
+            # 同上：@ 挂在消息开头时也要和正文隔开
+            if mentions and text.strip():
+                text = " " + text
             # 只在有文本时才加 Text 段：带表情包但不带文字时若塞入空 Text，
             # 消息段列表会出现一个空文本段（部分客户端会显示空白气泡）。
             if text.strip():
@@ -187,6 +531,10 @@ class MessageSender:
             segments.append(Reply(id=str(reply_id)))
         segments.extend(body)
         temp_sticker = None
+        # 只发文字的通道（微信 ClawBot / QQ 官方）收不到图片段：适配器会静默丢掉，
+        # 上层却看到"发送成功"。这里直接不发，连缩放都省掉。
+        if sticker is not None and not client_supports(self._active_client(), "sticker"):
+            sticker = None
         if sticker is not None:
             try:
                 send_sticker, temp_sticker = resize_for_output(sticker, self.config)
@@ -198,49 +546,326 @@ class MessageSender:
                 print(f"表情包发送失败: {e}")
         if not segments:
             return True
+        await self._pace_text_only(session_type, target_id)
         try:
-            return await self.send_segments(session_type, target_id, segments)
+            ok = await self.send_segments(session_type, target_id, segments, group=group)
+            if ok and sticker is not None:
+                # 供聊天记录把表情包以真实图片记进历史（主流程取用后清除）
+                self.last_sent_sticker = {"key": f"{normalized_type}|{target_id}",
+                                          "path": str(sticker)}
+            return ok
         finally:
             if temp_sticker is not None:
                 Path(temp_sticker).unlink(missing_ok=True)
 
-    async def send_voice(self, session_type: str, target_id, wav_path) -> bool:
+    async def _pace_text_only(self, session_type: str, target_id) -> None:
+        """只能发文字的接入方式要拉开间隔：连着蹦好几条容易被服务端当成刷屏。
+
+        微信 ClawBot 这类通道一条回复会按句发好几条，句间隔只有几百毫秒；
+        端上看到的正常节奏是 1.5 秒上下一条（别的实现也是这么节流的）。
+        能发语音的通道保持原样：QQ 那边多条气泡连着出来是用户习惯的观感。
+        """
+        if client_supports(self._active_client(), "voice"):
+            return
+        key = f"{session_type}|{target_id}"
+        now = time.monotonic()
+        gap = TEXT_ONLY_SEND_MIN_GAP + random.uniform(0, TEXT_ONLY_SEND_GAP_JITTER)
+        last = self._text_only_last_sent.get(key)
+        wait = 0.0 if last is None else max(0.0, last + gap - now)
+        if wait:
+            await asyncio.sleep(wait)
+        self._text_only_last_sent[key] = time.monotonic()
+
+    async def send_voice(self, session_type: str, target_id, wav_path, group=None) -> bool:
         from napcat import Record
         return await self.send_segments(session_type, target_id,
-                                        [Record(file=str(Path(wav_path).resolve()))])
+                                        [Record(file=str(Path(wav_path).resolve()))],
+                                        group=group)
+
+    async def poke_receipt(self, session_type: str, target_id, user_id) -> dict:
+        """戳一戳对方并返回结构化回执；被挡下时带上原因。
+
+        只返回 True/False 的话，被挡下的那次戳一戳在链路上完全无声：
+        模型以为戳了、判定以为没戳。回执让上层的判定与下一轮上下文看到真相。
+        """
+        client = self._active_client()
+        if client is None:
+            return _action_receipt("戳一戳", False, reason="no_client")
+        if not self.config.get("poke_enabled", True):
+            return _action_receipt("戳一戳", False, reason="disabled")
+        if not client_supports(client, "poke"):
+            return _action_receipt("戳一戳", False, reason="unsupported")
+        session_type, target_id = _normalize_target(session_type, target_id)
+        poke_id = str(user_id or "").strip() or str(target_id)
+        try:
+            if session_type == "group":
+                await client.group_poke(group_id=_as_target(target_id),
+                                        user_id=_as_target(poke_id))
+            else:
+                await client.friend_poke(user_id=_as_target(poke_id))
+        except Exception as e:
+            print(f"戳一戳发送失败 ({session_type} {target_id}): {type(e).__name__}: {e}")
+            return _action_receipt("戳一戳", False, reason="error")
+        return _action_receipt("戳一戳", True, target=poke_id)
+
+    async def send_poke(self, session_type: str, target_id, user_id) -> bool:
+        """戳一戳对方（群聊里 target_id 是群号、user_id 是被戳的人）。
+
+        回执见 poke_receipt：这里只保留"成没成功"的布尔结果，
+        详细原因留在 self.last_poke_receipt 上供上层取用。
+        """
+        receipt = await self.poke_receipt(session_type, target_id, user_id)
+        self.last_poke_receipt = receipt
+        return bool(receipt.get("ok"))
+
+    async def _poke_and_receipt(self, session_type: str, target_id, target) -> dict:
+        """戳一戳并返回回执。
+
+        send_poke 会被插件或测试替换成别的实现，那时拿不到 last_poke_receipt，
+        这里退回按布尔结果拼一份最小回执。
+        """
+        ok = await self.send_poke(session_type, target_id, target)
+        receipt = getattr(self, "last_poke_receipt", None)
+        if isinstance(receipt, dict) and receipt:
+            return receipt
+        return _action_receipt("戳一戳", bool(ok))
+
+    def _track_sent_id(self, bucket: List[str]) -> None:
+        """把刚发出去那条消息的 id 记下来（撤回时要用）。"""
+        mid = str(self.last_message_id or "").strip()
+        if mid:
+            bucket.append(mid)
+
+    async def delete_message(self, session_type: str, target_id, message_id) -> bool:
+        """撤回一条消息（自己的，或管理员权限下的别人的）。
+
+        只发文字的接入方式（微信 ClawBot / QQ 官方）没有撤回接口，直接跳过。
+        """
+        client = self._active_client()
+        mid = str(message_id or "").strip()
+        if client is None or not mid:
+            return False
+        if not client_supports(client, "recall"):
+            return False
+        try:
+            await client.delete_msg(message_id=_as_target(mid))
+        except Exception as e:
+            print(f"撤回消息失败 ({session_type} {target_id}): {type(e).__name__}: {e}")
+            return False
+        return True
+
+    def schedule_recall(self, session_type: str, target_id, message_ids,
+                        delay: float) -> None:
+        """过一会儿再撤回刚发出去的消息（模型要求撤回时走这里）。
+
+        从发出去到撤回隔着好几秒，不能占着会话锁干等，所以挂一个后台任务；
+        任务里 contextvars 已经还原了，要显式带上当时用的那条连接。
+        """
+        ids = [str(m) for m in (message_ids or []) if str(m or "").strip()]
+        if not ids:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        client = self._active_client()
+
+        async def _worker():
+            await asyncio.sleep(delay)
+            with self.using_client(client):
+                done = 0
+                for mid in ids:
+                    if await self.delete_message(session_type, target_id, mid):
+                        done += 1
+                if done < len(ids):
+                    print(f"撤回：{done}/{len(ids)} 条撤回成功"
+                          "（发不出去的通常是这条接入方式不支持撤回）。")
+
+        task = loop.create_task(_worker())
+        self._recall_tasks.add(task)
+        task.add_done_callback(self._recall_tasks.discard)
+
+    async def recall_recent(self, session_type: str, target_id, count: int = 1) -> int:
+        """立刻撤回这个会话最近发出去的消息，返回真的撤掉了几条。
+
+        主人说「撤回刚才那条」时走这里：模型填不填 recall 字段都不影响。
+        """
+        session_type, target_id = _normalize_target(session_type, target_id)
+        key = f"{session_type}|{target_id}"
+        now = time.monotonic()
+        items = [(t, m, g) for t, m, g in self._recent_sent.get(key, [])
+                 if now - t < RECENT_SENT_TTL_SECONDS]
+        self._recent_sent[key] = items
+        done = 0
+        for _ in range(max(1, int(count or 1))):
+            if not items:
+                break
+            _, mid, _ = items.pop()
+            if await self.delete_message(session_type, target_id, mid):
+                done += 1
+        self._recent_sent[key] = items
+        return done
+
+    async def recall_message(self, session_type: str, target_id, message_id) -> int:
+        """撤回指定的一条消息，连同与它同一句话的其它消息。
+
+        主人引用某条消息说「撤回这条」时走这里：同一条回复的一句话会拆成文字与
+        语音两条独立消息，只撤其中一条会剩下半截。这条消息太旧、记录里已经找不到
+        时至少把它自己撤掉。
+        """
+        session_type, target_id = _normalize_target(session_type, target_id)
+        wanted = str(message_id or "").strip()
+        if not wanted:
+            return 0
+        key = f"{session_type}|{target_id}"
+        now = time.monotonic()
+        items = [(t, m, g) for t, m, g in self._recent_sent.get(key, [])
+                 if now - t < RECENT_SENT_TTL_SECONDS]
+        group = next((g for _, m, g in items if m == wanted), None)
+        ids = [m for _, m, g in items if g == group] if group is not None else [wanted]
+        done = 0
+        for mid in ids:
+            if await self.delete_message(session_type, target_id, mid):
+                done += 1
+        if done:
+            gone = set(ids)
+            self._recent_sent[key] = [(t, m, g) for t, m, g in items if m not in gone]
+        else:
+            self._recent_sent[key] = items
+        return done
+
+    async def _send_plain_reply(self, session_type: str, target_id, sentences: List[dict],
+                                delivery: str, reply_id=None, at_ids=None) -> dict:
+        """只发文字、不合成语音的回复；delivery=chars 时一个字一条消息。
+
+        模型只有被主人明确要求「一个字一个字说话」时才会选 chars。回复被拆成多条
+        消息，引用与 @ 只挂在第一条上；拆出来的条数超过上限就退回按句发。
+        """
+        result = {"tts_ms": 0.0, "voice_ok": False, "tts_calls": 0, "sent_texts": [],
+                  "message_ids": [], "action_receipts": []}
+        texts: List[str] = []
+        if delivery == DELIVERY_CHARS:
+            for s in sentences:
+                texts.extend(_char_pieces(s.get("display") or s.get("zh") or ""))
+        if not texts or len(texts) > DELIVERY_MAX_MESSAGES:
+            texts = [str(s.get("display") or s.get("zh") or "").strip() for s in sentences]
+            texts = [t for t in texts if t]
+        # 正文里写了占位符时 @ 只挂在它所在的那条消息上，见 send_reply 同名变量
+        mention_in_body = any(MENTION_PLACEHOLDER in t for t in texts)
+        for idx, text in enumerate(texts):
+            if idx:
+                await asyncio.sleep(DELIVERY_CHAR_GAP_SECONDS)
+            # @ 只挂在第一条或承载占位符的那一条上：逐字发时占位符自成一格，
+            # 真正被@的是它所在的那条消息
+            ok = await self.send_text(
+                session_type, target_id, text,
+                reply_id=reply_id if idx == 0 else None,
+                at_ids=at_ids if (at_ids and (
+                    MENTION_PLACEHOLDER in text
+                    or (idx == 0 and not mention_in_body))) else None)
+            if ok:
+                result["sent_texts"].append(text)
+                self._track_sent_id(result["message_ids"])
+        return result
 
     # ---------------- 回复合送（保持原有分合逻辑 + 表情包） ----------------
     async def send_reply(self, session_type: str, target_id: str, sentences: List[dict],
                         emotions: dict, ctx: RoleContext, use_voice: bool = True,
-                        reply_id=None, allowed_at_ids=None) -> dict:
+                        reply_id=None, allowed_at_ids=None, poke_target=None,
+                        recall_request: str = "", at_names=None,
+                        speaker_id: str = "") -> dict:
         """按配置发送整组句子（文本+语音），返回 {tts_ms, voice_ok}。
 
         sentences: [{zh, lang, display, emotion}]
+        recall_request 为 "next" 时，无论模型填没填 recall，这条回复都会被撤回。
+        at_names / speaker_id 只用于把台词里写成普通文字的 @ 还原成真正的@。
         """
-        result = {"tts_ms": 0.0, "voice_ok": False, "tts_calls": 0, "sent_texts": []}
+        result = {"tts_ms": 0.0, "voice_ok": False, "tts_calls": 0, "sent_texts": [],
+                  "message_ids": [], "action_receipts": []}
+        # 这条接入方式发不了语音（微信 ClawBot、QQ 官方）就别去合成
+        if use_voice and not client_supports(self._active_client(), "voice"):
+            use_voice = False
+        # 选择性发送语音：整条回复只掷一次，逐句合成时不会再变
+        if use_voice and not voice_enabled_for(self.config, session_type):
+            use_voice = False
         if not sentences:
             return result
         session_type, target_id = _normalize_target(session_type, target_id)
+        # 动作字段只认第一句：@ 也在这里补，改完再取动作，免得改写出来的 mention_ids 白填。
+        # 字面写的两个 @ 可能落在后面任何一句上，所以每一句都要过一遍。
+        literal_mention = False
+        for sentence in sentences:
+            if apply_literal_mention(sentence, allowed_at_ids, at_names, speaker_id):
+                literal_mention = True
+        if literal_mention:
+            print("发送：台词里连着写的两个@，已换成真正的@。")
         action_sentence = next((s for s in sentences
-                                if s.get("reply_to") or s.get("mention_ids")), {})
-        selected_mentions = [str(q) for q in action_sentence.get("mention_ids", [])
-                             if str(q) in {str(x) for x in (allowed_at_ids or [])}]
+                                if s.get("reply_to") or s.get("mention_ids") or s.get("poke")
+                                or s.get("delivery") or s.get("recall")), {})
+        # @ 的目标取全部句子声明的合集：声明写在后面某一句时也要能认出来
+        selected_mentions = []
+        for sentence in sentences:
+            for qq in sentence.get("mention_ids") or []:
+                value = str(qq)
+                if value in {str(x) for x in (allowed_at_ids or [])} \
+                        and value not in selected_mentions:
+                    selected_mentions.append(value)
         action_reply_id = reply_id if action_sentence.get("reply_to") else None
         actions_pending = bool(action_reply_id is not None or selected_mentions)
+        # 正文里写了占位符时，@ 只跟着那条消息走：再顶到第一条最前面会让整条回复
+        # 里出现两个 @，而且第一个 @ 挂在并没有@人的那句上
+        mention_in_body = any(MENTION_PLACEHOLDER in str(s.get("display") or "")
+                              for s in sentences)
+        poke_pending = bool(action_sentence.get("poke")) and bool(poke_target)
+        recall_pending = (recall_request == "next"
+                          or (bool(action_sentence.get("recall"))
+                              and recall_request != RECALL_DENY)) \
+            and bool(self.config.get("recall_enabled", True))
+        recall_delay = recall_delay_of(action_sentence)
+        # 发送形态是逐字 / 纯文字时整条走纯文字分支：逐句流式发会把它拆碎，
+        # 语音合成也会白跑一遍
+        delivery = str(action_sentence.get("delivery") or "").strip().lower()
+        if delivery not in DELIVERY_MODES:
+            delivery = ""
+        if delivery:
+            if poke_pending:
+                result["action_receipts"].append(
+                    await self._poke_and_receipt(session_type, target_id, poke_target))
+            plain = await self._send_plain_reply(
+                session_type, target_id, sentences, delivery,
+                reply_id=action_reply_id, at_ids=selected_mentions)
+            if recall_pending:
+                self.schedule_recall(session_type, target_id,
+                                     plain.get("message_ids"), recall_delay)
+            return plain
 
         # 真的逐条发出去的文本（合并发送时只有一条）：调用方据此决定聊天记录
         # 要不要跟着拆成多条，免得界面上看到的是"一整段"，和 QQ 里的样子对不上
         sent_texts: List[str] = []
+        # 这条回复真正发出去的消息 id：模型要求撤回时按它逐条撤
+        sent_ids: List[str] = []
 
-        async def _send_text(text, sticker=None, zh=None):
-            nonlocal actions_pending
+        action_receipts: List[dict] = []
+
+        async def _send_text(text, sticker=None, zh=None, group=None):
+            nonlocal actions_pending, poke_pending
+            if poke_pending:
+                poke_pending = False
+                action_receipts.append(
+                    await self._poke_and_receipt(session_type, target_id, poke_target))
             ok = await self.send_text(
                 session_type, target_id, text, sticker=sticker,
                 reply_id=action_reply_id if actions_pending else None,
-                at_ids=selected_mentions if actions_pending else None)
+                # @ 跟着带占位符的那条消息走：占位符可能不在第一条上；
+                # 正文里根本没写占位符时才退回把 @ 顶在第一条最前面
+                at_ids=selected_mentions if (selected_mentions and (
+                    MENTION_PLACEHOLDER in str(text)
+                    or (actions_pending and not mention_in_body))) else None,
+                group=group)
             if ok:
                 actions_pending = False
                 sent_texts.append(str(text if zh is None else zh))
+                self._track_sent_id(sent_ids)
             return ok
 
         data_path = self.memory_manager.data_path
@@ -267,8 +892,9 @@ class MessageSender:
                                                      data_path, stats=self.stats,
                                                      mimic=s.get("mimic", ""),
                                                      mimics=available_mimics(ctx))
-            results = await asyncio.gather(*[_synthesize(s) for s in sentences],
-                                           return_exceptions=True)
+            async with voice_lock():
+                results = await asyncio.gather(*[_synthesize(s) for s in sentences],
+                                               return_exceptions=True)
             # 这条路径的耗时以前从不赋值，interactions.tts_ms 恒为 0，
             # 统计页的「平均 TTS 耗时」被系统性低估
             result["tts_ms"] = (time.time() - synth_started) * 1000
@@ -290,6 +916,10 @@ class MessageSender:
         async def _pick_sticker_for(idx: int):
             nonlocal sticker_sent
             if self.sticker_manager is None or self._active_client() is None:
+                return None
+            # 挑之前先看这条通道发不发得了图：只发文字的通道连挑都别挑
+            # （description 模式下挑一次要多调一次 LLM）
+            if not client_supports(self._active_client(), "sticker"):
                 return None
             try:
                 max_stickers = max(1, int(self.config.get("sticker_max_per_reply", 1)))
@@ -320,18 +950,27 @@ class MessageSender:
                     continue
                 # ② 逐句发送文本 + 对应语音（等上一条播完，用的是上一条自己的时长）
                 await pacer.wait()
+                # 这一句的文字与语音算同一条消息的两半：撤回要一起撤
+                msg_group = self.new_message_group()
                 if sentence_text:
-                    await _send_text(sentence_text, zh=sentences[idx].get("zh"))
-                await self.send_voice(session_type, target_id, wav)
+                    await _send_text(sentence_text, zh=sentences[idx].get("zh"),
+                                     group=msg_group)
+                await self.send_voice(session_type, target_id, wav, group=msg_group)
+                self._track_sent_id(sent_ids)
                 await pacer.hold_voice(wav)
                 wav.unlink(missing_ok=True)
                 sticker_i = await _pick_sticker_for(idx)
                 if sticker_i:
                     done_stickers.append(sticker_i)
 
-            # ③ 如果所有语音都失败，降级发送合并文本
+            # ③ 没有可用语音（这条接入方式发不了语音，或整段合成都失败）：文本仍按句逐条发。
+            # 合成不了语音就退回合并文本的话，「分开发送」在纯文字通道上等于没开，
+            # 整段回复会挤成一条（与逐句发送时每句都带文本的行为也不一致）
             if not valid_wavs:
-                await _send_text("".join(s["display"] for s in sentences))
+                for s in sentences:
+                    text = s["display"]
+                    if text:
+                        await _send_text(text, zh=s.get("zh"))
             else:
                 # ④ 处理语音失败的句子（补发文本，只发一次）
                 for idx in missing:
@@ -342,6 +981,7 @@ class MessageSender:
             # ⑤ 最后统一发送表情包
             for sticker_path in done_stickers:
                 await self.send_text(session_type, target_id, "", sticker=sticker_path)
+                self._track_sent_id(sent_ids)
 
         # ========== 合并发送（默认或文字分开但语音合并） ==========
         else:
@@ -363,6 +1003,7 @@ class MessageSender:
                 # 如果开启了文字分开发送（但语音合并），则先发语音，再逐句发文字
                 if separate_send and text_separate:
                     await self.send_voice(session_type, target_id, combined_audio)
+                    self._track_sent_id(sent_ids)
                     for i, s in enumerate(sentences):
                         await _send_text(s["display"], zh=s.get("zh"))
                         # 文字之间采用固定间隔（如果希望基于语音时长，可改为语音时长）
@@ -371,8 +1012,11 @@ class MessageSender:
                     # 正常合并发送：文字+语音一起发。
                     # 这条语音是本轮的最后一条，后面没有要发的语音，
                     # 再等它播完只会把整条会话锁住、拖慢排队的下一条消息
-                    await _send_text(combined_text)
-                    await self.send_voice(session_type, target_id, combined_audio)
+                    msg_group = self.new_message_group()
+                    await _send_text(combined_text, group=msg_group)
+                    await self.send_voice(session_type, target_id, combined_audio,
+                                          group=msg_group)
+                    self._track_sent_id(sent_ids)
 
                 # 清理临时文件
                 for w in valid_wavs:
@@ -389,17 +1033,25 @@ class MessageSender:
             sticker = await _pick_sticker_for(0)
             if sticker:
                 await self.send_text(session_type, target_id, "", sticker=sticker)
+                self._track_sent_id(sent_ids)
 
         await asyncio.to_thread(self.memory_manager.cleanup_voice_cache,
                                 self.config.get("max_voice_cache", 20))
+        if recall_pending:
+            self.schedule_recall(session_type, target_id, sent_ids, recall_delay)
+            action_receipts.append({"action": "撤回", "ok": bool(sent_ids),
+                                    "count": len(sent_ids), "at": time.time()})
         result["sent_texts"] = sent_texts
+        result["message_ids"] = sent_ids
+        result["action_receipts"] = action_receipts
         return result
 
     # ---------------- 主动消息（定时/提醒/问候） ----------------
     async def speak_and_send(self, session_type: str, target_id, text: str,
                              emotions: dict, ctx: Optional[RoleContext] = None,
                              use_voice: bool = None, sticker: bool = False,
-                             emotion: str = "", session_id: str = "") -> bool:
+                             emotion: str = "", session_id: str = "",
+                             record_history: bool = True) -> bool:
         if not text:
             return False
         if self._active_client() is None:
@@ -409,6 +1061,13 @@ class MessageSender:
             ctx = RoleContext(self.config)
         if use_voice is None:
             use_voice = bool(self.config.get("proactive_voice", False))
+        # 这条接入方式发不了语音/贴纸（微信 ClawBot、QQ 官方）就别去做这些：
+        # 语音那边会白跑一遍 TTS，贴纸则直接发失败
+        active = self._active_client()
+        if use_voice and not client_supports(active, "voice"):
+            use_voice = False
+        if sticker and not client_supports(active, "sticker"):
+            sticker = False
         sticker_path = (await self.sticker_manager.pick_async(ctx, emotion, text)
                         if (sticker and self.sticker_manager) else None)
         if use_voice and await check_tts_service(self.config):
@@ -423,13 +1082,13 @@ class MessageSender:
                     await self.send_voice(session_type, target_id, wav)
                     if sticker_path:
                         await self.send_text(session_type, target_id, "", sticker=sticker_path)
-                    if text_ok:
+                    if text_ok and record_history:
                         self.record_outgoing_history(session_id, text, ctx)
                     return bool(text_ok)
                 finally:
                     wav.unlink(missing_ok=True)
         ok = await self.send_text(session_type, target_id, text, sticker=sticker_path)
-        if ok:
+        if ok and record_history:
             self.record_outgoing_history(session_id, text, ctx)
         return ok
 

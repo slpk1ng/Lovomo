@@ -100,6 +100,7 @@ async def generate_in_character_text(ctx: RoleContext, instruction: str,
         return ""
     text = strip_thinking(str(text or "")).strip().strip('"“”')
     if not text:
+        print("角色话术生成为空（模型没有给出有效文本），本次跳过该条话术。")
         return ""
     if len(text) > raw_limit:
         clipped = clip_to_limit(text, raw_limit)
@@ -342,14 +343,20 @@ class ScheduledJobManager:
             else:
                 text = template_text
             if not text:
+                print(f"[定时任务] {job.get('name') or job.get('id', '')} 向 "
+                      f"{session_type} {session_id} 生成的话术为空，本次跳过"
+                      f"（检查 LLM 是否返回了空内容，或模板是否为空）。")
                 continue
             composed += 1
             try:
-                ok = await self.sender.speak_and_send(
-                    session_type, session_id, text, emotions, ctx,
-                    use_voice=bool(action.get("use_voice", False)),
-                    sticker=bool(self.config.get("proactive_sticker", False)),
-                    session_id=f"{session_type}_{session_id}")
+                # 按会话选连接：定时消息要发给"这条会话从哪条接入方式来的"那条通道，
+                # 否则微信/QQ 官方的会话会落到默认的 NapCat 上，根本发不出去
+                with self.sender.for_session(f"{session_type}_{session_id}"):
+                    ok = await self.sender.speak_and_send(
+                        session_type, session_id, text, emotions, ctx,
+                        use_voice=bool(action.get("use_voice", False)),
+                        sticker=bool(self.config.get("proactive_sticker", False)),
+                        session_id=f"{session_type}_{session_id}")
             except Exception as e:
                 # 单个目标失败不能中断整轮，更不能冒到调度器变成任务的 last_error
                 print(f"[定时任务] {job.get('name') or job.get('id', '')} 向 "

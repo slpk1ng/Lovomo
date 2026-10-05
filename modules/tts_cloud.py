@@ -130,9 +130,13 @@ async def synthesize_cloud(config, text: str, emotion: str, data_path: Path,
     from .tts import (_audio_too_long, _audio_too_short, _configured_char_map,
                       _log_tts_payload, _looks_like_audio, _normalize_tts_output,
                       _safe_print, _sanitize_tts_text, _unique_stamp, _wav_duration,
-                      detect_text_lang, strip_urls_for_tts)
+                      detect_text_lang, strip_non_dialogue_enabled,
+                      strip_non_dialogue_text, strip_urls_for_tts)
 
     text = strip_urls_for_tts(str(text or ""))
+    strip_nondialogue = strip_non_dialogue_enabled(config)
+    if strip_nondialogue:
+        text = strip_non_dialogue_text(text)
     if not re.sub(r'[\s。，！？、,.!?…～~；;：:]+', '', text):
         _safe_print("TTS skipped: punctuation-only sentence "
                     f"({text.encode('unicode_escape').decode('ascii')})")
@@ -158,7 +162,8 @@ async def synthesize_cloud(config, text: str, emotion: str, data_path: Path,
     cfg_lang = str(config.get("text_lang", "ja") or "ja")
     lang = detect_text_lang(clean_text, cfg_lang) if bool(config.get("tts_auto_lang", True)) \
         else cfg_lang
-    _log_tts_payload(config, text, clean_text, emotion, voice, cloud=True)
+    _log_tts_payload(config, text, clean_text, emotion, voice, cloud=True,
+                     spoken_source=text if strip_nondialogue else None)
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     if protocol == PROTOCOL_DASHSCOPE:
         endpoint = f"{base_url}{_DASHSCOPE_PATH}"

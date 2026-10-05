@@ -11,14 +11,11 @@
 """
 import re
 
-# 默认镜像：按实测可用性与能力排序（前缀式里 gh-proxy 连 api/codeload 都能过，
-# 另两个只过 raw；jsDelivr 是 CDN，最稳但会缓存，放在最后兜底）
+# 默认镜像：三个前缀式加速站，按实测可用性排序（raw 都通；api 那两个走一次重定向）
 DEFAULT_MIRRORS = (
     "https://gh-proxy.com/{url}",
-    "https://ghfast.top/{url}",
-    "https://ghproxy.net/{url}",
-    "https://cdn.jsdelivr.net/gh/{repo}@{ref}/{path}",
-    "https://gcore.jsdelivr.net/gh/{repo}@{ref}/{path}",
+    "https://githubproxy.cc/{url}",
+    "https://ghproxy.link/{url}",
 )
 
 # raw.githubusercontent.com/<owner>/<repo>/<ref>/<path...>

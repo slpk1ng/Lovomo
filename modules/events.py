@@ -2,8 +2,10 @@
 
 配置存于 data/events.json（WebUI「定时任务」页编辑）：
   [{"id": "newyear", "name": "元旦", "type": "date", "date": "01-01", "enabled": true,
-    "mode": "template|llm", "template": "新年快乐！", "llm_prompt": "今天是元旦，向主人送上祝福",
+    "mode": "llm|template", "template": "新年快乐！", "llm_prompt": "今天是元旦，向主人送上祝福",
     "use_voice": false, "targets": [{"session_type": "private", "session_id": "10001"}]}]
+
+问候默认由角色按人设现场生成（mode=llm），失败或显式配成 template 时才直接发预设话术。
 
 生日问候（type=birthday）可绑定 user_id（从用户画像读取生日）；
 另提供全局「画像生日问候」：所有画像中生日匹配今天的用户都会收到私信祝福。
@@ -171,7 +173,7 @@ class EventManager:
                 print(f"[节日问候] {event.get('name', event.get('id'))} 没有可发送的目标会话"
                       "（不是内置默认节日，或未勾选「默认节日发给全部会话」），跳过。")
                 continue
-            is_llm = str(event.get("mode", "template")) == "llm"
+            is_llm = str(event.get("mode", "llm")) != "template"
             if not is_llm:
                 # 模板模式：文案与目标无关，生成一次即可
                 text = await self._render_event_text(event, ctx)
@@ -203,7 +205,7 @@ class EventManager:
             if sent_any:
                 sent_total += 1
                 print(f"[节日问候] {event.get('name', event.get('id'))} 已发送"
-                      f"（模式：{event.get('mode', 'template')}）")
+                      f"（模式：{event.get('mode', 'llm')}）")
                 self._mark_sent(key)
             else:
                 print(f"[节日问候] {event.get('name', event.get('id'))} 全部会话发送失败，不标记已发送。")
@@ -229,11 +231,12 @@ class EventManager:
                         except Exception as e:
                             print(f"[生日祝福] 获取会话历史失败（忽略）: {type(e).__name__}: {e}")
                     text = await generate_proactive_text(ctx, text, history_block=block) or text
-                ok = await sender.speak_and_send(
-                    "private", user_id, text, emotions, ctx,
-                    use_voice=bool(self.config.get("birthday_greet_voice", False)),
-                    sticker=bool(self.config.get("proactive_sticker", False)),
-                    session_id=f"private_{user_id}")
+                with sender.for_session(f"private_{user_id}"):
+                    ok = await sender.speak_and_send(
+                        "private", user_id, text, emotions, ctx,
+                        use_voice=bool(self.config.get("birthday_greet_voice", False)),
+                        sticker=bool(self.config.get("proactive_sticker", False)),
+                        session_id=f"private_{user_id}")
                 if not ok:
                     print(f"[生日祝福] {user_id} 发送失败，不标记已发送，下次检查时重试。")
                     continue
@@ -242,17 +245,25 @@ class EventManager:
         return sent_total
 
     async def _send_to_targets(self, sender, targets, text, emotions, ctx, event) -> bool:
-        """把同一段话发给多个目标；返回是否至少成功发送了一个。"""
+        """把同一段话发给多个目标；返回是否至少成功发送了一个。
+
+        目标先去重：同一天同一个会话收到两遍问候，基本都是目标列表里有重复项。
+        """
         sent_any = False
+        seen = set()
         for target in targets:
             stype = target.get("session_type", "private")
             sid = target.get("session_id", "")
+            if (stype, str(sid)) in seen:
+                continue
+            seen.add((stype, str(sid)))
             try:
-                ok = await sender.speak_and_send(
-                    stype, sid, text, emotions, ctx,
-                    use_voice=bool(event.get("use_voice", False)),
-                    sticker=bool(self.config.get("proactive_sticker", False)),
-                    session_id=f"{stype}_{sid}")
+                with sender.for_session(f"{stype}_{sid}"):
+                    ok = await sender.speak_and_send(
+                        stype, sid, text, emotions, ctx,
+                        use_voice=bool(event.get("use_voice", False)),
+                        sticker=bool(self.config.get("proactive_sticker", False)),
+                        session_id=f"{stype}_{sid}")
             except Exception as e:
                 print(f"[节日问候] 发送失败 {target.get('session_id', '')}: {e}")
                 continue
@@ -264,8 +275,8 @@ class EventManager:
 
     async def _render_event_text(self, event: dict, ctx: RoleContext,
                                  history_block: str = "") -> str:
-        mode = event.get("mode", "template")
-        if mode == "llm":
+        mode = event.get("mode", "llm")
+        if mode != "template":
             instruction = render_template(str(event.get("llm_prompt", "") or
                                               f"今天是{event.get('name', '节日')}，向主人送上问候"),
                                           character_name=ctx.character_name)
@@ -290,9 +301,10 @@ class EventManager:
         for target in event.get("targets", []):
             stype = target.get("session_type", "private")
             sid = target.get("session_id", "")
-            ok = await sender.speak_and_send(stype, sid, text,
-                                             emotions_provider(), ctx,
-                                             use_voice=bool(event.get("use_voice", False)),
-                                             session_id=f"{stype}_{sid}")
+            with sender.for_session(f"{stype}_{sid}"):
+                ok = await sender.speak_and_send(stype, sid, text,
+                                                 emotions_provider(), ctx,
+                                                 use_voice=bool(event.get("use_voice", False)),
+                                                 session_id=f"{stype}_{sid}")
             sent_any = sent_any or bool(ok)
         return sent_any

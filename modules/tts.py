@@ -138,6 +138,57 @@ _TTS_CHAR_MAP = {
 _LEADING_JUNK_RE = re.compile(r'^(?:[\s\u3000。，、,.!?！？…～~；;：:\-—―_*#]+)')
 _TRAILING_WS_RE = re.compile(r'[\s\u3000]+$')
 
+# 2.1) 非台词内容：括号里的动作、表情、场景、演出（如 (笑)、[旁白]）与颜文字
+#      都不该被念出来。只影响语音，消息文本原样保留。
+_NONDIALOGUE_BRACKETS = (("(", ")"), ("（", "）"), ("[", "]"), ("［", "］"),
+                         ("【", "】"), ("{", "}"), ("｛", "｝"),
+                         ("〈", "〉"), ("〔", "〕"), ("〖", "〗"))
+_BRACKET_SEG_RE = re.compile("|".join(
+    re.escape(open_ch) + "[^" + re.escape(open_ch + close_ch) + "]*" + re.escape(close_ch)
+    for open_ch, close_ch in _NONDIALOGUE_BRACKETS))
+# 颜文字：整段由"表情符号"组成才判为颜文字；只有含强特征符号（ω ∀ ▽ □ ☆ 之类）才真的剔除，
+# 免得把「——」「～～」这类正常停顿标点也吃掉。
+_FACE_STRONG = "＾^´｀`ω・∀≧≦∇▽△▲°□Дд〇☆★♪♥♡⌒゜〃ゝゞ‿◕◡◠︶︵╯╰┻┳︻︼"
+_FACE_WEAK = "><;:：；'\"_\\|/／＼~～-—＝=＋+＊*"
+_KAOMOJI_SEG_RE = re.compile("[%s%s]{2,}" % (re.escape(_FACE_STRONG), re.escape(_FACE_WEAK)))
+
+
+def strip_non_dialogue_enabled(config) -> bool:
+    """是否把动作/表情/场景/颜文字这类非台词内容剔除后再合成（默认开启）。"""
+    if config is None:
+        return True
+    raw = config.get("tts_strip_non_dialogue", True)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() not in ("false", "0", "no", "off", "否", "关闭")
+
+
+def strip_non_dialogue_text(text: str, log: bool = True) -> str:
+    """剔除非台词内容（动作、表情、场景、演出、颜文字），只留要念的台词。"""
+    original = str(text or "")
+    if not original:
+        return original
+    removed = []
+
+    def _drop_bracket(match):
+        removed.append(match.group(0))
+        return ""
+
+    out = _BRACKET_SEG_RE.sub(_drop_bracket, original)
+
+    def _drop_face(match):
+        segment = match.group(0)
+        if any(ch in _FACE_STRONG for ch in segment):
+            removed.append(segment)
+            return ""
+        return segment
+
+    out = _KAOMOJI_SEG_RE.sub(_drop_face, out)
+    out = re.sub(r'[ \t\u3000]{2,}', ' ', out).strip()
+    if removed and log:
+        _safe_print(f"TTS 移除非台词内容（动作/表情/场景/颜文字，仅语音）: {removed}")
+    return out
+
 # 3) 语气拖音标记：全角波浪线（含归一化后的 — ― – 〜）与片假名长音符「ー」。
 #    连续 3 个以上一律压到 2 个。模型写「————————」时上面那条映射会把它变成
 #    十几个 ～ 送进合成，引擎会把这一串当成一个超长元音，直接进入
@@ -253,11 +304,14 @@ def _content_chars(text: str) -> str:
 
 
 def _log_tts_payload(config, original: str, clean_text: str, emotion: str, ref_path: str,
-                     cloud: bool = False):
+                     cloud: bool = False, spoken_source: str = None):
     """打印"LLM 交过来的完整内容 → 实际送去合成的文本"，便于排查少词问题。
 
     只要合成文本长度与原文不同（含只剩装饰符号被去掉的情况），就打印两边完整内容，
     这样"语音少词"的排查可以只看日志定位；内容与长度都没变时不刷屏。
+
+    spoken_source 是"按规则主动剔掉的动作/表情/场景之后的文本"：有它时，
+    内容字比对以它为基准，否则正常的非台词剔除会被误报成"清洗丢了内容"。
 
     cloud=True 时不打印参考音频、文本语言、切分、语速这几项：它们是 GPT-SoVITS 的
     请求参数，云端请求里没有，打出来会让人误以为它们被送进了云端接口。
@@ -265,7 +319,9 @@ def _log_tts_payload(config, original: str, clean_text: str, emotion: str, ref_p
     debug = str((config.get("tts_debug_log", "") if config is not None else "") or "").lower() \
         in ("true", "1", "yes", "on")
     changed = clean_text != original
-    content_lost = _content_chars(original) != _content_chars(clean_text)
+    reference = original if spoken_source is None else spoken_source
+    content_lost = _content_chars(reference) != _content_chars(clean_text)
+
     length_changed = len(clean_text) != len(original)
     if not (changed or length_changed or debug or content_lost):
         return
@@ -330,6 +386,8 @@ def split_tts_chunks(text: str, max_chars: int = 120, config=None) -> list:
     """
     extra_map = _configured_char_map(config)
     text = strip_urls_for_tts(text)
+    if strip_non_dialogue_enabled(config):
+        text = strip_non_dialogue_text(text)
     text = _sanitize_tts_text(text, extra_map=extra_map)
     if not text:
         return []
@@ -408,6 +466,10 @@ def _min_expected_seconds(text: str, config) -> float:
 # 时长上限的绝对下限：短句（大量停顿标点、结巴式重复）本身字数少，
 # 只按字数算上限会把正常音频误判成失控。
 _MAX_SECONDS_FLOOR = 6.0
+
+# 整句合成超长后最多再换一次切分方式：十来字的单句换 cut0/cut2 几乎没有区别，
+# 再拿整句反复试只会继续合成出拖腔，之后一律改走小节合成
+_TOO_LONG_FULL_ATTEMPTS = 2
 
 
 def _max_expected_seconds(text: str, config) -> float:
@@ -584,6 +646,9 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
         if sidecar:
             prompt_text = sidecar
     voice_tag = f"{emotion}+模仿:{mimic_key}" if mimic_key else emotion
+    strip_nondialogue = strip_non_dialogue_enabled(config)
+    if strip_nondialogue:
+        text = strip_non_dialogue_text(text)
     if not re.sub(r'[\s。，！？、,.!?…～~；;：:]+', '', text):
         _safe_print(f"TTS skipped: punctuation-only sentence "
                     f"({text.encode('unicode_escape').decode('ascii')})")
@@ -594,7 +659,9 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
         _safe_print("TTS skipped: empty after sanitize "
                     f"({text[:30].encode('unicode_escape').decode('ascii')})")
         return None
-    _log_tts_payload(config, text, clean_text, emotion, ref_path)
+    _log_tts_payload(config, text, clean_text, emotion, ref_path,
+                     spoken_source=text if strip_nondialogue else None)
+
     cfg_lang = str(config.get("text_lang", "ja") or "ja")
     if bool(config.get("tts_auto_lang", True)):
         lang = detect_text_lang(clean_text, cfg_lang)
@@ -621,6 +688,9 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
     best_path = None
     best_duration = 0.0
     raw_path = None
+    # 整句合成超长的次数：换一次切分方式仍超长就说明整句这条路走不通了，
+    # 后面统一改按小节合成，不再拿整句反复试
+    too_long_attempts = 0
     retry_delay = 1.0
     start = time.time()
 
@@ -654,6 +724,8 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
         return params
 
     for index, (variant, use_mimic) in enumerate(attempts):
+        if too_long_attempts >= _TOO_LONG_FULL_ATTEMPTS:
+            break
         transient_left = 2 if index == 0 else 1
         while True:
             try:
@@ -699,7 +771,8 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
                     # 偏长的一律不进 best_path：宁可这句不发语音，
                     # 也不能把几十秒的拖腔当成"最长的一段"挑出来发出去
                     temp_path.unlink(missing_ok=True)
-                    print("本次合成作废，换一种切分方式重试。")
+                    too_long_attempts += 1
+                    print("本次合成时长超限已作废，换一种切分方式重试。")
                 elif duration > best_duration:
                     if best_path is not None:
                         best_path.unlink(missing_ok=True)
@@ -719,6 +792,18 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
                 continue
             print(f"TTS 合成失败: {resp.status_code} - {str(resp.text)[:120]} | 文本={clean_text[:60]}")
             break
+    if too_long_attempts and best_path is None and not _piece_mode:
+        # 整句合成超长：不再拿整句反复试，改切小节合成 —— 小节短，念完就停，
+        # 最可能拿到正常时长的语音
+        piece_path = await _synthesize_by_pieces(
+            config, clean_text, emotion, emotions, data_path,
+            mimic=mimic, mimics=mimics)
+        if raw_path is not None:
+            raw_path.unlink(missing_ok=True)
+        if piece_path is not None:
+            if stats:
+                stats.record_tts((time.time() - start) * 1000)
+            return piece_path
     if best_path is not None:
         # 每种切分方式都短于台词该有的长度：服务端这次多半只念了个开头
         # （听感上就是"只说了两三个音"）。改成一小节一小节地合成再拼起来，
@@ -772,7 +857,7 @@ async def _synthesize_by_pieces(config, text: str, emotion: str, emotions: dict,
         (len(text) + _PIECE_MAX_PIECES - 1) // _PIECE_MAX_PIECES), config=config)
     if len(pieces) < 2:
         return None
-    print(f"整句合成时长始终不足，改按 {len(pieces)} 小节逐段合成后合并。")
+    print(f"整句合成不合格，改按 {len(pieces)} 小节逐段合成后合并。")
     paths = []
     try:
         for piece in pieces:

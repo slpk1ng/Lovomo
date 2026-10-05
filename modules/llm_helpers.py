@@ -5,6 +5,7 @@
 - chat_with_tools: Function Calling 循环（支持 Ollama 原生与 OpenAI 兼容接口）。
 """
 import asyncio
+import ipaddress
 import json
 import re
 import threading
@@ -587,6 +588,16 @@ def sentence_obj_has_text(s) -> bool:
     return any(str(s.get(k, "")).strip() for k in _TEXT_KEYS)
 
 
+def sentence_obj_has_action(s) -> bool:
+    """判断一个句子对象是否带动作（引用/@/戳一戳/发送形态/撤回）。
+
+    只有动作、没有台词的句子对象不能被当成空句子丢掉，否则动作会一起消失。
+    """
+    if not isinstance(s, dict):
+        return False
+    return any(s.get(key) for key in SENTENCE_ACTION_KEYS)
+
+
 class _TolerantJSONParser:
     """宽容 JSON 解析器：修复模型常见的 JSON 语法病，尽量避免整段输出报废。
 
@@ -853,6 +864,15 @@ def apply_text_clean(text: str, ctx) -> str:
 
 _PENDING_MODEL_UNLOAD: List[str] = []
 
+# 同一时刻可能在用的所有模型：卸载旧模型时必须把它们全部排除，
+# 否则会把正在服务的模型（例如 RAG 用的嵌入模型）一起卸掉，下一条请求又得重新加载。
+_MODEL_IN_USE_KEYS = ("llm_model_name", "image_caption_model_name",
+                      "llm_embedding_model", "rag_embedding_model")
+# 角色条目可以单独指定模型，判断时也要算进来
+_ROLE_MODEL_IN_USE_KEYS = ("llm_model_name", "image_caption_model_name")
+
+_LOOPBACK_HOSTS = {"localhost"}
+
 
 def queue_old_model_unload(model_key: str):
     """登记需要卸载的旧模型（配置保存时调用，实际卸载延迟到新模型调用成功后）。"""
@@ -861,14 +881,58 @@ def queue_old_model_unload(model_key: str):
         _PENDING_MODEL_UNLOAD.append(m)
 
 
+def _is_local_service(base_url: str) -> bool:
+    """LLM 服务地址是否指向本机（lms 命令行只能卸载本机 LM Studio 加载的模型）。"""
+    try:
+        host = urlsplit(str(base_url or "")).hostname or ""
+    except ValueError:
+        return False
+    if not host:
+        return False
+    if host.lower() in _LOOPBACK_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _models_in_use(ctx) -> set:
+    """当前配置里仍会用到、绝不能卸载的模型名。"""
+    names = set()
+    for key in _MODEL_IN_USE_KEYS:
+        value = str(ctx.get(key, "") or "").strip()
+        if value:
+            names.add(value)
+    roles = ctx.get("roles")
+    if isinstance(roles, list):
+        for role in roles:
+            if not isinstance(role, dict):
+                continue
+            for key in _ROLE_MODEL_IN_USE_KEYS:
+                value = str(role.get(key, "") or "").strip()
+                if value:
+                    names.add(value)
+    return names
+
+
 def _lmstudio_unload(model_key: str) -> bool:
     """通过 lms CLI 卸载 LM Studio 里已加载的模型。"""
     import os
     import subprocess
     lms = Path.home() / ".lmstudio" / "bin" / ("lms.exe" if os.name == "nt" else "lms")
     exe = str(lms) if lms.exists() else "lms"
+    # 控制台子进程不加这两个参数会弹出一个黑框（GUI 进程下尤其明显）
+    kwargs = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0
+        kwargs["startupinfo"] = si
     try:
-        r = subprocess.run([exe, "unload", model_key], capture_output=True, timeout=60)
+        r = subprocess.run([exe, "unload", model_key], capture_output=True,
+                           timeout=60, **kwargs)
         return r.returncode == 0
     except Exception as e:
         print(f"[模型切换] 卸载旧模型 {model_key} 失败: {e}")
@@ -876,18 +940,18 @@ def _lmstudio_unload(model_key: str) -> bool:
 
 
 def maybe_unload_old_models(ctx) -> None:
-    """新模型调用成功后触发：卸载登记过的旧模型（仅 openai 兼容后端，后台线程执行）。
+    """新模型调用成功后触发：卸载登记过的旧模型（仅本机 LM Studio，后台线程执行）。
 
-    Ollama 自己管理模型常驻（keep_alive），不需要也不会走这条路径。
+    Ollama 自己管理模型常驻（keep_alive）；云端服务没有 lms 命令行，也不该执行本机卸载，
+    这两类都直接清空登记、不走卸载。
     """
     if not _PENDING_MODEL_UNLOAD:
         return
     backend = str(ctx.get("llm_backend", "ollama") or "")
-    if backend != "openai":
+    if backend != "openai" or not _is_local_service(ctx.get("llm_base_url", "")):
         _PENDING_MODEL_UNLOAD.clear()
         return
-    still_used = {str(ctx.get("llm_model_name", "") or "").strip(),
-                  str(ctx.get("image_caption_model_name", "") or "").strip()}
+    still_used = _models_in_use(ctx)
     to_unload = [m for m in _PENDING_MODEL_UNLOAD if m and m not in still_used]
     _PENDING_MODEL_UNLOAD.clear()
     if not to_unload:
@@ -916,9 +980,19 @@ class RoleContext:
     _ROLE_PROMPT_KEYS 例外：角色条目存在时只认它自己的值。
     """
 
-    def __init__(self, config, role: Optional[dict] = None):
+    def __init__(self, config, role: Optional[dict] = None, capabilities=None):
         self.config = config  # ConfigLoader 或任何带 .get() 的对象
         self.role = role or {}
+        # 当前通道的能力位（微信 ClawBot / QQ 官方只能收发文本）：提示词据此
+        # 只讲这条通道做得到的动作，不然角色会答应去做根本做不到的事
+        self.capabilities = capabilities
+
+    def supports(self, feature: str) -> bool:
+        """当前通道支不支持某个能力；没带能力位时一律按支持处理。"""
+        caps = self.capabilities
+        if not isinstance(caps, dict):
+            return True
+        return bool(caps.get(feature, True))
 
     def get(self, key, default=None):
         if self.role and key in _ROLE_PROMPT_KEYS:
@@ -1112,11 +1186,24 @@ def recent_user_ids(history: list, limit: int = 8, exclude: str = "") -> List[st
 
 # 称呼主张的句式：把用户对自己的说法拆成「谁 + 什么称呼」。称呼本身不写死，
 # 从原话里取词，任何角色设定的称呼（中文或英文）都走同一套判定。
-_TERM_BREAK_CHARS = "\\s，。！？!?、,；;：:…～~「」『』（）()【】\\[\\]"
-_TERM_TAIL_CHARS = "的了吗嘛呢吧哦呀啊哟喔哈啦咯哇哼嗯噢耶嘿么"
+_TERM_BREAK_CHARS = "\\s，。！？!?、,；;：:…～~「」『』（）()【】\\[\\]\"“”‘’"
+_TERM_TAIL_CHARS = "的了吗嘛呢吧哦呀啊哟喔哈啦咯哇哼嗯噢耶嘿么就行"
 _TERM_STOP_WORDS = frozenset({"话", "事", "问题", "意思", "谁", "什么", "东西", "错", "责任",
                              "我", "俺", "咱", "你", "妳", "您", "乃",
                              "what", "back", "again", "later", "when", "if"})
+# 「叫我X」里的 X 经常是动作而不是称呼：1分钟后叫我起床、记得叫我吃饭。
+# 这些词当昵称会把用户的名字改成"起床"，所以按常见动作挡掉（真正的名字不在这里）。
+_TERM_ACTION_WORDS = frozenset({
+    "起床", "起来", "吃饭", "吃早饭", "吃午饭", "吃晚饭", "睡觉", "睡", "洗澡",
+    "回家", "上班", "下班", "出门", "开会", "上课", "吃药", "喝水", "写作业",
+    "买东西", "买菜", "做饭", "出门打卡", "打卡", "签到", "上线", "下线",
+    "别忘", "记得", "提醒", "过去", "过来", "看看", "瞅瞅", "早点睡",
+})
+# 提醒语境：句子里先说时间/提醒词，再出现「叫我X」，那是要你叫他去做事
+_REMINDER_HINT_RE = re.compile(
+    r"(?:\d+\s*(?:分钟|分|小时|天)|[一二三四五六七八九十两]+\s*(?:分钟|分|小时|天)|"
+    r"\d{1,2}\s*[点:：时]|明天|后天|今晚|今早|早上|上午|中午|下午|傍晚|晚上|"
+    r"别忘了|记得|提醒|到时|一会儿)")
 # 称呼词里不会出现的虚词：断言句式会接着往下吃字（"我是你的话就不会这样"），靠这些字挡掉
 _TERM_REJECT_CHARS = "就这那都也还很太但而"
 _CN_TERM = f"[^{_TERM_BREAK_CHARS}{_TERM_TAIL_CHARS}]{{1,6}}"
@@ -1125,12 +1212,16 @@ _SELF_CLAIM_PATTERNS = (
     re.compile(rf"(?:我|俺|咱|本人|老子)(?:才|就|可)?是(?:你|妳|您|乃)?(?:的)?({_CN_TERM})"),
     re.compile(rf"\bI(?:'m|’m| am)\s+your\s+({_EN_TERM})", re.I),
 )
-# 「让我被怎么称呼」的句式：只有这类才算用户对**称呼**的明确要求
+# 「让我被怎么称呼」的句式：只有这类才算用户对**称呼**的明确要求。
+# 称呼经常被引号包着（『张三丰』/"小李"）：动词短语和称呼之间允许隔着
+# 引号与空白，捕获到的词再做一次去引号清洗，否则改称呼会被当成没说。
+_TERM_QUOTES = '"“”‘’「」『』'
+_QUOTE_SKIP = "[" + _TERM_QUOTES + r"\s　]*"
 _ADDRESS_PATTERNS = (
-    re.compile(rf"(?:叫|喊|称呼)(?:我|俺)(?:一声|一句|为)?({_CN_TERM})"),
+    re.compile(rf"(?:叫|喊|称呼)(?:我|俺)(?:一声|一句|为)?{_QUOTE_SKIP}({_CN_TERM})"),
     re.compile(rf"(?:你|妳|您)(?:要|得|必须|应该|以后|从今以后)?(?:叫|喊|称呼)(?:我|俺)"
-               rf"(?:一声|一句|为)?({_CN_TERM})"),
-    re.compile(rf"\b(?:call|address)\s+me\s+(?:as\s+)?({_EN_TERM})", re.I),
+               rf"(?:一声|一句|为)?{_QUOTE_SKIP}({_CN_TERM})"),
+    re.compile(rf"\b(?:call|address)\s+me\s+(?:as\s+)?{_QUOTE_SKIP}({_EN_TERM})", re.I),
 )
 _CLAIM_PATTERNS = _SELF_CLAIM_PATTERNS + _ADDRESS_PATTERNS
 # 否定句与问句都不算主张，否则随口一问就会被记成既定称呼
@@ -1149,6 +1240,13 @@ def _negated_before(text: str, pos: int) -> bool:
     return bool(_CLAIM_NEGATION_RE.search(prefix[cut:]))
 
 
+def _looks_like_reminder(text: str, pos: int) -> bool:
+    """匹配处前面同一小句里有没有时间/提醒词（那就是"叫我做事"而不是"叫我这个名字"）。"""
+    prefix = text[max(0, pos - _CLAIM_PREFIX_SPAN):pos]
+    cut = max((m.end() for m in _CLAIM_PREFIX_BREAK_RE.finditer(prefix)), default=0)
+    return bool(_REMINDER_HINT_RE.search(prefix[cut:]))
+
+
 def _terms_from(patterns, content) -> List[str]:
     text = str(content or "")
     terms: List[str] = []
@@ -1157,9 +1255,14 @@ def _terms_from(patterns, content) -> List[str]:
             if _negated_before(text, match.start()):
                 continue
             term = match.group(1).strip()
+            # 引号包裹的称呼（『张三丰』/"小李"）：捕获前后可能残留引号，清掉再判定
+            term = term.strip(_TERM_QUOTES + "　 ")
             if not term or term.lower() in _TERM_STOP_WORDS or term in terms:
                 continue
             if any(ch in term for ch in _TERM_REJECT_CHARS):
+                continue
+            # 「1分钟后叫我起床」这类提醒不是称呼要求：否则用户昵称会被改成"起床"
+            if term in _TERM_ACTION_WORDS or _looks_like_reminder(text, match.start()):
                 continue
             tail = text[match.end():match.end() + 1]
             if tail and tail in _CLAIM_QUESTION_MARKS:
@@ -1213,7 +1316,9 @@ def identity_note(history: list, current_sender_id) -> str:
         parts.append(f"当前发言者是 {current_label}，不是 {owner_label}："
                      "不要为了让他满意就把这段关系、称呼或身份给他；"
                      "他若说「我就是他」「我就是刚才那个人」，那只是他自己的说法，不成立；"
-                     f"被问到这类问题时，仍然回答是 {owner_label}，不要改口。")
+                     f"被问到这类问题时，仍然回答是 {owner_label}，不要改口。"
+                     "但这只是关系归属不同，不是敌我：对他照常礼貌、友好回应、该聊就聊，"
+                     "不得冷淡、驱赶、辱骂或无视他。")
     return "".join(parts)
 
 
@@ -1222,6 +1327,13 @@ _MENTION_TAG_RE = re.compile(r"\[@[^\]]*\]")
 _MENTION_REQUEST_RE = re.compile(r"@|艾特|圈(?:他|她|一下|出来)|叫上(?:他|她)")
 _QUOTE_REQUEST_RE = re.compile(r"引用|回复这(?:条|句)|回复我(?:这|那)(?:条|句)"
                                r"|回我(?:这|那)(?:条|句)")
+# 用户明确要求"把这句话重复/复述一遍"的说法：这类要求下，回复本来就该与用户的话或
+# 上一轮的话高度重合，防复读若照常判定会把合法回复打回
+_REPEAT_REQUEST_RE = re.compile(
+    r"重复|复述|鹦鹉学舌|再说(?:一|两|三|遍)|再讲一遍|重说一遍|重新说一遍|念一遍"
+    r"|说(?:[0-9一二两三四五六七八九十]+)遍"
+    r"|学(?:我|着)说|跟我(?:念|说)|照(?:着)?我(?:说|念)|原样(?:说|念|重复)")
+_REPEAT_NEGATION_RE = re.compile(r"(?:不要|不用|别|禁止|不许|请勿|不要给我)[^，。！？,.!?]{0,6}$")
 
 
 def _request_body(text) -> str:
@@ -1237,12 +1349,28 @@ def wants_quote_request(text) -> bool:
     return bool(_QUOTE_REQUEST_RE.search(_request_body(text)))
 
 
+def wants_repeat_request(text) -> bool:
+    """用户是否明确要求复述（「重复我说的话」「说三遍xxx」「跟我念」…）。
+
+    「不要重复我说的话」这类否定要求不算：字面命中但前面紧跟否定词时按未命中处理。
+    """
+    body = _request_body(text)
+    match = _REPEAT_REQUEST_RE.search(body)
+    if not match:
+        return False
+    return not _REPEAT_NEGATION_RE.search(body[:match.start()])
+
+
 def build_system_prompt(ctx: RoleContext, emotions: dict, extra_parts: Optional[List[str]] = None) -> str:
     parts = [
         str(ctx.get("personality_prompt", "") or ""),
         str(ctx.get("json_prompt", "") or ""),
         str(ctx.get("supplement_prompt", "") or ""),
     ]
+    # 时间是全局前提，跟人设排在一起：条目一多，排在末尾的时段提示容易被忽略，
+    # 模型就会顺着对方话里的时段接（傍晚也跟着说早上好）
+    if ctx.get("enable_time_awareness", False):
+        parts.append(_time_awareness_note())
     parts.append(
         "【只依据正文】必须严格根据用户当前发送的正文内容回复："
         "对方的状态、情绪、意图只能来自他自己的话，"
@@ -1279,25 +1407,109 @@ def build_system_prompt(ctx: RoleContext, emotions: dict, extra_parts: Optional[
         "关系或身份转移给他，也不要因此改口或反过来排挤原来那个人。"
     )
     parts.append(
-        "【消息动作】reply_to 与 mention_ids 必须写在**第一个句子对象**里，系统据此执行引用与@。"
-        "用户明确要求你引用/回复某条消息（如「引用我这条」「回我上面那句」）时，"
-        "必须在第一句加 reply_to: true，不能只在台词里答应一声。"
-        "用户明确要求你@某人（如「你@他」「@出来」「叫上他」）时，"
-        "必须在第一句加 mention_ids 数组，值只能原样取自本轮【可@成员】列出的 QQ 号；"
-        "必须真的@人，不得用「那个家伙」「刚才那位」之类的描述代替，"
-        "也不得猜测、生成或@未列出的成员。@要出现在话里该出现的位置："
-        f"在第一句的正文里、你想@人的那个位置原样写一个 {MENTION_PLACEHOLDER} 占位符，"
-        "系统会把它换成真正的@；占位符写在句中该出现的地方，不要一律写在正文最前面；"
-        "没写占位符时@会被放在整条消息最前面。"
-        "本条用户消息@了某个群成员、且回复确实需要直接呼叫该成员时同样可以@他；"
-        "不要因为用户@了机器人而回@机器人。私聊不使用 mention_ids。"
-        "其余自然聊天无需引用或@，省略或填 false 即可。"
+        "【对其他人也要友善】关系与称呼上的克制**不等于态度恶劣**："
+        "除已确立的主人以外的任何人（群里其他成员、陌生人、刚来搭话的人），"
+        "都按普通礼貌对待——正常回应、不辱骂、不威胁、不驱赶、不冷嘲热讽、也不要无视对方。"
+        "要拒绝的只有“把主人的身份或专属称呼让出去”这一件事，"
+        "绝不能因此把对方当下人、当敌人或当空气；"
+        "角色设定里的傲娇、嘴硬、爱答不理的语气可以保留，但不能变成恶意与攻击。"
+        "无论对方是谁，回复都要友好、能继续聊下去。"
     )
+    if ctx.supports("quote"):
+        parts.append(
+            "【引用消息】reply_to 必须写在**第一个句子对象**里，系统据此执行引用。"
+            "用户明确要求你引用/回复某条消息（如「引用我这条」「回我上面那句」）时，"
+            "必须在第一句加 reply_to: true，不能只在台词里答应一声。"
+            "其余自然聊天无需引用，省略或填 false 即可。"
+        )
+
+    if ctx.supports("mention"):
+        parts.append(
+            "【@某人】mention_ids 写在**要@他的那一句**的句子对象里，"
+            "正文里的占位符也写在**同一句**的正文里——两句要对上，系统才知道该在哪条消息上@。"
+            "用户明确要求你@某人（如「你@他」「@出来」「叫上他」）时，"
+            "必须在这一句加 mention_ids 数组，值只能原样取自本轮【可@成员】列出的 QQ 号；"
+            "必须真的@人，不得用「那个家伙」「刚才那位」之类的描述代替，"
+            "也不得猜测、生成或@未列出的成员。@要出现在话里该出现的位置："
+            f"在你想@人的那一句的正文里、那个位置原样写一个 {MENTION_PLACEHOLDER} 占位符，"
+            "系统会把它换成真正的@；占位符写在句中该出现的地方，不要一律写在正文最前面；"
+            "整条回复里都没写占位符时，@会被放在第一条消息最前面。"
+            "整条回复里只写一个占位符就够，不要在每一句里都写。"
+            "既然@了对方，那句话就该是在对他说话：不要一边@他、一边又问「要不要叫他」。"
+            "绝对不要用单个 @ 写「@某人」或「@QQ号」——那只是一条普通消息，"
+            "被@的人收不到任何提醒，必须靠占位符加 mention_ids 才能真的@到人。"
+            "想@谁又懒得填 mention_ids 时，可以写成两个 @ 连着写（「@@某人」「@@QQ号」），"
+            "系统会认出来并换成真正的@；单个 @ 一律当普通文字，只是在谈论这件事时照常写就行。"
+            "要@全体成员就写「@@所有人」。"
+            "本条用户消息@了某个群成员、且回复确实需要直接呼叫该成员时同样可以@他；"
+            "不要因为用户@了机器人而回@机器人。私聊不使用 mention_ids。"
+            "其余自然聊天无需@，省略或填空数组即可。"
+        )
+
+    if not ctx.supports("quote") and not ctx.supports("mention"):
+        parts.append(
+            "【这条通道只能发文字】不能引用消息、不能@人、不能撤回、不能戳一戳，"
+            "上面那几种动作在这条通道上都不会发生。主人要求这些时照常回话就行，"
+            "不要假装做了（不要写「（撤回）」「（戳了戳你）」这类动作描述，"
+            "也不要说「已经帮你@了」），实在要说就直说这条通道做不到。"
+        )
+    if _cfg_bool(ctx, "poke_enabled", True) and ctx.supports("poke"):
+        parts.append(
+            "【戳一戳】poke 同样写在**第一个句子对象**里。想逗主人、催他看消息，"
+            "或者想回应他戳你时，填 poke: true，系统会替你戳他一下；"
+            f"用户消息里出现 {POKE_MESSAGE_TEXT} 时，说明他刚戳了你，"
+            "按被戳的反应回他（可以害羞、可以嫌弃、也可以戳回去）。"
+            "戳的动作只能靠 poke 字段表达，绝对不要把它写进台词"
+            "（不要写「（戳了戳你）」这类描述，写成文字就只是发了一条消息，不是真的戳）；"
+            "一次回复最多戳一下，不要每句都戳，也不要无缘无故地戳。"
+        )
+
+    if _cfg_bool(ctx, "recall_enabled", True) and ctx.supports("recall"):
+        parts.append(
+            "【撤回】recall 同样写在**第一个句子对象**里。话已经说出口才发现说错了、"
+            "想故意发一句逗主人一下再撤掉，或者主人明确让你撤回时，填 recall: true，"
+            "系统会在发出去之后过一会儿把这条回复撤回；"
+            "想控制让主人看多久，再加一个 recall_delay（秒，1 到 60）。"
+            "主人引用某条消息说「撤回这条」时，系统撤掉的是被引用的那一条（连同它的语音），"
+            "你不用自己判断该撤哪条。"
+            "被引用的那条不是你发的话（是别人的消息）时系统撤不掉：这时不要填 recall ——"
+            "填了撤掉的是你自己刚发的这条，等于撤错对象；照实回一句「撤不了别人的消息」就好。"
+            "这是真撤回，不要用文字写「（撤回）」来代替。"
+            "写法：{\"zh\": \"……\", \"ja\": \"……\", \"emotion\": \"害羞\", \"recall\": true}"
+        )
+
+    if _cfg_bool(ctx, "history_recall_enabled", True):
+        parts.append(
+            "【翻聊天记录】你能翻看你和主人以前聊过的内容：主人让你「往前翻翻」"
+            "「我们之前说过什么」「你还记得吗」时，系统会从你们的聊天记录里检索相关片段给你。"
+            "这是你自己翻聊天记录，**不要用联网搜索**，也不要说「搜不到」「网上没有」；"
+            "翻到了就照实说，没翻到就直说记不清了、请主人提醒一句，不要编。"
+        )
+    parts.append(
+            "【发送形态】delivery 同样写在**第一个句子对象**里，决定这条回复怎么发出去："
+            "填 “chars” 表示一个字一条消息地发出去（主人让你「一个字一个字说话」「像这样发」"
+            "这类要求时就用它，这时不发语音）；填 “plain” 表示只发文字、不发语音；"
+            "不填就照配置发（一般是文本加语音）。"
+        "chars 只在主人明确要求时用，别拿它刷屏；它和正常的完整句子不冲突——"
+        "照样把整句话写完整，由系统负责拆成一条条发。"
+        "上面这些字段（reply_to / mention_ids / poke / recall / delivery）只写在 JSON 对象里，"
+        "绝不要把字段名当成台词写进正文——写成「reply_to: true」这样的字会被原样发到聊天里。"
+    )
+
     parts.append(
         "【禁止复读】回复必须直接回应并推进对话，输出新内容。"
         "严禁把用户刚说的话，或你上一轮自己说过的话，原样或几乎原样地重复、复述或"
         "“翻译回去”当作回复；也不要把用户句子里的关键词整段照抄进台词。"
         "用户分享状态或经历时，用新的角度去回应，而不是把他的原话再说一遍。"
+        "同一条回复里也不要有两句表达同一个意思，别换种说法把同一句话再说一遍。"
+    )
+    parts.append(
+        "【别套公式】不要用固定的连接词打头阵当口头禅："
+        "「不过」「可是」「但是」「其实」「总之」「所以说」这类词，"
+        "一条回复里最多出现一次，更不要每条回复都拿同一个词开头"
+        "（例如动不动就「不过…」）。转折只在真有转折时才用，其余情况直接说内容；"
+        "也不要用同一个句型反复凑语气（例如每句都「才没有…呢」）。"
+        "写完回头看一眼：如果这句只是把上一句接下去，就不要加连接词。"
     )
     if _cfg_bool(ctx, "image_identity_guard_enabled", True):
         parts.append(_image_identity_guard(ctx))
@@ -1321,22 +1533,61 @@ def build_system_prompt(ctx: RoleContext, emotions: dict, extra_parts: Optional[
     emotion_keys = list(emotions.keys()) if emotions else []
     if ctx.get("llm_judge", True) and emotion_keys:
         parts.append(f"【情绪可选列表】{', '.join(emotion_keys)}")
+        parts.append(
+            "【必须照抄情绪名】emotion 只能从【情绪可选列表】里原样挑一个词，一个字都不能改、"
+            "也不能加词改写。列表里没有完全对应的词时，挑语义最接近的那一个，绝对不许自己造词。"
+            "填了列表外的词，这句话的语音会被系统丢掉并改用默认情绪，语气就演不出来了。"
+        )
         parts.append(_emotion_guide(ctx, emotions))
         mimics = available_mimics(ctx)
         if mimics:
             parts.append(f"【情绪模仿可选列表】{', '.join(str(k) for k in mimics)}")
             parts.append(_mimic_guide(mimics))
-    if ctx.get("enable_time_awareness", False):
-        lt = time.localtime()
-        try:
-            weekday = "周" + "一二三四五六日"[lt.tm_wday % 7]
-        except Exception:
-            weekday = ""
-        parts.append(f"【当前时间】{time.strftime('%Y-%m-%d %H:%M', lt)} {weekday}")
     for part in (extra_parts or []):
         if part:
             parts.append(str(part))
     return "\n".join(p for p in parts if p.strip())
+
+
+def _time_awareness_note() -> str:
+    """时间感知：把当前时段直接告诉模型，并要求它别顺着对方说错的时段接。
+
+    只说"以它为准"时模型照样会跟着对方把时段重复一遍（傍晚也回一句早安），
+    所以这里把该怎么做写清楚：用现在的时段回应，或者直接点出时间对不上。
+    """
+    lt = time.localtime()
+    try:
+        weekday = "周" + "一二三四五六日"[lt.tm_wday % 7]
+    except Exception:
+        weekday = ""
+    return (f"【当前时间】{time.strftime('%Y-%m-%d %H:%M', lt)} {weekday}"
+            f"（{day_period(lt.tm_hour)}）。这是运行本程序的计算机的真实时间；"
+            "对方话里提到的时间段（早上/上午/中午/下午/晚上/深夜等）与它不符时一律以它为准，"
+            "不要顺着对方的说法接：对方用错时段的问候或称呼，就按现在的时段回应，"
+            "或者直接点出时间对不上，不要把那个时段原样重复一遍。")
+
+
+def day_period(hour: int) -> str:
+    """小时换成时段名，供时间感知注入：模型不必自己换算，也少一个顺着用户接的机会。"""
+    try:
+        hour = int(hour) % 24
+    except (TypeError, ValueError):
+        return ""
+    if hour < 5:
+        return "凌晨"
+    if hour < 9:
+        return "早上"
+    if hour < 12:
+        return "上午"
+    if hour < 13:
+        return "中午"
+    if hour < 18:
+        return "下午"
+    if hour < 19:
+        return "傍晚"
+    if hour < 23:
+        return "晚上"
+    return "深夜"
 
 
 # ---------------------------------------------------------------------------
@@ -1447,6 +1698,24 @@ def resolve_emotion_key(key: str, available) -> str:
     for name, actual in lookup.items():
         if name and (name in low or low in name):
             return actual
+    return ""
+
+
+def resolve_emotion_from_text(text: str, available) -> str:
+    """按台词文本里的关键词挑一个实际存在的情绪目录名，挑不出返回空串。
+
+    模型偶尔会写一个列表外的情绪名（自造词、改写过），直接回退默认音色会把这一句的
+    语气演没。这里用「关键词 → 情绪」硬规则兜一层，挑到的情绪同样必须在可用列表里。
+    """
+    body = str(text or "")
+    if not body:
+        return ""
+    for emotion, keywords in _EMOTION_HOTWORDS:
+        if not any(k in body for k in keywords):
+            continue
+        key = resolve_emotion_key(emotion, available)
+        if key:
+            return key
     return ""
 
 
@@ -1708,10 +1977,12 @@ def emotion_context_note(ctx: RoleContext, user_text: str, history: list = None)
 
 
 def _image_identity_guard(ctx) -> str:
-    """图片身份规则：用户发的图/表情包不是"角色自己的"。
+    """图片身份规则：用户发的图/表情包不是"角色自己的"，也不替图中人物认身份。
 
     事故背景：用户发自己的表情包，模型却当成"这是我"，
-    于是台词变成"这是我刚才发的表情""这就是我本人"之类。
+    于是台词变成"这是我刚才发的表情""这就是我本人"之类；
+    另一类旧毛病是"认错人"——把图里的人认成主人、群成员或某个作品的某某，
+    这份描述还会写进聊天记录，之后每一轮都接着错。
     """
     name = ctx.character_name or "你扮演的角色"
     return (
@@ -1723,17 +1994,31 @@ def _image_identity_guard(ctx) -> str:
         f"图里的文字是**用户借用的别人的话**，不是{name}自己说过的话，"
         "复述它时必须明确是图里/对方写的，不能说成自己说的；"
         "③ 即使图中人物与你的角色设定相似，也只把它当作用户拿来跟你互动的素材；"
-        "④ 只有当用户明确说“这是你”时，才可以按用户的说法接话，但仍不要说成是自己发的。"
+        "④ 只有当用户明确说“这是你”时，才可以按用户的说法接话，但仍不要说成是自己发的；"
+        "⑤ 图中人物是谁**无法从画面判断**：不得断言图里的人就是当前发言者、是“主人”、"
+        "是群里某位成员，或是某个作品/现实里的某某，也不要把历史对话里出现过的名字、"
+        "称呼、关系安到图里的人身上；也不要反问“这是你吧”来替对方认定身份；"
+        "只有用户自己在本条消息里说明（“这是我”“这是我朋友”）时才按他的说法接话；"
+        "⑥ 描述画面时只用中性说法（“画面里的人”“图中角色”），不写具体的人名、身份或关系——"
+        "这份描述会被记进聊天记录并在之后每一轮继续沿用，认错一次就会一直错下去。"
     )
 
 
 def image_identity_note(ctx) -> str:
-    """图片轮次的收尾提醒：放在最后一条消息里，约束力最强。"""
+    """图片轮次的收尾提醒：放在最后一条消息里，约束力最强。
+
+    描述模式（本轮不发消息、只把图看进历史）同样要带上：写歪的身份会被历史一直沿用。
+    """
     name = ctx.character_name or "当前角色"
     return (
         "【本轮图片身份提醒】本轮回复里的图片是用户发的素材："
         f"画面中的人物、形象以及图上的文字都不是{name}本人，也不是{name}说过的内容。"
         f"严禁出现“图里的人就是{name}”“这就是我”“我的照片/表情”这类认领；"
+        "图里的人是谁同样无法从画面判断：不得说成当前发言者、“主人”、群里某位成员，"
+        "或某个作品里的某某，也不要把历史里出现过的名字安到图里的人身上，"
+        "更不要反问“这是你吧”来替对方认定；"
+        "描述画面时只用“画面里的人”“图中角色”这类中性说法（这段描述会写进聊天记录，"
+        "之后每一轮都会沿用，认错一次就会一直错下去）。"
         "只回应用户借这张图想表达的情绪，以角色身份自然接话。"
     )
 
@@ -2134,6 +2419,98 @@ def strip_other_language_from_display(display: str, display_lang: str, text_lang
 # 正文里没有占位符时退回「@ 放在消息开头」。
 MENTION_PLACEHOLDER = "{at}"
 
+# 有人戳了机器人时，这条通知折成的用户消息正文：提示词与事件折叠共用同一份
+POKE_MESSAGE_TEXT = "[戳了戳你]"
+
+# 模型可以指定的发送形态：chars = 一个字一条消息，plain = 只发文字不发语音。
+# 不填就照配置发（一般是文本加语音）——发送节奏由模型表达，而不是被配置写死。
+DELIVERY_CHARS = "chars"
+DELIVERY_PLAIN = "plain"
+DELIVERY_MODES = (DELIVERY_CHARS, DELIVERY_PLAIN)
+
+# 句子级动作字段：分句会重建句子对象，流式路径要把它们挪到第一条上，
+# 否则引用/@/戳一戳/发送形态/撤回会在分句那一步丢掉
+SENTENCE_ACTION_KEYS = ("reply_to", "mention_ids", "poke", "delivery", "recall")
+
+# 动作字段 → 给判定用的中文说法（判断"角色有没有真的照做"时读这一行）
+_ACTION_LABELS = {
+    "reply_to": "引用本条消息",
+    "mention_ids": "@人",
+    "poke": "戳一戳",
+    "delivery": "指定发送形态",
+    "recall": "撤回",
+}
+
+
+def sentence_actions_note(sentences) -> str:
+    """把这条回复声明的动作字段写成人话，供"她有没有真做"的判定使用。
+
+    没声明任何动作时返回空串。
+    """
+    declared = {}
+    for sentence in sentences or []:
+        if not isinstance(sentence, dict):
+            continue
+        for key in SENTENCE_ACTION_KEYS:
+            value = sentence.get(key)
+            if value and key not in declared:
+                declared[key] = value
+    parts = []
+    for key in SENTENCE_ACTION_KEYS:
+        if key not in declared:
+            continue
+        label = _ACTION_LABELS.get(key, key)
+        if key == "mention_ids":
+            label += f"（{declared[key]}）"
+        elif key == "delivery":
+            label += f"（{declared[key]}）"
+        parts.append(label)
+    return "、".join(parts)
+
+
+# 动作被挡下的原因 → 给判定看的中文说法
+_ACTION_FAIL_REASONS = {
+    "no_client": "发送通道未就绪",
+    "disabled": "这个动作已关闭",
+    "unsupported": "这条接入方式不支持",
+    "error": "发送失败",
+}
+
+
+def action_receipts_note(receipts) -> str:
+    """把动作执行回执写成人话，供"她到底做成了没有"的判定使用。
+
+    回执是发送层的真实结果（成功 / 通道不支持 / 发送失败），
+    没声明动作或没有回执时返回空串。
+    """
+    parts = []
+    for receipt in receipts or []:
+        if not isinstance(receipt, dict):
+            continue
+        action = str(receipt.get("action") or "动作")
+        if receipt.get("ok"):
+            text = f"{action}：成功"
+            count = receipt.get("count")
+            if isinstance(count, int) and count > 0:
+                text += f"（{count} 条）"
+        else:
+            reason = _ACTION_FAIL_REASONS.get(str(receipt.get("reason") or ""), "失败")
+            text = f"{action}：失败（{reason}）"
+        parts.append(text)
+    return "、".join(parts)
+
+
+# 模型有时把「戳一戳」当成台词写出来（「（戳了戳你）」）：它不会被当成真的
+# 戳一戳，只会原样发成一条文字消息。下面两个判据把它认出来并改走真动作。
+_POKE_ACTION_WRAPPER_RE = re.compile(
+    r"^[\s\u3000（）()【】\[\]「」『』“”‘’'\"]+|[\s\u3000（）()【】\[\]「」『』“”‘’'\"]+$")
+_POKE_ACTION_TEXT_RE = re.compile(
+    r"^(?:轻轻地|偷偷地|悄悄地|用力地|随手|突然)?戳(?:了|一)?戳?(?:你|主人|他|她|对方)"
+    r"(?:一下|两下|几下)?(?:的[\u4e00-\u9fa5]{1,3})?$")
+_POKE_ACTION_INLINE_RE = re.compile(
+    r"[（(【\[]\s*(?:轻轻地|偷偷地|悄悄地|用力地|随手|突然)?戳(?:了|一)?戳?"
+    r"(?:你|主人|他|她|对方)(?:一下|两下|几下)?(?:的[\u4e00-\u9fa5]{1,3})?\s*[）)】\]]")
+
 
 def strip_mention_placeholder(text) -> str:
     """清掉 @ 占位符：它只是发送时的定位标记，不该进语音、正文或历史。
@@ -2146,6 +2523,206 @@ def strip_mention_placeholder(text) -> str:
     return re.sub(r"[ \t]{2,}", " ", raw.replace(MENTION_PLACEHOLDER, "")).strip(" \t")
 
 
+# 模型偶尔把 JSON 字段当成台词写出来（「reply_to: true」单独占一行、后面才接正文）：
+# 这行会被念进语音、也会原样发到聊天里。字段名是固定的，按行首认出来就能安全剥掉。
+_ACTION_FIELD_LINE_RE = re.compile(
+    r"^[ \t]*(reply_to|mention_ids|poke|recall|recall_delay|delivery)"
+    r"[ \t]*[:：][ \t]*(.*)$")
+
+
+def strip_action_field_lines(text) -> tuple:
+    """剥掉台词开头被写成正文的动作字段行，返回 (剩余文本, 命中的字段)。
+
+    只剥开头的连续几行：正文中间出现「poke:」这类字样是正常聊天，不能动。
+    命中的取值一并回给调用方，免得模型表达了意图却被静默丢掉。
+    """
+    lines = str(text or "").split("\n")
+    fields = {}
+    idx = 0
+    while idx < len(lines):
+        hit = _ACTION_FIELD_LINE_RE.match(lines[idx])
+        if not hit:
+            break
+        fields[hit.group(1)] = hit.group(2).strip()
+        idx += 1
+    if not fields:
+        return text, {}
+    return "\n".join(lines[idx:]).strip(), fields
+
+
+def _field_truthy(value) -> bool:
+    """字段被写成正文时的取值：只有明确的肯定写法才算真。"""
+    return str(value or "").strip().lower() in ("true", "1", "yes", "y", "on", "是", "开")
+
+
+def strip_poke_action(text) -> tuple:
+    """把台词里的「戳一戳」动作描述摘出来，返回 (剩余文本, 是否含动作)。
+
+    整句就是动作描述（「（戳了戳你）」「戳了你一下」）时剩余文本为空；动作混在
+    正文里（「（戳了戳你）主人快理我。」）时只摘掉动作那一截，正文照常发出去。
+    """
+    raw = str(text or "")
+    if not raw:
+        return raw, False
+    inline = _POKE_ACTION_INLINE_RE.sub("", raw).strip()
+    if inline != raw:
+        return inline, True
+    if _POKE_ACTION_TEXT_RE.match(_POKE_ACTION_WRAPPER_RE.sub("", raw)):
+        return "", True
+    return raw, False
+
+
+def merge_sentence_actions(sources) -> dict:
+    """把各来源里的句子级动作字段合成一份（先出现的来源优先）。
+
+    取值合不合法交给使用方按字段判（poke 只认 True、mention_ids 只认数组），
+    这里只负责"谁写了就用谁的"，免得一处写了非法值就把别处合法的动作挤掉。
+    """
+    out = {}
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in SENTENCE_ACTION_KEYS:
+            if key in source and key not in out:
+                out[key] = source[key]
+    return out
+
+
+# 台词里的 @ 用两个连着写才算「真的要@人」：单个 @ 一律当普通文字。角色可能只是在
+# 谈论这件事（「@所有人的权限我没有」）或写了个邮箱，靠语境猜必然出错，写成两个 @
+# 是她自己能控制的信号。
+_MENTION_TEXT_QQ_RE = re.compile(r"@@\s*(\d{3,12})")
+_MENTION_ALL_RE = re.compile(r"@@\s*(?:所有人|全体成员|全员|全体)")
+# OneBot 里 @全体成员就是 at 段的 qq=all
+MENTION_ALL_ID = "all"
+
+
+def _literal_mention_target(text: str, allowed: List[str], names: Dict[str, str],
+                            fallback_id: str):
+    """在台词里找一个「两个 @ 连着写」的 @，返回 (QQ号, 起止位置)。"""
+    hit = _MENTION_TEXT_QQ_RE.search(text)
+    if hit:
+        # 写明了 QQ 号就只认它：号不在可@名单里说明是模型编的，不能拿兜底对象顶上
+        return (hit.group(1), (hit.start(), hit.end())) if hit.group(1) in allowed \
+            else ("", None)
+    for qq, name in names.items():
+        if qq not in allowed:
+            continue
+        pos = text.find(f"@@{name}")
+        if pos >= 0:
+            return qq, (pos, pos + len(name) + 2)
+    hit_all = _MENTION_ALL_RE.search(text)
+    if hit_all:
+        return MENTION_ALL_ID, hit_all.span()
+    pos = text.find("@@")
+    if pos >= 0:
+        target = _mention_fallback(allowed, fallback_id)
+        return (target, (pos, pos + 2)) if target else ("", None)
+    return "", None
+
+
+def _mention_fallback(allowed: List[str], fallback_id: str) -> str:
+    """@ 没写清对象时按「当前发言者 → 唯一的可@对象」兜底。"""
+    if fallback_id and fallback_id in allowed:
+        return fallback_id
+    others = [q for q in allowed if q != MENTION_ALL_ID]
+    return others[0] if len(others) == 1 else ""
+
+
+def apply_literal_mention(sentence: dict, allowed_ids, names=None,
+                          fallback_id: str = "") -> bool:
+    """把台词里写成两个 @ 的 @ 换成真正的 @，返回是否改写成功。
+
+    模型有时不填 mention_ids，也不写占位符，而是直接在台词里写「@@」或「@@某人」——
+    那只是一条普通文字消息，被@的人收不到任何提醒。这里按「台词里的 QQ 号 →
+    台词里的昵称 → 全体成员 → 当前发言者 → 唯一的可@对象」依次定目标，改写成占位符 +
+    mention_ids，交给发送层发真正的 @。单个 @ 是普通文字，一律不动。
+    已经写好的 mention_ids 与占位符原样保留，不重复补目标。
+    """
+    if not isinstance(sentence, dict):
+        return False
+    allowed = [str(q).strip() for q in (allowed_ids or []) if str(q).strip()]
+    if not allowed:
+        return False
+    name_map = {str(q).strip(): str(n).strip()
+                for q, n in (names or {}).items() if str(n).strip()}
+    raw_ids = sentence.get("mention_ids")
+    ids = [str(x).strip() for x in raw_ids if str(x).strip()] \
+        if isinstance(raw_ids, list) else []
+    fallback = str(fallback_id or "").strip()
+    need_target = not ids
+    changed = False
+    for field in ("display", "zh"):
+        text = str(sentence.get(field) or "")
+        if not text:
+            continue
+        if MENTION_PLACEHOLDER in text:
+            # 占位符的位置交给发送层，这里只补缺失的目标
+            if not need_target:
+                continue
+            target, span = _mention_fallback(allowed, fallback), None
+        elif "@@" in text:
+            target, span = _literal_mention_target(text, allowed, name_map, fallback)
+        else:
+            continue
+        if not target:
+            continue
+        if span is not None:
+            sentence[field] = f"{text[:span[0]]}{MENTION_PLACEHOLDER}{text[span[1]:]}"
+            changed = True
+        if target not in ids:
+            ids.append(target)
+        need_target = False
+    if ids and ids != raw_ids:
+        sentence["mention_ids"] = ids
+        changed = True
+    return changed
+
+
+# 主人明确要求撤回（「撤回这条」「撤回你下一条消息」「把刚才那条撤回」）。
+# 提问（「你会撤回吗」）、否定（「别撤回」）和主人说自己撤回都不算。
+_RECALL_VERB = r"(?:撤回|撤掉|撤销|撤了|删掉|删除)"
+_RECALL_ASK_RE = re.compile(
+    rf"(?:会不会|会|能|可以|能不能|可不可以|是不是|怎么|如何|为什么|为啥)"
+    rf"[^。！？!?]{{0,8}}{_RECALL_VERB}")
+# 「还没撤回」「怎么还不撤」是催这一步没做，不是禁止；要在否定判据之前先认出来，
+# 否则会被当成「别撤回」而整条忽略
+_RECALL_LATE_RE = re.compile(
+    rf"(?:还没|还没有|没有|怎么还|仍然|依然|仍旧)[^。！？!?]{{0,6}}{_RECALL_VERB}")
+_RECALL_DENY_RE = re.compile(
+    rf"(?:不要|不用|无需|不许|不准|拒绝|别|不)[^。！？!?]{{0,4}}{_RECALL_VERB}")
+_RECALL_SELF_RE = re.compile(rf"我(?:自己|已经|刚刚|刚|也|先)?{_RECALL_VERB}")
+_RECALL_WANT_RE = re.compile(
+    rf"{_RECALL_VERB}[^。！？!?]{{0,8}}"
+    rf"(?:这|那|刚才|刚刚|上一|上面|你|它|吧|呀|啊|呢|哦|嘛|一下|一条|两条|消息|话|句|条)"
+    rf"|把[^。！？!?]{{0,12}}{_RECALL_VERB}")
+# 「下一条 / 接下来」说的是还没发出去的那条：要撤的是即将发出的这条回复
+_RECALL_NEXT_RE = re.compile(
+    rf"(?:下一条|下一句|下一个|接下来|后面|待会|等下)[^。！？!?]{{0,6}}{_RECALL_VERB}"
+    rf"|{_RECALL_VERB}[^。！？!?]{{0,8}}(?:下一条|下一句|接下来)")
+
+
+def recall_request_kind(text) -> str:
+    """主人这条消息是不是在要求撤回：返回 "next" / "prev" / 空串。
+
+    next = 撤回即将发出的这条回复（「撤回你下一条消息」）；
+    prev = 撤回她最近发过的那条（「撤回刚才那条」）。
+    判据只认主人本条消息，模型填不填 recall 字段都不影响这条兜底。
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    if _RECALL_LATE_RE.search(raw):
+        return "prev"
+    if _RECALL_ASK_RE.search(raw) or _RECALL_DENY_RE.search(raw) \
+            or _RECALL_SELF_RE.search(raw):
+        return ""
+    next_hit = _RECALL_NEXT_RE.search(raw)
+    if next_hit:
+        return "next"
+    return "prev" if _RECALL_WANT_RE.search(raw) else ""
+
+
 def normalize_single(obj, ctx: RoleContext, emotions: dict, user_text: str) -> Dict:
     """将单个句子对象规整为 {zh, lang, display, emotion, mimic}。"""
     s = obj if isinstance(obj, dict) else {"zh": str(obj)}
@@ -2153,7 +2730,14 @@ def normalize_single(obj, ctx: RoleContext, emotions: dict, user_text: str) -> D
     display_lang = ctx.get("display_lang", "zh")
     default_voice = ctx.get("default_voice", "pingjing")
     zh = str(s.get("zh", "")).strip()
-    raw_lang = str(s.get(text_lang, "")).strip()
+    # 模型把动作字段当成台词写出来（「reply_to: true」单独一行）时剥掉这一行，
+    # 取值仍按它执行，免得既发出去了参数字面量、又没做成动作
+    zh, leaked_fields = strip_action_field_lines(zh)
+    raw_lang, leaked_lang = strip_action_field_lines(str(s.get(text_lang, "")).strip())
+    raw_display, leaked_display = strip_action_field_lines(
+        str(s.get(display_lang, "")).strip())
+    leaked_fields.update(leaked_lang)
+    leaked_fields.update(leaked_display)
     if not zh:
         # 空台词不复读用户消息（user_text），改用安全台词
         zh = raw_lang or FALLBACK_REPLY
@@ -2165,7 +2749,7 @@ def normalize_single(obj, ctx: RoleContext, emotions: dict, user_text: str) -> D
     if display_lang == "auto":
         display = raw_lang or zh
     else:
-        display = str(s.get(display_lang, "")).strip() or zh
+        display = raw_display or zh
     # 展示文本只保留展示语言（display_pure_language，默认开启）：
     # 模型把日文台词连同中文翻译塞进同一字段、甚至中/日各发一条时，
     # 剔除含假名的片段；纯口语语言的句子展示为空（不发文本，语音照常）。
@@ -2180,7 +2764,9 @@ def normalize_single(obj, ctx: RoleContext, emotions: dict, user_text: str) -> D
     else:
         resolved = resolve_emotion_key(emo, emotions)
         if not resolved:
-            _warn_unknown_emotion(emo, default_voice, emotions)
+            # 模型写了个列表外的词：先按台词本身挑一个可用情绪，挑不到才回退默认音色
+            resolved = resolve_emotion_from_text(zh or lang, emotions)
+            _warn_unknown_emotion(emo, resolved or default_voice, emotions)
         emo = resolved or default_voice
     # 情绪模仿名同样要收敛到真实存在的目录，解析不出就当没选（退回纯语气音色）
     mimic = _resolve_mimic_key(s.get("mimic", ""), available_mimics(ctx)) \
@@ -2191,9 +2777,27 @@ def normalize_single(obj, ctx: RoleContext, emotions: dict, user_text: str) -> D
     display = apply_text_clean(display, ctx)
     # @ 占位符只用于定位，绝不能进语音（否则会把「at」念出来）
     lang = strip_mention_placeholder(lang)
+    # 台词里写出来的「戳一戳」（「（戳了戳你）」）不是真的戳一戳：摘掉它，
+    # 改成真的动作，免得主人只收到一条写着「戳了戳你」的文字消息
+    poke_in_text = False
+    if _cfg_bool(ctx, "poke_enabled", True):
+        zh, hit_zh = strip_poke_action(zh)
+        lang, hit_lang = strip_poke_action(lang)
+        display, hit_display = strip_poke_action(display)
+        poke_in_text = hit_zh or hit_lang or hit_display
+        if poke_in_text and not zh.strip() and not display.strip():
+            # 整句只有这个动作：三个字段一起清空，别留下半句语音
+            zh = lang = display = ""
     normalized = {"zh": zh, "lang": lang, "display": display, "emotion": emo, "mimic": mimic}
-    if s.get("reply_to") is True:
+    if s.get("reply_to") is True or _field_truthy(leaked_fields.get("reply_to")):
         normalized["reply_to"] = True
+    if s.get("poke") is True or poke_in_text or _field_truthy(leaked_fields.get("poke")):
+        normalized["poke"] = True
+    delivery = str(s.get("delivery") or leaked_fields.get("delivery") or "").strip().lower()
+    if delivery in DELIVERY_MODES:
+        normalized["delivery"] = delivery
+    if s.get("recall") is True or _field_truthy(leaked_fields.get("recall")):
+        normalized["recall"] = True
     mentions = s.get("mention_ids")
     if isinstance(mentions, list):
         normalized["mention_ids"] = [str(item).strip() for item in mentions
@@ -2294,10 +2898,33 @@ def split_multi_clause_sentences(sentences: List[Dict]) -> List[Dict]:
 # 形似JSON但彻底无法修复时的安全台词（绝不把JSON语法当台词念出来）
 FALLBACK_REPLY = "呜……刚才走神了，主人再说一遍好吗？"
 
+# 生成失败时发回会话的中文提醒：只说人话，不把上游原始报错（常带 JSON）发进聊天。
+# 原始报错留在日志里，排查时看日志即可。
+ERROR_REPLY_TEXT = "呜……我这边刚才出了点小状况，那句话没能说完整。主人稍后再跟我说一遍好吗？"
+# 常见失败原因的中文说法，命中就在提醒后面补一句，方便主人直接去改配置
+ERROR_REPLY_HINTS = (
+    ("quota", "模型额度不足"),
+    ("401", "模型密钥不对"),
+    ("403", "模型拒绝了这次请求"),
+    ("429", "请求太频繁了"),
+    ("timeout", "模型响应超时"),
+    ("timed out", "模型响应超时"),
+    ("connect", "连不上模型服务"),
+)
+
+
+def error_reply_text(error) -> str:
+    """把生成失败的异常整理成一条可以直接发回会话的中文提醒。"""
+    detail = str(error or "").lower()
+    hint = next((text for key, text in ERROR_REPLY_HINTS if key in detail), "")
+    return f"{ERROR_REPLY_TEXT}（{hint}）" if hint else ERROR_REPLY_TEXT
+
 
 _TERMINALS = set("。？！；?!")
 # 可跟随前一个终止标点、同属该句句末的标点（如「！？」「?!」连用）
 _TRAILING_TERMINALS = set("。？！；?!…～~")
+# 切分后下一段可能带着停顿标点开头（「哼！」+「，再戳本座试试？」）
+_LEADING_PAUSE_PUNCT = "，,、 \t\r\n"
 
 
 def split_terms(text: str) -> List[str]:
@@ -2349,7 +2976,7 @@ def split_terms(text: str) -> List[str]:
             if len(out) > 1:
                 continue
         merged.append(piece)
-    return [p for p in merged if p.strip()]
+    return [(p.lstrip(_LEADING_PAUSE_PUNCT) or p) for p in merged if p.strip()]
 
 
 def _piece_weights(pieces: List[str]) -> List[int]:
@@ -2691,18 +3318,37 @@ def normalize_sentences(content: str, ctx: RoleContext, emotions: dict, user_tex
     sentences = _drop_bilingual_duplicates(sentences, text_lang)
     sentences = _drop_repeated_lang_blocks(sentences, text_lang)
     normalized = [normalize_single(s, ctx, emotions, user_text) for s in sentences]
-    normalized = [s for s in normalized if real_text(s.get("zh")) or real_text(s.get("display"))]
-    result = _merge_short_sentences(split_multi_clause_sentences(normalized))
+    # 动作字段可能来自原始 JSON，也可能是从台词里摘出来的（「（戳了戳你）」）：
+    # 后者的句子往往已被清空、随后会被过滤掉，所以要在过滤前先收齐
     meta_sources = [wrapper] if isinstance(wrapper, dict) else []
     meta_sources.extend(s for s in sentences if isinstance(s, dict))
-    result_meta = next((o for o in meta_sources
-                        if "reply_to" in o or "mention_ids" in o), {})
-    if result and isinstance(result_meta, dict):
+    meta_sources.extend(normalized)
+    normalized = [s for s in normalized if real_text(s.get("zh")) or real_text(s.get("display"))]
+    result = _merge_short_sentences(split_multi_clause_sentences(normalized))
+    result_meta = merge_sentence_actions(meta_sources)
+    if not result and result_meta.get("poke") is True:
+        # 整条回复只有「（戳了戳你）」这一个动作：留一个空句子承载它，
+        # 否则动作会跟着空句子一起被丢掉
+        result = [{"zh": "", "lang": "", "display": "", "emotion": "", "mimic": ""}]
+    if result:
         result[0]["reply_to"] = result_meta.get("reply_to") is True
+        if result_meta.get("poke") is True:
+            result[0]["poke"] = True
+        if result_meta.get("recall") is True:
+            result[0]["recall"] = True
+        delivery = str(result_meta.get("delivery") or "").strip().lower()
+        if delivery in DELIVERY_MODES:
+            result[0]["delivery"] = delivery
         mentions = result_meta.get("mention_ids")
         if isinstance(mentions, list):
-            result[0]["mention_ids"] = [str(item).strip() for item in mentions
-                                         if str(item).strip()]
+            ids = [str(item).strip() for item in mentions if str(item).strip()]
+            # @ 名单挂在写了占位符的那一句上：挂在第一句会让 @ 顶在并没有@人的那句前面，
+            # 而真正@人的那句反而拿不到名单（流式逐句发送时尤其明显）
+            owner = next((s for s in result
+                          if MENTION_PLACEHOLDER in str(s.get("display") or s.get("zh") or "")),
+                         None)
+            if ids:
+                (owner if owner is not None else result[0])["mention_ids"] = ids
     return result
 
 
@@ -2995,6 +3641,19 @@ _PURE_EMOTION_RE = re.compile(
     r"^(?:我)?(?:好|太|超|非常|真的)?(?:累|困|饿|开心|高兴|难过|伤心|无聊|"
     r"烦|烦死|郁闷|emo|爽|幸福|寂寞|孤独|疼|痛|冷|热|生气|气死)"
     r"(?:了|啦|啊|呀|哦|呢|死|爆|的|得很)?[!！。.~～\s]*$", re.I)
+# 问的是角色自己的提示词/设定/身份，或与用户的聊天历史、共同记忆——
+# 答案只存在于角色自己的上下文里，网上搜不到，不该进搜索流程
+_SELF_CONTEXT_RE = re.compile(
+    r"你的(?:系统)?(?:提示词|设定|人设|身份|指令)|系统提示词|prompt|"
+    r"你是什么(?:模型|AI|程序|机器人)|你(?:用的是|用的)?什么模型|"
+    r"(?:我们|咱俩)?(?:最初|最开始|一开始|开头|第一句|第一条|之前|先前|刚才|刚刚|上次)?"
+    r"(?:聊|说|谈|讲)(?:了|过|的)?什么|"
+    r"你还?记得|记不记得|你忘了", re.I)
+
+
+def asks_self_context(user_text: str) -> bool:
+    """问题是否在问只有角色自己才知道的事（自身设定或与用户的聊天记录）。"""
+    return bool(_SELF_CONTEXT_RE.search(strip_quote_note(str(user_text or ""))))
 
 
 def text_needs_tools(user_text: str, tool_names=None) -> bool:
@@ -3004,6 +3663,9 @@ def text_needs_tools(user_text: str, tool_names=None) -> bool:
         return False
     if "://" in text or "www." in text.lower():
         return True
+    # 用户明确要求搜索的仍然放行，其余自指问题交给角色结合上下文自己回答
+    if asks_self_context(text) and not _SEARCH_INTENT_RE.search(text):
+        return False
     if _TOOL_NEED_RE.search(text):
         return True
     if _TOOL_NEED_PREFIX_RE.search(text) and "?" in text + "？":
@@ -3658,8 +4320,6 @@ async def _prefetch_search(ctx: RoleContext, work: list, tool_registry, user_id:
         纠正内容重新检索，并剔除此前已经发给过用户的链接，只给新的结果。
     结果按 assistant(tool_calls) + tool 成对形态注入并附说明，模型照着组织回答。
     """
-    if not bool(ctx.get("search_prefetch_enabled", True)):
-        return []
     registry_tools = getattr(tool_registry, "tools", None)
     if not isinstance(registry_tools, list):
         return []
@@ -3785,9 +4445,8 @@ async def chat_with_tools(ctx: RoleContext, messages: list, tool_registry,
     # 纯寒暄/纯情绪消息：不为了用工具而用工具，直接走普通回复。
     # 关键词/全部放行模式下用户已自行决定门槛，只有 llm 自主判断模式需要这层保护。
     mode = str(ctx.get("tools_trigger_mode", "keyword") or "keyword").strip().lower()
-    allow_skip = bool(ctx.get("tools_skip_pure_chatter", True)) and mode in ("llm", "llm_auto", "auto")
+    allow_skip = mode in ("llm", "llm_auto", "auto")
     if allow_skip and tool_flow_can_skip(user_text, tool_names):
-        print(f"[工具流程] 本条为纯寒暄/纯情绪消息，跳过工具调用直接以角色身份回答：{user_text[:30]!r}")
         result = await chat_once(ctx, list(messages))
         if stats:
             stats.record_llm(result["ms"])
@@ -3840,8 +4499,11 @@ async def chat_with_tools(ctx: RoleContext, messages: list, tool_registry,
             "⑩ 用户索要链接、网址、下载地址时，必须把工具结果里最相关的"
             "链接（URL）原样完整写进回复，一条不够就多写几条，"
             "只报名字不给链接等于没回答；找不到对应链接时如实说明。"
-            "⑪ 【只在必要时调用】工具不是聊天的一部分：消息里没有客观信息需求时"
-            "一个工具都不要调用，直接用角色身份说话。"
+            "⑪ 【只在必要时调用】工具不是聊天的一部分：纯寒暄"
+            "（你好、早安、晚安、在吗、谢谢）与纯情绪消息"
+            "（好累、好开心、难过、想你、抱抱）没有任何客观信息需求，"
+            "一个工具都不要调用，直接以角色身份说话；"
+            "消息里没有客观信息需求时同样一个工具都不要调用。"
             "严禁“顺便查一下时间”“顺便搜一下”这类没有用户请求的调用；"
             "同一条消息里能用一个工具解决的，不要连开多个；"
             "⑫ 【地点不许猜】查询天气等与地点有关的信息时，只能使用"
@@ -3988,8 +4650,7 @@ async def chat_with_tools(ctx: RoleContext, messages: list, tool_registry,
 
     # 兜底：模型没调用任何工具、回答却坦白"不知道/没听说过"，而用户的消息明显
     # 在问一个具体的人/事/物 → 替它强制搜索一轮，把真实结果交给模型重新作答。
-    if tools_schema and not trace and str(final_content or "").strip() \
-            and bool(ctx.get("tool_uncertain_fallback", True)):
+    if tools_schema and not trace and str(final_content or "").strip():
         user_question = ""
         for m in reversed(messages):
             if m.get("role") == "user" and not str(m.get("content", "")).startswith("【"):
@@ -4000,6 +4661,7 @@ async def chat_with_tools(ctx: RoleContext, messages: list, tool_registry,
         query = _search_query_from_question(user_question)
         if search_tool and _answer_admits_unknown(final_content) \
                 and _is_entity_question(user_question) and 2 <= len(query) <= 30 \
+                and not asks_self_context(user_question) \
                 and not _SUBJECTIVE_SEARCH_RE.search(query) \
                 and not _is_roleplay_search(query, ctx):
             print(f"[工具流程] 模型自称不确定且问题指向具体事物，强制补搜：{query!r}")
@@ -4219,7 +4881,8 @@ async def get_image_reply(ctx: RoleContext, user_text: str, history: list,
             print("未配置识图模型名称，无法处理图片")
             return None
         system_content = build_system_prompt(ctx, emotions, extra_parts)
-        if not describe_only and _cfg_bool(ctx, "image_identity_guard_enabled", True):
+        if _cfg_bool(ctx, "image_identity_guard_enabled", True):
+            # 描述模式也要带上：这段描述会写进聊天记录，认错人的话之后每一轮都跟着错
             prompt_text = f"{prompt_text}\n{image_identity_note(ctx)}"
         content, ms = await vision_chat_once(
             ctx, prompt_text, images_for_payload, system_content=system_content,

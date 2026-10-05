@@ -7,6 +7,9 @@ from .database import DatabaseManager
 
 
 class StatsManager:
+    # 聚合粒度：区间本身按天，下钻到某天后按小时、再下钻到某小时后按分钟
+    BUCKET_SECONDS = {"day": 86400, "hour": 3600, "minute": 60}
+
     def __init__(self, db: DatabaseManager, start_time: float = None):
         self.db = db
         self.start_time = start_time or time.time()
@@ -66,11 +69,21 @@ class StatsManager:
             days = 30
         return today0 - (days - 1) * 86400, now, days
 
-    def get_stats(self, range_key: str = "30") -> dict:
+    def get_stats(self, range_key: str = "30", window=None, granularity: str = "") -> dict:
         now = time.time()
         day = 86400
         start, end, days = self._range_bounds(range_key)
-        out = {"range": {"key": range_key, "start": start, "end": end, "days": days}}
+        # 点开某一天/某一小时下钻时，由前端给出具体窗口与粒度
+        if window:
+            start, end = float(window[0]), float(window[1])
+            span = int(end) - int(start)
+            days = max(1, (span + day - 1) // day)
+        if not granularity:
+            # 今天/昨天只跨一天，按天聚合只会得到一个点：改成按小时
+            granularity = "hour" if range_key in ("today", "yesterday") else "day"
+        bucket = self.BUCKET_SECONDS.get(granularity, day)
+        out = {"range": {"key": range_key, "start": start, "end": end, "days": days,
+                         "granularity": granularity}}
         try:
             out["totals"] = self.db.query_one(
                 "SELECT COUNT(*) AS n, IFNULL(AVG(llm_ms),0) AS avg_llm, IFNULL(AVG(tts_ms),0) AS avg_tts,"
@@ -86,21 +99,21 @@ class StatsManager:
                                   0, 0, 0, 0, 0, -1))
             out["today"] = self.db.query_one(
                 "SELECT COUNT(*) AS n FROM interactions WHERE ts >= ?", (today0,)) or {}
-            out["per_day"] = self.db.query_all(
-                "SELECT CAST((? - ts + 86399)/86400 AS INTEGER) AS day_idx, COUNT(*) AS n,"
+            out["per_bucket"] = self.db.query_all(
+                "SELECT CAST((ts - ?) / ? AS INTEGER) AS idx, COUNT(*) AS n,"
                 " IFNULL(SUM(llm_calls),0) AS llm_calls, IFNULL(SUM(tts_calls),0) AS tts_calls,"
                 " IFNULL(SUM(tool_calls),0) AS tool_calls"
-                " FROM interactions WHERE ts >= ? AND ts < ? GROUP BY day_idx ORDER BY day_idx",
-                (today0, start, end))
+                " FROM interactions WHERE ts >= ? AND ts < ? GROUP BY idx ORDER BY idx",
+                (start, bucket, start, end))
             out["emotions"] = self.db.query_all(
                 "SELECT emotion, COUNT(*) AS n FROM interactions"
                 " WHERE ts >= ? AND ts < ? AND IFNULL(emotion,'') != ''"
                 " GROUP BY emotion ORDER BY n DESC LIMIT 12", (start, end))
             out["emotion_trend"] = self.db.query_all(
-                "SELECT CAST((? - ts + 86399)/86400 AS INTEGER) AS day_idx, emotion, COUNT(*) AS n"
+                "SELECT CAST((ts - ?) / ? AS INTEGER) AS idx, emotion, COUNT(*) AS n"
                 " FROM interactions WHERE ts >= ? AND ts < ? AND IFNULL(emotion,'') != ''"
-                " GROUP BY day_idx, emotion ORDER BY day_idx",
-                (today0, start, end))
+                " GROUP BY idx, emotion ORDER BY idx",
+                (start, bucket, start, end))
             # 三个 TOP 榜同样只在所选区间内统计，之前无 WHERE 会与区间汇总对不上
             # 会话榜的「用户」列取该会话里发言最多的那个人（群聊才有意义，
             # 私聊就是会话对方）

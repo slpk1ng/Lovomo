@@ -11,7 +11,7 @@ import httpx
 
 from .tls import unverified_context, verified_context
 
-APP_VERSION = "1.2.3.0"
+APP_VERSION = "1.2.4.0"
 
 # 发布里可能直接挂 .exe，也可能打成压缩包；压缩包的扩展名（下载后自动解压取 exe）
 ARCHIVE_SUFFIXES = (".zip",)
@@ -46,6 +46,15 @@ def is_newer(latest, current) -> bool:
     if not str(latest or "").strip():
         return False
     return version_key(latest) > version_key(current)
+
+
+def is_prerelease_version(v) -> bool:
+    """版本号是否带预发布后缀（1.2.0.0-beta、1.3.0.0-rc.1 等）。
+
+    发布页不能只看 GitHub 的 prerelease 标记：作者常常只把 -beta 写进 tag、
+    没勾「预发布」，于是测试版会被当成正式版。
+    """
+    return version_key(v)[1] == 0
 
 
 def _release_tag(release: dict) -> str:
@@ -136,6 +145,7 @@ def pick_latest_release(releases, include_prerelease: bool = False) -> dict:
             "url": str(best.get("html_url", "") or ""),
             "name": str(best.get("name", "") or "")[:200],
             "prerelease": bool(best.get("prerelease")),
+            "body": str(best.get("body") or "")[:4000],
             "installer": pick_installer_asset(best)}
 
 

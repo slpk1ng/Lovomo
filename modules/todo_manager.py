@@ -43,6 +43,15 @@ DEFAULT_TODO_PATTERNS = [
 
 DEFAULT_TODO_KEYWORDS = ["提醒", "待办", "别忘了", "记得", "叫我"]
 
+# 程序离线期间错过的提醒，重新上线时仍补发；超过这个时长就只判过期，不再翻旧账
+MISSED_CATCHUP_SECONDS = 6 * 3600
+# 补发要等接入方式连上，排到启动之后一点
+MISSED_CATCHUP_DELAY = 15
+# 发送失败（接入方式掉线、投递失败）后的重试节奏：只把状态改回 pending 而不重排，
+# 这条提醒在本次运行里就再也不会触发了，用户看到的是「提醒一直没来」
+TODO_RETRY_DELAY = 120
+TODO_RETRY_MAX = 6
+
 DEFAULT_EXTRACT_PROMPT = (
     "你是待办提取助手。判断用户消息是否包含一个明确的提醒/待办事项。"
     "如果有，输出JSON：{\"has_todo\": true, \"content\": \"要提醒的事项\", "
@@ -101,6 +110,9 @@ EXTRACT_HARD_RULES = (
     "4. 「叫我/提醒我/记得」后面的动词才是事项："
     "「叫我起床」→ content 是「起床」；「提醒我吃药」→ content 是「吃药」。\n"
     "5. 时间与事项都拿不准时输出 {\"has_todo\": false}，宁可漏提醒也不要编造。\n"
+    "6. 主人只是在抱怨或追问（「怎么没提醒我」「你怎么没叫我」「我睡过头了」）时，"
+    "这不是新的提醒请求：只有主人**本条消息里自己说出了时间**，才允许输出 "
+    "{\"has_todo\": true}；本条消息里没有任何时间就输出 {\"has_todo\": false}。\n"
 )
 
 # "提醒指令本身"的黑名单：单独出现时不是待办内容
@@ -297,6 +309,58 @@ def _expr_num(token: str) -> Optional[int]:
     return _cn_num_to_int(token)
 
 
+# 用户原话里出现过的钟点（带「点/时/:」标记），用于校验模型给的 time 有出处
+_CLOCK_MENTION_RE = re.compile(
+    r"(凌晨|早上|早晨|上午|中午|下午|傍晚|晚上|夜里)?\s*"
+    rf"(\d{{1,2}}|{_CN_NUM})\s*[点时:：]\s*(半|\d{{1,2}}\s*分?)?")
+
+
+def clock_mentions(text: str) -> set:
+    """把一段话里说到的钟点解析成 {(时, 分)}（时段换算与 _parse_time_expr 一致）。"""
+    out = set()
+    for m in _CLOCK_MENTION_RE.finditer(str(text or "")):
+        period, hour_token, minute_token = m.group(1), m.group(2), m.group(3) or ""
+        hour = _expr_num(hour_token)
+        if hour is None:
+            continue
+        if period in ("下午", "傍晚", "晚上", "夜里") and hour < 12:
+            hour += 12
+        elif period in ("晚上", "夜里") and hour == 12:
+            hour = 0
+        if not 0 <= hour <= 23:
+            continue
+        if "半" in minute_token:
+            minute = 30
+        else:
+            digits = re.sub(r"\D", "", minute_token)
+            minute = int(digits) if digits else 0
+        if 0 <= minute <= 59:
+            out.add((hour, minute))
+    return out
+
+
+def clock_time_mentioned(text: str, hhmm: str, now: float) -> bool:
+    """模型给出的 HH:MM 是否真在用户这条消息里说过。
+
+    模型经常凭空补一个时间（主人说「怎么没提醒我」，它却回 time="14:00"），
+    于是凭空多出一条第二天的待办。这里要求时刻必须能在原话里找到：
+    12/24 小时制互认（「下午两点」与 "14:00" 算同一时刻）；
+    「30分提醒我」这类裸分钟指当前小时的第 30 分，允许对应本小时或下一小时。
+    """
+    m = re.fullmatch(r"\s*(\d{1,2})\s*[:：]\s*(\d{1,2})\s*", str(hhmm or ""))
+    if not m:
+        return False
+    hour, minute = int(m.group(1)), int(m.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return False
+    said = clock_mentions(text)
+    if (hour, minute) in said or (hour % 12, minute) in said:
+        return True
+    bare = {_expr_num(t) for t in _TODO_BARE_MIN_RE.findall(str(text or ""))}
+    lt = time.localtime(now)
+    return minute in bare and hour in {lt.tm_hour, (lt.tm_hour + 1) % 24}
+
+
 class TodoManager:
     def __init__(self, config, db: DatabaseManager, scheduler: SchedulerManager,
                  sender=None, emotions_provider=None):
@@ -306,6 +370,7 @@ class TodoManager:
         self.sender = sender
         self.emotions_provider = emotions_provider  # 返回当前角色 emotions dict
         self.ctx_provider = None                    # 返回当前角色 RoleContext
+        self._retry_counts = {}                     # 待办 ID → 已重试次数（发送失败重排用）
 
     # ---------------- 提取 ----------------
     def _patterns(self) -> List[re.Pattern]:
@@ -529,10 +594,16 @@ class TodoManager:
         # 之前 delay_minutes 优先，小模型算分钟差经常出错（"23点"被算成 40/80 分钟后），
         # 是提醒时间错乱的根因；只有模型没给出可解析的 time 时才退回相对分钟数。
         if data.get("time"):
-            remind_ts = self._parse_time_expr(str(data.get("time")), now)
-            if remind_ts is not None:
-                print(f"[待办提取] 绝对时间 {data.get('time')!r} → 触发时刻 "
-                      f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(remind_ts))}")
+            # 时间必须在用户这条消息里真的出现过：模型会凭空补一个钟点
+            # （主人说「怎么没提醒我」，它回 time="14:00"），凭空多出一条待办
+            if clock_time_mentioned(text, str(data.get("time")), now):
+                remind_ts = self._parse_time_expr(str(data.get("time")), now)
+                if remind_ts is not None:
+                    print(f"[待办提取] 绝对时间 {data.get('time')!r} → 触发时刻 "
+                          f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(remind_ts))}")
+            else:
+                print(f"[待办提取] 丢弃模型给出的时间 {data.get('time')!r}"
+                      f"（用户这条消息里没有说过这个钟点）")
         if remind_ts is None:
             delay = data.get("delay_minutes")
             try:
@@ -602,6 +673,35 @@ class TodoManager:
             print(f"保存待办失败: {e}")
             return None
 
+    def resume(self, todo_id: int) -> bool:
+        """把待办改回「待提醒」并重新排上提醒（列表里手动恢复过期/漏发的待办用）。
+
+        只把库里的状态改回 pending 而不重排，这条待办在本次运行里就再也不会触发，
+        所以恢复状态和重排必须一起做；时间已经过了就尽快补发一次。
+        """
+        rows = self.db.query_all("SELECT * FROM todos WHERE id=?", (todo_id,))
+        if not rows:
+            return False
+        row = rows[0]
+        try:
+            use_voice = bool(row["use_voice"]) if row.get("use_voice") is not None else None
+        except (KeyError, TypeError):
+            use_voice = None
+        content = str(row.get("content") or "")
+        session_type = str(row.get("session_type") or "private")
+        session_id = str(row.get("session_id") or "")
+        try:
+            remind_ts = float(row.get("remind_time") or 0)
+        except (TypeError, ValueError):
+            remind_ts = 0.0
+        delay = max(MISSED_CATCHUP_DELAY, remind_ts - time.time())
+        self.db.execute("UPDATE todos SET status='pending' WHERE id=?", (todo_id,))
+        self._retry_counts.pop(todo_id, None)
+        self._schedule(todo_id, content, time.time() + delay, session_type, session_id,
+                       use_voice)
+        print(f"[待办提醒] #{todo_id} 已恢复为待提醒，{delay:.0f} 秒后重新提醒。")
+        return True
+
     def _schedule(self, todo_id: int, content: str, remind_ts: float,
                   session_type: str, session_id: str, use_voice: bool = None):
         async def _remind(todo_id=todo_id, content=content,
@@ -644,21 +744,51 @@ class TodoManager:
         emotions = self.emotions_provider() if self.emotions_provider else {}
         if use_voice is None:
             use_voice = bool(self.config.get("todo_voice", False))
+        # 会话ID在库里已经是「private_xxx」形式，再拼一次前缀会变成
+        # 「private_private_xxx」，按会话选连接就找不到（提醒会发到默认的 NapCat 上）
+        full_session = str(session_id or "")
+        prefix = f"{session_type}_"
+        if not full_session.startswith(prefix):
+            full_session = f"{prefix}{full_session}"
         try:
-            sent = await self.sender.speak_and_send(
-                session_type, session_id, message, emotions, ctx,
-                use_voice=bool(use_voice),
-                emotion=emotion or str(self.config.get("todo_voice_emotion", "") or "pingjing"),
-                session_id=f"{session_type}_{session_id}")
+            # 按会话选连接：微信会话的提醒不能走默认的 NapCat
+            with self.sender.for_session(full_session):
+                sent = await self.sender.speak_and_send(
+                    session_type, session_id, message, emotions, ctx,
+                    use_voice=bool(use_voice),
+                    emotion=emotion or str(self.config.get("todo_voice_emotion", "") or "pingjing"),
+                    session_id=full_session)
         except Exception as e:
             sent = False
             print(f"[待办提醒] 发送异常：{type(e).__name__}: {e}")
         if sent:
+            self._retry_counts.pop(todo_id, None)
             self.db.execute("UPDATE todos SET status='done' WHERE id=?", (todo_id,))
         else:
             # 发送方失败时是返回 False 而不是抛异常：不检查就会把没发出的提醒标成已完成
             print(f"[待办提醒] 未发送成功，待办 #{todo_id} 保留为待提醒状态。")
             self.db.execute("UPDATE todos SET status='pending' WHERE id=?", (todo_id,))
+            self._schedule_retry(todo_id, content, session_type, session_id, use_voice)
+
+    def _schedule_retry(self, todo_id: int, content: str, session_type: str,
+                        session_id: str, use_voice: bool = None):
+        """发送失败后重排一次提醒：状态留在 pending 但不重排，就再也不会触发。
+
+        退避重试（60s × 次数）到上限仍发不出去就标为「已过期」，
+        免得一个掉线的会话把这条提醒无限挂着 —— 列表里能看到它没送达。
+        """
+        attempts = self._retry_counts.get(todo_id, 0) + 1
+        if attempts > TODO_RETRY_MAX:
+            self._retry_counts.pop(todo_id, None)
+            print(f"[待办提醒] #{todo_id} 连续 {TODO_RETRY_MAX} 次未能送达，"
+                  "标为「已过期」不再重发（可在待办列表里处理）。")
+            self.db.execute("UPDATE todos SET status='missed' WHERE id=?", (todo_id,))
+            return
+        self._retry_counts[todo_id] = attempts
+        delay = TODO_RETRY_DELAY * attempts
+        print(f"[待办提醒] #{todo_id} 将在 {delay} 秒后第 {attempts} 次重试。")
+        self._schedule(todo_id, content, time.time() + delay, session_type, session_id,
+                       use_voice)
 
     def _remind_mode(self) -> str:
         mode = str(self.config.get("todo_remind_mode", "llm") or "llm").strip().lower()
@@ -691,21 +821,34 @@ class TodoManager:
         return text
 
     def restore_pending(self):
-        """程序启动时恢复未完成的待办调度。"""
+        """程序启动时恢复未完成的待办调度。
+
+        离线期间已经到点的提醒不直接判过期：短时间内的仍补发一次。
+        程序没开就永远收不到提醒、只能看到一条「已过期」，等于提醒白设了。
+        """
         try:
             rows = self.db.query_all("SELECT * FROM todos WHERE status='pending'")
             now = time.time()
+            expired = 0
             for row in rows:
                 remind_ts = row.get("remind_time") or 0
                 if remind_ts <= now:
-                    self.db.execute("UPDATE todos SET status='missed' WHERE id=?", (row["id"],))
-                    continue
+                    if now - remind_ts > MISSED_CATCHUP_SECONDS:
+                        self.db.execute("UPDATE todos SET status='missed' WHERE id=?",
+                                        (row["id"],))
+                        expired += 1
+                        continue
+                    # 排到启动之后：连接还没建立，立刻发会直接失败
+                    print(f"[待办提醒] #{row['id']}「{row['content']}」的提醒时间已过，"
+                          "程序重新上线后补发一次。")
+                    remind_ts = now + MISSED_CATCHUP_DELAY
                 self._schedule(row["id"], row["content"], remind_ts,
                                row.get("session_type", "private"), row.get("session_id", ""),
                                use_voice=(None if row.get("use_voice") is None
                                           else bool(row.get("use_voice"))))
             if rows:
-                print(f"已恢复 {len(rows)} 条待办提醒调度。")
+                print(f"已恢复 {len(rows) - expired} 条待办提醒调度"
+                      + (f"，另有 {expired} 条超过补发时限已判过期。" if expired else "。"))
         except Exception as e:
             print(f"恢复待办失败: {e}")
 

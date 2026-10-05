@@ -216,3 +216,36 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- Lovomo：运行期数据与本地构建产物 ---
+config.json
+data/
+*.db
+*.db-shm
+*.db-wal
+plugins/packages/
+*.zip
+output/
+dist_n5/
+build_n5/
+.tmp_test/
+.tmp_icon/
+.tmp_lexlogs.json
+_live_logs.json
+.lovomo_write_*
+NVIDIA Corporation/
+
+# --- Lovomo：本机调试脚本 ---
+_probe_ilink.py
+_ui_server.py
+
+# --- 本机工作区 ---
+.workbuddy/
+.workbuddy-ai/
+.zcodeignore
+
+# 插件市场是独立仓库（slpk1ng/Lovomo_Plugin_Market），本目录是它的本地工作副本
+plugins/
+
+# 打包脚本是构建的一部分，不跟着 *.spec 一起忽略
+!lovomo_app.spec

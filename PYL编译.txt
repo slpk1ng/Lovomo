@@ -1,0 +1,1 @@
+python -m PyInstaller lovomo_app.spec
