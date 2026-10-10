@@ -547,7 +547,8 @@ class TodoManager:
                            + "\n".join(context_lines)
                            + "\n\n请依据上面的上下文判断主人真正要提醒的事项。")
         try:
-            data = await generate_json_reply(ctx, system, user_prompt, max_tokens=200)
+            data = await generate_json_reply(ctx, system, user_prompt, max_tokens=200,
+                                             label="待办时间解析")
         except Exception as e:
             print(f"LLM 待办提取失败: {e}")
             return []

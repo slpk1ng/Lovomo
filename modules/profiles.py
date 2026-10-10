@@ -286,7 +286,8 @@ class UserProfileManager:
                        "或与其它条目重复的，照抄原条目原文列进 notes_remove（不要改写措辞），"
                        "仍然有效的保持不动；新出现的重要事项照常写进 notes。")
         try:
-            data = await generate_json_reply(ctx, system, user_prompt, max_tokens=256)
+            data = await generate_json_reply(ctx, system, user_prompt, max_tokens=256,
+                                             label="用户画像")
         except Exception as e:
             print(f"用户画像提取失败: {e}")
             return

@@ -386,6 +386,104 @@
             color: var(--brand-dark);
             border-left-color: var(--brand);
         }
+        /* ===== 配置页：大分组（子分组多到一屏放不下）的右侧树状图 =====
+         * 字段行默认收起，子分组标题留在原位；鼠标停在这个分组上时，
+         * 右侧浮出树状图列出全部子分组，点一下直接展开并滚过去。 */
+        .config-tree {
+            position: fixed;
+            right: 24px;
+            top: 80px;
+            display: none;
+            width: 208px;
+            max-height: calc(100vh - 40px);
+            overflow-y: auto;
+            padding: 10px 12px;
+            background: var(--surface);
+            border: 1px solid var(--line);
+            border-radius: var(--radius-card);
+            box-shadow: var(--shadow-card);
+            z-index: 120;
+        }
+        .config-tree-root {
+            font-size: var(--fs-sm);
+            font-weight: var(--fw-semibold);
+            color: var(--ink);
+            padding-bottom: 8px;
+            margin-bottom: 8px;
+            border-bottom: 1px solid var(--line);
+        }
+        .config-tree-list { position: relative; padding-left: 12px; }
+        .config-tree-list::before {
+            content: "";
+            position: absolute;
+            left: 4px; top: 6px; bottom: 6px;
+            width: 1px;
+            background: var(--line-strong);
+        }
+        .config-tree-item {
+            position: relative;
+            padding: 5px 8px;
+            margin: 1px 0;
+            border-radius: var(--radius-ctl);
+            cursor: pointer;
+            font-size: var(--fs-xs);
+            line-height: 1.5;
+            color: var(--ink-2);
+        }
+        .config-tree-item::before {
+            content: "";
+            position: absolute;
+            left: -8px; top: 50%;
+            width: 7px; height: 1px;
+            background: var(--line-strong);
+        }
+        .config-tree-item:hover { background: var(--brand-light); color: var(--brand-dark); }
+        .config-tree-item.open { color: var(--brand-dark); font-weight: var(--fw-medium); }
+        .config-tree-actions {
+            display: flex;
+            gap: 14px;
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid var(--line);
+            font-size: var(--fs-xs);
+        }
+        .config-tree-actions span { color: var(--brand-dark); cursor: pointer; }
+        .config-tree-actions span:hover { text-decoration: underline; }
+        /* 收起的子分组：字段行留在表单里（保存照旧收集），只是不显示 */
+        .config-group > .form-row[data-collapsed="1"] { display: none !important; }
+        .config-subgroup-head { cursor: pointer; user-select: none; }
+        .config-subgroup-head::after {
+            content: "▸";
+            float: right;
+            color: var(--ink-3);
+            font-weight: var(--fw-normal);
+        }
+        .config-subgroup-head.open::after { content: "▾"; }
+        /* ===== 配置文件页：右下角「切换预设」浮层 ===== */
+        .profile-picker {
+            position: absolute;
+            right: 0;
+            bottom: calc(100% + 8px);
+            width: 200px;
+            max-height: 300px;
+            overflow-y: auto;
+            padding: 6px;
+            background: var(--surface);
+            border: 1px solid var(--line);
+            border-radius: var(--radius-card);
+            box-shadow: var(--shadow-card);
+            z-index: 120;
+        }
+        .profile-picker[hidden] { display: none; }
+        .profile-picker-item {
+            padding: 7px 10px;
+            border-radius: var(--radius-ctl);
+            cursor: pointer;
+            font-size: var(--fs-sm);
+            color: var(--ink-2);
+        }
+        .profile-picker-item:hover { background: var(--brand-light); color: var(--brand-dark); }
+        .profile-picker-item.current { color: var(--brand-dark); font-weight: var(--fw-semibold); }
         /* ===== 折线图悬停提示框 ===== */
         .chart-tip {
             position: fixed;
@@ -1013,37 +1111,6 @@
         .modal-close:hover { background: rgba(255, 255, 255, 0.18); }
         .modal-tools { background: var(--surface-2); border-bottom: 1px solid var(--line); }
 
-        /* ---------- 配置预设弹窗 ---------- */
-        .preset-body { display: flex; gap: var(--sp-4); align-items: flex-start; }
-        .preset-nav { flex: 0 0 116px; display: flex; flex-direction: column; gap: var(--sp-2); }
-        .preset-nav-item {
-            padding: 10px var(--sp-3); border-radius: var(--radius-ctl); cursor: pointer;
-            font-size: var(--fs-sm); color: var(--ink-2); background: var(--surface-2);
-            border: 1px solid transparent; transition: background 0.15s var(--ease);
-        }
-        .preset-nav-item:hover { background: var(--brand-light); }
-        .preset-nav-item.active {
-            background: var(--brand-light); color: var(--brand-dark);
-            font-weight: var(--fw-semibold); border-color: rgba(47, 107, 237, 0.28);
-        }
-        .preset-main { flex: 1; min-width: 0; }
-        .preset-footer {
-            display: flex; align-items: center; gap: var(--sp-3);
-            padding: 10px 15px var(--sp-4);
-        }
-        .preset-footer .sub-desc { flex: 1; min-width: 0; margin: 0; }
-        .preset-row { padding: 10px 0; border-bottom: 1px solid var(--line); }
-        .preset-row:last-child { border-bottom: 0; }
-        .preset-head { display: flex; align-items: center; gap: var(--sp-2); }
-        .preset-note {
-            flex: 1; min-width: 0; padding: 7px 10px; font-size: var(--fs-sm);
-            border: 1px solid var(--line-strong); border-radius: var(--radius-ctl);
-            background: var(--surface); color: var(--ink);
-        }
-        .preset-note:focus { outline: none; border-color: var(--brand); }
-        .preset-head .btn { flex: 0 0 auto; padding: 7px 12px; font-size: var(--fs-sm); }
-        .preset-meta { margin-top: 5px; font-size: var(--fs-xs); color: var(--ink-3); }
-
         /* ---------- 右下角悬浮操作区 ---------- */
         .float-actions, .plugin-apply-bar {
             right: clamp(16px, 1.7vw, 28px);
@@ -1490,11 +1557,7 @@
         }
         .modal-body { padding: var(--sp-5); }
 
-        /* 20) 预设面板：把导航项的描边补实，避免"只有底色没有边界" */
-        .preset-nav-item { border: 1px solid transparent; }
-        .preset-nav-item:hover { border-color: rgba(47, 107, 237, 0.20); }
-
-        /* 21) 日志页铺满时的边距修正：
+        /* 20) 日志页铺满时的边距修正：
               #panel-logs.active 用 height:100% 吃满高度，若父级 padding 未计入
               会导致深色台贴住视口底边。这里显式留出安全间距。 */
         #panel-logs.active { padding-bottom: 0; }
@@ -1927,8 +1990,51 @@
                     <button class="btn btn-gray" id="check-update-btn" data-icon="checkUpdate">检查更新</button>
                     <span class="update-bubble" id="update-bubble" hidden>有新版本！</span>
                 </span>
-                <button class="btn btn-gray" id="config-preset-btn" data-icon="swap">切换预设</button>
                 <button class="btn btn-gray" id="clear-ui-cache-btn" data-icon="clean" title="更新了但是感觉没有变化？点击这个按钮清理界面缓存。">清理界面缓存</button>
+            </div>
+        </div>
+        <div class="panel" id="panel-profiles">
+            <div class="config-form">
+                <div class="section-block">
+                    <h3>配置文件</h3>
+                    <div class="sub-desc">
+                        每份配置文件就是一套完整配置，接入方式可以各自选用一份。default 就是主配置本身（设置页改的就是它），不能删除也不能重命名。
+                        接入方式列表属于主配置，不随配置文件切换。
+                        密钥与密码只在设置页统一管理，这一页不显示也不改动它们。
+                    </div>
+                    <div class="inline-form" style="flex-wrap:wrap;gap:var(--sp-2);">
+                        <div class="field" style="flex:0 0 auto;">
+                            <label>正在编辑</label>
+                            <select id="profile-select" style="min-width:200px;"></select>
+                        </div>
+                        <div class="field" style="flex:0 0 auto;">
+                            <label>名称</label>
+                            <input type="text" id="profile-name" placeholder="新建 / 重命名时填">
+                        </div>
+                        <div class="field" style="flex:0 0 auto;">
+                            <button class="btn btn-green" id="profile-create-btn">新建</button>
+                        </div>
+                        <div class="field" style="flex:0 0 auto;">
+                            <button class="btn btn-gray" id="profile-rename-btn">重命名</button>
+                        </div>
+                        <div class="field" style="flex:0 0 auto;">
+                            <button class="btn btn-red" id="profile-delete-btn">删除</button>
+                        </div>
+                        <div class="field" style="flex:0 0 auto;">
+                            <button class="btn btn-gray" id="profile-open-dir-btn" data-icon="folder">打开目录</button>
+                        </div>
+                    </div>
+                    <div class="muted" id="profile-usedby" style="margin-top:6px;"></div>
+                </div>
+                <div id="profile-groups"></div>
+            </div>
+            <div class="anchor-nav" id="profile-anchor-nav"></div>
+            <div class="float-actions" id="profile-float-actions">
+                <div id="profile-message"></div>
+                <button class="btn btn-gray" id="profile-switch-btn" data-icon="sliders">切换预设</button>
+                <button class="save-btn" id="profile-save-btn" data-icon="save">保存配置文件</button>
+                <button class="btn btn-gray" id="profile-back-btn" data-icon="swap">返回设置</button>
+                <div class="profile-picker" id="profile-picker" hidden></div>
             </div>
         </div>
         <div class="panel" id="panel-connections">
@@ -2176,45 +2282,6 @@
                     <div id="sticker-auto-picked" class="muted">还没有选择图片或文件夹</div>
                     <div id="sticker-auto-progress" class="muted"></div>
                     <div id="sticker-auto-result"></div>
-                </div>
-            </div>
-        </div>
-        <div class="modal-overlay" id="config-preset-modal">
-            <div class="modal-content" style="height:auto;max-height:86%;width:720px;">
-                <div class="modal-header">
-                    <h3>切换预设</h3>
-                    <span class="modal-close" id="config-preset-close">×</span>
-                </div>
-                <div class="modal-body preset-body">
-                    <div class="preset-nav">
-                        <div class="preset-nav-item active" id="preset-tab-import">导入配置</div>
-                        <div class="preset-nav-item" id="preset-tab-export">导出配置</div>
-                    </div>
-                    <div class="preset-main">
-                        <div id="preset-pane-import">
-                            <div class="sub-desc">选一份之前导出的预设，一键切回当时的配置。</div>
-                            <div id="preset-import-list"></div>
-                        </div>
-                        <div id="preset-pane-export" style="display:none;">
-                            <div class="sub-desc">把当前配置存成一份预设放在本机，之后随时可以切回来。</div>
-                            <div class="form-row">
-                                <label>备注</label>
-                                <div class="field-wrapper">
-                                    <input type="text" id="preset-note" placeholder="选填，例如「换声线前」">
-                                </div>
-                            </div>
-                            <div class="inline-form">
-                                <div class="field" style="flex:0;">
-                                    <button class="btn" id="preset-save" data-icon="export">导出当前配置</button>
-                                </div>
-                            </div>
-                            <div id="preset-export-list"></div>
-                        </div>
-                    </div>
-                </div>
-                <div class="preset-footer">
-                    <button class="btn btn-gray" id="preset-open-dir" data-icon="folder">查看文件夹</button>
-                    <span class="sub-desc" id="preset-msg"></span>
                 </div>
             </div>
         </div>
@@ -2520,6 +2587,7 @@
                     <span style="float:right; font-weight:normal;">
                         <label style="font-size: var(--fs-base);">时间区间</label>
                         <select id="stats-range">
+                            <option value="all">总共</option>
                             <option value="today">今天</option>
                             <option value="yesterday">昨天</option>
                             <option value="7">近 7 天</option>
@@ -2537,6 +2605,7 @@
                 <div class="chart-box"><h4>心情与好感曲线
                     <span style="float:right; font-weight:normal;">
                         <select id="curve-range" title="时间区间" style="margin-right:6px;">
+                            <option value="all">总共</option>
                             <option value="today">今天</option>
                             <option value="yesterday">昨天</option>
                             <option value="7">近 7 天</option>
@@ -2551,6 +2620,23 @@
                     <div class="muted" id="curve-empty" style="display:none;">还没有曲线数据：心情/好感在对话中发生变化后，这里会随时间积累出曲线。</div>
                     <canvas id="chart-mood" width="900" height="260"></canvas>
                     <canvas id="chart-affection" width="900" height="260" style="margin-top:10px;"></canvas>
+                </div>
+                <div class="chart-box"><h4>Token 消耗
+                    <span style="float:right; font-weight:normal;">
+                        <select id="token-range" title="时间区间">
+                            <option value="all">总共</option>
+                            <option value="today">今天</option>
+                            <option value="yesterday">昨天</option>
+                            <option value="7">近 7 天</option>
+                            <option value="14">近 14 天</option>
+                            <option value="30">近 30 天</option>
+                        </select>
+                        <a id="token-back" href="javascript:void(0)" style="display:none; margin-left:8px;">返回上一层</a>
+                    </span>
+                </h4>
+                    <div class="muted" id="token-summary"></div>
+                    <canvas id="chart-tokens" width="900" height="260"></canvas>
+                    <div id="token-labels" style="margin-top:10px;"></div>
                 </div>
                 <div class="chart-box"><h4>心情日记
                     <span style="float:right; font-weight:normal;">
@@ -2689,7 +2775,7 @@
                    所有功能都必须先打开对应开关才会生效。</p>
 
                 <h3>一、每个页面的作用</h3>
-                <p><strong>1. 配置文件</strong>：所有运行参数与功能总开关。左侧有锚点导航，右上角可切换预设（把当前配置存一份在本机，之后随时切回来；「查看文件夹」直接打开预设目录）。保存结果就显示在右下角保存按钮上方（改单个开关也会在那里提示），不用再往上翻找。日常使用关系不大的开关都在页面最底部的「更多」里，例如统计、软件更新、插件系统、音量统一、语音识别、防刷屏与「隐藏高级 GSV 参数」——这个开关只隐藏 GPT-SoVITS 的推理细节（采样、切分、批处理、语速、种子等），服务地址、模型目录、参考音频根目录、文本语言、时长校验与台词清洗这些必填项不受影响。</p>
+                <p><strong>1. 配置文件</strong>：所有运行参数与功能总开关。左侧有锚点导航，锚点最上方的「配置文件」进入配置文件页——整套配置可以按名字存成多份，每条接入方式各用一份（default 就是这里的主配置）。保存结果就显示在右下角保存按钮上方（改单个开关也会在那里提示），不用再往上翻找。日常使用关系不大的开关都在页面最底部的「更多」里，例如统计、软件更新、插件系统、音量统一、语音识别、防刷屏与「隐藏高级 GSV 参数」——这个开关只隐藏 GPT-SoVITS 的推理细节（采样、切分、批处理、语速、种子等），服务地址、模型目录、参考音频根目录、文本语言、时长校验与台词清洗这些必填项不受影响。</p>
                 <p><strong>2. 接入方式</strong>：机器人的消息通道，一个平台一条。NapCat 填 WebSocket 地址；微信 ClawBot 与 QQ 官方机器人点「刷新二维码」扫码登录，登录态、收消息游标与会话令牌都随这条连接保存。角色在编辑角色时可以绑定某一条连接（多账号时各用各的），不绑就走默认连接。微信里收不到回复时先点这里的「投递自检」：它会区分「服务端收下了」与「真的投递到微信了」，只是前者时重新扫码登录一次即可重建绑定。</p>
 		<p><strong>3. 插件市场（测试版）</strong>：管<strong>装插件</strong>——
 		   上传自己的 .zip 包、打开插件目录、刷新在线市场；自己写的插件也用这一页的
@@ -2917,6 +3003,11 @@
                     <label>机器人 ID</label>
                     <input type="text" id="conn-bot-id" placeholder="例如 weixin_personal">
                 </div>
+                <div class="field wide" id="conn-field-profile">
+                    <label>配置文件</label>
+                    <select id="conn-profile"></select>
+                    <div class="muted" style="margin-top:4px;">这条接入方式收到的消息用哪套配置；default 表示跟随主配置。</div>
+                </div>
                 <div class="field wide" id="conn-qr-box">
                     <label>扫码</label>
                     <div class="conn-qr-wrap">
@@ -2940,6 +3031,7 @@
             </div>
         </div>
     </div>
+    <div class="config-tree" id="config-tree"></div>
     <div class="modal-overlay" id="app-dialog">
         <div class="modal-content app-dialog-content">
             <h3 id="app-dialog-title"></h3>
@@ -3057,7 +3149,7 @@
             "还没有曲线数据：心情/好感在对话中发生变化后，这里会随时间积累出曲线。": "No curve data yet: once mood or affection changes during conversation, the curves build up here over time.",
             "， 点名字直接跳到那个插件的页面，不用先翻卡片。 页面右下角的「检查插件更新」会列出市场上有新版本的插件并一键替换。": ", and clicking a name jumps straight to that plugin's page without digging through the cards. The “Check for plugin updates” button in the bottom-right lists plugins with a newer version in the market and replaces them in one click.",
             "，级别是": ", and the level is",
-            "：所有运行参数与功能总开关。左侧有锚点导航，右上角可切换预设（把当前配置存一份在本机，之后随时切回来；「查看文件夹」直接打开预设目录）。保存结果就显示在右下角保存按钮上方（改单个开关也会在那里提示），不用再往上翻找。日常使用关系不大的开关都在页面最底部的「更多」里，例如统计、软件更新、插件系统、音量统一、语音识别、防刷屏与「隐藏高级 GSV 参数」——这个开关只隐藏 GPT-SoVITS 的推理细节（采样、切分、批处理、语速、种子等），服务地址、模型目录、参考音频根目录、文本语言、时长校验与台词清洗这些必填项不受影响。": ": every runtime setting and feature switch. Anchor navigation sits on the left, and presets can be switched in the top-right (save the current configuration on this machine and switch back at any time; “Open folder” takes you to the preset directory). The save result is shown above the save buttons in the bottom-right corner (single switches report there too), so there is no need to scroll back up. Switches you rarely need live under “More” at the very bottom of the page: statistics, software updates, the plugin system, loudness normalisation, speech recognition, anti-flood and “Hide advanced GSV parameters” — that last one only hides the GPT-SoVITS inference details (sampling, splitting, batching, speed, seed and so on), while required fields such as the service address, model directory, reference-audio root, text language, duration checks and script cleaning stay visible.",
+            "：所有运行参数与功能总开关。左侧有锚点导航，锚点最上方的「配置文件」进入配置文件页——整套配置可以按名字存成多份，每条接入方式各用一份（default 就是这里的主配置）。保存结果就显示在右下角保存按钮上方（改单个开关也会在那里提示），不用再往上翻找。日常使用关系不大的开关都在页面最底部的「更多」里，例如统计、软件更新、插件系统、音量统一、语音识别、防刷屏与「隐藏高级 GSV 参数」——这个开关只隐藏 GPT-SoVITS 的推理细节（采样、切分、批处理、语速、种子等），服务地址、模型目录、参考音频根目录、文本语言、时长校验与台词清洗这些必填项不受影响。": ": every runtime setting and feature switch. Anchor navigation sits on the left, and the “Profiles” entry at the top of that navigation opens the profiles page — the whole configuration can be saved under several names, and each connection picks one (default is the main configuration edited here). The save result is shown above the save buttons in the bottom-right corner (single switches report there too), so there is no need to scroll back up. Switches you rarely need live under “More” at the very bottom of the page: statistics, software updates, the plugin system, loudness normalisation, speech recognition, anti-flood and “Hide advanced GSV parameters” — that last one only hides the GPT-SoVITS inference details (sampling, splitting, batching, speed, seed and so on), while required fields such as the service address, model directory, reference-audio root, text language, duration checks and script cleaning stay visible.",
             "：打开「TTS 台词清洗与日志」里的 「移除非台词内容」（默认开）。开启后括号里的动作、表情与场景说明以及颜文字只在消息文本里保留， 不进语音；引号里的台词不受影响，日志会写明剔除了哪些内容。": ": turn on “Strip non-dialogue content” under “TTS script cleaning and logging” (on by default). With it on, actions, expressions and scene notes in brackets and kaomoji stay in the message text but are never spoken; dialogue inside quotes is untouched, and the log lists what was removed.",
             "：消息量、情绪分布、角色心情值与实时性能。折线图把鼠标停在某一列上会显示那一列所有曲线的「颜色 数值」，同一列有多条曲线时会一次列全。": ": message volume, emotion distribution, character mood and live performance. Hovering a column of a line chart shows the “colour value” of every curve in that column, listing them all when several share it.",
             "；界面按级别着色（时间绿色不加粗，INFO 白、WARN 黄、ERROR 红）， 和": "; the interface colours lines by level (the timestamp in green without bold, INFO white, WARN yellow, ERROR red), and",
@@ -3097,6 +3189,14 @@
             "导出配置": "Export Configuration",
             "导入配置": "Import Configuration",
             "切换预设": "Switch preset",
+            "保存配置文件": "Save profile",
+            "正在编辑": "Editing",
+            "新建": "New",
+            "重命名": "Rename",
+            "打开目录": "Open folder",
+            "返回设置": "Back to settings",
+            "每份配置文件就是一套完整配置，接入方式可以各自选用一份。default 就是主配置本身（设置页改的就是它），不能删除也不能重命名。 接入方式列表属于主配置，不随配置文件切换。 密钥与密码只在设置页统一管理，这一页不显示也不改动它们。": "Each profile is a complete set of settings, and every connection can pick one. default is the main configuration itself (the one edited on the settings page) and cannot be deleted or renamed. The connection list belongs to the main configuration and does not follow the profile. API keys and passwords are managed only on the settings page; this page neither shows nor changes them.",
+            "这条接入方式收到的消息用哪套配置；default 表示跟随主配置。": "Which profile handles messages from this connection; default means it follows the main configuration.",
             "清理界面缓存": "Clear interface cache",
             "前往 GitHub 更新": "Update from GitHub",
             "在线更新": "Update online",
@@ -3267,6 +3367,7 @@
             "时间区间": "Time range",
             "今天": "Today",
             "昨天": "Yesterday",
+            "总共": "All time",
             "近 7 天": "Last 7 days",
             "近 14 天": "Last 14 days",
             "近 30 天": "Last 30 days",
@@ -3483,6 +3584,8 @@
             "WebUI 设置": "WebUI Settings",
             "LLM 大模型": "LLM Model",
             "识图模型": "Vision Model",
+            "语音与回复": "Voice and Reply",
+            "概率回复与智能回复": "Probability Reply and Smart Reply",
             "TTS 服务与模型": "TTS Service and Model",
             "TTS 参考音频与语言": "TTS Reference Audio and Language",
             "TTS 推理参数": "TTS Inference Parameters",
@@ -3499,6 +3602,7 @@
             "多角色对话": "Multi-role Conversations",
             "定时任务与主动消息": "Scheduled Tasks and Proactive Messages",
             "防刷屏": "Flood Control",
+            "本地模型": "Local Models",
             "统计": "Statistics",
             "软件更新": "Software Updates",
             "插件系统": "Plugin System",
@@ -3532,6 +3636,9 @@
             "换模型后自动卸载旧模型": "Unload the old model after switching",
             "修改模型保存后，等新模型首次调用成功时自动卸载不再使用的旧模型（LM Studio）": "After you change the model and save, the previous model is unloaded once the new one has been called successfully for the first time (LM Studio)",
             "默认开启。显存有限时旧模型常驻会挤爆显存或拖慢速度；需要 LM Studio 自带的 lms 命令行。": "On by default. With limited VRAM a resident old model can exhaust memory or slow things down; requires the lms command line shipped with LM Studio.",
+            "启动时预加载本地模型": "Preload local models at startup",
+            "程序打开时自动加载配置里用到的本机模型": "Load the local models used by the configuration automatically when the program opens",
+            "默认开启。模型不必等到第一条消息才加载：对话、识图与嵌入模型都会预加载；LM Studio 走它自带的 lms 命令行，其余本机服务（Ollama、llama.cpp、vLLM 等）用一次极短的请求预热。服务地址在云端的模型不受影响。": "On by default, so the model does not have to wait for the first message: chat, vision and embedding models are all preloaded. LM Studio is loaded through its own lms command line, and other local services (Ollama, llama.cpp, vLLM and so on) are warmed up with a single very short request. Models whose service address is in the cloud are not affected.",
             "推进未完成的事": "Push unfinished tasks through",
             "角色只答应不动手时，回复发完之后系统再判一次，接着让她把内容真正做出来，不需要主人再催一次": "When the character only agrees without acting, the reply is checked once after it is sent and she is pushed to actually deliver the content, with no need for the user to ask again",
             "默认开启。只在主人催着要结果、或要求了戳一戳 / @人 / 引用 / 撤回这类动作时才判定；判定说不出还差什么就不会多接一条。": "On by default. The check runs only when the user is pressing for a result or asks for an action such as a poke, an @, a quote or a recall; if the check cannot say what is still missing, no extra reply is added.",
@@ -3814,7 +3921,7 @@
             "分开发送": "Split sending",
             "开启后，显示语音分开发送和文本分开发送选项。": "When on, the split voice and split text options appear.",
             "语音分开发送": "Split voice sending",
-            "开启后，每句话将单独作为一条语音消息发送。（QQ官方机器人平台受限，建议关闭；NapCat可开启）": "When on, every sentence is sent as its own voice message. (Restricted on the official QQ bot platform, so keep it off there; NapCat can enable it.)",
+            "开启后，每句话将单独作为一条语音消息发送。QQ 官方机器人一条回复最多 5 条消息，超出时每句的文字会并进语音一起发。": "When on, every sentence is sent as its own voice message. The official QQ bot allows at most 5 messages per reply, and beyond that each sentence's text rides along with its voice.",
             "动态等待": "Dynamic wait",
             "根据语音时长动态等待": "Wait dynamically based on the audio duration",
             "开启后，分开发送时会根据音频实际时长动态等待。": "When on, split sending waits according to the actual audio duration.",
@@ -4027,6 +4134,17 @@
             "点击某个小时查看该小时的分钟数据": "Click an hour to see its per-minute data",
             "当前筛选下没有曲线数据。": "No curve data for the current filter.",
             "心情日记": "Mood Diary",
+            "Token 消耗": "Token Usage",
+            "总共": "All time",
+            "全部时间": "All time",
+            "总 tokens": "Total tokens",
+            "输入 tokens": "Prompt tokens",
+            "用途": "Purpose",
+            "调用次数": "Calls",
+            "输入": "Prompt",
+            "输出": "Completion",
+            "合计": "Total",
+            "该时段还没有 token 记录。": "No token records for this period yet.",
             "接入方式": "Connections",
             "消息从哪里来。三种接入方式各自独立，可以同时启用多条；改动保存后几秒内自动重连，无需重启。": "Where messages come from. The three connection types are independent and several can be enabled at once; changes reconnect automatically a few seconds after saving.",
             "新建接入方式": "Add connection",
@@ -5402,20 +5520,23 @@
             { title: 'LLM 大模型', keys: ['llm_backend', 'llm_base_url', 'llm_model_name', 'llm_api_key', 'num_ctx', 'history_length', 'enable_think', 'llm_timeout', 'llm_auto_unload_old', 'text_clean_blocklist', 'llm_sampling_enabled', 'llm_top_p', 'llm_top_k', 'llm_repeat_penalty', 'llm_extra_body'] },
             { title: '识图模型', keys: ['image_caption_model_name', 'image_caption_backend', 'image_caption_base_url', 'image_caption_api_key', 'image_caption_timeout', 'image_identity_guard_enabled'] },
 
-            /* ===== TTS 语音 ===== */
-            { title: 'TTS 服务与模型', keys: ['tts_backend', 'auto_start_tts', 'tts_start_script', 'client_base_url', 'model_dir', 'ref_audio_root', 'timeout_seconds', 'device', 'media_type', 'cloud_tts_base_url', 'cloud_tts_protocol', 'cloud_tts_api_key', 'cloud_tts_model', 'cloud_tts_voice', 'cloud_tts_voice_map', 'prompt_text', 'prompt_lang', 'text_lang', 'tts_auto_lang'] },
-            { title: 'TTS 推理参数', keys: ['top_k', 'top_p', 'temperature', 'text_split_method', 'batch_size', 'batch_threshold', 'split_bucket', 'speed_factor', 'fragment_interval', 'streaming_mode', 'seed', 'parallel_infer', 'repetition_penalty'] },
-            { title: 'TTS 台词清洗与日志', keys: ['tts_strip_non_dialogue', 'tts_char_map', 'tts_duration_guard', 'tts_min_seconds_per_char', 'tts_max_seconds_per_char', 'tts_debug_log'] },
-            { title: '情绪与语气', keys: ['llm_judge', 'default_voice', 'voice_transition', 'breathing_gap_ms', 'crossfade_ms', 'enable_default_emotions', 'llm_emotion_intensity', 'intensity_to_temperature', 'intensity_to_top_k', 'emotion_guide_enabled', 'emotion_guide_extra'] },
-            { title: '【实验性】情绪模仿', keys: ['emotion_mimic_enabled', 'emotion_mimic_root', 'emotion_mimic_voice_weight'] },
-
-            /* ===== 回复与发送 ===== */
-            { title: '回复方式', keys: ['tts_reply_enabled', 'reply_voice_mode', 'reply_voice_chance', 'streaming_enabled', 'poke_enabled', 'recall_enabled', 'display_pure_language', 'display_lang'] },
-            { title: '防复读', keys: ['repeat_guard_rounds', 'repeat_guard_streaming_check', 'repeat_guard_regen_check', 'repeat_guard_compare_self', 'repeat_guard_compare_user', 'repeat_guard_self_threshold', 'repeat_guard_user_threshold'] },
-            { title: '推进未完成的事', keys: ['unfinished_action_enabled'] },
-            { title: '发送与对话记忆', keys: ['separate_send', 'send_voice_separately', 'separate_force_segment', 'text_separate', 'dynamic_sleep', 'max_voice_cache', 'isolated_session', 'summary_enabled', 'summary_threshold', 'summary_max_history', 'summary_prompt', 'dynamic_context_enabled', 'topic_summary_every_n', 'topic_summary_prompt', 'history_recall_enabled', 'history_recall_mode', 'history_recall_top_k'] },
-            { title: '群聊与私聊', keys: ['only_private', 'group_need_at', 'whitelist_ids'] },
-            { title: '回复审判与心情', keys: ['reply_judge_enabled', 'mood_enabled', 'mood_style_enabled', 'mood_regress_rate', 'mood_daily_recover', 'mood_env_enabled', 'mood_env_night_start', 'mood_env_night_end', 'mood_env_night_drop', 'mood_env_weekend_boost', 'mood_env_lonely_days', 'mood_env_lonely_drop', 'mood_diary_enabled', 'reply_judge_prompt', 'reply_judge_mood_min', 'reply_judge_mood_max', 'reply_judge_mood_initial', 'reply_judge_mood_delta_max', 'reply_judge_mood_low', 'reply_judge_mood_high', 'reply_judge_prob_low', 'reply_judge_prob_high'] },
+            /* ===== 语音与回复 =====
+             * TTS 与回复相关的子分组有十几个，平铺出来太长；收进一个大分组，
+             * 子分组默认只显示标题，鼠标停在分组上时右侧浮出树状图。 */
+            { title: '语音与回复', tree: true, children: [
+                { title: 'TTS 服务与模型', keys: ['tts_backend', 'auto_start_tts', 'tts_start_script', 'client_base_url', 'model_dir', 'ref_audio_root', 'timeout_seconds', 'device', 'media_type', 'cloud_tts_base_url', 'cloud_tts_protocol', 'cloud_tts_api_key', 'cloud_tts_model', 'cloud_tts_voice', 'cloud_tts_voice_map', 'prompt_text', 'prompt_lang', 'text_lang', 'tts_auto_lang'] },
+                { title: 'TTS 推理参数', keys: ['top_k', 'top_p', 'temperature', 'text_split_method', 'batch_size', 'batch_threshold', 'split_bucket', 'speed_factor', 'fragment_interval', 'streaming_mode', 'seed', 'parallel_infer', 'repetition_penalty'] },
+                { title: 'TTS 台词清洗与日志', keys: ['tts_strip_non_dialogue', 'tts_char_map', 'tts_duration_guard', 'tts_min_seconds_per_char', 'tts_max_seconds_per_char', 'tts_debug_log'] },
+                { title: '情绪与语气', keys: ['llm_judge', 'default_voice', 'voice_transition', 'breathing_gap_ms', 'crossfade_ms', 'enable_default_emotions', 'llm_emotion_intensity', 'intensity_to_temperature', 'intensity_to_top_k', 'emotion_guide_enabled', 'emotion_guide_extra'] },
+                { title: '【实验性】情绪模仿', keys: ['emotion_mimic_enabled', 'emotion_mimic_root', 'emotion_mimic_voice_weight'] },
+                { title: '回复方式', keys: ['tts_reply_enabled', 'reply_voice_mode', 'reply_voice_chance', 'streaming_enabled', 'poke_enabled', 'recall_enabled', 'display_pure_language', 'display_lang'] },
+                { title: '防复读', keys: ['repeat_guard_rounds', 'repeat_guard_streaming_check', 'repeat_guard_regen_check', 'repeat_guard_compare_self', 'repeat_guard_compare_user', 'repeat_guard_self_threshold', 'repeat_guard_user_threshold'] },
+                { title: '推进未完成的事', keys: ['unfinished_action_enabled'] },
+                { title: '发送与对话记忆', keys: ['separate_send', 'send_voice_separately', 'separate_force_segment', 'text_separate', 'dynamic_sleep', 'max_voice_cache', 'isolated_session', 'summary_enabled', 'summary_threshold', 'summary_max_history', 'summary_prompt', 'dynamic_context_enabled', 'topic_summary_every_n', 'topic_summary_prompt', 'history_recall_enabled', 'history_recall_mode', 'history_recall_top_k'] },
+                { title: '群聊与私聊', keys: ['only_private', 'group_need_at', 'whitelist_ids'] },
+                { title: '回复审判与心情', keys: ['reply_judge_enabled', 'mood_enabled', 'mood_style_enabled', 'mood_regress_rate', 'mood_daily_recover', 'mood_env_enabled', 'mood_env_night_start', 'mood_env_night_end', 'mood_env_night_drop', 'mood_env_weekend_boost', 'mood_env_lonely_days', 'mood_env_lonely_drop', 'mood_diary_enabled', 'reply_judge_prompt', 'reply_judge_mood_min', 'reply_judge_mood_max', 'reply_judge_mood_initial', 'reply_judge_mood_delta_max', 'reply_judge_mood_low', 'reply_judge_mood_high', 'reply_judge_prob_low', 'reply_judge_prob_high'] },
+                { title: '概率回复与智能回复', keys: ['reply_probability_enabled', 'reply_probability', 'smart_reply_enabled', 'smart_reply_delay_seconds', 'smart_reply_prompt'] }
+            ] },
 
             /* ===== 对话增强 ===== */
             { title: '用户画像', keys: ['profiles_enabled', 'profiles_auto_extract', 'profiles_max_chars', 'profiles_extract_prompt', 'profiles_inject_template'] },
@@ -5441,6 +5562,7 @@
                 { title: '音量统一', keys: ['tts_loudness_normalize', 'tts_loudness_target_db', 'tts_loudness_peak_db', 'tts_loudness_max_gain_db', 'tts_ref_normalize'] },
                 { title: '语音识别', keys: ['asr_engine', 'asr_lang', 'asr_base_url', 'asr_dashscope_model', 'asr_local_model_size'] },
                 { title: '防刷屏', keys: ['anti_spam_enabled', 'anti_spam_window_seconds', 'anti_spam_max_in_window'] },
+                { title: '本地模型', keys: ['llm_auto_load_local'] },
                 { title: '其他', keys: ['hide_gsv_options', 'enable_time_awareness'] }
             ] }
         ];
@@ -5475,6 +5597,7 @@
             'llm_embedding_model': { label: 'Embedding 模型名', description: '【可选】外部 API 的 Embedding 模型名', hint: '使用云端 API 时需填写，如 text-embedding-v3。本地 Ollama 留空则使用 rag_embedding_model。', required: false, type: 'string' },
             'llm_model_name': { label: '大语言模型 (LLM) 名称', description: '【必填】大语言模型 (LLM) 名称', hint: '可手动填写模型 ID，或点「选文件夹」扫描本地模型 /「服务列表」从 LLM 服务获取。LM Studio 注意：填模型 ID（如 qwen/qwen3.5-9b），不是仓库名。', required: true, type: 'model_select' },
             'llm_auto_unload_old': { label: '换模型后自动卸载旧模型', description: '修改模型保存后，等新模型首次调用成功时自动卸载不再使用的旧模型（LM Studio）', hint: '默认开启。显存有限时旧模型常驻会挤爆显存或拖慢速度；需要 LM Studio 自带的 lms 命令行。', required: false, type: 'boolean', default: true },
+            'llm_auto_load_local': { label: '启动时预加载本地模型', description: '程序打开时自动加载配置里用到的本机模型', hint: '默认开启。模型不必等到第一条消息才加载：对话、识图与嵌入模型都会预加载；LM Studio 走它自带的 lms 命令行，其余本机服务（Ollama、llama.cpp、vLLM 等）用一次极短的请求预热。服务地址在云端的模型不受影响。', required: false, type: 'boolean', default: true },
             'text_clean_blocklist': { label: '文本清洗屏蔽词', description: 'LLM 回复中出现这些字符/词时会被剔除后再发送（语音和文字都生效）', hint: '每行一个字符或词，也可用逗号分隔，例如剔除不想出现的口癖词、符号。留空不启用。', required: false, type: 'text' },
             'image_caption_model_name': { label: '识图模型名称', description: '【可选】识图模型名称', hint: '用于处理图片，接收图片并输出JSON。可手动填写或点「选文件夹」/「服务列表」选择。留空则遇到图片时直接跳过。', required: false, type: 'model_select' },
             'image_caption_backend': { label: '识图模型接口', description: '识图模型后端接口类型', hint: '留空则跟随 LLM 接口类型。ollama：本地 Ollama；openai：云端 OpenAI 兼容接口。', required: false, type: 'string', options: ['', 'ollama', 'openai'], default: '' },
@@ -5552,7 +5675,7 @@
             'max_voice_cache': { label: '最大语音缓存数', description: '最大语音缓存数量', hint: '最多保留的临时/合并音频文件数。', required: false, type: 'int', default: 20 },
             'isolated_session': { label: '隔离会话', description: '隔离会话', hint: '启用后，群成员的上下文独立。', required: false, type: 'boolean', default: false },
             'separate_send': { label: '分开发送', description: '分开发送', hint: '开启后，显示语音分开发送和文本分开发送选项。', required: false, type: 'boolean', default: false },
-            'send_voice_separately': { label: '语音分开发送', description: '语音分开发送', hint: '开启后，每句话将单独作为一条语音消息发送。（QQ官方机器人平台受限，建议关闭；NapCat可开启）', required: false, type: 'boolean', condition: { separate_send: true }, default: false },
+            'send_voice_separately': { label: '语音分开发送', description: '语音分开发送', hint: '开启后，每句话将单独作为一条语音消息发送。QQ 官方机器人一条回复最多 5 条消息，超出时每句的文字会并进语音一起发。', required: false, type: 'boolean', condition: { separate_send: true }, default: false },
             'dynamic_sleep': { label: '动态等待', description: '根据语音时长动态等待', hint: '开启后，分开发送时会根据音频实际时长动态等待。', required: false, type: 'boolean', condition: { send_voice_separately: true }, default: true },
             'text_separate': { label: '文本分开发送', description: '文本分开发送', hint: '开启后，在语音合并发送的前提下，文本将按句逐条发送。', required: false, type: 'boolean', condition: { separate_send: true }, default: false },
             'only_private': { label: '仅响应私聊', description: '仅响应私聊', hint: '开启后，群聊仅在被@时响应。', required: false, type: 'boolean', default: false },
@@ -5628,6 +5751,11 @@
             'reply_judge_mood_high': { label: '心情低迷上限', description: '心情值不低于该值时，回复概率恢复为「心情恢复回复概率」', hint: '默认 60（与初始心情值相同）。心情介于上下限之间时概率线性过渡。', required: false, type: 'int', condition: { mood_enabled: true, reply_judge_enabled: true }, default: 60 },
             'reply_judge_prob_low': { label: '心情最低回复概率', description: '心情值处于最低谷时仍开口回复的概率', hint: '0~1，默认 0.2。', required: false, type: 'float', condition: { mood_enabled: true, reply_judge_enabled: true }, default: 0.2 },
             'reply_judge_prob_high': { label: '心情恢复回复概率', description: '心情值恢复正常后开口回复的概率', hint: '0~1，默认 1.0（完全由 LLM 的 should_reply 决定）。', required: false, type: 'float', condition: { mood_enabled: true, reply_judge_enabled: true }, default: 1.0 },
+            'reply_probability_enabled': { label: '概率回复', description: '不看心情，按一个固定概率决定这条消息回不回', hint: '开启后每条消息都按下面的概率掷一次；同时开了「回复审判」或「心情值」时，以这里的固定概率为准。', required: false, type: 'boolean', default: false },
+            'reply_probability': { label: '回复概率', description: '这条消息被回复的概率', hint: '0~1，默认 0.5（一半的概率回复）。', required: false, type: 'float', condition: { reply_probability_enabled: true }, default: 0.5 },
+            'smart_reply_enabled': { label: '智能回复', description: '先判断对方有没有说完，还没说完就再多等一会儿', hint: '判定为「还没说完」时会先发一次 LLM 请求减慢 10 秒；这段时间里对方没有继续发消息，就直接回复。', required: false, type: 'boolean', default: false },
+            'smart_reply_delay_seconds': { label: '智能回复等待秒数', description: '判定为「还没说完」时最多再等这么久', hint: '默认 10 秒；等待期间对方又发了消息就重新计时。', required: false, type: 'float', condition: { smart_reply_enabled: true }, default: 10 },
+            'smart_reply_prompt': { label: '智能回复判定提示词', description: '交给 LLM 判断「对方说完了没」的提示词', hint: '留空使用内置提示词；提示词需要让模型只回一个布尔值。', required: false, type: 'text', condition: { smart_reply_enabled: true }, default: '' },
             /* ===== 定时任务与主动消息 ===== */
             'scheduler_enabled': { label: '定时任务总开关', description: '开启后自定义定时任务与问候检查才会运行', hint: '任务列表在「定时任务」页面管理。', required: false, type: 'boolean', default: true },
             'proactive_enabled': { label: '主动消息（闲置唤醒）', description: '长时间未互动时主动开口找话题', hint: '对聊天记录里存在过的所有会话生效：程序启动时会按每个会话最后一次用户发言时间恢复闲置计时，重启后依然会主动开口。', required: false, type: 'boolean', default: false },
@@ -6052,14 +6180,20 @@
             }));
             showModelChoice(input, keys, '该文件夹里');
         }
+        /* 设置页与配置文件页各有一份同样的字段，按元素反查它属于哪一份表单；
+           不限定范围的话 querySelector 命中的永远是先渲染的设置页那一份。 */
+        function formScopeOf(el) {
+            return (el && el.closest && (el.closest('#profile-groups') || el.closest('#config-groups'))) || document;
+        }
         async function chooseModelFromService(input) {
+            const scope = formScopeOf(input);
             const isVision = input && input.dataset && input.dataset.key === 'image_caption_model_name';
-            const visionBase = document.querySelector('[data-key="image_caption_base_url"]');
-            const baseInput = document.querySelector('[data-key="llm_base_url"]');
+            const visionBase = scope.querySelector('[data-key="image_caption_base_url"]');
+            const baseInput = scope.querySelector('[data-key="llm_base_url"]');
             const ownedBase = isVision && visionBase && visionBase.value.trim()
                 ? visionBase.value : (baseInput ? baseInput.value : '');
-            const backendSel = document.querySelector('[data-key="llm_backend"]');
-            const visionBackend = document.querySelector('[data-key="image_caption_backend"]');
+            const backendSel = scope.querySelector('[data-key="llm_backend"]');
+            const visionBackend = scope.querySelector('[data-key="image_caption_backend"]');
             const ownedBackend = isVision && visionBackend && visionBackend.value.trim()
                 ? visionBackend.value : (backendSel ? backendSel.value : 'ollama');
             const res = await apiPostSoft('api/llm/list_remote_models', {
@@ -6578,8 +6712,7 @@
             wechat_clawbot: ['conn-field-botid'],
         };
         const CONNECTION_QR = {
-            qq_official: { url: 'https://q.qq.com/',
-                           tip: '扫码打开 QQ 开放平台创建机器人，再把 AppID 与 AppSecret 填到上面' },
+            qq_official: { tip: '正在取二维码…' },
             wechat_clawbot: { tip: '正在取登录二维码…' },
         };
 
@@ -6588,15 +6721,20 @@
             return hit ? hit.name : String(id || '');
         }
 
+        function connectionLoggedIn(c) {
+            // 凭据在就算登录过：扫码成功后账号标识不一定带回来，只看它会把
+            // 已经能收发的连接一直显示成「未登录（需扫码）」
+            return !!(c && (c.account_id || c.bot_token));
+        }
+
         function connectionSummary(c) {
             if (c.platform === 'qq_official') return c.app_id ? `AppID ${c.app_id}` : '未填写 AppID';
             if (c.platform === 'wechat_clawbot') {
                 // 扫码登录过的才带上账号：否则同名的两条分不出该删哪条
                 const parts = [];
                 if (c.bot_id) parts.push(`机器人 ${c.bot_id}`);
-                parts.push(c.account_id
-                    ? `已登录 ${String(c.account_id).split('@')[0]}`
-                    : '未登录（需扫码）');
+                const who = c.account_id ? String(c.account_id).split('@')[0] : '';
+                parts.push(connectionLoggedIn(c) ? `已登录${who ? ' ' + who : ''}` : '未登录（需扫码）');
                 return parts.join(' · ');
             }
             return String(c.ws_url || '');
@@ -6635,7 +6773,7 @@
                     <span class="conn-dot${c.enabled ? ' on' : ''}"></span>
                     <div class="conn-main">
                         <div class="conn-name">${esc(c.name || c.id)}</div>
-                        <div class="conn-sub">${esc(platformName(c.platform))} · ${esc(connectionSummary(c))}</div>
+                        <div class="conn-sub">${esc(platformName(c.platform))} · ${esc(connectionSummary(c))} · 配置：${esc(connectionProfileLabel(c.config_profile))}</div>
                     </div>
                     <button class="btn btn-gray" data-conn-act="toggle" data-id="${esc(c.id)}">${c.enabled ? '停用' : '启用'}</button>
                     <button class="btn btn-gray" data-conn-act="edit" data-id="${esc(c.id)}">编辑</button>
@@ -6658,11 +6796,35 @@
                 const d = await apiGet('api/connections');
                 connectionsCache = d.connections || [];
                 connectionPlatforms = d.platforms || [];
+                try {
+                    await loadConfigProfiles(true);
+                } catch (e) {
+                    configProfilesCache = [];
+                }
                 renderConnections();
                 fillRoleConnectionSelects();
             } catch (e) {
                 setConnectionsMsg('接入方式加载失败: ' + e.message, true);
             }
+        }
+
+        function connectionProfileLabel(name) {
+            if (!name || name === 'default') return '跟随主配置';
+            return name;
+        }
+
+        function fillConnectionProfileSelect(conn) {
+            const sel = document.getElementById('conn-profile');
+            if (!sel) return;
+            sel.innerHTML = configProfilesCache.map(p =>
+                `<option value="${esc(p.name)}">${esc(p.name)}${p.builtin ? '（跟随主配置）' : ''}</option>`
+            ).join('');
+            const current = (conn && conn.config_profile) || 'default';
+            if (!configProfilesCache.some(p => p.name === current)) {
+                sel.insertAdjacentHTML('beforeend',
+                    `<option value="${esc(current)}">${esc(current)}（配置文件已不存在）</option>`);
+            }
+            sel.value = current;
         }
 
         async function onConnectionAction(act, id) {
@@ -6732,8 +6894,10 @@
             }
             if (qrBox) qrBox.style.display = qr ? '' : 'none';
             if (!qr) return;
-            if (btn) btn.style.display = platform === 'wechat_clawbot' ? '' : 'none';
+            if (btn) btn.style.display = '';
             if (state) state.textContent = qr.tip;
+            // 二维码都是现取的：换平台先把上一张清掉，别把另一家的码留在框里
+            if (img) img.removeAttribute('src');
             // 微信侧的已知故障：服务端收下发送请求却不投递到微信，日志里一样是成功。
             // 只有重新扫码能重建绑定，所以在扫码区直接写明这条出路。
             const hint = document.getElementById('conn-qr-hint');
@@ -6741,9 +6905,6 @@
                 hint.textContent = platform === 'wechat_clawbot'
                     ? '微信里收不到回复时，重新扫一次码登录即可恢复：服务端可能收下请求却不投递到微信，日志里同样显示成功。'
                     : '';
-            }
-            if (qr.url && img) {
-                img.src = `${API_BASE}/api/connections/qr?text=${encodeURIComponent(qr.url)}`;
             }
         }
 
@@ -6788,11 +6949,17 @@
                                         { platform, id: editingConnectionId });
                 if (r && r.success === false) throw new Error(r.error || '取二维码失败');
                 connectionLoginToken = r.token || '';
-                // 二维码里要编 qr_content（扫码打开微信的登录确认页），不是轮询票据
+                // 二维码里要编 qr_content（扫码打开的是对方侧的确认页），不是轮询票据
                 const qrText = r.qr_content || r.qrcode || '';
-                document.getElementById('conn-qr-img').src =
-                    `${API_BASE}/api/connections/qr?text=${encodeURIComponent(qrText)}`;
-                state.textContent = '请使用手机微信扫码，并在微信里确认登录…';
+                const img = document.getElementById('conn-qr-img');
+                // 出码接口失败时只剩一个空框最难排查，直接把失败说出来
+                img.onerror = () => {
+                    state.textContent = '二维码加载失败，点「刷新二维码」重试。';
+                };
+                img.src = `${API_BASE}/api/connections/qr?text=${encodeURIComponent(qrText)}`;
+                state.textContent = platform === 'qq_official'
+                    ? '请使用手机 QQ 扫码，并在手机上确认绑定…'
+                    : '请使用手机微信扫码，并在微信里确认登录…';
                 connectionLoginTimer = setInterval(pollConnectionLogin, 2000);
             } catch (e) {
                 state.textContent = '取二维码失败: ' + e.message;
@@ -6817,29 +6984,60 @@
                 }
                 stopConnectionLogin();
                 const state = document.getElementById('conn-qr-state');
+                const bound = s.platform === 'qq_official';
+                const okText = bound ? '绑定成功，接入方式会在几秒内自动连接。'
+                                     : '已扫码登录成功，重启程序后即可收发消息。';
                 if (s.saved) {
-                    state.textContent = '已扫码登录成功，重启程序后即可收发消息。';
+                    state.textContent = okText;
                     loadConnections();
                     closeConnectionDialog();
                     return;
                 }
                 // 新建流程：拿到的凭据随这条接入方式一起存下去
                 const payload = connectionDialogPayload();
-                payload.bot_token = s.bot_token || '';
-                if (s.bot_id) {
-                    payload.account_id = s.bot_id;
-                    payload.bot_id = payload.bot_id || s.bot_id;
-                    document.getElementById('conn-account-id').value = s.bot_id;
+                if (bound) {
+                    payload.app_id = s.app_id || '';
+                    payload.app_secret = s.app_secret || '';
+                    document.getElementById('conn-app-id').value = payload.app_id;
+                    document.getElementById('conn-app-secret').value = payload.app_secret;
+                    payload.name = payload.name || 'QQ 官方机器人';
+                } else {
+                    payload.bot_token = s.bot_token || '';
+                    if (s.bot_id) {
+                        payload.account_id = s.bot_id;
+                        payload.bot_id = payload.bot_id || s.bot_id;
+                        document.getElementById('conn-account-id').value = s.bot_id;
+                    }
+                    if (s.base_url) payload.base_url = s.base_url;
+                    payload.name = payload.name || '微信 ClawBot';
                 }
-                if (s.base_url) payload.base_url = s.base_url;
-                payload.name = payload.name || '微信 ClawBot';
                 if (await saveConnection(payload)) {
-                    state.textContent = '已扫码登录成功，重启程序后即可收发消息。';
+                    state.textContent = okText;
                     closeConnectionDialog();
                 } else {
                     state.textContent = '已扫码，但保存接入方式失败，请重试。';
                 }
             } catch (e) { /* 单次轮询失败不打断，等下一轮 */ }
+        }
+
+        /* 扫码平台：没有凭据就把二维码取回来，有凭据就提示已绑定/已登录。
+         * conn 不传时按当前编辑的那条找（切换平台时走这条路）。 */
+        function startScanOrShowBound(conn) {
+            const platform = document.getElementById('conn-platform').value;
+            if (!CONNECTION_QR[platform]) return;
+            const current = conn
+                || connectionsCache.find(c => String(c.id) === editingConnectionId);
+            const bound = platform === 'qq_official'
+                ? !!(current && current.app_id && current.app_secret)
+                : connectionLoggedIn(current);
+            if (!bound) {
+                startConnectionLogin();
+                return;
+            }
+            document.getElementById('conn-qr-state').textContent =
+                platform === 'qq_official'
+                    ? `已绑定（AppID ${(current && current.app_id) || '凭据已保存'}）；要换机器人请点「刷新二维码」`
+                    : `已登录（${(current && current.account_id) || '凭据已保存'}）；要换账号请点「刷新二维码」`;
         }
 
         function openConnectionDialog(conn) {
@@ -6861,16 +7059,12 @@
             });
             document.getElementById('conn-bot-token').value = '';
             document.getElementById('conn-account-id').value = (conn && conn.account_id) || '';
+            fillConnectionProfileSelect(conn);
             updateConnectionDialogFields();
             el.classList.add('active');
-            // 微信：像创建机器人那样，打开弹窗就把登录二维码取回来；
-            // 已经登录过的就不必再取（要换账号点「刷新二维码」）
-            if (sel.value === 'wechat_clawbot' && !(conn && conn.account_id)) {
-                startConnectionLogin();
-            } else if (sel.value === 'wechat_clawbot') {
-                document.getElementById('conn-qr-state').textContent =
-                    `已登录（${conn.account_id}）；要换账号请点「刷新二维码」`;
-            }
+            // 扫码平台：像创建机器人那样，打开弹窗就把二维码取回来；
+            // 已经有凭据的不必再取（要换一个点「刷新二维码」）
+            startScanOrShowBound(conn);
         }
 
         function closeConnectionDialog() {
@@ -6893,6 +7087,7 @@
                 bot_id: document.getElementById('conn-bot-id').value.trim(),
                 bot_token: document.getElementById('conn-bot-token').value,
                 account_id: document.getElementById('conn-account-id').value,
+                config_profile: document.getElementById('conn-profile').value || 'default',
             };
             const existing = connectionsCache.find(c => String(c.id) === editingConnectionId);
             if (existing) payload.enabled = !!existing.enabled;
@@ -7034,7 +7229,8 @@
         // 快捷键 Esc 的「返回」用：页面浏览历史 + 二级页 → 上级页的对应关系
         const panelHistory = [];
         const ESC_BACK_PANELS = { 'plugin-page': 'installed-plugins',
-                                  'plugin-webui': 'installed-plugins' };
+                                  'plugin-webui': 'installed-plugins',
+                                  'profiles': 'config' };
         const mainScrollEl = document.querySelector('.main-content');
 
         function restorePanelScroll(panelId) {
@@ -7058,7 +7254,9 @@
                 if (panelHistory.length > 20) panelHistory.shift();
             }
             document.querySelectorAll('.sidebar .menu-item').forEach(m => {
-                m.classList.toggle('active', m.dataset.panel === panelId);
+                // 配置文件页没有独立的侧边栏入口，高亮留在「配置文件」（即设置页）上
+                const owner = panelId === 'profiles' ? 'config' : panelId;
+                m.classList.toggle('active', m.dataset.panel === owner);
             });
             document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
             const target = document.getElementById(`panel-${panelId}`);
@@ -7072,9 +7270,14 @@
             if (panelId === 'config' && !configDirty) {
                 Promise.resolve(loadConfig()).then(() => restorePanelScroll(panelId));
             }
+            if (panelId === 'profiles' && !profileDirty) {
+                Promise.resolve(openProfilesPanel()).then(() => restorePanelScroll(panelId));
+            }
             activePanelId = panelId;
             document.getElementById('anchor-nav').classList.toggle('active', panelId === 'config');
             document.getElementById('float-actions').classList.toggle('active', panelId === 'config');
+            document.getElementById('profile-anchor-nav').classList.toggle('active', panelId === 'profiles');
+            document.getElementById('profile-float-actions').classList.toggle('active', panelId === 'profiles');
             document.getElementById('plugin-apply-bar')
                 .classList.toggle('active', panelId === 'plugin-page');
             if (panelId === 'chat') loadChatList();
@@ -7150,14 +7353,19 @@
 
         // 任何一处表单改动都标记为"有未保存内容"，供切页时判断是否重新拉取
         document.addEventListener('input', e => {
-            if (e.target && e.target.closest && e.target.closest('#config-groups')) configDirty = true;
+            if (!e.target || !e.target.closest) return;
+            if (e.target.closest('#config-groups')) configDirty = true;
+            else if (e.target.closest('#profile-groups')) profileDirty = true;
         });
         document.addEventListener('change', e => {
-            if (e.target && e.target.closest && e.target.closest('#config-groups')) configDirty = true;
+            if (!e.target || !e.target.closest) return;
+            if (e.target.closest('#config-groups')) configDirty = true;
+            else if (e.target.closest('#profile-groups')) profileDirty = true;
         });
 
-        function applyFieldValue(key, value) {
-            const control = document.querySelector(`[data-key="${key}"]`);
+        function applyFieldValue(key, value, scope) {
+            const root = scope || document;
+            const control = root.querySelector(`[data-key="${key}"]`);
             if (!control) return;
             if (control.type === 'checkbox') {
                 control.checked = !!value;
@@ -7233,13 +7441,16 @@
             es: 'Español', ja: '日本語', ko: '한국어', fr: 'Français', ru: 'Русский'
         };
 
-        function makeVoiceDesignButton() {
+        /* 「声音设计」按钮开在哪个表单里，弹出的窗口就把音色填回哪一份表单 */
+        let voiceDesignScope = null;
+
+        function makeVoiceDesignButton(scope) {
             const btn = document.createElement('button');
             btn.type = 'button';
             btn.className = 'btn btn-gray';
             btn.textContent = '声音设计…';
             btn.title = '用一段文字描述创建一个自定义音色';
-            btn.addEventListener('click', openVoiceDesignModal);
+            btn.addEventListener('click', () => openVoiceDesignModal(scope));
             return btn;
         }
 
@@ -7250,9 +7461,10 @@
             el.style.color = isError ? '#c0392b' : '';
         }
 
-        function openVoiceDesignModal() {
+        function openVoiceDesignModal(scope) {
             const overlay = document.getElementById('voice-design-modal');
             if (!overlay) return;
+            voiceDesignScope = scope || document;
             overlay.classList.add('active');
             vdMsg('');
             const box = document.getElementById('vd-preview-box');
@@ -7331,7 +7543,7 @@
         }
 
         function applyDesignedVoice(voice, silent) {
-            const input = document.querySelector('[data-key="cloud_tts_voice"]');
+            const input = (voiceDesignScope || document).querySelector('[data-key="cloud_tts_voice"]');
             if (!input || !voice) return;
             input.value = voice;
             input.dispatchEvent(new Event('change', { bubbles: true }));
@@ -7383,13 +7595,16 @@
         // 桌面窗口的文件对话框不一定给多选，所以每次选中的文件都追加进来而不是替换
         let enrollFiles = [];
 
-        function makeVoiceEnrollButton() {
+        /* 「声音复刻」按钮开在哪个表单里，弹出的窗口就把音色填回哪一份表单 */
+        let voiceEnrollScope = null;
+
+        function makeVoiceEnrollButton(scope) {
             const btn = document.createElement('button');
             btn.type = 'button';
             btn.className = 'btn btn-gray';
             btn.textContent = '声音复刻…';
             btn.title = '上传一段或多段音频，让模型照着学出这个音色';
-            btn.addEventListener('click', openVoiceEnrollModal);
+            btn.addEventListener('click', () => openVoiceEnrollModal(scope));
             return btn;
         }
 
@@ -7400,9 +7615,10 @@
             el.style.color = isError ? '#c0392b' : '';
         }
 
-        function openVoiceEnrollModal() {
+        function openVoiceEnrollModal(scope) {
             const overlay = document.getElementById('voice-enroll-modal');
             if (!overlay) return;
+            voiceEnrollScope = scope || document;
             overlay.classList.add('active');
             veMsg('');
             renderEnrollFileList();
@@ -7526,7 +7742,7 @@
         }
 
         function applyEnrolledVoice(voice, silent) {
-            const input = document.querySelector('[data-key="cloud_tts_voice"]');
+            const input = (voiceEnrollScope || document).querySelector('[data-key="cloud_tts_voice"]');
             if (!input || !voice) return;
             input.value = voice;
             input.dispatchEvent(new Event('change', { bubbles: true }));
@@ -7572,8 +7788,10 @@
             }
         }
 
-        /* 单条配置项的字段行：分组与「多角色配置」顶部共用同一套渲染 */
-        function buildConfigRow(key, config, defaults = {}) {
+        /* 单条配置项的字段行：分组与「多角色配置」顶部共用同一套渲染。
+           scope 是这一份表单的根节点——设置页与配置文件页各有一份同样的字段，
+           不限定范围的话查到的永远是先渲染的那一份。 */
+        function buildConfigRow(key, config, defaults = {}, scope = document) {
             if (!(key in configMeta)) return null;
             const meta = configMeta[key];
             // 后端没返回该键时回落默认值
@@ -7618,7 +7836,7 @@
                 input.addEventListener('change', () => {
                     span.textContent = input.checked ? '✔ 已开启' : '✘ 已关闭';
                     checkboxWrapper.classList.toggle('checked', input.checked);
-                    updateConditionalVisibility();
+                    updateConditionalVisibility(scope);
                 });
                 checkboxWrapper.appendChild(input);
                 checkboxWrapper.appendChild(span);
@@ -7654,7 +7872,7 @@
                 input.value = value;
                 input.dataset.key = key;
                 input.style.cssText = 'flex:1 1 auto;width:auto;min-width:220px;';
-                input.addEventListener('change', updateConditionalVisibility);
+                input.addEventListener('change', () => updateConditionalVisibility(scope));
                 const syncPreset = () => {
                     const hit = meta.presets.find(p => String(p.value) === String(input.value));
                     select.value = hit ? hit.value : '';
@@ -7666,19 +7884,19 @@
                     input.value = select.value;
                     // 预设可顺带把配套字段一起填好（如选服务商同时定协议/模型/音色）
                     Object.entries((hit && hit.also) || {}).forEach(([targetKey, targetValue]) => {
-                        const target = document.querySelector(`[data-key="${targetKey}"]`);
+                        const target = scope.querySelector(`[data-key="${targetKey}"]`);
                         if (!target) return;
                         target.value = targetValue;
                         target.dispatchEvent(new Event('change', { bubbles: true }));
                     });
-                    updateConditionalVisibility();
+                    updateConditionalVisibility(scope);
                 });
                 input.addEventListener('input', syncPreset);
                 input.addEventListener('change', syncPreset);
                 controlRow.appendChild(select);
                 controlRow.appendChild(input);
-                if (meta.voiceDesigner) controlRow.appendChild(makeVoiceDesignButton());
-                if (meta.voiceEnroller) controlRow.appendChild(makeVoiceEnrollButton());
+                if (meta.voiceDesigner) controlRow.appendChild(makeVoiceDesignButton(scope));
+                if (meta.voiceEnroller) controlRow.appendChild(makeVoiceEnrollButton(scope));
             } else if (meta.options && meta.options.length > 0) {
                 if (meta.allowCustom) {
                     const input = document.createElement('input');
@@ -7686,7 +7904,7 @@
                     input.value = value;
                     input.dataset.key = key;
                     input.setAttribute('list', `datalist-${key}`);
-                    input.addEventListener('change', updateConditionalVisibility);
+                    input.addEventListener('change', () => updateConditionalVisibility(scope));
                     const datalist = document.createElement('datalist');
                     datalist.id = `datalist-${key}`;
                     meta.options.forEach(opt => {
@@ -7706,7 +7924,7 @@
                         if (String(value) === String(opt)) option.selected = true;
                         select.appendChild(option);
                     });
-                    select.addEventListener('change', updateConditionalVisibility);
+                    select.addEventListener('change', () => updateConditionalVisibility(scope));
                     controlRow.appendChild(select);
                 }
             } else if (meta.type === 'path' || meta.type === 'model_select') {
@@ -7715,7 +7933,7 @@
                 input.value = value;
                 input.dataset.key = key;
                 input.style.cssText = 'flex:1 1 auto;width:auto;min-width:220px;';
-                input.addEventListener('change', updateConditionalVisibility);
+                input.addEventListener('change', () => updateConditionalVisibility(scope));
                 controlRow.appendChild(input);
                 controlRow.appendChild(makeBrowseButton(input, meta.type));
                 if (meta.type === 'model_select') {
@@ -7778,7 +7996,7 @@
                 }
                 input.value = value;
                 input.dataset.key = key;
-                input.addEventListener('change', updateConditionalVisibility);
+                input.addEventListener('change', () => updateConditionalVisibility(scope));
                 controlRow.appendChild(input);
             }
             if (defaults && key in defaults && String(defaults[key]) !== String(value)) {
@@ -7789,7 +8007,7 @@
                 resetBtn.style.cssText = 'width:20px;height:20px;min-width:20px;flex:0 0 auto;'
                     + 'font-size: var(--fs-sm);line-height:1;padding:0;margin-left:auto;cursor:pointer;'
                     + 'border-radius:50%;border:1px solid #888;background:transparent;color:#888;';
-                resetBtn.addEventListener('click', () => applyFieldValue(key, defaults[key]));
+                resetBtn.addEventListener('click', () => applyFieldValue(key, defaults[key], scope));
                 controlRow.appendChild(resetBtn);
             }
             wrapper.appendChild(controlRow);
@@ -7803,8 +8021,107 @@
             return row;
         }
 
+        /* 大分组（group.tree）的子分组默认收起，只留标题；鼠标停在这个分组上时
+           右侧浮出树状图，点其中一项就展开对应子分组并滚过去。
+           树状图挂在 body 上（同 #chart-tip 的位置），切页重渲染不会残留。 */
+        let configTreeHideTimer = null;
+
+        function hideConfigTree() {
+            const el = document.getElementById('config-tree');
+            if (el) el.style.display = 'none';
+        }
+
+        function keepConfigTree() {
+            clearTimeout(configTreeHideTimer);
+        }
+
+        function scheduleHideConfigTree() {
+            clearTimeout(configTreeHideTimer);
+            configTreeHideTimer = setTimeout(hideConfigTree, 200);
+        }
+
+        function bindConfigTreeOnce() {
+            const tree = document.getElementById('config-tree');
+            if (!tree || tree._bound) return tree;
+            tree._bound = true;
+            tree.addEventListener('mouseenter', keepConfigTree);
+            tree.addEventListener('mouseleave', scheduleHideConfigTree);
+            return tree;
+        }
+
+        function setSubgroupOpen(entry, open) {
+            entry.rows.forEach(row => {
+                if (open) delete row.dataset.collapsed;
+                else row.dataset.collapsed = '1';
+            });
+            entry.head.classList.toggle('open', open);
+        }
+
+        function renderSubgroupTree(groupDiv, group, config, defaults, scope) {
+            const entries = group.children.map(sub => {
+                const head = document.createElement('h4');
+                head.className = 'config-subtitle config-subgroup-head';
+                head.textContent = sub.title;
+                groupDiv.appendChild(head);
+                const rows = [];
+                sub.keys.forEach(key => {
+                    const row = buildConfigRow(key, config, defaults, scope);
+                    if (!row) return;
+                    rows.push(row);
+                    groupDiv.appendChild(row);
+                });
+                const entry = { title: sub.title, head, rows };
+                setSubgroupOpen(entry, false);
+                head.addEventListener('click', () => setSubgroupOpen(entry, !head.classList.contains('open')));
+                return entry;
+            });
+
+            const tree = bindConfigTreeOnce();
+            const showTree = () => {
+                if (!tree) return;
+                tree.innerHTML = '';
+                const root = document.createElement('div');
+                root.className = 'config-tree-root';
+                root.textContent = group.title;
+                tree.appendChild(root);
+                const list = document.createElement('div');
+                list.className = 'config-tree-list';
+                entries.forEach(entry => {
+                    const item = document.createElement('div');
+                    item.className = 'config-tree-item' + (entry.head.classList.contains('open') ? ' open' : '');
+                    item.textContent = entry.title;
+                    item.addEventListener('click', () => {
+                        setSubgroupOpen(entry, true);
+                        item.classList.add('open');
+                        entry.head.scrollIntoView({ block: 'center', behavior: 'smooth' });
+                    });
+                    list.appendChild(item);
+                });
+                tree.appendChild(list);
+                const actions = document.createElement('div');
+                actions.className = 'config-tree-actions';
+                [['全部展开', true], ['全部收起', false]].forEach(([label, open]) => {
+                    const btn = document.createElement('span');
+                    btn.textContent = label;
+                    btn.addEventListener('click', () => {
+                        entries.forEach(entry => setSubgroupOpen(entry, open));
+                        list.querySelectorAll('.config-tree-item').forEach(item => item.classList.toggle('open', open));
+                    });
+                    actions.appendChild(btn);
+                });
+                tree.appendChild(actions);
+                tree.style.display = 'block';
+                // 竖直方向对齐这个分组，超出视口时再夹回来
+                const rect = groupDiv.getBoundingClientRect();
+                const maxTop = Math.max(12, window.innerHeight - tree.offsetHeight - 12);
+                tree.style.top = Math.min(Math.max(rect.top, 12), maxTop) + 'px';
+            };
+            groupDiv.addEventListener('mouseenter', () => { keepConfigTree(); showTree(); });
+            groupDiv.addEventListener('mouseleave', scheduleHideConfigTree);
+        }
+
         function renderConfigForm(config, defaults = {}, options = {}) {
-            const container = document.getElementById('config-groups');
+            const container = options.container || document.getElementById('config-groups');
             if (!options.append) container.innerHTML = '';
             (options.groups || configGroups).forEach(group => {
                 const groupDiv = document.createElement('div');
@@ -7812,6 +8129,11 @@
                 const title = document.createElement('h3');
                 title.textContent = group.title;
                 groupDiv.appendChild(title);
+                if (group.tree && group.children) {
+                    renderSubgroupTree(groupDiv, group, config, defaults, container);
+                    container.appendChild(groupDiv);
+                    return;
+                }
                 // 分组里的子分组（如「更多」）只用一条小标题分隔，字段行仍是同一套渲染
                 const items = group.children
                     ? group.children.reduce((all, sub) => all.concat([{ subtitle: sub.title }], sub.keys), [])
@@ -7825,23 +8147,25 @@
                         return;
                     }
                     const key = item;
-                    const row = buildConfigRow(key, config, defaults);
+                    const row = buildConfigRow(key, config, defaults, container);
                     if (row) groupDiv.appendChild(row);
                 });
                 container.appendChild(groupDiv);
             });
         }
 
-        function renderRolesConfig(config) {
+        function renderRolesConfig(config, options = {}) {
+            const root = options.container || document.getElementById('config-groups');
+            const defaults = options.defaults || config.defaults || {};
             const container = document.createElement('div');
             container.className = 'config-group';
             container.innerHTML = `
-                <h3>多角色配置 <button id="addRoleBtn" class="btn" style="float:right;">${icon('plus')}添加条目</button><button id="insertDefaultRoleBtn" class="btn" style="float:right;margin-right:8px;">${icon('sparkles')}插入丛雨默认提示词</button></h3>
+                <h3>多角色配置 <button data-add-role class="btn" style="float:right;">${icon('plus')}添加条目</button><button data-insert-default-role class="btn" style="float:right;margin-right:8px;">${icon('sparkles')}插入丛雨默认提示词</button></h3>
                 <div class="sub-desc" style="font-size: var(--fs-xs);color:#888;margin-bottom:8px;">每个角色可配置独立的人设、提示词、语音目录与默认情绪；开启「多角色对话」后群聊中提及角色名即可由对应角色回复。角色填了「独占 NapCat 地址」时，它用自己的 QQ 号收发消息。</div>
-                <div id="roles-container" class="roles-container"></div>
+                <div class="roles-container" data-roles-container></div>
             `;
-            const configGroupsDiv = document.getElementById('config-groups');
-            configGroupsDiv.appendChild(container);
+            root.appendChild(container);
+            const rolesBox = container.querySelector('[data-roles-container]');
 
             function renderRoleItem(index, role) {
                 const roleDiv = document.createElement('div');
@@ -7896,15 +8220,14 @@
                 return roleDiv;
             }
 
-            document.getElementById('addRoleBtn').addEventListener('click', () => {
+            container.querySelector('[data-add-role]').addEventListener('click', () => {
                 const newRole = { character_name: '', character_key: '', personality_prompt: '', json_prompt: '', supplement_prompt: '', default_voice: 'pingjing', ref_audio_root: '', emotion_mimic_root: '', text_lang: 'ja', connection_id: '' };
-                const roleEl = renderRoleItem(document.querySelectorAll('.role-item').length, newRole);
-                document.getElementById('roles-container').appendChild(roleEl);
+                const roleEl = renderRoleItem(rolesBox.querySelectorAll('.role-item').length, newRole);
+                rolesBox.appendChild(roleEl);
                 bindDeleteRole(roleEl);
             });
 
-            document.getElementById('insertDefaultRoleBtn').addEventListener('click', () => {
-                const defaults = config.defaults || {};
+            container.querySelector('[data-insert-default-role]').addEventListener('click', () => {
                 const defaultRoles = Array.isArray(defaults.roles) ? defaults.roles : [];
                 if (!defaultRoles.length) {
                     showConfigMessage('未找到默认角色配置', 'error');
@@ -7923,8 +8246,8 @@
                         text_lang: r.text_lang || 'ja',
                         napcat_ws_url: '', napcat_token: ''
                     };
-                    const roleEl = renderRoleItem(document.querySelectorAll('.role-item').length, role);
-                    document.getElementById('roles-container').appendChild(roleEl);
+                    const roleEl = renderRoleItem(rolesBox.querySelectorAll('.role-item').length, role);
+                    rolesBox.appendChild(roleEl);
                     bindDeleteRole(roleEl);
                 });
             });
@@ -7935,7 +8258,7 @@
                     delBtn.addEventListener('click', (e) => {
                         e.preventDefault();
                         roleEl.remove();
-                        const items = document.querySelectorAll('.role-item');
+                        const items = rolesBox.querySelectorAll('.role-item');
                         items.forEach((item, i) => {
                             item.querySelector('summary').innerHTML = `角色条目 ${i + 1} <button class="btn delete-role-btn" style="background:#f44336; color:white; float:right; margin-left:10px;">删除</button>`;
                             bindDeleteRole(item);
@@ -7947,19 +8270,20 @@
             const roles = config.roles || [];
             roles.forEach((role, idx) => {
                 const roleEl = renderRoleItem(idx, role);
-                document.getElementById('roles-container').appendChild(roleEl);
+                rolesBox.appendChild(roleEl);
                 bindDeleteRole(roleEl);
             });
 
             // 「当前激活的角色标识符」原本单独占一个分组，现在挪到这一块的最上面
-            const activeRow = buildConfigRow('active_character', config, config.defaults || {});
+            const activeRow = buildConfigRow('active_character', config, defaults, container);
             if (activeRow) {
-                container.insertBefore(activeRow, document.getElementById('roles-container'));
+                container.insertBefore(activeRow, rolesBox);
             }
         }
 
-        function updateConditionalVisibility() {
-            const rows = document.querySelectorAll('.form-row[data-field-key]');
+        function updateConditionalVisibility(scope) {
+            const root = scope || document;
+            const rows = root.querySelectorAll('.form-row[data-field-key]');
             rows.forEach(row => {
                 const key = row.dataset.fieldKey;
                 const meta = configMeta[key];
@@ -7969,14 +8293,14 @@
                 }
                 let visible = true;
                 for (const [parentKey, expectedValue] of Object.entries(meta.condition)) {
-                    const parentInput = document.querySelector(`[data-key="${parentKey}"]`);
+                    const parentInput = root.querySelector(`[data-key="${parentKey}"]`);
                     if (!parentInput) { visible = false; break; }
                     // { differsFrom: '另一字段' }：本字段留空表示「跟随」，
                     // 只有非空且与目标字段不同才算满足；比较时去掉结尾斜杠，
                     // 与后端把两个地址 rstrip("/") 后再拼接口路径的做法一致
                     if (expectedValue && typeof expectedValue === 'object') {
                         const norm = v => String(v || '').trim().replace(/\/+$/, '');
-                        const other = document.querySelector(`[data-key="${expectedValue.differsFrom}"]`);
+                        const other = root.querySelector(`[data-key="${expectedValue.differsFrom}"]`);
                         const ownValue = norm(parentInput.value);
                         const otherValue = other ? norm(other.value) : '';
                         if (!ownValue || ownValue === otherValue) { visible = false; break; }
@@ -8003,11 +8327,13 @@
                 const config = await apiGet('api/config');
                 currentConfig = config;
                 const defaults = config.defaults || {};
-                renderConfigForm(config, defaults, { groups: configMainGroups });
-                renderRolesConfig(config);
-                renderConfigForm(config, defaults, { groups: configTailGroups, append: true });
-                updateConditionalVisibility();
-                buildAnchorNav();
+                const box = document.getElementById('config-groups');
+                renderConfigForm(config, defaults, { groups: configMainGroups, container: box });
+                renderRolesConfig(config, { container: box });
+                renderConfigForm(config, defaults, { groups: configTailGroups, container: box, append: true });
+                updateConditionalVisibility(box);
+                buildAnchorNav(document.getElementById('anchor-nav'), box,
+                               [{ title: '配置文件', onClick: () => switchPanel('profiles') }]);
                 configDirty = false;
             } catch (e) {
                 console.error('加载配置失败：', e);
@@ -8015,168 +8341,278 @@
             }
         }
 
-        /* ==================== 配置预设 ==================== */
-        function presetMsg(text, isError) {
-            const el = document.getElementById('preset-msg');
+        /* ==================== 配置文件 ====================
+         * 每份配置文件是一套完整配置，接入方式可以各自选用一份；
+         * default 代表主配置本身（设置页改的就是它），不能删除也不能重命名。 */
+        let configProfilesCache = [];
+        let profileConfig = null;      // 当前正在编辑的配置文件内容
+        let profileDefaults = {};      // 后端给的出厂默认值，新建配置文件时以它为底
+        let profileSecretKeys = [];    // 这一页不显示也不改动的密钥字段（后端给的清单）
+        let editingProfileName = '';   // 当前正在编辑的配置文件名
+        let profileDirty = false;
+
+        function profileMsg(text, isError) {
+            const el = document.getElementById('profile-message');
             if (!el) return;
+            el.className = text ? `message ${isError ? 'error' : 'success'}` : '';
             el.textContent = text || '';
-            el.style.color = isError ? '#c0392b' : '';
-        }
-
-        function openConfigPresetModal() {
-            const overlay = document.getElementById('config-preset-modal');
-            if (!overlay) return;
-            overlay.classList.add('active');
-            presetMsg('');
-            switchPresetTab('import');
-            loadConfigPresets();
-        }
-
-        function closeConfigPresetModal() {
-            const overlay = document.getElementById('config-preset-modal');
-            if (overlay) overlay.classList.remove('active');
-        }
-
-        function switchPresetTab(which) {
-            const isImport = which !== 'export';
-            document.getElementById('preset-tab-import').classList.toggle('active', isImport);
-            document.getElementById('preset-tab-export').classList.toggle('active', !isImport);
-            document.getElementById('preset-pane-import').style.display = isImport ? '' : 'none';
-            document.getElementById('preset-pane-export').style.display = isImport ? 'none' : '';
-        }
-
-        function formatPresetSize(bytes) {
-            const size = Number(bytes) || 0;
-            if (size < 1024) return `${size} B`;
-            if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
-            return `${(size / 1024 / 1024).toFixed(1)} MB`;
-        }
-
-        async function loadConfigPresets() {
-            try {
-                const data = await apiGet('api/config/presets');
-                renderConfigPresets(data.presets || []);
-            } catch (e) {
-                presetMsg(e.message, true);
+            clearTimeout(el._hideTimer);
+            if (text) {
+                el._hideTimer = setTimeout(() => { el.textContent = ''; el.className = ''; }, 5000);
             }
         }
 
-        function renderConfigPresets(presets) {
-            const boxes = ['preset-import-list', 'preset-export-list']
-                .map(id => document.getElementById(id)).filter(Boolean);
-            boxes.forEach(box => { box.innerHTML = ''; });
-            if (!boxes.length) return;
-            if (!presets.length) {
-                boxes.forEach(box => {
-                    const empty = document.createElement('div');
-                    empty.className = 'sub-desc';
-                    empty.textContent = '还没有导出过预设。';
-                    box.appendChild(empty);
+        async function loadConfigProfiles(force = false) {
+            if (configProfilesCache.length && !force) return configProfilesCache;
+            const data = await apiGet('api/config/profiles');
+            configProfilesCache = data.profiles || [];
+            return configProfilesCache;
+        }
+
+        function renderProfileOptions() {
+            const sel = document.getElementById('profile-select');
+            if (!sel) return;
+            const current = editingProfileName || sel.value;
+            sel.innerHTML = configProfilesCache.map(p =>
+                `<option value="${esc(p.name)}">${esc(p.name)}${p.builtin ? '（主配置）' : ''}</option>`
+            ).join('');
+            if (current) sel.value = current;
+        }
+
+        function renderProfileUsedBy() {
+            const el = document.getElementById('profile-usedby');
+            if (!el) return;
+            const item = configProfilesCache.find(p => p.name === editingProfileName);
+            const used = (item && item.used_by) || [];
+            el.textContent = used.length
+                ? `正在使用：${used.join('、')}`
+                : '还没有接入方式在用这份配置文件。';
+        }
+
+        async function openProfilesPanel() {
+            try {
+                await loadConfigProfiles(true);
+                if (!editingProfileName) editingProfileName = 'default';
+                renderProfileOptions();
+                await loadProfileConfig(editingProfileName);
+            } catch (e) {
+                profileMsg('加载配置文件失败: ' + e.message, true);
+            }
+        }
+
+        async function loadProfileConfig(name) {
+            const data = await apiPost('api/config/profiles/read', { name: name });
+            if (data && data.success === false) throw new Error(data.error || '读取失败');
+            editingProfileName = data.name || name;
+            profileConfig = data.config || {};
+            profileDefaults = data.defaults || {};
+            profileSecretKeys = data.secret_keys || [];
+            const box = document.getElementById('profile-groups');
+            const defaults = profileDefaults;
+            renderConfigForm(profileConfig, defaults, { groups: configMainGroups, container: box });
+            renderRolesConfig(profileConfig, { container: box, defaults });
+            renderConfigForm(profileConfig, defaults, { groups: configTailGroups, container: box, append: true });
+            updateConditionalVisibility(box);
+            buildAnchorNav(document.getElementById('profile-anchor-nav'), box, [], 'profile-group');
+            document.getElementById('profile-select').value = editingProfileName;
+            document.getElementById('profile-name').value = '';
+            renderProfileUsedBy();
+            profileDirty = false;
+        }
+
+        /* 切到另一份配置文件。返回是否真的切了：调用方（下拉框）失败时要回退选中项。 */
+        async function switchProfile(next) {
+            if (!next || next === editingProfileName) return false;
+            if (profileDirty && !await uiConfirm('这份配置文件有改动还没保存，切换后会丢失。继续？')) {
+                return false;
+            }
+            try {
+                await loadProfileConfig(next);
+                profileMsg('', false);
+                return true;
+            } catch (e) {
+                profileMsg('读取失败: ' + e.message, true);
+                return false;
+            }
+        }
+
+        /* 配置文件页的密钥字段一律是空的（密钥只在设置页管理）：提交前把空着的密钥项
+           摘掉，服务端按「没提交就沿用原值」处理，免得改个开关就把密钥清空。 */
+        function stripUntouchedSecrets(data) {
+            (profileSecretKeys || []).forEach(key => {
+                const value = data[key];
+                if (value === undefined) return;
+                if (typeof value === 'string' ? !value.trim() : !value) delete data[key];
+            });
+            return data;
+        }
+
+        async function saveProfileConfig() {
+            const btn = document.getElementById('profile-save-btn');
+            const name = editingProfileName;
+            if (!name) return;
+            const payload = stripUntouchedSecrets(
+                collectFormData(document.getElementById('profile-groups'), profileConfig));
+            btn.disabled = true;
+            profileMsg('正在保存…', false);
+            try {
+                if (name === 'default') {
+                    await apiPost('api/config/save', { ...payload, restart_tts: false });
+                    currentConfig = null;
+                    if (!configDirty) loadConfig();
+                } else {
+                    const r = await apiPost('api/config/profiles/save', { name: name, config: payload });
+                    if (r && r.success === false) throw new Error(r.error || '保存失败');
+                }
+                profileMsg(`已保存配置文件「${name}」。`, false);
+                profileDirty = false;
+                await loadConfigProfiles(true);
+                renderProfileOptions();
+                renderProfileUsedBy();
+            } catch (e) {
+                profileMsg('保存失败: ' + e.message, true);
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        async function createProfileFromForm() {
+            const name = document.getElementById('profile-name').value.trim();
+            if (!name) { profileMsg('请先在「名称」里填一个配置文件名。', true); return; }
+            try {
+                // 新配置文件从出厂默认值起步：主配置里的密钥、密码和个人设置一概不带，
+                // 否则随手导出或分享一份配置文件就把自己的账号带出去了
+                const r = await apiPost('api/config/profiles/save', {
+                    name: name,
+                    config: profileDefaults,
                 });
+                if (r && r.success === false) throw new Error(r.error || '新建失败');
+                await loadConfigProfiles(true);
+                renderProfileOptions();
+                await loadProfileConfig(r.profile.name);
+                profileMsg(`已新建配置文件「${r.profile.name}」（出厂默认值）。`, false);
+            } catch (e) {
+                profileMsg('新建失败: ' + e.message, true);
+            }
+        }
+
+        function renderProfilePicker() {
+            const box = document.getElementById('profile-picker');
+            if (!box) return;
+            box.innerHTML = configProfilesCache.map(p => {
+                const used = (p.used_by || []).length;
+                const suffix = p.builtin ? '（主配置）' : (used ? ` · ${used} 处在用` : '');
+                return `<div class="profile-picker-item${p.name === editingProfileName ? ' current' : ''}"`
+                    + ` data-profile="${esc(p.name)}">${esc(p.name)}${esc(suffix)}</div>`;
+            }).join('');
+            box.querySelectorAll('[data-profile]').forEach(item => {
+                item.addEventListener('click', async () => {
+                    toggleProfilePicker(false);
+                    await switchProfile(item.dataset.profile);
+                });
+            });
+        }
+
+        function toggleProfilePicker(show) {
+            const box = document.getElementById('profile-picker');
+            if (!box) return;
+            const next = show === undefined ? box.hidden : show;
+            if (next) renderProfilePicker();
+            box.hidden = !next;
+        }
+
+        async function renameProfile() {
+            if (editingProfileName === 'default') {
+                profileMsg('default 是主配置本身，不能重命名。', true);
                 return;
             }
-            presets.forEach(item => boxes.forEach(box => box.appendChild(buildPresetRow(item))));
-        }
-
-        function buildPresetRow(item) {
-            const note = document.createElement('input');
-            note.type = 'text';
-            note.className = 'preset-note';
-            note.value = item.note || '';
-            note.placeholder = '备注';
-            note.addEventListener('change', () => savePresetNote(item.id, note.value));
-
-            const applyBtn = document.createElement('button');
-            applyBtn.type = 'button';
-            applyBtn.className = 'btn';
-            applyBtn.textContent = '导入配置';
-            applyBtn.addEventListener('click', () => applyConfigPreset(item.id, applyBtn));
-
-            const delBtn = document.createElement('button');
-            delBtn.type = 'button';
-            delBtn.className = 'btn btn-gray';
-            delBtn.textContent = '删除';
-            delBtn.addEventListener('click', () => deleteConfigPreset(item.id));
-
-            const head = document.createElement('div');
-            head.className = 'preset-head';
-            head.append(note, applyBtn, delBtn);
-
-            const meta = document.createElement('div');
-            meta.className = 'preset-meta';
-            meta.textContent = `${item.created_at} · ${formatPresetSize(item.size)}`;
-
-            const row = document.createElement('div');
-            row.className = 'preset-row';
-            row.append(head, meta);
-            return row;
-        }
-
-        async function exportConfigPreset() {
-            const btn = document.getElementById('preset-save');
-            const noteInput = document.getElementById('preset-note');
-            if (btn) btn.disabled = true;
-            presetMsg('正在导出…', false);
+            const name = document.getElementById('profile-name').value.trim();
+            if (!name) { profileMsg('请先在「名称」里填新名字。', true); return; }
             try {
-                await apiPost('api/config/presets/save',
-                              { note: (noteInput || {}).value || '' });
-                if (noteInput) noteInput.value = '';
-                presetMsg('已导出这份预设。', false);
-                await loadConfigPresets();
+                const r = await apiPost('api/config/profiles/save', {
+                    name: name,
+                    rename_from: editingProfileName,
+                    config: stripUntouchedSecrets(
+                        collectFormData(document.getElementById('profile-groups'), profileConfig)),
+                });
+                if (r && r.success === false) throw new Error(r.error || '重命名失败');
+                await loadConfigProfiles(true);
+                await loadProfileConfig(r.profile.name);
+                profileMsg(`已重命名为「${r.profile.name}」。`, false);
             } catch (e) {
-                presetMsg(e.message, true);
-            } finally {
-                if (btn) btn.disabled = false;
+                profileMsg('重命名失败: ' + e.message, true);
             }
         }
 
-        async function applyConfigPreset(id, btn) {
-            if (!await uiConfirm('切换回这份预设？当前的配置会被覆盖。')) return;
-            if (btn) btn.disabled = true;
+        async function deleteProfile() {
+            if (editingProfileName === 'default') {
+                profileMsg('default 是主配置本身，不能删除。', true);
+                return;
+            }
+            if (!await uiConfirm(`删除配置文件「${editingProfileName}」？`)) return;
             try {
-                await apiPost('api/config/presets/apply', { id: id });
-                closeConfigPresetModal();
-                showConfigMessage('已切换回这份预设。', 'success');
-                loadConfig();
+                await apiPost('api/config/profiles/delete', { name: editingProfileName });
+                editingProfileName = 'default';
+                await loadConfigProfiles(true);
+                renderProfileOptions();
+                await loadProfileConfig('default');
+                profileMsg('已删除。', false);
             } catch (e) {
-                presetMsg(e.message, true);
-            } finally {
-                if (btn) btn.disabled = false;
+                profileMsg('删除失败: ' + e.message, true);
             }
         }
 
-        async function savePresetNote(id, note) {
+        async function openProfilesDir() {
             try {
-                await apiPost('api/config/presets/note', { id: id, note: note });
-                presetMsg('备注已保存。', false);
+                await apiPost('api/config/profiles/open_dir', {});
             } catch (e) {
-                presetMsg(e.message, true);
+                profileMsg('打开目录失败: ' + e.message, true);
             }
         }
 
-        async function deleteConfigPreset(id) {
-            if (!await uiConfirm('删除这份预设？')) return;
-            try {
-                await apiPost('api/config/presets/delete', { id: id });
-                presetMsg('已删除这份预设。', false);
-                await loadConfigPresets();
-            } catch (e) {
-                presetMsg(e.message, true);
-            }
-        }
+        document.getElementById('profile-select').addEventListener('change', async (ev) => {
+            const next = ev.target.value;
+            if (!await switchProfile(next)) ev.target.value = editingProfileName;
+        });
+        document.getElementById('profile-switch-btn').addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            toggleProfilePicker();
+        });
+        document.addEventListener('click', (ev) => {
+            const box = document.getElementById('profile-picker');
+            if (!box || box.hidden) return;
+            if (ev.target.closest && (ev.target.closest('#profile-switch-btn') || ev.target.closest('#profile-picker'))) return;
+            box.hidden = true;
+        });
+        document.getElementById('profile-save-btn').addEventListener('click', saveProfileConfig);
+        document.getElementById('profile-create-btn').addEventListener('click', createProfileFromForm);
+        document.getElementById('profile-rename-btn').addEventListener('click', renameProfile);
+        document.getElementById('profile-delete-btn').addEventListener('click', deleteProfile);
+        document.getElementById('profile-open-dir-btn').addEventListener('click', openProfilesDir);
+        document.getElementById('profile-back-btn').addEventListener('click', () => switchPanel('config'));
 
-        function buildAnchorNav() {
-            const nav = document.getElementById('anchor-nav');
+        /* leading：导航顶部额外的入口（如设置页顶部的「配置文件」），不参与滚动高亮 */
+        function buildAnchorNav(navEl, rootEl, leading = [], idPrefix = 'cfg-group') {
+            const nav = navEl || document.getElementById('anchor-nav');
+            const root = rootEl || document.getElementById('config-groups');
             if (!nav) return;
             const scroller = document.querySelector('.main-content');
             if (nav._spy) scroller.removeEventListener('scroll', nav._spy);   // 重渲染时先摘掉旧监听
             nav.innerHTML = '';
             const pairs = [];
-            const groups = document.querySelectorAll('#config-groups .config-group');
+            leading.forEach(entry => {
+                const item = document.createElement('div');
+                item.className = 'anchor-item anchor-entry';
+                item.textContent = entry.title;
+                item.title = entry.title;
+                item.addEventListener('click', entry.onClick);
+                nav.appendChild(item);
+            });
+            const groups = root.querySelectorAll('.config-group');
             groups.forEach((groupEl, i) => {
                 const h3 = groupEl.querySelector('h3');
                 if (!h3) return;
-                const id = `cfg-group-${i}`;
+                const id = `${idPrefix}-${i}`;
                 groupEl.id = id;
                 const item = document.createElement('div');
                 item.className = 'anchor-item';
@@ -8220,38 +8656,43 @@
             }, 5000);
         }
 
+        /* 把一份表单（设置页或配置文件页）里的字段收成配置对象 */
+        function collectFormData(root, baseConfig) {
+            const storedRoles = {};
+            ((baseConfig || {}).roles || []).forEach(r => {
+                if (r && r.character_key) storedRoles[r.character_key] = r;
+            });
+            const roles = [];
+            root.querySelectorAll('.role-item').forEach(el => {
+                const role = {};
+                el.querySelectorAll('[data-role-key]').forEach(input => {
+                    role[input.dataset.roleKey] = input.value;
+                });
+                // 表单只渲染了一部分字段，界面上没有的（如 prompt_lang）以已存配置为底
+                // 保留，否则每次保存都会把它静默清空
+                roles.push(Object.assign({}, storedRoles[role.character_key] || {}, role));
+            });
+
+            const formData = {};
+            root.querySelectorAll('[data-key]').forEach(el => {
+                const key = el.dataset.key;
+                if (el.type === 'checkbox') formData[key] = el.checked;
+                else if (el.type === 'number') {
+                    if (String(el.value).trim() === '') return;
+                    const num = Number(el.value);
+                    if (Number.isFinite(num)) formData[key] = num;
+                }
+                else formData[key] = el.value;
+            });
+            formData['roles'] = roles;
+            formData['active_character'] = root.querySelector('[data-key="active_character"]')?.value
+                || ((baseConfig || {}).defaults || {}).active_character || '';
+            return formData;
+        }
+
         async function saveConfig(restart_tts = false) {
             try {
-                const storedRoles = {};
-                ((currentConfig || {}).roles || []).forEach(r => {
-                    if (r && r.character_key) storedRoles[r.character_key] = r;
-                });
-                const roles = [];
-                document.querySelectorAll('.role-item').forEach(el => {
-                    const role = {};
-                    el.querySelectorAll('[data-role-key]').forEach(input => {
-                        role[input.dataset.roleKey] = input.value;
-                    });
-                    // 表单只渲染了一部分字段，界面上没有的（如 prompt_lang）以已存配置为底
-                    // 保留，否则每次保存都会把它静默清空
-                    roles.push(Object.assign({}, storedRoles[role.character_key] || {}, role));
-                });
-                const activeKey = document.querySelector('[data-key="active_character"]')?.value
-                    || (currentConfig?.defaults || {}).active_character || '';
-
-                const formData = {};
-                document.querySelectorAll('#config-groups [data-key]').forEach(el => {
-                    const key = el.dataset.key;
-                    if (el.type === 'checkbox') formData[key] = el.checked;
-                    else if (el.type === 'number') {
-                        if (String(el.value).trim() === '') return;
-                        const num = Number(el.value);
-                        if (Number.isFinite(num)) formData[key] = num;
-                    }
-                    else formData[key] = el.value;
-                });
-                formData['roles'] = roles;
-                formData['active_character'] = activeKey;
+                const formData = collectFormData(document.getElementById('config-groups'), currentConfig);
                 formData['restart_tts'] = restart_tts;
 
                 await apiPost('api/config/save', formData);
@@ -8298,25 +8739,11 @@
             if ((ev.ctrlKey || ev.metaKey) && key === 's') {
                 ev.preventDefault();
                 if (activePanelId === 'config') saveConfig(false);
+                else if (activePanelId === 'profiles') saveProfileConfig();
                 return;
             }
             if (ev.key === 'Escape') {
                 if (escapeBack()) ev.preventDefault();
-            }
-        });
-        document.getElementById('config-preset-btn').addEventListener('click', openConfigPresetModal);
-        document.getElementById('config-preset-close').addEventListener('click', closeConfigPresetModal);
-        document.getElementById('config-preset-modal').addEventListener('click', (ev) => {
-            if (ev.target.id === 'config-preset-modal') closeConfigPresetModal();
-        });
-        document.getElementById('preset-tab-import').addEventListener('click', () => switchPresetTab('import'));
-        document.getElementById('preset-tab-export').addEventListener('click', () => switchPresetTab('export'));
-        document.getElementById('preset-save').addEventListener('click', exportConfigPreset);
-        document.getElementById('preset-open-dir').addEventListener('click', async () => {
-            try {
-                await apiPost('api/config/presets/open_dir', {});
-            } catch (e) {
-                presetMsg('打开文件夹失败: ' + e.message, true);
             }
         });
 
@@ -9914,10 +10341,8 @@
             addBtn.addEventListener('click', () => openConnectionDialog(null));
             document.getElementById('conn-platform').addEventListener('change', () => {
                 updateConnectionDialogFields();
-                // 微信：切到这个平台就把登录二维码取回来，跟创建机器人一样
-                if (document.getElementById('conn-platform').value === 'wechat_clawbot') {
-                    startConnectionLogin();
-                }
+                // 切到扫码平台就把二维码取回来，跟创建机器人一样
+                startScanOrShowBound(null);
             });
             document.getElementById('conn-cancel-btn')
                 .addEventListener('click', closeConnectionDialog);
@@ -9943,11 +10368,15 @@
         // ---- 心情 / 好感曲线：一个会话一条线，可按角色、会话与时间区间筛选 ----
         let curveState = null;
 
+        // ---- Token 消耗：自己的区间选择与下钻栈，与曲线互不影响 ----
+        let tokenState = null;
+
         // 时间区间：今天 / 昨天按小时分桶，其余按天；下钻到某小时后按分钟分桶
         function curveRangeSpec() {
             const sel = document.getElementById('curve-range');
             const key = sel && sel.value ? sel.value : 'today';
             if (key === 'today' || key === 'yesterday') return { key, hourly: true, days: 1 };
+            if (key === 'all') return { key, hourly: false, days: 0 };
             return { key, hourly: false, days: Math.max(1, parseInt(key, 10) || 30) };
         }
 
@@ -9962,12 +10391,14 @@
         // ---- 下钻：区间 → 某一天 → 某一小时 ----
         // 下钻栈里每一项是「点开的那一格」：level=day 表示进了某天（横轴换成小时），
         // level=hour 表示进了某小时（横轴换成分钟）
-        function drillStack() {
-            return (curveState && curveState.drill) || [];
+        // st 省略时用心情/好感曲线那份状态；token 图自己有一份
+        function drillStack(st) {
+            const owner = st || curveState;
+            return (owner && owner.drill) || [];
         }
 
-        function drillWindowOf() {
-            const stack = drillStack();
+        function drillWindowOf(st) {
+            const stack = drillStack(st);
             const last = stack[stack.length - 1];
             if (!last) return null;
             if (last.level === 'day') {
@@ -9977,14 +10408,14 @@
         }
 
         // 当前横轴的层级；minute 已是最细，不能再往下钻
-        function drillLevel() {
-            const stack = drillStack();
-            if (!stack.length) return curveRangeSpec().hourly ? 'hour' : 'day';
+        function drillLevel(st, baseLevel) {
+            const stack = drillStack(st);
+            if (!stack.length) return baseLevel || (curveRangeSpec().hourly ? 'hour' : 'day');
             return stack[stack.length - 1].level === 'day' ? 'hour' : 'minute';
         }
 
-        function drillLabelText() {
-            const stack = drillStack();
+        function drillLabelText(st) {
+            const stack = drillStack(st);
             const last = stack[stack.length - 1];
             if (!last) return '';
             const d = new Date(last.start * 1000);
@@ -10032,6 +10463,26 @@
             const day0 = curveState.today0s - (spec.key === 'yesterday' ? 86400 : 0);
             if (spec.hourly) {
                 return axisOf({ start: day0, end: day0 + 86400, days: 1, granularity: 'hour' });
+            }
+            if (spec.key === 'all') {
+                // 总共：从最早一个记录点所在那天画到今天；不足两天的窗口按小时分桶，
+                // 否则按天聚合整张图只会有一两个点
+                let minTs = 0;
+                (curveState.curves || []).forEach(c => (c.points || []).forEach(p => {
+                    const ts = Number(p && p[0]) || 0;
+                    if (ts && (!minTs || ts < minTs)) minTs = ts;
+                }));
+                const dayStart = minTs
+                    ? Math.floor(new Date(minTs * 1000).setHours(0, 0, 0, 0) / 1000)
+                    : curveState.today0s;
+                const days = Math.max(1,
+                    Math.round((curveState.today0s + 86400 - dayStart) / 86400));
+                if (days <= 1) {
+                    return axisOf({ start: dayStart, end: dayStart + 86400, days: 1,
+                                    granularity: 'hour' });
+                }
+                return axisOf({ start: dayStart, end: curveState.today0s + 86400,
+                                days, granularity: 'day' });
             }
             return axisOf({ start: curveState.today0s - (spec.days - 1) * 86400,
                             end: curveState.today0s + 86400, days: spec.days,
@@ -10210,6 +10661,132 @@
             bindChartDrill();
         }
 
+        // ---- Token 消耗 ----
+        function fmtTokens(n) {
+            return Number(n || 0).toLocaleString('en-US');
+        }
+
+        // 没下钻时横轴层级由后端返回的粒度决定（今天/昨天是小时，其余是天）
+        function tokenLevel() {
+            const base = (tokenState && tokenState.granularity === 'hour') ? 'hour' : 'day';
+            return drillLevel(tokenState, base);
+        }
+
+        function tokenRangeLabel(info) {
+            if (!info) return '';
+            if (info.key === 'all') return '总共';
+            if (info.key === 'today') return '今天';
+            if (info.key === 'yesterday') return '昨天';
+            return `近 ${Math.max(1, info.days || 30)} 天`;
+        }
+
+        function tokenDrillTo(startTs) {
+            if (!tokenState || !Number.isFinite(startTs) || tokenLevel() === 'minute') return;
+            tokenState.drill = drillStack(tokenState).concat(
+                [{ level: tokenLevel(), start: startTs }]);
+            hideChartTip();
+            loadTokenStats();
+        }
+
+        async function loadTokenStats() {
+            const rangeSel = document.getElementById('token-range');
+            if (rangeSel && !rangeSel.dataset.bound) {
+                rangeSel.dataset.bound = '1';
+                try {
+                    const saved = localStorage.getItem('lovomo_token_range');
+                    if (saved) rangeSel.value = saved;
+                } catch (e) {}
+                rangeSel.addEventListener('change', () => {
+                    try { localStorage.setItem('lovomo_token_range', rangeSel.value); } catch (e) {}
+                    // 换了区间就回到区间本身那一层
+                    if (tokenState) tokenState.drill = [];
+                    loadTokenStats();
+                });
+            }
+            const back = document.getElementById('token-back');
+            if (back && !back.dataset.bound) {
+                back.dataset.bound = '1';
+                back.addEventListener('click', () => {
+                    if (!tokenState || !drillStack(tokenState).length) return;
+                    tokenState.drill = drillStack(tokenState).slice(0, -1);
+                    hideChartTip();
+                    loadTokenStats();
+                });
+            }
+            const canvas = document.getElementById('chart-tokens');
+            if (canvas && !canvas.dataset.drillBound) {
+                canvas.dataset.drillBound = '1';
+                canvas.addEventListener('click', ev => {
+                    const b = canvas._axisBuckets;
+                    const info = canvas._chartInfo;
+                    if (!b || !info || info.labels.length < 2) return;
+                    const rect = canvas.getBoundingClientRect();
+                    const step = info.iw / (info.labels.length - 1);
+                    let idx = Math.round((ev.clientX - rect.left - info.padL) / step);
+                    idx = Math.max(0, Math.min(info.labels.length - 1, idx));
+                    tokenDrillTo(b.start + idx * b.size);
+                });
+            }
+            const range = (rangeSel && rangeSel.value) || 'all';
+            const win = drillWindowOf(tokenState);
+            let data = {};
+            try {
+                data = await apiGet(`api/token-stats?range=${encodeURIComponent(range)}`
+                    + (win ? `&start=${Math.floor(win.start)}&end=${Math.floor(win.end)}`
+                             + `&granularity=${encodeURIComponent(win.granularity)}` : ''));
+            } catch (e) {
+                document.getElementById('token-summary').innerHTML =
+                    `<span class="muted">加载 token 统计失败: ${esc(e.message)}</span>`;
+                return;
+            }
+            const info = data.range || { key: range, start: 0, end: 0, days: 1,
+                                         granularity: 'day' };
+            tokenState = { drill: drillStack(tokenState),
+                           granularity: info.granularity || 'day' };
+            if (back) back.style.display = drillStack(tokenState).length ? '' : 'none';
+            const viewLabel = drillLabelText(tokenState) || tokenRangeLabel(info);
+            const totals = data.totals || {};
+            const all = data.all_total || {};
+            document.getElementById('token-summary').innerHTML =
+                `<b>${fmtTokens(totals.total)}</b> tokens（${esc(viewLabel)}）`
+                + ` · 输入 ${fmtTokens(totals.prompt)} / 输出 ${fmtTokens(totals.completion)}`
+                + ` · 云端 ${fmtTokens(totals.cloud)} / 本地 ${fmtTokens(totals.local)}`
+                + ` · ${totals.calls || 0} 次调用`
+                + ` · 累计 ${fmtTokens(all.total)} tokens / ${all.calls || 0} 次`;
+            const buckets = axisOf(drillWindowOf(tokenState) || info);
+            const cutoff = chartBucketCutoff(buckets.start, buckets.size, buckets.count);
+            const byIdx = {};
+            (data.per_bucket || []).forEach(r => { byIdx[r.idx] = r; });
+            const totalData = [], promptData = [];
+            for (let i = 0; i < buckets.count; i++) {
+                const r = byIdx[i] || {};
+                totalData.push(i > cutoff ? null : (r.total || 0));
+                promptData.push(i > cutoff ? null : (r.prompt || 0));
+            }
+            canvas._axisBuckets = buckets;
+            drawLineChart(canvas, buckets.labels, [
+                { label: t('总 tokens'), data: totalData },
+                { label: t('输入 tokens'), data: promptData },
+            ]);
+            // 该时段按模型与用途拆分
+            const byModel = data.by_model || [];
+            const byLabel = data.by_label || [];
+            const modelRows = byModel.map(r =>
+                `<tr><td>${esc(r.model || '未知模型')}</td><td>${Number(r.local) === 1 ? '本地' : '云端'}</td>`
+                + `<td>${r.calls}</td><td>${fmtTokens(r.prompt)}</td>`
+                + `<td>${fmtTokens(r.completion)}</td><td>${fmtTokens(r.total)}</td></tr>`).join('');
+            const labelRows = byLabel.map(r =>
+                `<tr><td>${esc(r.label || '其他')}</td><td>${r.calls}</td>`
+                + `<td>${fmtTokens(r.prompt)}</td><td>${fmtTokens(r.completion)}</td>`
+                + `<td>${fmtTokens(r.total)}</td></tr>`).join('');
+            document.getElementById('token-labels').innerHTML = (byModel.length || byLabel.length)
+                ? `<table class="data-table"><tr><th>模型</th><th>位置</th><th>调用次数</th>`
+                  + `<th>输入</th><th>输出</th><th>合计</th></tr>${modelRows}</table>`
+                  + `<table class="data-table" style="margin-top:10px;"><tr><th>用途</th><th>调用次数</th>`
+                  + `<th>输入</th><th>输出</th><th>合计</th></tr>${labelRows}</table>`
+                : '<div class="muted">该时段还没有 token 记录。</div>';
+        }
+
         async function loadStatsPage() {
             const rangeSel = document.getElementById('stats-range');
             if (!rangeSel.dataset.bound) {
@@ -10219,6 +10796,19 @@
                     if (saved) rangeSel.value = saved;
                 } catch (e) {}
                 rangeSel.addEventListener('change', () => {
+                    // 所有统计图的时间区间都以「对话统计」为准：其余图的下拉跟着走，
+                    // 之后仍可在各自的下拉里单独调整（只影响那一张图）。
+                    // 程序赋值不触发 change 事件，下面的统一刷新就是它们的重载
+                    ['token-range', 'curve-range'].forEach(id => {
+                        const sel = document.getElementById(id);
+                        if (!sel) return;
+                        sel.value = rangeSel.value;
+                        try {
+                            localStorage.setItem(id === 'token-range'
+                                ? 'lovomo_token_range' : 'lovomo_curve_range', sel.value);
+                        } catch (e) {}
+                    });
+                    if (tokenState) tokenState.drill = [];
                     // 换了区间就回到区间本身那一层
                     if (curveState) curveState.drill = [];
                     loadStatsPage();
@@ -10234,7 +10824,7 @@
                 const rangeInfo = s.range || { days: 14, key: range, granularity: 'day' };
                 const rDays = Math.max(1, rangeInfo.days || 14);
                 const rangeLabel = rangeInfo.key === 'today' ? '今天' : rangeInfo.key === 'yesterday'
-                    ? '昨天' : `近 ${rDays} 天`;
+                    ? '昨天' : rangeInfo.key === 'all' ? '总共' : `近 ${rDays} 天`;
                 // 下钻后卡片与各图都只统计当前这一格覆盖的时间
                 const viewLabel = drillLabelText() || rangeLabel;
                 document.getElementById('chart-msgs-title').textContent = `${viewLabel}消息量与调用次数`;
@@ -10330,6 +10920,8 @@
                 renderCurves();
                 // 心情日记
                 loadMoodDiary();
+                // Token 消耗（自己的区间选择与下钻）
+                loadTokenStats();
                 // 情绪分布
                 const emos = s.emotions || [];
                 drawBarChart(document.getElementById('chart-emotions'),

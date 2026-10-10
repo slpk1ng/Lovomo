@@ -23,6 +23,7 @@ from typing import Callable, Optional
 from .scheduler import SchedulerManager
 from .llm_helpers import (RoleContext, generate_text_reply, strip_thinking,
                           looks_like_thinking, no_think_suffix)
+from .session_context import reply_ctx_of
 
 JOB_PREFIX = "sched_"
 
@@ -89,7 +90,8 @@ async def generate_in_character_text(ctx: RoleContext, instruction: str,
     prompt_parts = [str(history_block or "").strip(), instruction]
     user_prompt = "\n\n".join(p for p in prompt_parts if p) + no_think_suffix(ctx)
     try:
-        text = await generate_text_reply(ctx, system, user_prompt, max_tokens=max_tokens)
+        text = await generate_text_reply(ctx, system, user_prompt, max_tokens=max_tokens,
+                                         label="主动消息")
     except Exception as e:
         print(f"角色话术生成失败: {type(e).__name__}: {e}")
         return ""
@@ -323,19 +325,22 @@ class ScheduledJobManager:
         sent_any = False
         composed = 0
         for session_type, session_id in targets:
+            # 每个目标各取一份上下文：定时消息要按"这条会话从哪条接入方式来的"
+            # 那份配置生成（模型、接口地址与人设），否则绑了配置文件也没用
+            session_key = f"{session_type}_{session_id}"
+            session_ctx = reply_ctx_of(ctx.role, session_id=session_key)
             # LLM 模式按目标逐个生成：各会话的上下文不同，共用一句话会让
             # 每个会话都收到一句对不上话题的开场白
             if mode == "llm":
-                session_key = f"{session_type}_{session_id}"
                 instruction = render_template(
                     str(action.get("llm_prompt", "") or "主动打个招呼"),
-                    character_name=ctx.character_name)
-                block = self._history_block(session_key, ctx)
+                    character_name=session_ctx.character_name)
+                block = self._history_block(session_key, session_ctx)
                 if block:
                     print(f"[定时任务] 已带上会话 {session_key} 的聊天历史"
                           f"（{len(block)} 字），话术会承接上次话题。")
                 try:
-                    text = await generate_proactive_text(ctx, instruction,
+                    text = await generate_proactive_text(session_ctx, instruction,
                                                          history_block=block)
                 except Exception as e:
                     print(f"定时任务 LLM 生成失败: {e}")
@@ -351,12 +356,12 @@ class ScheduledJobManager:
             try:
                 # 按会话选连接：定时消息要发给"这条会话从哪条接入方式来的"那条通道，
                 # 否则微信/QQ 官方的会话会落到默认的 NapCat 上，根本发不出去
-                with self.sender.for_session(f"{session_type}_{session_id}"):
+                with self.sender.for_session(session_key):
                     ok = await self.sender.speak_and_send(
-                        session_type, session_id, text, emotions, ctx,
+                        session_type, session_id, text, emotions, session_ctx,
                         use_voice=bool(action.get("use_voice", False)),
                         sticker=bool(self.config.get("proactive_sticker", False)),
-                        session_id=f"{session_type}_{session_id}")
+                        session_id=session_key)
             except Exception as e:
                 # 单个目标失败不能中断整轮，更不能冒到调度器变成任务的 last_error
                 print(f"[定时任务] {job.get('name') or job.get('id', '')} 向 "

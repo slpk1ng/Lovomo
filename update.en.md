@@ -3,7 +3,68 @@
 ### v1.2.4.0
 
 
+#### ✨ Added
+
+- Relationship progress: a character can now be romanced gradually, Galgame style — affection only builds up slowly through long-term company (with a daily cap per person); Flirting and Lover are decided by whether romantic signals actually show up in the interaction, and whether to accept a confession, or to speak up first, is the character's own call. The earliest relationship nature that may settle a relationship, the partner limit (unlimited by default) and the daily affection cap are all configurable, and the User Profiles page shows each person's current relationship progress and affection.
+
+- Mood diary: the statistics panel gained a session filter, so you can read one session's entries only.
+
+- Statistics panel: the mood/affection curves gained a time-range filter — Today and Yesterday are shown by hour, and clicking an hour drills down to that hour's per-minute data.
+
+- Mood diary: an entry is written even on a day when not a single word was exchanged — on days 1/2/3/7/14/30/60/90/180/365 since the last chat (private sessions only).
+
+- Connections: the "NapCat Connection" block on the config page is now a "Connections" block.
+
+- Two new connection types: WeChat ClawBot and the official QQ bot.
+
+- WeChat ClawBot: incoming voice messages are now supported — they are turned into text before the character replies.
+
+- Relationship progress: added a four-level "dating difficulty" (Easy / Normal / Hard / Very Hard, Normal by default), and affection changes now swing with some randomness.
+
+- Companion play: added random adventures, promise tracking, anniversary congratulations, neglect decay, jealousy and stage-unlock behaviours, all driven by a daily companion check.
+
+- Mood now rises and falls with late nights, weekends and long stretches without a chat, and every day a mood diary in the character's own voice — written from that day's real conversations — is written and sent out for each session.
+
+- Voice: added a "strip non-dialogue content" switch (on by default) — actions, expressions and scene notes in brackets (such as (笑) or [旁白]) and kaomoji are no longer spoken and stay in the message text only; the log lists what was removed.
+
+- Mood: added a "mood regression rate" (0.1 by default) that pulls the mood a little toward its initial value every turn. The mood used to only ever climb, so a few compliments pinned it at the ceiling and nothing moved it afterwards no matter what you talked about; now praise lifts it and a long flat stretch slowly drifts it back to the initial value.
+
+- Conversation recall: the character now remembers details from earlier conversations — unresolved topics are pinned on every turn (having agreed to go to the seaside but not set off yet is no longer forgotten once the chat drifts), and passages relevant to the current topic are retrieved from the history and injected. The lookup can be semantic (embedding, still matches when the wording changes) or character-overlap (lexical, no dependencies and works offline); it falls back to character overlap when embeddings are unavailable. The switch, the lookup mode and the number of passages are all under "Sending and Conversation Memory".
+
+- Group management: a character can mute a group member or recall a message someone else sent (both the requester and the bot must be an admin or the group owner).
+
+- Statistics panel: added token usage statistics with Total / Today / Yesterday / Last 7 days / Last 14 days / Last 30 days ranges, drill-down by day, hour and minute like the mood curves, plus a ranking of usage by purpose.
+
+- Quotes: when the message being answered is pushed away by someone else's messages, the reply now quotes that message instead.
+
+- Smart reply: in groups and private chats the bot first judges whether you have finished; if not, it waits a while before answering, and restarts the wait when you send more in the meantime.
+
+- Reply probability: each message can be given a fixed chance of being answered (0.5 by default); when the roll misses, that message is left unanswered.
+
+- Configuration profiles: the whole configuration can be saved under several names, and each connection uses one (default is the main configuration and cannot be deleted).
+
+- Profiles page: a Profiles entry at the top of the anchor navigation on the settings page opens a page where profiles can be created, renamed and deleted, with "Save profile" in the bottom-right corner.
+
+- Official QQ bot: quoting, recalling, images and voice are now supported; one passive reply may contain at most 5 messages, and text is merged into its voice message when that would be exceeded — if it still overflows, the rest is sent right after as proactive messages.
+
+- Official QQ bot: added QR binding — pick "official QQ bot" when creating a connection and scan with mobile QQ to fill in the AppID and AppSecret automatically, instead of copying them from the open platform by hand.
+
+- Profiles page: a "Switch preset" button in the bottom-right corner lets you hop to another configuration profile and keep tweaking it.
+
+- Config page: the dozen or so TTS and reply groups are merged into one "Voice and Reply" group; its sub-groups stay collapsed and hovering the group lists all of them in a tree on the right.
+
+- Local models: added a "Preload local models at startup" switch (on by default) that loads the local models used by the configuration (chat, vision and embedding models; LM Studio, Ollama, llama.cpp and so on) when the program opens, instead of waiting for the first message.
+
+
 #### 🛠 Fixed
+
+- WeChat ClawBot: fixed incoming voice messages failing to produce text (the silk format has no decoder on this machine, so conversion failed outright).
+
+- Replies: fixed the character copying speaker labels and sticker markers from the context into her lines, which made the whole reply look like malformed output and get discarded.
+
+- Replies: fixed text messages tumbling out one after another when a whole reply carries no voice.
+
+- Mood diary: fixed a diary written in one conversation drifting into another one and bringing things said elsewhere along with it.
 
 - Context background: fixed the summary and topic being generated in the character's voice, which turned the character's mood and subjective judgement into background fed into every later turn — they are now compiled neutrally in the third person, and existing in-character background is no longer injected until it is rewritten.
 
@@ -27,6 +88,8 @@
 
 - Mood diary: fixed the same session receiving two diary entries in one check (a session now gets at most one per run), and diary entries older than a day are no longer delivered late (they remain visible in the Mood Diary list).
 
+- Mood diary: fixed a timed-out send being retried and the same entry arriving twice — a timeout only means the send receipt never came back, so the entry is neither retried nor queued again.
+
 - Chat console: fixed the mood, affection, promise and other state surviving a conversation reset; clearing now returns to a completely fresh state.
 
 - Plugins: fixed plugins being unable to send messages in WeChat / official QQ bot sessions.
@@ -37,13 +100,9 @@
 
 - User profiles: fixed notes only ever growing, with outdated and duplicated entries left behind forever.
 
+- TTS: fixed "Auto-start TTS service" giving up after 60 seconds with a not-ready message (a cold start often takes longer, and giving up also skipped switching the model weights) — the wait is now 300 seconds and the TTS process's own output goes to `%LOCALAPPDATA%\Lovomo\tts_start.log` so a failed start can be diagnosed.
+
 - Configuration page: fixed the "GitHub accelerator mirrors" box being much narrower than every other input.
-
-- Sidebar "Plugins": fixed the expanded list offering the web UI of disabled plugins; only enabled ones are listed now.
-
-- Reminders: fixed a plain complaint such as "why didn't you remind me?" being taken as a new reminder with an invented time, which added a stray reminder for the next day — a time only counts when the user actually said it.
-
-- Reminders: fixed reminders for WeChat and similar connections being sent over the default connection, so they never arrived on time (the session ID had its prefix doubled).
 
 - Reminders: fixed reminders missed while the app was closed being merely marked "expired" and never delivered — they are now caught up.
 
@@ -51,73 +110,24 @@
 
 - Relationship progress: fixed affection being shared as a single copy across every group chat and private chat with the same person — each session now keeps its own, so chatting in a group no longer moves the private chat's affection or relationship progress (existing saves are migrated onto that person's private record instead of resetting to zero).
 
-- Mood diary: fixed the day's mood summary counting the ups and downs of every session of that character together; it now only uses that session's own records for the day.
-
-- Split sending: fixed a whole reply being collapsed into a single message on text-only connections (WeChat ClawBot, QQ Official) — when voice cannot be synthesized the text is now still sent sentence by sentence.
-
-- WeChat ClawBot: fixed the typing handshake sitting on the message-sending path and costing two extra round trips per message — it now runs once per reply and never blocks the send.
-
-- Chat history: fixed avatars sitting flush against the message bubble; there is now a gap between them.
-
 - Knowledge Base (RAG): fixed the failure log naming llm_base_url as the target endpoint — it now prints the endpoint actually requested and points out that the Embedding endpoint must be filled in when the embedding service does not live at llm_base_url; a search that finds nothing also prints the closest similarity, so tuning rag_min_similarity is no longer guesswork.
-
-- Session IDs: fixed one conversation being treated as two because of two different spellings — a session ID derived from the memory file name (where the @ and . of an openid were sanitised into _) is now restored to the runtime spelling. Otherwise proactive messages and reminders could not tell the platform, fell back to the default NapCat and failed with "cannot get user info", and the send target was truncated at the underscore; the two keys already stored in the state file are merged into one when it is loaded.
 
 - Chat recall: fixed chat recall, promise fulfilment and the daily encounter never taking effect at all — the three modules were never actually wired up at startup, so recall never retrieved a single past topic and promises were never fulfilled; the recall index also failed to save because its vector entries were not plain numbers, and now persists correctly.
 
-- Recalling a message: fixed quoting an older message that mentions “recall” being taken as a new request and recalling the character's own previous message — the check now only looks at what you type yourself, not at quoted or forwarded content.
-
-- Chat recall: fixed retrieval always pulling several near-identical segments from the same stretch of conversation while the genuinely relevant earlier memories were missed — only one segment per stretch is kept now, and the result is injected in chronological order.
-
 - @-mentions: fixed the mention running into the text that follows it with no space in between.
 
-- @-mentions: two @ signs written together are now the real mention ("@@someone", "@@QQ number", "@@everyone") while a single @ is always plain text — the character talking about "@everyone" in her line is no longer mistaken for an actual mention and replaced with an @ of the current speaker, which reversed the meaning.
-
-- Recalling a message: fixed quoting a message and asking her to recall it recalling her latest message instead of the quoted one — the quoted one is recalled now, together with the voice of the same sentence, and a nudge like "you still haven't recalled it" is no longer read as "don't recall".
-
-- Delivery mode: fixed a streaming reply dropping every sentence from the point where a delivery mode such as "one message per character" appeared on a later sentence — the remaining sentences are now sent as usual, so QQ no longer receives less than the chat history shows.
-
-- Base prompt: on text-only channels (WeChat ClawBot, the official QQ bot) the character is no longer taught to @, quote, poke or recall, which those channels cannot do at all, and is told plainly that the channel is text-only instead of pretending otherwise.
-
-
 - Model management: fixed the local model being reloaded on every reply, the RAG embedding model being evicted and erroring in a loop, and an unload command window popping up with cloud models when Unload the old model after switching was enabled.
+
 - Emotion tone: fixed a whole sentence falling back to the default tone because the model wrote an emotion outside the list; the prompt now asks for the closest word from the list, and an unrecognised value is resolved from the line itself when possible.
+
 - Repeat guard: fixed replies being judged as repetition and sent back for regeneration when the user explicitly asked to hear something repeated.
-- Speech synthesis: fixed a segment being discarded and sent as text only when its synthesis ran over the time limit; another split method is tried now, and piece-by-piece synthesis is used if it is still too long.
-- Stats page: message volume and call counts plus the emotion trend are now shown hourly for Today / Yesterday instead of a single point, any range can be clicked to drill down (range to day to hour to minute), and times that have not arrived yet are no longer drawn.
-- Restart: fixed the tray Restart Lovomo leaving two processes behind with the old one orphaned.
+
+- Stats page: message volume and call counts plus the emotion trend are now shown hourly for Today / Yesterday instead of a single point, and any range can be clicked to drill down (range to day to hour to minute).
+
 - Sentence splitting: fixed the piece after a terminal mark carrying a leading comma into the next message (a line starting with a comma showed up in the group).
-- Base prompt: two sentences in the same reply must not say the same thing.
-- Task follow-through check: instead of only reporting what was not done, it now returns how to do it and which action to use (1-3 steps, naming who to poke, which message to recall, which members to @), with the available action list in its input; when it cannot say what is missing, no extra reply is added.
-- Auto continuation: the continuation turn no longer disables the repeat guard entirely; only the reply being replaced is dropped from the comparison, so it neither regenerates in a loop nor repeats the same line.
-- Action receipts: fixed the case where the character wrote a poke in its JSON but the system judged it as not done and kept asking her to redo it — pokes, @-mentions and recalls now return an execution receipt (success / unsupported channel / send failure) that both the check and the next turn read, so a blocked action is reported honestly instead of being played as done.
-- Sentence splitting: fixed action fields (poke, @-mention, quote, recall, delivery mode) being dropped when a line is split into several messages, which left the character only talking about the action.
-- Recall scope: fixed one recall wiping every message split out of a whole turn; only the messages of the sentence that asked for the recall are recalled now.
-- Tool notes: failed calls are kept in the context notes, so the character knows next turn that the action was refused instead of assuming it went through.
 
-- Promise tracking: fixed the character merely reminding the user of something the user had promised being stored as her own promise, so that the next day she would "keep" the user's promise instead of her own; only what the character herself agreed to do is extracted.
-- Group @-mentions: fixed a literal @@ written in a second or later sentence (instead of the first) being sent as plain text instead of becoming a real mention; a literal @@ in any sentence is now honoured, at the position where it was written.
-- Task follow-through: fixed the character agreeing forever without acting. Right after a reply is sent the system checks again (was the content actually delivered, were the declared action fields actually carried out) and, if not, has her continue on her own without the user having to ask again; the check only runs when the user is pressing for a result or asks for a concrete action, and adds no extra reply when it cannot say what is missing (can be turned off with Push unfinished tasks through).
 
-- Task follow-through: fixed the system still pushing her to continue after she had plainly refused or said she cannot do it / has no permission; she is no longer pushed in that case.
-
-- Poke: the poke cooldown and daily cap are both gone — pokes go out however many times she pokes.
-
-- Action fields: fixed the model writing an action field as dialogue, leaving a line like "reply_to: true" at the start of a message — such lines are stripped while the action itself is still carried out.
-
-- @-mentions: fixed the mention landing on a sentence that mentions nobody, so the person never got the notification — the mention now follows only the sentence that carries the placeholder, and is hoisted to the front of the message only when no sentence carries it.
-
-- Recalling a message: group admins and the group owner can now have the character recall **someone else's** message (both the requester and the character must be an admin or the owner); an ordinary member cannot make her delete other people's messages.
-
-#### ✨ Added
-
-- Relationship progress: a character can now be romanced gradually, Galgame style — affection only builds up slowly through long-term company (with a daily cap per person); Flirting and Lover are decided by whether romantic signals actually show up in the interaction, and whether to accept a confession, or to speak up first, is the character's own call. The earliest relationship nature that may settle a relationship, the partner limit (unlimited by default) and the daily affection cap are all configurable, and the User Profiles page shows each person's current relationship progress and affection.
-
-- Mood diary: the statistics panel gained a session filter, so you can read one session's entries only.
-
-- Statistics panel: the mood/affection curves gained a time-range filter — Today and Yesterday are shown by hour, and clicking an hour drills down to that hour's per-minute data.
-
-- Mood diary: an entry is written even on a day when not a single word was exchanged — on days 1/2/3/7/14/30/60/90/180/365 since the last chat (private sessions only).
+#### ⚡ Improved
 
 - UI: list pages such as Chat History, Plugin Market, Scheduled Tasks and User Profiles show skeleton placeholders first and fade in when the data arrives.
 
@@ -129,25 +139,9 @@
 
 - Plugin market: the search box and sort control now sit on the same row as Market and Category.
 
-- Connections: the "NapCat Connection" block on the config page is now a "Connections" block — where messages come from becomes a first-class item you can create several of and enable or disable one by one; the old NapCat URL and token (including each role's own) are migrated into a connection automatically, and each role now picks which connection to bind to from a dropdown.
-
-- Two new connection types: WeChat ClawBot and the official QQ bot.
-
-- Relationship progress: added a four-level "dating difficulty" (Easy / Normal / Hard / Very Hard, Normal by default), and affection changes now swing with some randomness.
-
-- Companion play: added random adventures, promise tracking, anniversary congratulations, neglect decay, jealousy and stage-unlock behaviours, all driven by a daily companion check.
-
-- Mood now rises and falls with late nights, weekends and long stretches without a chat, and every day a mood diary in the character's own voice — written from that day's real conversations — is written and sent out for each session.
-
 - Preset wording: holiday greetings, birthday wishes and scheduled tasks now generate their text in character by default, falling back to the preset wording only if generation fails.
 
-- Mood: added a daily recovery — a mood that has sunk to rock bottom slowly climbs back on its own from the next day; the mood also drifts with late nights, weekends and long silences, and each day a diary entry in the character's voice is written for every session from that day's actual conversations and sent out.
-
-- Update dialog: when a new version is found, this version's release notes are shown alongside.
-
-- Voice: added a "strip non-dialogue content" switch (on by default) — actions, expressions and scene notes in brackets (such as (笑) or [旁白]) and kaomoji are no longer spoken and stay in the message text only; the log lists what was removed.
-
-- Mood: added a "mood regression rate" (0.1 by default) that pulls the mood a little toward its initial value every turn. The mood used to only ever climb, so a few compliments pinned it at the ceiling and nothing moved it afterwards no matter what you talked about; now praise lifts it and a long flat stretch slowly drifts it back to the initial value.
+- WebUI: a new "Chat Console" page lets you talk to the character for debugging without opening a chat app; the statistics panel gains mood/affection curves and the mood diary; the config page gains character archive export/import.
 
 - UI: two shortcuts were added — Ctrl+S is the same as "Save only", and Esc goes back level by level (closing a dialog first, then leaving a plugin feature page/webui for the plugin list, and finally returning to the previous page).
 
@@ -159,12 +153,9 @@
 
 - Plugins: one click on "Plugins" in the sidebar expands a list containing only the plugins that ship a webui, and clicking a name jumps straight to that plugin's page; the plugin name on a card works the same way.
 
-- WebUI: a new "Chat Console" page lets you talk to the character for debugging without opening a chat app; the statistics panel gains mood/affection curves and the mood diary; the config page gains character archive export/import.
+- Mood: added a daily recovery — a mood that has sunk to rock bottom slowly climbs back on its own from the next day.
 
-- Conversation recall: the character now remembers details from earlier conversations — unresolved topics are pinned on every turn (having agreed to go to the seaside but not set off yet is no longer forgotten once the chat drifts), and passages relevant to the current topic are retrieved from the history and injected. The lookup can be semantic (embedding, still matches when the wording changes) or character-overlap (lexical, no dependencies and works offline); it falls back to character overlap when embeddings are unavailable. The switch, the lookup mode and the number of passages are all under "Sending and Conversation Memory".
-
-- GitHub mirrors: the default list is now gh-proxy.com / githubproxy.cc / ghproxy.link (all three serve raw; the two latter ones go through one redirect for the API).
-
+- Update dialog: when a new version is found, this version's release notes are shown alongside.
 
 
 
@@ -634,3 +625,5 @@
 - The sticker keep decision rides along with the vision-caption call (zero extra requests); mood statistics can expand several sessions' records; tool testing supports custom JSON parameters; the JSON editor area can be resized.
 
 - Deleting a session also clears the corresponding character's mood records.
+
+- Proactive messages: fixed idle openers, festival greetings, birthday wishes and scheduled messages still being generated with the main configuration when the connection is bound to a config profile.

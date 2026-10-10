@@ -4,10 +4,15 @@
 # 管理器槽位（sticker_mgr/memory_manager/global_config/sender/mood_mgr）统一经
 # modules.app_context 读写；_PENDING_IMAGES 与 _image_cache_last_check 是本模块
 # 自有的可变状态，随模块走。
+import asyncio
 import hashlib
+import io
 import os
 import re
+import shutil
+import subprocess
 import time
+import wave
 from pathlib import Path
 from typing import Optional, Dict
 from urllib.parse import urlsplit
@@ -19,6 +24,7 @@ from modules.reply_pipeline import _spawn, _sticker_judgement_from_llm, _norm_te
 from modules.llm_helpers import RoleContext, download_image, sniff_image_mime
 from modules.tls import verified_context
 from modules.asr import AUDIO_MIMES
+from modules.tts_service import no_window_kwargs
 
 
 async def auto_capture_from_images(ctx: RoleContext, capture: dict, image_urls: list,
@@ -167,6 +173,8 @@ _IMAGE_EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
 # 让 OneBot 把用户语音转成 wav：本地 ASR 脚本与线上接口都吃这个格式
 VOICE_OUT_FORMAT = "wav"
 VOICE_FALLBACK_SUFFIX = ".wav"
+# 识别脚本要的采样率，转码（含 silk 解码）一律出 16k 单声道 wav
+VOICE_SAMPLE_RATE = 16000
 
 
 # ============================================================================
@@ -273,7 +281,7 @@ def _cache_image_bytes(data: bytes, ext: str = ".jpg") -> str:
         if now - _image_cache_last_check > _IMAGE_CACHE_CHECK_INTERVAL:
             _image_cache_last_check = now
             try:
-                limit_mb = max(1, int(app_context.global_config.get("image_cache_max_mb", 500) or 500))
+                limit_mb = max(1, int(app_context.active_config().get("image_cache_max_mb", 500) or 500))
             except (TypeError, ValueError):
                 limit_mb = 500
             files = [f for f in cache_dir.iterdir() if f.is_file()]
@@ -463,11 +471,92 @@ async def _download_audio_to_temp(url: str) -> Optional[str]:
         return None
 
 
+def _find_ffmpeg() -> str:
+    """找 ffmpeg：优先 GPT-SoVITS 自带的（识别脚本那套 runtime 里有），其次 PATH。"""
+    try:
+        from modules.asr import resolve_sovits_root
+        root = resolve_sovits_root(app_context.active_config() or {})
+        if root is not None:
+            bundled = root / "runtime" / "ffmpeg.exe"
+            if bundled.exists():
+                return str(bundled)
+            bundled = root / "ffmpeg.exe"
+            if bundled.exists():
+                return str(bundled)
+    except Exception:
+        pass
+    return shutil.which("ffmpeg") or ""
+
+
+def _decode_silk_to_wav(path: str) -> str:
+    """把腾讯 silk 解成 16k 单声道 wav。
+
+    silk 是腾讯私有格式，ffmpeg 没有它的解码器，只能靠 pysilk（SILK SDK 的
+    绑定）解；解出来的采样率由 pysilk 自己认，传入的值只决定输出重采样到多少。
+    """
+    import pysilk
+
+    raw = Path(path).read_bytes()
+    # 微信/QQ 的语音在 SILK 头前多带一个 0x02 标记，解之前要去掉
+    if raw[:1] == b"\x02":
+        raw = raw[1:]
+    pcm = io.BytesIO()
+    pysilk.decode(io.BytesIO(raw), pcm, VOICE_SAMPLE_RATE)
+    target = str(Path(path).with_name(f"asr_{time.time_ns()}.wav"))
+    with wave.open(target, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(VOICE_SAMPLE_RATE)
+        wav.writeframes(pcm.getvalue())
+    return target
+
+
+def _convert_audio_to_wav(path: str) -> str:
+    """把识别脚本啃不动的语音格式（silk/amr/mp3…）转成 16k 单声道 wav。
+
+    转换失败时原样返回原路径：识别那边至少还能试一次，错误信息也更真实。
+    """
+    suffix = Path(path).suffix.lower()
+    if suffix == ".wav":
+        return path
+    if suffix == ".silk":
+        try:
+            return _decode_silk_to_wav(path)
+        except ImportError:
+            print("语音转码跳过：silk 需要 pysilk 才能解（当前环境没有装），"
+                  "这条语音识别不了")
+            return path
+        except Exception as e:
+            print(f"语音转码失败: {type(e).__name__}: {e}")
+            return path
+    ffmpeg = _find_ffmpeg()
+    if not ffmpeg:
+        print(f"语音转码跳过：找不到 ffmpeg（{suffix} 可能识别不了，"
+              "可在 GPT-SoVITS 的 runtime 目录放一个 ffmpeg.exe）")
+        return path
+    target = str(Path(path).with_name(f"asr_{time.time_ns()}.wav"))
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-y", "-loglevel", "error", "-i", path,
+             "-ar", str(VOICE_SAMPLE_RATE), "-ac", "1", target],
+            capture_output=True, text=True, timeout=60, **no_window_kwargs())
+        if proc.returncode == 0 and os.path.isfile(target) \
+                and Path(target).stat().st_size > 0:
+            return target
+        print(f"语音转码失败: {str(proc.stderr or '')[:200]}")
+    except Exception as e:
+        print(f"语音转码失败: {type(e).__name__}: {e}")
+    return path
+
+
 async def transcribe_voice_message(client, sources: list, file_ids: dict) -> str:
     """用户发来的语音转文字，取「语音识别」那几项配置（识别不出来返回空串）。
 
     QQ 里的语音常是 silk/amr 这类识别脚本啃不动的格式，先让 OneBot 转成 wav
-    并落到本地；转不了就退回直接下载直链。多段语音只取第一段识别出文字的。
+    并落到本地；转不了就退回直接下载直链。微信 ClawBot 没有转码接口，
+    语音按原始格式落盘后在这里统一转成 wav（silk 走 pysilk，其余走 ffmpeg）
+    再交给识别。
+    多段语音只取第一段识别出文字的。
     """
     from modules.asr import transcribe_file
     getter = getattr(client, "get_record", None)
@@ -496,7 +585,10 @@ async def transcribe_voice_message(client, sources: list, file_ids: dict) -> str
             if not path:
                 continue
             try:
-                text = await transcribe_file(app_context.global_config, path)
+                wav = await asyncio.to_thread(_convert_audio_to_wav, path)
+                if wav != path:
+                    temp_files.append(wav)
+                text = await transcribe_file(app_context.active_config(), wav)
             except Exception as e:
                 print(f"语音识别失败: {type(e).__name__}: {e}")
                 continue

@@ -17,8 +17,7 @@ _WEBUI_PASSWORD_KEYS = ("webui_password", "webui_second_password")
 _SECOND_PASSWORD_PATHS = frozenset({
     "/api/history", "/api/delete", "/api/history/delete_messages",
     "/api/config/save", "/api/config/import", "/api/config/export",
-    "/api/config/presets/save", "/api/config/presets/note",
-    "/api/config/presets/apply", "/api/config/presets/delete",
+    "/api/config/profiles/save", "/api/config/profiles/delete",
     "/api/connections/save", "/api/connections/delete",
     "/api/roles/save", "/api/jobs/save", "/api/jobs/batch", "/api/jobs/run",
     "/api/events/save", "/api/events/batch",
@@ -144,6 +143,15 @@ def _mask_preview(value: str) -> str:
 def _is_masked_value(value) -> bool:
     v = str(value or "")
     return v == "********" or ("****" in v and v.endswith("位）"))
+
+
+def _is_kept_secret(value) -> bool:
+    """密钥字段的「没改动」判定：空值或打码预览都表示沿用磁盘上已有的值。
+
+    配置文件页不显示密钥（密钥只在设置页管理），那一页保存回来的密钥字段必然
+    是空的；没有这条规则，随便改个开关就会把密钥覆盖成空串。
+    """
+    return _is_masked_value(value) or not str(value or "").strip()
 
 
 def _encrypt_api_keys(config: dict) -> dict:

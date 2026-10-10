@@ -473,9 +473,15 @@ def _sticker_capture_instruction(ctx, describe_only: bool = False) -> str:
         "\n判定标准（前两条是硬性否决，必须优先执行）："
         "\n① 纯风景 / 空镜 / 静物 / 室内随手拍 / 无人物、无文字、无明确情绪表达的图片："
         '一律 {"sticker_safe": false}，不要收藏，也不要因为"画面好看""氛围有趣"就收藏；'
-        "\n② 画面阴森、恐怖、诡异、病态、压抑，或只是普通生活记录、截图、"
-        "文档、商品图、自拍头像：一律 {\"sticker_safe\": false}；"
+        "\n② 整张图是界面/页面的截图或长图（画面里有状态栏、时间电量、导航栏、标题栏、"
+        "播放控件、进度条、滚动条、按钮、输入框、聊天气泡、评论区/弹幕/点赞关注、"
+        "广告位，或一张图被嵌在别的界面里，比如视频页面里的图、帖子里的图），"
+        "以及文档、表格、代码、商品图、自拍头像、普通生活记录 —— "
+        '一律 {"sticker_safe": false}；'
+        "画面阴森、恐怖、诡异、病态、压抑的，同样 "
+        '{"sticker_safe": false}；'
         "\n③ 只有在【这张图将来被当表情包发出去时有明确的使用场景】才收藏："
+        "它得先是表情包形态的图 —— 单一画面（可以带大字文案），"
         "画面里有夸张的表情/动作，或带有可用于互动的文字，"
         "或明显用于挑逗、撩拨、嘲讽、炫耀、撒娇、无语等互动用途；"
         "\n④ 判定场景的是【发图一方想表达的语气】，不是画面里角色的此刻心情；"
@@ -967,6 +973,205 @@ def maybe_unload_old_models(ctx) -> None:
     threading.Thread(target=_work, daemon=True).start()
 
 
+# ---------------------------------------------------------------------------
+# 启动预加载：配置里用到的本地模型在程序打开时先加载好
+# ---------------------------------------------------------------------------
+
+# 预加载请求的上限：模型大时加载要几分钟，得等得到（服务不在时连接会立刻失败）
+_WARMUP_TIMEOUT = 600
+
+
+def _as_bool(value, default: bool = True) -> bool:
+    """开关型配置：字符串 "false" / "0" 不能被当成真。"""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def _lmstudio_cli() -> str:
+    """lms 命令行路径；没装 LM Studio 时返回空串。"""
+    import os
+    import shutil
+    lms = Path.home() / ".lmstudio" / "bin" / ("lms.exe" if os.name == "nt" else "lms")
+    if lms.exists():
+        return str(lms)
+    return shutil.which("lms") or ""
+
+
+def _lms_command(exe: str, args: List[str], timeout: int):
+    """跑一条 lms 命令。控制台子进程不加这两个参数会弹出一个黑框（GUI 进程下尤其明显）。"""
+    import os
+    import subprocess
+    kwargs = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = 0
+        kwargs["startupinfo"] = si
+    return subprocess.run([exe, *args], capture_output=True, timeout=timeout, **kwargs)
+
+
+def _lmstudio_loaded(exe: str) -> set:
+    """LM Studio 里已经加载的模型名。"""
+    try:
+        out = _lms_command(exe, ["ps", "--json"], 60).stdout
+        items = json.loads(out.decode("utf-8", "replace") or "[]")
+    except Exception:
+        return set()
+    return {str(item.get("modelKey") or "") for item in items if isinstance(item, dict)}
+
+
+def _lmstudio_load(model_key: str) -> bool:
+    """通过 lms CLI 让本机 LM Studio 加载模型。
+
+    已经加载的模型再 load 一次会另起一个实例（显存翻倍，装不下就直接报错），
+    所以先看一遍已加载清单，在的就算加载好了。
+    """
+    exe = _lmstudio_cli()
+    if not exe:
+        return False
+    if model_key in _lmstudio_loaded(exe):
+        return True
+    try:
+        return _lms_command(exe, ["load", model_key], 1800).returncode == 0
+    except Exception as e:
+        print(f"[模型预加载] 加载 {model_key} 失败: {e}")
+        return False
+
+
+def _embedding_target(ctx) -> Optional[tuple]:
+    """嵌入模型那一路的 (模型名, 接口类型, 服务地址, 密钥, "embedding")。
+
+    模型名与地址的取法和 RAG 的嵌入保持一致（会话回忆检索共用同一套），
+    否则会去预热一个实际不会被用到的模型。
+    """
+    backend = (str(ctx.get("rag_embedding_backend", "") or "")
+               or str(ctx.get("llm_backend", "ollama") or "ollama"))
+    model = (str(ctx.get("llm_embedding_model", "") or "")
+             or str(ctx.get("rag_embedding_model", "") or ""))
+    if backend == "ollama":
+        # 与 rag.py 一致：ollama 分支固定走本机默认地址，不看 llm_base_url
+        return (model or "nomic-embed-text", backend, "http://127.0.0.1:11434", "", "embedding")
+    model = model or str(ctx.get("llm_model_name", "") or "")
+    if not model:
+        return None
+    base_url = (str(ctx.get("llm_embedding_url", "") or "").strip()
+                or str(ctx.get("llm_base_url", "") or ""))
+    return (model, backend, base_url, str(ctx.get("llm_api_key", "") or ""), "embedding")
+
+
+def _startup_targets(ctx) -> List[tuple]:
+    """这份配置里要预加载的 (模型名, 接口类型, 服务地址, 密钥, 用途)。
+
+    识图模型可以单独指向别的服务，所以逐模型取自己那份地址，不一律按 LLM 配置来。
+    """
+    llm = (str(ctx.get("llm_backend", "ollama") or "ollama"),
+           str(ctx.get("llm_base_url", "") or ""),
+           str(ctx.get("llm_api_key", "") or ""))
+    vision = (str(ctx.get("image_caption_backend", "") or "") or llm[0],
+              str(ctx.get("image_caption_base_url", "") or "") or llm[1],
+              str(ctx.get("image_caption_api_key", "") or "") or llm[2])
+    pairs = [(ctx.get("llm_model_name", ""), llm, "chat"),
+             (ctx.get("image_caption_model_name", ""), vision, "chat")]
+    roles = ctx.get("roles")
+    if isinstance(roles, list):
+        for role in roles:
+            if isinstance(role, dict):
+                pairs.append((role.get("llm_model_name", ""), llm, "chat"))
+                pairs.append((role.get("image_caption_model_name", ""), vision, "chat"))
+    embedding = _embedding_target(ctx)
+    if embedding:
+        pairs.append((embedding[0], embedding[1:4], embedding[4]))
+    targets: List[tuple] = []
+    for value, service, kind in pairs:
+        name = str(value or "").strip()
+        if name and (name, service[1]) not in [(t[0], t[2]) for t in targets]:
+            targets.append((name, *service, kind))
+    return targets
+
+
+def _post_warmup(endpoint: str, payload: dict, headers: dict) -> bool:
+    if not endpoint:
+        return False
+    try:
+        with httpx.Client(timeout=_WARMUP_TIMEOUT, proxy=None, trust_env=False,
+                          verify=verified_context()) as client:
+            return client.post(endpoint, json=payload, headers=headers).status_code < 400
+    except Exception as e:
+        print(f"[模型预加载] 请求本机服务失败（{endpoint}）：{type(e).__name__}: {e}")
+        return False
+
+
+def _warmup_local_model(backend: str, base_url: str, api_key: str, model_key: str,
+                        kind: str = "chat") -> bool:
+    """给本机服务发一次极短的请求，逼它把模型加载进显存。
+
+    对话模型只出 1 个 token，嵌入模型只嵌一句短文本；Ollama 的嵌入端点有新旧两版，
+    按 RAG 的取法逐个试。
+    """
+    base = str(base_url or "").strip().rstrip("/")
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    if kind == "embedding":
+        if backend == "ollama":
+            return (_post_warmup(f"{base}/api/embed", {"model": model_key, "input": "hi"}, {})
+                    or _post_warmup(f"{base}/api/embeddings",
+                                    {"model": model_key, "prompt": "hi"}, {}))
+        endpoint = base if base.lower().endswith("/embeddings") else f"{base}/embeddings"
+        return _post_warmup(endpoint, {"model": model_key, "input": "hi"}, headers)
+    payload = {"model": model_key, "messages": [{"role": "user", "content": "hi"}]}
+    if backend == "ollama":
+        payload.update({"stream": False, "options": {"num_predict": 1}})
+        return _post_warmup(chat_endpoint(base, backend), payload, {})
+    payload.update({"max_tokens": 1, "stream": False})
+    return _post_warmup(chat_endpoint(base, backend), payload, headers)
+
+
+def _load_local_model(backend: str, base_url: str, api_key: str, model_key: str,
+                      kind: str = "chat") -> bool:
+    """让本机服务把这个模型加载起来。
+
+    LM Studio 装了 lms 命令行时优先用它（该软件关掉「即时加载」也能加载）；
+    其余本机服务（Ollama、llama.cpp、vLLM…）发一次极短的请求把它带起来。
+    """
+    if backend == "openai" and _lmstudio_load(model_key):
+        return True
+    return _warmup_local_model(backend, base_url, api_key, model_key, kind)
+
+
+def auto_load_local_models(configs) -> None:
+    """程序启动时预加载配置里用到的本地模型（后台线程执行，不阻塞启动）。
+
+    configs 是启动时在用的那几份配置（主配置 + 各条启用接入方式绑定的配置文件）：
+    逐份、逐模型判断开关、接口类型与地址是否在本机，本机模型去重后一起加载。
+    """
+    targets: List[tuple] = []
+    for ctx in configs:
+        if not _as_bool(ctx.get("llm_auto_load_local"), True):
+            continue
+        for name, backend, base_url, api_key, kind in _startup_targets(ctx):
+            if backend not in ("ollama", "openai") or not _is_local_service(base_url):
+                continue
+            if (name, base_url) not in [(t[0], t[2]) for t in targets]:
+                targets.append((name, backend, base_url, api_key, kind))
+    if not targets:
+        return
+
+    def _work():
+        for name, backend, base_url, api_key, kind in targets:
+            if _load_local_model(backend, base_url, api_key, name, kind):
+                print(f"[模型预加载] 本地模型已加载：{name}")
+            else:
+                print(f"[模型预加载] 本地模型 {name} 未能加载"
+                      "（服务不可达、模型名与服务里的不一致，或未开启即时加载）")
+
+    threading.Thread(target=_work, daemon=True).start()
+
+
 # 人设提示词：角色条目自己留空就代表「这个角色没有这段提示词」，
 # 不能回退到全局配置——全局那份是内置默认角色的人设文案，会让没填提示词的角色
 # （新建后未设置名称、人设的空白条目）静默变成默认角色。
@@ -1079,6 +1284,8 @@ def build_merged_history(history: list, ctx: RoleContext,
     只在**最近一条**这样的消息后面追加一条备查备注：
     让模型回答"你唱一段我听听"之类的追问时能直接引用此前搜到的内容，
     而不是因为上下文里没有结果又重新搜索一遍。
+    助手消息若带有 action_notes（上一轮动作的执行回执）同理只取最近一条：
+    上一轮对谁做了动作、谁做成了谁没做成，模型以此为准，不会认错对象。
 
     用户消息附带的画面描述只在**最近一条用户消息**上保留：画面描述一旦回填就永久
     留在历史里，之后每一轮都会被当成当前话题的指代对象（用户说"这是什么东西"时，
@@ -1092,6 +1299,8 @@ def build_merged_history(history: list, ctx: RoleContext,
     merged = []
     notes_idx = next((i for i in range(len(history_data) - 1, -1, -1)
                       if str(history_data[i].get("tool_notes") or "").strip()), None)
+    action_idx = next((i for i in range(len(history_data) - 1, -1, -1)
+                       if str(history_data[i].get("action_notes") or "").strip()), None)
     last_user_idx = next((i for i in range(len(history_data) - 1, -1, -1)
                           if history_data[i].get("role", "user") == "user"), None)
     # 备查备注也是 role="user"，记下它在 merged 里的位置：否则紧随其后的用户真话
@@ -1123,6 +1332,13 @@ def build_merged_history(history: list, ctx: RoleContext,
                 "【此前工具查询结果备查】下面是上一轮通过工具查到的结果记录，"
                 "回答用户追问时直接引用这些内容，严禁就同一内容再次调用搜索/抓取：\n"
                 + str(msg.get("tool_notes"))[:note_chars * max_entries + 200]})
+            note_pos = len(merged) - 1
+        if idx == action_idx:
+            merged.append({"role": "user", "content":
+                "【上一轮动作结果备查】下面是你上一条回复里各动作的真实执行结果，"
+                "对象写的是编号标签或 QQ 号。回答「对谁做过什么」「做成了没有」"
+                "这类追问时以此为准：没做成的不要说成做成了，也不要把动作安到别人头上：\n"
+                + str(msg.get("action_notes"))[:400]})
             note_pos = len(merged) - 1
     return merged
 
@@ -1448,34 +1664,80 @@ def build_system_prompt(ctx: RoleContext, emotions: dict, extra_parts: Optional[
 
     if not ctx.supports("quote") and not ctx.supports("mention"):
         parts.append(
-            "【这条通道只能发文字】不能引用消息、不能@人、不能撤回、不能戳一戳，"
+            "【这条通道只能发文字】不能引用消息、不能@人、不能撤回、不能戳一戳、"
+            "也不能禁言别人或撤回别人的消息，"
             "上面那几种动作在这条通道上都不会发生。主人要求这些时照常回话就行，"
             "不要假装做了（不要写「（撤回）」「（戳了戳你）」这类动作描述，"
             "也不要说「已经帮你@了」），实在要说就直说这条通道做不到。"
         )
     if _cfg_bool(ctx, "poke_enabled", True) and ctx.supports("poke"):
         parts.append(
-            "【戳一戳】poke 同样写在**第一个句子对象**里。想逗主人、催他看消息，"
-            "或者想回应他戳你时，填 poke: true，系统会替你戳他一下；"
+            "【戳一戳】poke 同样写在**第一个句子对象**里。想逗主人、催他看消息、"
+            "单纯想戳一下，或者想回应他戳你时，填 poke: true，系统会替你戳他一下"
+            "——戳的对象固定是**本轮正在跟你说话的那个人**（群里就是当前发言者），"
+            "戳不了别的人；"
+            "想戳就自己戳，不用等他先动手；"
             f"用户消息里出现 {POKE_MESSAGE_TEXT} 时，说明他刚戳了你，"
             "按被戳的反应回他（可以害羞、可以嫌弃、也可以戳回去）。"
             "戳的动作只能靠 poke 字段表达，绝对不要把它写进台词"
-            "（不要写「（戳了戳你）」这类描述，写成文字就只是发了一条消息，不是真的戳）；"
-            "一次回复最多戳一下，不要每句都戳，也不要无缘无故地戳。"
+            "（「（戳了戳你）」「（伸手轻轻戳回去）」这类描述都只是发了一条文字消息，不是真的戳），"
+            "也不要在台词里宣布已经戳过（「已经戳了你一下」这类话不算做）；"
+            "一次回复最多戳一下，不要每句都戳。"
         )
 
     if _cfg_bool(ctx, "recall_enabled", True) and ctx.supports("recall"):
         parts.append(
-            "【撤回】recall 同样写在**第一个句子对象**里。话已经说出口才发现说错了、"
-            "想故意发一句逗主人一下再撤掉，或者主人明确让你撤回时，填 recall: true，"
+            "【撤回】recall 同样写在**第一个句子对象**里，它撤的是**你自己刚发出去的这条回复**："
+            "话已经说出口才发现说错了、或者想故意发一句逗主人一下再撤掉时填 recall: true，"
             "系统会在发出去之后过一会儿把这条回复撤回；"
             "想控制让主人看多久，再加一个 recall_delay（秒，1 到 60）。"
-            "主人引用某条消息说「撤回这条」时，系统撤掉的是被引用的那一条（连同它的语音），"
-            "你不用自己判断该撤哪条。"
-            "被引用的那条不是你发的话（是别人的消息）时系统撤不掉：这时不要填 recall ——"
-            "填了撤掉的是你自己刚发的这条，等于撤错对象；照实回一句「撤不了别人的消息」就好。"
+            "主人让你撤回某条消息（引用那条说「撤回这条」，或者说「刚才那条」）时不用你填 recall"
+            "——填了撤掉的是你刚发出去的这条新回复。"
+            "要撤别人的消息请填 recall_other 字段（规则见下面那条）；"
+            "被引用的那条本来就是你自己发的话，系统会直接替你撤掉，不用你判断该撤哪条。"
+            "所以这时不要自己下结论说撤不了，也不要说「消息太旧」「已经超时」这类话，"
+            "撤没撤掉系统会告诉你。"
             "这是真撤回，不要用文字写「（撤回）」来代替。"
             "写法：{\"zh\": \"……\", \"ja\": \"……\", \"emotion\": \"害羞\", \"recall\": true}"
+        )
+
+    if _cfg_bool(ctx, "recall_other_enabled", True) and ctx.supports("recall_other"):
+        parts.append(
+            "【撤回别人的消息】recall_other 写在**第一个句子对象**里，撤的是**别人发的**消息："
+            "主人让你把别人的某条消息撤掉（引用那条说「撤回这条」「把这条删了」「让他别说了」）"
+            "时填 recall_other: true；"
+            "群里有人刷屏、说了难听的话，你自己想把某条撤掉时也用它。"
+            "撤哪一条不用你判断：你引用了某条消息，系统就去撤被引用的那一条；"
+            "没有引用时，撤的是主人刚发来的这条消息。"
+            "你只要填 recall_other: true，同时自然地回一句话就好。"
+            "这条通道上你只有自己和管理员/群主都有权限时才撤得掉，撤没撤掉系统会告诉你，"
+            "不要自己下结论，也不要自己猜原因（别说消息太旧、超时这类话）。"
+            "这是真撤回，不要用文字写「（撤回）」来代替。"
+            "写法：{\"zh\": \"……\", \"ja\": \"……\", \"emotion\": \"平静\", \"recall_other\": true}"
+        )
+
+    if _cfg_bool(ctx, "mute_enabled", True) and ctx.supports("mute"):
+        parts.append(
+            "【禁言】mute 写在**第一个句子对象**里，用来禁言群里的某个人："
+            "填 mute: true 表示禁言**这一轮要针对的那个人**——@了谁就是被@的人，"
+            "回复了谁的消息就是被回复的人，都没有时就是刚刚在说话的那个人"
+            "（主人说「禁言他」时指的就是他）；只有主人明说要禁言他自己"
+            "（「禁言我」）时才是当前跟你说话的人；"
+            "想指名别人，也可以把 mute 直接填成他的 QQ 号（只能填本轮消息里真实出现过的号码，"
+            "绝不猜、绝不编）。"
+            "目标是谁说不准时就不要填 mute，在台词里问一句是谁就好。"
+            "想控制禁言多久，再加一个 mute_duration（单位秒，最短 60，最长 2592000 即 30 天），"
+            "不填默认 10 分钟。"
+            "只有群聊里能用；禁言别人时你和管理员/群主都得有权限，"
+            "别人让你禁言他自己则只要你有权限就够，"
+            "群主不能被禁言（平台限制，做不到就如实说明，别硬试）。"
+            "主人只是抱怨某个人烦、既没有 @ 他也没有回复他的消息时，不要禁言任何人。"
+            "成没成功系统会告诉你，不要自己下结论，也不要自己猜原因。"
+            "禁言是真动作，不要用文字写「（把他禁言了）」来代替，"
+            "也不要在台词里宣布结果（「已成功禁言…」「已经把他禁言了」这类话一律不许写）"
+            "——没填 mute 字段就是没做，写了也不算，系统会照你写的去禁言或者告诉你做不到。"
+            "写法：{\"zh\": \"……\", \"ja\": \"……\", \"emotion\": \"生气\", \"mute\": true, "
+            "\"mute_duration\": 600}"
         )
 
     if _cfg_bool(ctx, "history_recall_enabled", True):
@@ -1486,13 +1748,17 @@ def build_system_prompt(ctx: RoleContext, emotions: dict, extra_parts: Optional[
             "翻到了就照实说，没翻到就直说记不清了、请主人提醒一句，不要编。"
         )
     parts.append(
-            "【发送形态】delivery 同样写在**第一个句子对象**里，决定这条回复怎么发出去："
-            "填 “chars” 表示一个字一条消息地发出去（主人让你「一个字一个字说话」「像这样发」"
-            "这类要求时就用它，这时不发语音）；填 “plain” 表示只发文字、不发语音；"
-            "不填就照配置发（一般是文本加语音）。"
+        "【发送形态】delivery 同样写在**第一个句子对象**里，决定这条回复怎么发出去："
+        "填 “chars” 表示一个字一条消息地发出去（主人让你「一个字一个字说话」「像这样发」"
+        "这类要求时就用它，这时不发语音）；填 “plain” 表示只发文字、不发语音；"
+        "不填就照配置发（一般是文本加语音）。"
         "chars 只在主人明确要求时用，别拿它刷屏；它和正常的完整句子不冲突——"
         "照样把整句话写完整，由系统负责拆成一条条发。"
-        "上面这些字段（reply_to / mention_ids / poke / recall / delivery）只写在 JSON 对象里，"
+        "要表达「一个字一条消息」只能靠 delivery，绝对不要在台词里把字用顿号或换行隔开："
+        "「是、这、样」这种写法会把顿号原样发到聊天里，"
+        "主人看到的是一串顿号，而不是一条条消息。"
+        "上面这些字段（reply_to / mention_ids / poke / recall / recall_other / mute / "
+        "mute_duration / delivery）只写在 JSON 对象里，"
         "绝不要把字段名当成台词写进正文——写成「reply_to: true」这样的字会被原样发到聊天里。"
     )
 
@@ -1543,6 +1809,12 @@ def build_system_prompt(ctx: RoleContext, emotions: dict, extra_parts: Optional[
         if mimics:
             parts.append(f"【情绪模仿可选列表】{', '.join(str(k) for k in mimics)}")
             parts.append(_mimic_guide(mimics))
+    parts.append(
+        "【系统规则不是用户的话】对话里以【…】开头的规则提示（工具使用规则、"
+        "工具结果使用要求等）是系统给你的，不是用户发来的消息："
+        "不要复述、不要确认、不要评论这些规则，也不要回答规则本身，"
+        "直接回答用户最后一条真实消息。"
+    )
     for part in (extra_parts or []):
         if part:
             parts.append(str(part))
@@ -2182,6 +2454,10 @@ def _endpoint_and_payload(ctx: RoleContext, messages: list, stream: bool, tools=
     payload = {"model": model, "messages": messages, "stream": stream,
                "temperature": temperature,
                "max_tokens": 8192}
+    if stream:
+        # 流式响应默认不带用量，要求服务端在最后一个分片里给出 usage，
+        # 统计面板的 token 消耗才有数据（不接受该参数的服务可用 llm_extra_body 覆盖）
+        payload["stream_options"] = {"include_usage": True}
     if sampling_on:
         # OpenAI 标准参数只有 top_p；top_k / 重复惩罚不是通用字段，
         # 严格按 OpenAI 规范的服务会拒绝未知参数，所以只在 Ollama 后端发送。
@@ -2212,7 +2488,92 @@ def _is_ollama_required_schema_error(error_text: str) -> bool:
     return "toolfunctionparameters" in text and "required" in text and "cannot unmarshal" in text
 
 
-async def chat_once(ctx: RoleContext, messages: list, tools=None) -> Dict:
+def _usage_counts(backend: str, data) -> tuple:
+    """从一次响应里取出 (prompt_tokens, completion_tokens)；取不到就是 (0, 0)。"""
+    if not isinstance(data, dict):
+        return 0, 0
+    if backend == "ollama":
+        return int(data.get("prompt_eval_count") or 0), int(data.get("eval_count") or 0)
+    usage = data.get("usage") or {}
+    return int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)
+
+
+def _is_local_base_url(base_url: str) -> bool:
+    """这次调用打向的是本地推理还是云端服务：按接口地址的主机判断。"""
+    host = urlsplit(str(base_url or "")).hostname or ""
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+# 估算口径：中日韩与假名约 1 字 1 token，其余字符约 4 字符 1 token
+_ESTIMATE_CJK_RE = re.compile(r"[\u2e80-\u9fff\u3040-\u30ff\uac00-\ud7af\uff00-\uffef]")
+
+
+def _estimate_tokens(text: str) -> int:
+    if not text:
+        return 0
+    cjk = len(_ESTIMATE_CJK_RE.findall(text))
+    return cjk + (len(text) - cjk) // 4
+
+
+def _messages_text(messages) -> str:
+    """把请求里的文本拼出来（多模态 content 只取文本分片，别把图片 base64 当字数）。"""
+    parts = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            for piece in content:
+                if isinstance(piece, dict) and isinstance(piece.get("text"), str):
+                    parts.append(piece["text"])
+    return "\n".join(parts)
+
+
+def _response_text(backend: str, data) -> str:
+    """取这次响应的正文，供服务端没回用量时估算 completion tokens。"""
+    if not isinstance(data, dict):
+        return ""
+    if backend == "ollama":
+        message = data.get("message") or {}
+    else:
+        message = ((data.get("choices") or [{}])[0] or {}).get("message") or {}
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(piece.get("text") or "" for piece in content
+                       if isinstance(piece, dict))
+    return ""
+
+
+def record_token_usage(label: str, backend: str, data, model: str = "",
+                       local: bool = False, prompt_text: str = "",
+                       response_text: str = "") -> None:
+    """把一次 LLM 调用的 token 用量记进统计库；没接统计时静默跳过。
+
+    model / local 记下这次消耗来自哪个模型、是本地推理还是云端服务。
+    服务端没回用量时（不少本地推理服务不带 usage 字段）按字符数估算后照记，
+    否则本地模型在统计面板的「按模型」表里整列消失。
+    """
+    prompt, completion = _usage_counts(backend, data)
+    if prompt <= 0 and completion <= 0:
+        prompt = _estimate_tokens(prompt_text)
+        completion = _estimate_tokens(response_text)
+        if prompt <= 0 and completion <= 0:
+            return
+    from . import app_context
+    mgr = app_context.stats_mgr
+    if mgr is None:
+        return
+    try:
+        mgr.record_tokens(label, prompt, completion, model=str(model or ""), local=local)
+    except Exception as e:
+        print(f"记录 token 用量失败: {type(e).__name__}: {e}")
+
+
+async def chat_once(ctx: RoleContext, messages: list, tools=None, label: str = "") -> Dict:
     backend, endpoint, payload, headers, timeout = _endpoint_and_payload(ctx, messages, False, tools)
     base_url = str(ctx.get("llm_base_url", "http://127.0.0.1:11434")).rstrip("/")
     start = time.time()
@@ -2245,6 +2606,10 @@ async def chat_once(ctx: RoleContext, messages: list, tools=None) -> Dict:
         except httpx.TimeoutException as e:
             raise ConnectionError(f"请求 LLM 服务超时：{endpoint}（timeout={timeout}s）。"
                                   "若模型加载较慢可调大 llm_timeout。") from e
+    record_token_usage(label, backend, data, model=payload.get("model"),
+                       local=_is_local_base_url(base_url),
+                       prompt_text=_messages_text(messages),
+                       response_text=_response_text(backend, data))
     ms = (time.time() - start) * 1000
     maybe_unload_old_models(ctx)
     content = ""
@@ -2269,10 +2634,14 @@ async def chat_once(ctx: RoleContext, messages: list, tools=None) -> Dict:
     return {"content": content, "tool_calls": tool_calls, "ms": ms, "backend": backend}
 
 
-async def _stream_chat_inner(ctx: RoleContext, messages: list) -> AsyncGenerator[Dict, None]:
+async def _stream_chat_inner(ctx: RoleContext, messages: list,
+                             label: str = "") -> AsyncGenerator[Dict, None]:
     backend, endpoint, payload, headers, timeout = _endpoint_and_payload(ctx, messages, True)
     start = time.time()
     first_token_ms = None
+    # 服务端没回 usage 时收尾按字符估算记账：流里攒下正文，别让本地模型漏出统计
+    stream_text: List[str] = []
+    usage_seen = False
     async with httpx.AsyncClient(timeout=timeout, proxy=None, trust_env=False,
                                  verify=verified_context()) as client:
         async with client.stream("POST", endpoint, json=payload, headers=headers) as resp:
@@ -2293,12 +2662,19 @@ async def _stream_chat_inner(ctx: RoleContext, messages: list) -> AsyncGenerator
                         chunk = json.loads(line)
                     except Exception:
                         continue
+                    if chunk.get("done"):
+                        usage_seen = True
+                        record_token_usage(label, backend, chunk,
+                                           model=payload.get("model"),
+                                           local=_is_local_base_url(endpoint))
                     msg = chunk.get("message", {}) or {}
                     # 推理模型会把思维链放在 thinking / reasoning 字段里：
                     # 绝不能当成台词流出去（否则会合成一整段思考内容语音）
                     if thinking_fragments(msg):
                         continue
                     delta_text = msg.get("content", "") or ""
+                    if delta_text:
+                        stream_text.append(delta_text)
                     if not delta_text and not (msg.get("tool_calls") or []):
                         continue
                     if first_token_ms is None and delta_text:
@@ -2319,9 +2695,16 @@ async def _stream_chat_inner(ctx: RoleContext, messages: list) -> AsyncGenerator
                         chunk = json.loads(data_str)
                     except Exception:
                         continue
+                    if chunk.get("usage"):
+                        usage_seen = True
+                        record_token_usage(label, backend, chunk,
+                                           model=payload.get("model"),
+                                           local=_is_local_base_url(endpoint))
                     delta = ((chunk.get("choices") or [{}])[0].get("delta") or {})
                     delta_text = delta.get("content", "") or ""
                     tool_fragments = delta.get("tool_calls") or []
+                    if delta_text:
+                        stream_text.append(delta_text)
                     if not delta_text and not tool_fragments:
                         # 只有既没有正文也没有工具分片时才是纯思考块（OpenAI 兼容
                         # 服务常把思维链放在 reasoning_content）。按"整块跳过"处理会
@@ -2333,14 +2716,20 @@ async def _stream_chat_inner(ctx: RoleContext, messages: list) -> AsyncGenerator
                            "tool_calls": delta.get("tool_calls") or [],
                            "first_token_ms": first_token_ms,
                            "ms_done": None}
+    if not usage_seen and stream_text:
+        record_token_usage(label, backend, None, model=payload.get("model"),
+                           local=_is_local_base_url(endpoint),
+                           prompt_text=_messages_text(messages),
+                           response_text="".join(stream_text))
 
 
-async def stream_chat(ctx: RoleContext, messages: list) -> AsyncGenerator[Dict, None]:
+async def stream_chat(ctx: RoleContext, messages: list,
+                      label: str = "") -> AsyncGenerator[Dict, None]:
     """流式对话（对外入口）：连接异常时给出端点明确的错误。"""
     base_url = str(ctx.get("llm_base_url", "http://127.0.0.1:11434")).rstrip("/")
     backend = ctx.get("llm_backend", "ollama")
     try:
-        async for chunk in _stream_chat_inner(ctx, messages):
+        async for chunk in _stream_chat_inner(ctx, messages, label):
             yield chunk
     except httpx.ConnectError as e:
         raise ConnectionError(conn_fail_hint(base_url, base_url, backend)) from e
@@ -2429,8 +2818,9 @@ DELIVERY_PLAIN = "plain"
 DELIVERY_MODES = (DELIVERY_CHARS, DELIVERY_PLAIN)
 
 # 句子级动作字段：分句会重建句子对象，流式路径要把它们挪到第一条上，
-# 否则引用/@/戳一戳/发送形态/撤回会在分句那一步丢掉
-SENTENCE_ACTION_KEYS = ("reply_to", "mention_ids", "poke", "delivery", "recall")
+# 否则引用/@/戳一戳/发送形态/撤回/禁言会在分句那一步丢掉
+SENTENCE_ACTION_KEYS = ("reply_to", "mention_ids", "poke", "delivery", "recall",
+                        "recall_other", "mute", "mute_duration")
 
 # 动作字段 → 给判定用的中文说法（判断"角色有没有真的照做"时读这一行）
 _ACTION_LABELS = {
@@ -2439,6 +2829,9 @@ _ACTION_LABELS = {
     "poke": "戳一戳",
     "delivery": "指定发送形态",
     "recall": "撤回",
+    "recall_other": "撤回别人的消息",
+    "mute": "禁言",
+    "mute_duration": "禁言时长",
 }
 
 
@@ -2459,6 +2852,9 @@ def sentence_actions_note(sentences) -> str:
     for key in SENTENCE_ACTION_KEYS:
         if key not in declared:
             continue
+        if key == "mute_duration":
+            # 禁言时长只是 mute 的修饰，不单独算一个动作
+            continue
         label = _ACTION_LABELS.get(key, key)
         if key == "mention_ids":
             label += f"（{declared[key]}）"
@@ -2473,21 +2869,31 @@ _ACTION_FAIL_REASONS = {
     "no_client": "发送通道未就绪",
     "disabled": "这个动作已关闭",
     "unsupported": "这条接入方式不支持",
+    "denied": "没有权限",
+    "no_target": "没听清要禁言谁",
+    "target_owner": "对方是群主，禁言不了",
     "error": "发送失败",
 }
 
 
-def action_receipts_note(receipts) -> str:
+def action_receipts_note(receipts, speaker_labels: Optional[Dict] = None) -> str:
     """把动作执行回执写成人话，供"她到底做成了没有"的判定使用。
 
     回执是发送层的真实结果（成功 / 通道不支持 / 发送失败），
     没声明动作或没有回执时返回空串。
+    回执带 target（这次动作落在谁头上）时把对象一并写出来：
+    群里几个人时只说「禁言：成功」，判定与下一轮都分不清禁的是谁。
     """
+    labels = speaker_labels or {}
     parts = []
     for receipt in receipts or []:
         if not isinstance(receipt, dict):
             continue
         action = str(receipt.get("action") or "动作")
+        target = str(receipt.get("target") or "")
+        if target:
+            label = str(labels.get(target) or "")
+            action += f"（对象：{label}）" if label else f"（对象：QQ:{target}）"
         if receipt.get("ok"):
             text = f"{action}：成功"
             count = receipt.get("count")
@@ -2501,15 +2907,86 @@ def action_receipts_note(receipts) -> str:
 
 
 # 模型有时把「戳一戳」当成台词写出来（「（戳了戳你）」）：它不会被当成真的
-# 戳一戳，只会原样发成一条文字消息。下面两个判据把它认出来并改走真动作。
+# 戳一戳，只会原样发成一条文字消息。下面三个判据把它认出来并改走真动作。
 _POKE_ACTION_WRAPPER_RE = re.compile(
     r"^[\s\u3000（）()【】\[\]「」『』“”‘’'\"]+|[\s\u3000（）()【】\[\]「」『』“”‘’'\"]+$")
 _POKE_ACTION_TEXT_RE = re.compile(
-    r"^(?:轻轻地|偷偷地|悄悄地|用力地|随手|突然)?戳(?:了|一)?戳?(?:你|主人|他|她|对方)"
+    r"^(?:轻轻地|偷偷地|悄悄地|用力地|随手|突然)?戳(?:了|一)?戳?"
+    r"(?:你|主人|他|她|对方|回去|回来)"
     r"(?:一下|两下|几下)?(?:的[\u4e00-\u9fa5]{1,3})?$")
 _POKE_ACTION_INLINE_RE = re.compile(
     r"[（(【\[]\s*(?:轻轻地|偷偷地|悄悄地|用力地|随手|突然)?戳(?:了|一)?戳?"
-    r"(?:你|主人|他|她|对方)(?:一下|两下|几下)?(?:的[\u4e00-\u9fa5]{1,3})?\s*[）)】\]]")
+    r"(?:你|主人|他|她|对方|回去|回来)(?:一下|两下|几下)?(?:的[\u4e00-\u9fa5]{1,3})?\s*[）)】\]]")
+# 动作被写成长句里的一个分句时（「（鼓起脸颊，伸手轻轻戳回去）」「（朝主人的额头弹了一下）」），
+# 上面两条匹配不到：动作不在括号开头、动词也可能是「弹」「敲」。这种只在括号（舞台提示）里认，
+# 且要求动作与对象挨得近，免得把「你戳我干什么」这类普通对话也算成戳人。正文原样保留，只补真动作。
+_STAGE_SPAN_RE = re.compile(r"[（(【\[][^）)】\]]*[）)】\]]")
+_POKE_STAGE_ACTION_RE = re.compile(
+    r"(?:戳|弹|敲)(?:了|一|下|过去|回去|回来)?[^\u3002！？，；\n]{0,6}?"
+    r"(?:你|主人|他|她|对方|回去|回来)"
+    r"|(?:你|主人|他|她|对方)[^\u3002！？，；\n]{0,6}?"
+    r"(?:戳|弹|敲)(?:了|一|下|过去|回去|回来)")
+
+# 其它动作写成舞台提示时（「（撤回这条）」「（禁言你）」「（引用主人那条）」）同样不会真的发生。
+# 判据与戳一致：只在括号里认、要求动词与对象挨得近；带假设语气的整段跳过（「（要是能禁言你就好了）」
+# 是她想一想，不是真要做）。撤回自己那条与撤回别人那条要先分清楚，两条都命中时按「别人的」算。
+_STAGE_HYPOTHETICAL_RE = re.compile(r"要是|如果|假如|真想|恨不得|差点|本来想|不然|否则|再敢")
+_STAGE_ACTION_RULES = (
+    ("recall_other", re.compile(
+        r"(?:撤回|收回|撤销|撤掉)[^\u3002！？，；\n]{0,4}?(?:你|主人|他|她|别人|对方)")),
+    ("recall", re.compile(r"撤回|收回|撤销|撤掉")),
+    ("mute", re.compile(r"禁言")),
+    ("reply_to", re.compile(r"引用")),
+    ("delivery", re.compile(r"一个字一条|一字一条|逐字|一个字一个字")),
+)
+
+
+def detect_stage_actions(text) -> dict:
+    """把台词里写成舞台提示的动作认出来，返回该补上的动作字段（正文不动）。
+
+    只在括号里认，普通对话里的「你戳我干什么」不算；假设语气的整段跳过。
+    """
+    out = {}
+    for span in _STAGE_SPAN_RE.finditer(str(text or "")):
+        body = span.group(0)
+        if _STAGE_HYPOTHETICAL_RE.search(body):
+            continue
+        for field, pattern in _STAGE_ACTION_RULES:
+            if pattern.search(body):
+                out[field] = True
+        if out.get("recall_other"):
+            out.pop("recall", None)
+    return out
+
+
+# 模型还会把动作的"结果"当台词写出来（「已成功禁言群主300秒」「本座都戳回去啦」）：
+# 系统从没执行过，主人却以为做了。这些措辞一律按"她真要这么做"处理，补成真动作，
+# 由发送层给出真实回执 —— 说了就要做到，不许只在嘴上完成。
+# 只认"已经做了/正在做"的措辞；带假设语气的整句跳过
+#（「再敢说一遍就禁言你」「要是能戳你就好了」是她想一想，不是真要做）。
+_CLAIMED_ACTION_RULES = (
+    ("mute", re.compile(r"已(?:经)?(?:成功)?禁言"
+                        r"|已(?:经)?(?:成功)?对[^\u3002！？\n]{0,20}?禁言"
+                        r"|禁言(?:好|完)了")),
+    ("poke", re.compile(r"已(?:经)?(?:成功)?戳(?:了|过|你|主人|他|她)"
+                        r"|戳(?:了|过)(?:你|主人|他|她)"
+                        r"|戳回去(?:啦|了)")),
+    ("recall_other", re.compile(r"已(?:经)?(?:成功)?(?:撤回|收回|撤销|撤掉)"
+                                r"[^\u3002！？\n]{0,6}?(?:你|主人|他|她|别人|对方)")),
+)
+_CLAIMED_CLAUSE_SPLIT = re.compile(r"[。！？\n]+")
+
+
+def detect_claimed_actions(text) -> dict:
+    """把台词里"宣称已经做完"的动作认出来，返回该补上的动作字段（正文不动）。"""
+    out = {}
+    for clause in _CLAIMED_CLAUSE_SPLIT.split(str(text or "")):
+        if not clause.strip() or _STAGE_HYPOTHETICAL_RE.search(clause):
+            continue
+        for field, pattern in _CLAIMED_ACTION_RULES:
+            if pattern.search(clause):
+                out[field] = True
+    return out
 
 
 def strip_mention_placeholder(text) -> str:
@@ -2526,7 +3003,7 @@ def strip_mention_placeholder(text) -> str:
 # 模型偶尔把 JSON 字段当成台词写出来（「reply_to: true」单独占一行、后面才接正文）：
 # 这行会被念进语音、也会原样发到聊天里。字段名是固定的，按行首认出来就能安全剥掉。
 _ACTION_FIELD_LINE_RE = re.compile(
-    r"^[ \t]*(reply_to|mention_ids|poke|recall|recall_delay|delivery)"
+    r"^[ \t]*(reply_to|mention_ids|poke|recall|recall_delay|recall_other|mute|mute_duration|delivery)"
     r"[ \t]*[:：][ \t]*(.*)$")
 
 
@@ -2555,11 +3032,64 @@ def _field_truthy(value) -> bool:
     return str(value or "").strip().lower() in ("true", "1", "yes", "y", "on", "是", "开")
 
 
+# 历史里的助手消息写成「[角色1] 台词」，表情包写成「[表情包: 文件名]」。
+# 模型会把这两种写法照抄进回复：既不是台词（会被念出来、发到聊天里），
+# 又让整段以「[」开头，被当成形似 JSON 的输出而整条丢弃（表现为「走神了」）。
+_SPEAKER_LABEL_RE = re.compile(r"\[\s*(?:角色|用户)\s*\d+\s*\]")
+_STICKER_PLACEHOLDER_RE = re.compile(
+    r"\[\s*(?:调用|使用|发送|插入)?\s*表情包(?:的)?"
+    r"(?:翻译|译文|訳|调用|日[文本语]|英[文本语]|中[文本语])?\s*[:：][^\]\n]*\]")
+# 「[表情包: xxx]」还会被换壳照抄：外面套一层括号说明
+# （「[（表情包的日文翻译）:（内容）]」）。括号说明里带表情包/翻译这类字样的
+# 整段同样不是台词，一并剥掉；说明里没有这些字样的括号（「[（生气）:哼]」）不动
+_STICKER_NOTE_RE = re.compile(
+    r"\[\s*[（(][^[\]（）()]{0,24}(?:表情包|贴图|翻译|译文|訳|sticker)[^[\]（）()]{0,24}[）)]\s*[:：]"
+    r"[^\]\n]{0,80}\]?")
+
+
+def strip_model_artifacts(text) -> str:
+    """剥掉模型从上下文里抄来的说话人序号标签与表情包占位符。"""
+    raw = str(text or "")
+    if not raw:
+        return raw
+    out = _SPEAKER_LABEL_RE.sub(" ", raw)
+    out = _STICKER_PLACEHOLDER_RE.sub(" ", out)
+    out = _STICKER_NOTE_RE.sub(" ", out)
+    if out == raw:
+        return raw
+    return re.sub(r"[ \t]{2,}", " ", out).strip()
+
+
+# 模型想表达「一个字一条消息」时，会把台词里的字用顿号隔开、或者一行一个地写出来
+# （「是、这、样」）：这些符号会被原样发到聊天里，主人看到的是一串顿号；
+# 下一轮它还会照着自己这行学，越写越歪。
+_PER_CHAR_SEP_RE = re.compile(r"[、,，\n\r]+")
+
+
+def collapse_per_char_separators(text) -> str:
+    """把「是、这、样」这类逐字写法还原成「是这样」。
+
+    只在整段几乎每个字符之间都插了分隔符时才算逐字写法：正常的列举
+    （「苹果、香蕉、梨」）与夹着 @ 占位符的台词都不受影响。
+    """
+    raw = str(text or "")
+    if not raw.strip():
+        return raw
+    chunks = _PER_CHAR_SEP_RE.split(raw.strip())
+    if len(chunks) < 4:
+        return raw
+    # 末段允许带句末标点（「吧？」），其余每一段都必须是一个字
+    if sum(1 for c in chunks if len(c) == 1) < len(chunks) - 1:
+        return raw
+    return "".join(chunks)
+
+
 def strip_poke_action(text) -> tuple:
     """把台词里的「戳一戳」动作描述摘出来，返回 (剩余文本, 是否含动作)。
 
     整句就是动作描述（「（戳了戳你）」「戳了你一下」）时剩余文本为空；动作混在
     正文里（「（戳了戳你）主人快理我。」）时只摘掉动作那一截，正文照常发出去。
+    动作写成舞台提示里的一个分句（「（伸手轻轻戳回去）」）时正文不动，只补真动作。
     """
     raw = str(text or "")
     if not raw:
@@ -2569,6 +3099,12 @@ def strip_poke_action(text) -> tuple:
         return inline, True
     if _POKE_ACTION_TEXT_RE.match(_POKE_ACTION_WRAPPER_RE.sub("", raw)):
         return "", True
+    for span in _STAGE_SPAN_RE.finditer(raw):
+        body = span.group(0)
+        if _STAGE_HYPOTHETICAL_RE.search(body):
+            continue
+        if _POKE_STAGE_ACTION_RE.search(body):
+            return raw, True
     return raw, False
 
 
@@ -2593,17 +3129,26 @@ def merge_sentence_actions(sources) -> dict:
 # 是她自己能控制的信号。
 _MENTION_TEXT_QQ_RE = re.compile(r"@@\s*(\d{3,12})")
 _MENTION_ALL_RE = re.compile(r"@@\s*(?:所有人|全体成员|全员|全体)")
+# 单个 @ 后面紧跟一个可@成员的 QQ 号（模型照抄「@昵称(QQ:号码)」时常常只写一个 @）：
+# 纯数字不会跟「@所有人」撞车，后面接「.」的是邮箱域名，也不认。
+_MENTION_TEXT_QQ_ONE_RE = re.compile(r"(?<!@)@(\d{3,12})(?!\.)")
 # OneBot 里 @全体成员就是 at 段的 qq=all
 MENTION_ALL_ID = "all"
 
 
 def _literal_mention_target(text: str, allowed: List[str], names: Dict[str, str],
                             fallback_id: str):
-    """在台词里找一个「两个 @ 连着写」的 @，返回 (QQ号, 起止位置)。"""
+    """在台词里找一个写成普通文字的 @，返回 (QQ号, 起止位置)。"""
     hit = _MENTION_TEXT_QQ_RE.search(text)
     if hit:
         # 写明了 QQ 号就只认它：号不在可@名单里说明是模型编的，不能拿兜底对象顶上
         return (hit.group(1), (hit.start(), hit.end())) if hit.group(1) in allowed \
+            else ("", None)
+    hit_one = _MENTION_TEXT_QQ_ONE_RE.search(text)
+    if hit_one:
+        # 单个 @ 后写的是可@成员的 QQ 号：这是想@人，只是没写成两个 @，
+        # 不能当普通文字发出去（被@的人收不到提醒，聊天里还多出一串号码）
+        return (hit_one.group(1), hit_one.span()) if hit_one.group(1) in allowed \
             else ("", None)
     for qq, name in names.items():
         if qq not in allowed:
@@ -2631,12 +3176,13 @@ def _mention_fallback(allowed: List[str], fallback_id: str) -> str:
 
 def apply_literal_mention(sentence: dict, allowed_ids, names=None,
                           fallback_id: str = "") -> bool:
-    """把台词里写成两个 @ 的 @ 换成真正的 @，返回是否改写成功。
+    """把台词里写成普通文字的 @ 换成真正的 @，返回是否改写成功。
 
-    模型有时不填 mention_ids，也不写占位符，而是直接在台词里写「@@」或「@@某人」——
-    那只是一条普通文字消息，被@的人收不到任何提醒。这里按「台词里的 QQ 号 →
-    台词里的昵称 → 全体成员 → 当前发言者 → 唯一的可@对象」依次定目标，改写成占位符 +
-    mention_ids，交给发送层发真正的 @。单个 @ 是普通文字，一律不动。
+    模型有时不填 mention_ids，也不写占位符，而是直接在台词里写「@@」「@@某人」
+    或「@QQ号」——那只是一条普通文字消息，被@的人收不到任何提醒。这里按「台词里的
+    QQ 号 → 台词里的昵称 → 全体成员 → 当前发言者 → 唯一的可@对象」依次定目标，
+    改写成占位符 + mention_ids，交给发送层发真正的 @。@ 后面不是可@成员的 QQ 号时
+    仍当普通文字（谈论「@所有人」、邮箱地址都不动）。
     已经写好的 mention_ids 与占位符原样保留，不重复补目标。
     """
     if not isinstance(sentence, dict):
@@ -2661,7 +3207,7 @@ def apply_literal_mention(sentence: dict, allowed_ids, names=None,
             if not need_target:
                 continue
             target, span = _mention_fallback(allowed, fallback), None
-        elif "@@" in text:
+        elif "@@" in text or _MENTION_TEXT_QQ_ONE_RE.search(text):
             target, span = _literal_mention_target(text, allowed, name_map, fallback)
         else:
             continue
@@ -2709,7 +3255,7 @@ def recall_request_kind(text) -> str:
     prev = 撤回她最近发过的那条（「撤回刚才那条」）。
     判据只认主人本条消息，模型填不填 recall 字段都不影响这条兜底。
     """
-    raw = str(text or "").strip()
+    raw = _compact_at_spans(text).strip()
     if not raw:
         return ""
     if _RECALL_LATE_RE.search(raw):
@@ -2723,24 +3269,101 @@ def recall_request_kind(text) -> str:
     return "prev" if _RECALL_WANT_RE.search(raw) else ""
 
 
+# 群消息里 @ 成员会展开成「[@昵称(QQ:号码)]」：昵称+号码把「把…禁言」「把…撤回」
+# 隔出词距判据的范围，吩咐会被当成闲聊。
+# 判定前先把它折成一个 @，只影响下面的正则匹配，不改发给模型与历史里的原文。
+_AT_SPAN_RE = re.compile(r"\[@[^\[\]]{1,64}\]")
+
+
+def _compact_at_spans(text) -> str:
+    return _AT_SPAN_RE.sub("@", str(text or ""))
+
+
+# 主人明确吩咐禁言某人（「把他禁言1个小时」「禁言@某人」「禁言啊」）。提问（「你要禁言我」
+# 「该不该禁言他」）与否定（「别禁言他」）都不算——那是在问或在拦，不是在吩咐。
+# 禁言谁由上层按他这一轮 @ 到的人定；没有指名就不猜，交回给模型判断。
+_MUTE_VERB = r"禁言"
+_MUTE_ASK_RE = re.compile(
+    r"(?:会不会|会|能|可以|能不能|可不可以|是不是|该不该|要不要|怎么|如何|为什么|为啥)"
+    rf"[^。！？!?]{{0,8}}{_MUTE_VERB}"
+    rf"|你(?:要|会|敢|想|能|可以|打算|准备)[^。！？!?]{{0,4}}{_MUTE_VERB}")
+_MUTE_DENY_RE = re.compile(
+    rf"(?:不要|不用|无需|不许|不准|拒绝|别)[^。！？!?]{{0,4}}{_MUTE_VERB}"
+    rf"|不(?:要|用|必|准|许|需|应|再|想)?[^。！？!?]{{0,2}}{_MUTE_VERB}")
+# 吩咐的几种写法：把/给他禁言…；禁言@某人；「禁言啊」「禁言他」这种短口令；
+# 以及直接跟时长的「禁言600秒」
+_MUTE_WANT_RE = re.compile(
+    rf"(?:把|给|替)[^。！？!?]{{0,8}}{_MUTE_VERB}"
+    rf"|{_MUTE_VERB}\s*(?:@|\[@)"
+    rf"|^[^。！？!?\n]{{0,4}}{_MUTE_VERB}[了啊吧呀哦～~！!]{{0,2}}$"
+    rf"|^[^。！？!?\n]{{0,4}}{_MUTE_VERB}(?:他|她|它|我|本座)[了啊吧呀哦～~]?$"
+    rf"|^[^。！？!?\n]{{0,8}}{_MUTE_VERB}(?:他|她|它|我|本座)?\s*\d+\s*(?:个?小时|分钟|分|秒|天)$")
+# 主人明说要禁言自己（「禁言我」「把本座禁言」）：只有这时他才是被禁的对象
+_MUTE_SELF_RE = re.compile(
+    rf"{_MUTE_VERB}(?:我|本座|自己)|把(?:我|本座|自己)[^。！？!?]{{0,4}}{_MUTE_VERB}")
+# 主人说的禁言时长（「1个小时」「600秒」「10分钟」）
+_MUTE_DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(个?小时|分钟|分|秒|天)")
+_MUTE_UNIT_SECONDS = {"小时": 3600, "分钟": 60, "分": 60, "秒": 1, "天": 86400}
+
+
+def wants_mute_request(text) -> bool:
+    """主人这条消息是不是在吩咐禁言某人。"""
+    raw = _compact_at_spans(text).strip()
+    if not raw:
+        return False
+    if _MUTE_ASK_RE.search(raw) or _MUTE_DENY_RE.search(raw):
+        return False
+    return bool(_MUTE_WANT_RE.search(raw))
+
+
+def wants_self_mute(text) -> bool:
+    """主人这条消息是不是在要求禁言他自己。"""
+    raw = _compact_at_spans(text)
+    return bool(wants_mute_request(raw) and _MUTE_SELF_RE.search(raw))
+
+
+def mute_request_seconds(text) -> int:
+    """主人说的禁言时长（秒）；没说或说不清返回 0，由发送层用默认值。"""
+    match = _MUTE_DURATION_RE.search(str(text or ""))
+    if not match:
+        return 0
+    try:
+        amount = float(match.group(1))
+    except (TypeError, ValueError):
+        return 0
+    return int(amount * _MUTE_UNIT_SECONDS.get(match.group(2).lstrip("个"), 0))
+
+
 def normalize_single(obj, ctx: RoleContext, emotions: dict, user_text: str) -> Dict:
     """将单个句子对象规整为 {zh, lang, display, emotion, mimic}。"""
     s = obj if isinstance(obj, dict) else {"zh": str(obj)}
     text_lang = ctx.get("text_lang", "ja")
     display_lang = ctx.get("display_lang", "zh")
     default_voice = ctx.get("default_voice", "pingjing")
-    zh = str(s.get("zh", "")).strip()
+    zh = strip_model_artifacts(str(s.get("zh", "")).strip())
     # 模型把动作字段当成台词写出来（「reply_to: true」单独一行）时剥掉这一行，
     # 取值仍按它执行，免得既发出去了参数字面量、又没做成动作
     zh, leaked_fields = strip_action_field_lines(zh)
-    raw_lang, leaked_lang = strip_action_field_lines(str(s.get(text_lang, "")).strip())
-    raw_display, leaked_display = strip_action_field_lines(
-        str(s.get(display_lang, "")).strip())
+    raw_lang = strip_model_artifacts(str(s.get(text_lang, "")).strip())
+    raw_lang, leaked_lang = strip_action_field_lines(raw_lang)
+    raw_display = strip_model_artifacts(str(s.get(display_lang, "")).strip())
+    raw_display, leaked_display = strip_action_field_lines(raw_display)
     leaked_fields.update(leaked_lang)
     leaked_fields.update(leaked_display)
+    # 「是、这、样」这类逐字写法只是模型在表达发送节奏，顿号本身不是台词
+    zh = collapse_per_char_separators(zh)
+    raw_lang = collapse_per_char_separators(raw_lang)
+    raw_display = collapse_per_char_separators(raw_display)
     if not zh:
-        # 空台词不复读用户消息（user_text），改用安全台词
-        zh = raw_lang or FALLBACK_REPLY
+        # 只有动作、没有台词的对象（模型把 mute / recall_other / poke 单独写成一块）：
+        # 不能编一句台词出来，否则主人收到的是"刚才走神了"这种跟本轮毫无关系的兜底话。
+        # 留空句子，动作照常执行，发送层不发这一句。
+        if sentence_obj_has_action(s) or leaked_fields:
+            zh = ""
+        else:
+            # 空台词不复读用户消息（user_text），改用安全台词
+            _report_fallback("这一句既没有台词也没有动作", s)
+            zh = raw_lang or FALLBACK_REPLY
     # URL 绝不进语音（TTS 会逐字符念成乱码）：口语字段剔除链接，展示字段保留。
     # 纯链接的台词剔除后为空，发送层会跳过该句语音、照常发送文本。
     lang = strip_urls_for_tts(raw_lang)
@@ -2777,8 +3400,14 @@ def normalize_single(obj, ctx: RoleContext, emotions: dict, user_text: str) -> D
     display = apply_text_clean(display, ctx)
     # @ 占位符只用于定位，绝不能进语音（否则会把「at」念出来）
     lang = strip_mention_placeholder(lang)
-    # 台词里写出来的「戳一戳」（「（戳了戳你）」）不是真的戳一戳：摘掉它，
-    # 改成真的动作，免得主人只收到一条写着「戳了戳你」的文字消息
+    # 台词里写出来的动作（「（戳了戳你）」「（撤回这条）」）不是真的动作：摘掉或标记它，
+    # 改成真的动作，免得主人只收到一条写着动作描述的文字消息
+    stage_actions = detect_stage_actions(zh)
+    stage_actions.update(detect_stage_actions(lang))
+    stage_actions.update(detect_stage_actions(display))
+    for _text in (zh, lang, display):
+        for _field in detect_claimed_actions(_text):
+            stage_actions.setdefault(_field, True)
     poke_in_text = False
     if _cfg_bool(ctx, "poke_enabled", True):
         zh, hit_zh = strip_poke_action(zh)
@@ -2789,15 +3418,47 @@ def normalize_single(obj, ctx: RoleContext, emotions: dict, user_text: str) -> D
             # 整句只有这个动作：三个字段一起清空，别留下半句语音
             zh = lang = display = ""
     normalized = {"zh": zh, "lang": lang, "display": display, "emotion": emo, "mimic": mimic}
-    if s.get("reply_to") is True or _field_truthy(leaked_fields.get("reply_to")):
+    if s.get("reply_to") is True or stage_actions.get("reply_to") \
+            or _field_truthy(leaked_fields.get("reply_to")):
         normalized["reply_to"] = True
     if s.get("poke") is True or poke_in_text or _field_truthy(leaked_fields.get("poke")):
         normalized["poke"] = True
     delivery = str(s.get("delivery") or leaked_fields.get("delivery") or "").strip().lower()
+    if delivery not in DELIVERY_MODES and stage_actions.get("delivery"):
+        delivery = DELIVERY_CHARS
     if delivery in DELIVERY_MODES:
         normalized["delivery"] = delivery
-    if s.get("recall") is True or _field_truthy(leaked_fields.get("recall")):
+    recall_in_text = bool(stage_actions.get("recall")) and _cfg_bool(ctx, "recall_enabled", True)
+    recall_other_in_text = bool(stage_actions.get("recall_other")) \
+        and _cfg_bool(ctx, "recall_enabled", True)
+    if s.get("recall") is True or recall_in_text or _field_truthy(leaked_fields.get("recall")):
         normalized["recall"] = True
+    # 撤回别人的消息：只认 true，撤哪一条由发送层按引用/本轮消息定，模型不用填目标
+    if s.get("recall_other") is True or recall_other_in_text \
+            or _field_truthy(leaked_fields.get("recall_other")):
+        normalized["recall_other"] = True
+        normalized.pop("recall", None)
+    # 禁言：true = 禁言这一轮针对的人（被@的 / 被引用的 / 当前发言者）；
+    # 也可以直接填对方的 QQ 号（发送层会核对能不能禁）
+    raw_mute = s.get("mute")
+    if raw_mute in (None, ""):
+        raw_mute = leaked_fields.get("mute")
+    if raw_mute is True or _field_truthy(raw_mute):
+        normalized["mute"] = True
+    elif str(raw_mute or "").strip().isdigit():
+        normalized["mute"] = str(raw_mute).strip()
+    elif stage_actions.get("mute") and _cfg_bool(ctx, "mute_enabled", True):
+        normalized["mute"] = True
+    # 禁言时长（秒）：不填就用发送层的默认值，非法取值一律当没填
+    raw_duration = s.get("mute_duration")
+    if raw_duration in (None, ""):
+        raw_duration = leaked_fields.get("mute_duration")
+    try:
+        seconds = int(float(str(raw_duration).strip()))
+    except (TypeError, ValueError):
+        seconds = 0
+    if seconds > 0:
+        normalized["mute_duration"] = seconds
     mentions = s.get("mention_ids")
     if isinstance(mentions, list):
         normalized["mention_ids"] = [str(item).strip() for item in mentions
@@ -2897,6 +3558,17 @@ def split_multi_clause_sentences(sentences: List[Dict]) -> List[Dict]:
 
 # 形似JSON但彻底无法修复时的安全台词（绝不把JSON语法当台词念出来）
 FALLBACK_REPLY = "呜……刚才走神了，主人再说一遍好吗？"
+
+
+def _report_fallback(reason: str, raw) -> None:
+    """兜底台词发出时说明原因，并附上模型原始输出（截断），便于定位是哪一环出的问题。"""
+    if not isinstance(raw, str):
+        try:
+            raw = json.dumps(raw, ensure_ascii=False)
+        except (TypeError, ValueError):
+            raw = str(raw)
+    text = re.sub(r"\s+", " ", str(raw or "")).strip()
+    print(f"回复兜底（{reason}）：模型原始输出 {len(text)} 字 → {text[:200]!r}")
 
 # 生成失败时发回会话的中文提醒：只说人话，不把上游原始报错（常带 JSON）发进聊天。
 # 原始报错留在日志里，排查时看日志即可。
@@ -3267,6 +3939,7 @@ def normalize_sentences(content: str, ctx: RoleContext, emotions: dict, user_tex
     - 包装块之外又补了独立块、sentences 值为字符串、纯文本兜底
     """
     default_voice = ctx.get("default_voice", "pingjing")
+    content = strip_model_artifacts(content)
     raw = strip_thinking(content or "")   # 兜底：JSON 里若夹带思考内容也一并剥掉
     objs = extract_json_objects(content)
 
@@ -3283,9 +3956,15 @@ def normalize_sentences(content: str, ctx: RoleContext, emotions: dict, user_tex
             sentences = sentence_like
 
     if sentences is not None:
+        # sentences 偶尔被写成字符串数组（[{"zh": …}] → ["…"]）：字符串元素先包成句子对象；
+        # 列表/数字之类的非台词元素直接丢掉，免得后面按句子对象处理时崩掉。
+        sentences = [{"zh": s} if isinstance(s, str) else s for s in sentences]
         # 丢弃只有 emotion 等元数据、没有台词内容的句子对象，
-        # 否则会被用户消息兜底，把用户刚说的话朗读出来
-        sentences = [s for s in sentences if sentence_obj_has_text(s)]
+        # 否则会被用户消息兜底，把用户刚说的话朗读出来。
+        # 只有动作、没有台词的对象要留着，动作不能跟着空句子一起丢。
+        sentences = [s for s in sentences
+                     if isinstance(s, dict)
+                     and (sentence_obj_has_text(s) or sentence_obj_has_action(s))]
         if not sentences:
             sentences = None
 
@@ -3293,16 +3972,23 @@ def normalize_sentences(content: str, ctx: RoleContext, emotions: dict, user_tex
         # 无句子块：单对象兜底（含 "sentences": "文本" 的错误格式）
         first = next((o for o in objs if isinstance(o, dict)), None)
         if first is not None and (first.get("sentences") is not None
-                                  or any(k in first for k in _SENTENCE_KEYS)):
+                                  or any(k in first for k in _SENTENCE_KEYS)
+                                  or sentence_obj_has_action(first)):
             s = first.get("sentences")
             if isinstance(s, str) and s.strip():
                 sentences = [{"zh": s}]
             else:
                 zh = str(first.get("zh", "") or "").strip()
                 if not zh:
-                    # 无任何台词内容（如 {"sentences": []}）：不复读用户消息
-                    sentences = [{"zh": FALLBACK_REPLY, "lang": FALLBACK_REPLY,
-                                  "display": FALLBACK_REPLY, "emotion": default_voice}]
+                    if sentence_obj_has_action(first):
+                        # 整段只写了动作、一句台词都没有：留空句子承载动作，
+                        # 动作由 merge_sentence_actions 收走，不编兜底台词
+                        sentences = [dict(first)]
+                    else:
+                        # 无任何台词内容（如 {"sentences": []}）：不复读用户消息
+                        _report_fallback("模型输出里没有台词内容", content)
+                        sentences = [{"zh": FALLBACK_REPLY, "lang": FALLBACK_REPLY,
+                                      "display": FALLBACK_REPLY, "emotion": default_voice}]
                 else:
                     sentences = [{"zh": zh, "emotion": first.get("emotion", default_voice)}]
         else:
@@ -3312,6 +3998,7 @@ def normalize_sentences(content: str, ctx: RoleContext, emotions: dict, user_tex
             elif _looks_like_json(raw):
                 # 形似JSON但已无法修复：绝不能把JSON语法当台词念出来
                 # （否则会出现"回复中含JSON块"的事故），改用安全台词
+                _report_fallback("模型输出形似 JSON，但里面没有可识别的句子", content)
                 raw = FALLBACK_REPLY
             sentences = [{"zh": raw, "lang": raw, "display": raw, "emotion": default_voice}]
     text_lang = str(ctx.get("text_lang", "ja") or "ja")
@@ -3326,8 +4013,10 @@ def normalize_sentences(content: str, ctx: RoleContext, emotions: dict, user_tex
     normalized = [s for s in normalized if real_text(s.get("zh")) or real_text(s.get("display"))]
     result = _merge_short_sentences(split_multi_clause_sentences(normalized))
     result_meta = merge_sentence_actions(meta_sources)
-    if not result and result_meta.get("poke") is True:
-        # 整条回复只有「（戳了戳你）」这一个动作：留一个空句子承载它，
+    if not result and (result_meta.get("poke") is True
+                       or result_meta.get("recall_other") is True
+                       or bool(result_meta.get("mute"))):
+        # 整条回复只有「（戳了戳你）」这类动作、没有台词：留一个空句子承载它，
         # 否则动作会跟着空句子一起被丢掉
         result = [{"zh": "", "lang": "", "display": "", "emotion": "", "mimic": ""}]
     if result:
@@ -3336,6 +4025,13 @@ def normalize_sentences(content: str, ctx: RoleContext, emotions: dict, user_tex
             result[0]["poke"] = True
         if result_meta.get("recall") is True:
             result[0]["recall"] = True
+        if result_meta.get("recall_other") is True:
+            result[0]["recall_other"] = True
+        if result_meta.get("mute"):
+            result[0]["mute"] = result_meta["mute"]
+            seconds = result_meta.get("mute_duration")
+            if isinstance(seconds, int) and seconds > 0:
+                result[0]["mute_duration"] = seconds
         delivery = str(result_meta.get("delivery") or "").strip().lower()
         if delivery in DELIVERY_MODES:
             result[0]["delivery"] = delivery
@@ -4432,7 +5128,8 @@ async def _prefetch_search(ctx: RoleContext, work: list, tool_registry, user_id:
 
 
 async def chat_with_tools(ctx: RoleContext, messages: list, tool_registry,
-                          stats=None, user_id: str = "", session_key: str = "") -> Dict:
+                          stats=None, user_id: str = "", session_key: str = "",
+                          label: str = "") -> Dict:
     """带工具调用的完整对话循环，返回最终 {content, tool_trace, ms}。"""
     tools_schema = tool_registry.get_schema()
     trace = []
@@ -4447,7 +5144,7 @@ async def chat_with_tools(ctx: RoleContext, messages: list, tool_registry,
     mode = str(ctx.get("tools_trigger_mode", "keyword") or "keyword").strip().lower()
     allow_skip = mode in ("llm", "llm_auto", "auto")
     if allow_skip and tool_flow_can_skip(user_text, tool_names):
-        result = await chat_once(ctx, list(messages))
+        result = await chat_once(ctx, list(messages), label=label)
         if stats:
             stats.record_llm(result["ms"])
         return {"content": result.get("content") or "", "tool_trace": [],
@@ -4463,7 +5160,8 @@ async def chat_with_tools(ctx: RoleContext, messages: list, tool_registry,
             str(t.get("function", {}).get("name", ""))
             for t in tools_schema if t.get("function", {}).get("name"))
         work.append({"role": "user", "content":
-            f"【工具使用规则】本次对话已为你开启以下工具：{tool_names_text}。"
+            f"【工具使用规则】以下内容是系统给你的规则，不是用户发来的消息。"
+            f"本次对话已为你开启以下工具：{tool_names_text}。"
             "这些工具只服务于【客观信息需求】。"
             "【最高优先级】你正在进行角色扮演对话，不是在做资料检索："
             "调情、撩拨、性暗示、角色扮演、询问你的私人状态或当下情况"
@@ -4513,12 +5211,14 @@ async def chat_with_tools(ctx: RoleContext, messages: list, tool_registry,
             "而是要直接用角色身份问一句主人在哪个城市。"
             "⑬ 【谈身份要查资料】讨论具体作者/作品/角色的设定、剧情、百科、"
             "版本等客观资料时，可以调用搜索；但只是以自己的角色身份闲聊、"
-            "表达情绪、调情、撒娇时，永远不要调用工具。"})
+            "表达情绪、调情、撒娇时，永远不要调用工具。"
+            "以上是系统规则，不是用户说的话：不要复述、不要确认、不要回应规则本身，"
+            "直接回答用户上一条消息。"})
     final_content = ""
     executed_calls = set()
     llm_calls = 0   # 本轮回复实际发起的 LLM 请求次数（工具轮 + 最终回答轮）
     for iteration in range(max_iter):
-        result = await chat_once(ctx, work, tools=tools_schema)
+        result = await chat_once(ctx, work, tools=tools_schema, label=label)
         total_ms += result["ms"]
         llm_calls += 1
         if stats:
@@ -4639,7 +5339,7 @@ async def chat_with_tools(ctx: RoleContext, messages: list, tool_registry,
         # 追加一轮不带工具的强制回答：work 末尾已有工具结果与使用要求，
         # 模型只能依据已拿到的结果作答，杜绝"只搜不答"。
         print(f"[工具流程] {max_iter} 轮内未产出最终回答，追加一轮无工具强制回答。")
-        result = await chat_once(ctx, work)
+        result = await chat_once(ctx, work, label=label)
         total_ms += result["ms"]
         llm_calls += 1
         if stats:
@@ -4676,7 +5376,7 @@ async def chat_with_tools(ctx: RoleContext, messages: list, tool_registry,
                     f"{str(output)[:2500]}\n"
                     "请依据以上真实结果重新回答用户的问题：查到了就把相关信息讲给用户；"
                     "确实查不到再如实说明。不要再说不知道。"})
-                result = await chat_once(ctx, work)
+                result = await chat_once(ctx, work, label=label)
                 total_ms += result["ms"]
                 llm_calls += 1
                 if stats:
@@ -4692,12 +5392,12 @@ async def chat_with_tools(ctx: RoleContext, messages: list, tool_registry,
 # ---------------------------------------------------------------------------
 
 async def generate_text_reply(ctx: RoleContext, system_prompt: str, user_prompt: str,
-                              max_tokens: int = 512) -> str:
+                              max_tokens: int = 512, label: str = "") -> str:
     """简单的纯文本生成（用于开场白、摘要、画像提取等辅助任务）。"""
     messages = [{"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}]
     try:
-        result = await chat_once(ctx, messages)
+        result = await chat_once(ctx, messages, label=label)
         # chat_once 已剥离思考字段；这里再兜一次，防止 content 里内嵌的思考块漏出去
         return strip_thinking(result.get("content") or "")
     except Exception as e:
@@ -4706,14 +5406,14 @@ async def generate_text_reply(ctx: RoleContext, system_prompt: str, user_prompt:
 
 
 async def generate_json_reply(ctx: RoleContext, system_prompt: str, user_prompt: str,
-                              max_tokens: int = 512) -> Optional[dict]:
-    text = await generate_text_reply(ctx, system_prompt, user_prompt, max_tokens)
+                              max_tokens: int = 512, label: str = "") -> Optional[dict]:
+    text = await generate_text_reply(ctx, system_prompt, user_prompt, max_tokens, label=label)
     return extract_json(text)
 
 
 async def vision_chat_once(ctx, prompt_text: str, images: list, *,
                            system_content: str = "", history: list = None,
-                           stats=None, max_tokens: int = 1024) -> tuple:
+                           stats=None, max_tokens: int = 1024, label: str = "") -> tuple:
     """按「识图模型」的配置发一次识图请求，返回 (模型原文, 耗时毫秒)。
 
     images 是 [(来源, mime, base64)]：Ollama 走 message 的 images 字段，
@@ -4766,6 +5466,8 @@ async def vision_chat_once(ctx, prompt_text: str, images: list, *,
                 f"HTTP {resp.status_code} {endpoint}：{detail}{api_error_hint(detail)}",
                 request=resp.request, response=resp)
         data = resp.json()
+    record_token_usage(label, backend, data, model=payload.get("model"),
+                       local=_is_local_base_url(base_url))
     ms = (time.time() - start) * 1000
     if backend == "ollama":
         content = data.get("message", {}).get("content", "")
@@ -4886,7 +5588,7 @@ async def get_image_reply(ctx: RoleContext, user_text: str, history: list,
             prompt_text = f"{prompt_text}\n{image_identity_note(ctx)}"
         content, ms = await vision_chat_once(
             ctx, prompt_text, images_for_payload, system_content=system_content,
-            history=history_msgs, stats=stats)
+            history=history_msgs, stats=stats, label="识图")
 
         sentences = [] if describe_only else \
             normalize_sentences(content, ctx, emotions, user_text or "（图片）")
@@ -4895,7 +5597,8 @@ async def get_image_reply(ctx: RoleContext, user_text: str, history: list,
                 and "走神了" in str(sentences[0].get("zh", "") or "") and description:
             try:
                 regen_text = f"{user_text or '（看图）'}\n（用户发来一张图片，画面内容：{description}）"
-                chat = await chat_once(ctx, build_chat_messages(ctx, regen_text, history, emotions, extra_parts))
+                chat = await chat_once(ctx, build_chat_messages(ctx, regen_text, history, emotions, extra_parts),
+                                       label="识图补回复")
                 fixed = normalize_sentences(str(chat.get("content") or ""), ctx, emotions, user_text or "（图片）")
                 if fixed and not (len(fixed) == 1 and "走神了" in str(fixed[0].get("zh", "") or "")):
                     sentences = fixed
@@ -5027,7 +5730,7 @@ def _lang_label(target: str) -> str:
     return _TARGET_LABELS.get(t, f"{t}语")
 
 
-async def translate_to_lang(ctx, text: str, target: str) -> str:
+async def translate_to_lang(ctx, text: str, target: str, label: str = "") -> str:
     """把一句话翻译成目标语言；已是目标语言时原样返回，失败返回空串。"""
     body = str(text or "").strip()
     target = str(target or "").strip().lower()
@@ -5035,15 +5738,15 @@ async def translate_to_lang(ctx, text: str, target: str) -> str:
         return ""
     if not lang_text_broken(body, target):
         return body
-    label = _lang_label(target)
+    lang_label = _lang_label(target)
     try:
         res = await chat_once(ctx, [{"role": "user", "content":
-            f"把这句话翻译成自然的{label}，只输出译文本身，不要解释、不要罗马音，"
-            f"整句都用{label}书写，不要保留原语言的词汇：{body}"}])
+            f"把这句话翻译成自然的{lang_label}，只输出译文本身，不要解释、不要罗马音，"
+            f"整句都用{lang_label}书写，不要保留原语言的词汇：{body}"}], label=label)
         cand = str(res.get("content") or "").strip().strip('"“”‘’「」')
         if cand and not lang_text_broken(cand, target):
             return cand
-        print(f"该句{label}重译不可用（{cand[:30]!r}），保留原文本。")
+        print(f"该句{lang_label}重译不可用（{cand[:30]!r}），保留原文本。")
     except Exception as e:
         print(f"{target} 台词翻译失败，保留原文本: {type(e).__name__}: {e}")
     return ""
@@ -5087,6 +5790,7 @@ async def repair_sentence_lang(sentences, ctx) -> int:
     两种都不是用户要的，所以统一在发送前重译成目标语言。
     纯汉字但与中文台词明显不同的写法（如「受信」）视为日文，不做多余翻译。
     """
+    from .tts import strip_non_dialogue_text
     target = str(ctx.get("text_lang", "ja") or "").strip().lower()
     if not target or target == "auto":
         return 0
@@ -5103,8 +5807,11 @@ async def repair_sentence_lang(sentences, ctx) -> int:
             print(f"台词语言修复：耗时已达 {_REPAIR_TIME_BUDGET:.0f}s，其余句子保持原样"
                   "（合成侧按文字语言兜底）")
             break
-        source = strip_mention_placeholder(str(s.get("zh") or "").strip() or lang)
-        cand = await translate_to_lang(ctx, source, target)
+        # 旁白（原括号里的动作/表情）重译后括号会丢、变成普通句子被一起念出来：
+        # 翻译前先按语音的口径剔掉，只翻台词本身。
+        source = strip_mention_placeholder(strip_non_dialogue_text(
+            str(s.get("zh") or "").strip() or lang, log=False))
+        cand = await translate_to_lang(ctx, source, target, label="台词翻译")
         if cand:
             cand = strip_mention_placeholder(cand)
             if str(s.get("display") or "") == lang:

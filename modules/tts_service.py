@@ -28,6 +28,14 @@ def no_window_kwargs() -> dict:
     return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
 
 
+# 等 TTS 服务应答的上限与轮询间隔：api_v2 先把模型加载完才监听端口，
+# 冷启动（尤其 CUDA 上加载权重）超过一分钟是常态
+TTS_READY_TIMEOUT_SECONDS = 300
+TTS_READY_POLL_SECONDS = 5
+
+_tts_child_log = None
+
+
 # ============================================================ 子进程归属
 # Popen 出来的进程在 Windows 上**只是"父子"关系，不是"生死绑定"**：父进程
 # 退出（尤其是崩溃、被任务管理器结束、或退出路径没跑到 shutdown_all）之后，
@@ -184,6 +192,35 @@ def _child_record_path() -> Path:
     """
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
     return Path(base) / "Lovomo" / "tts_child.json"
+
+
+def _child_log_path() -> Path:
+    """TTS 子进程的输出写这里。
+
+    它加载模型失败、缺依赖、参数不对，只有这份输出看得出来；跟子进程记录放同一
+    个目录（程序目录可能只读）。
+    """
+    return _child_record_path().with_name("tts_start.log")
+
+
+def _open_child_log():
+    """给 TTS 子进程开输出文件：每次启动重写，留下的就是最近一次启动的输出。
+
+    句柄要一直留着（关掉它子进程就写不进来了），所以存在模块变量里。
+    """
+    global _tts_child_log
+    if _tts_child_log not in (None, subprocess.DEVNULL):
+        try:
+            _tts_child_log.close()
+        except Exception:
+            pass
+    try:
+        path = _child_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _tts_child_log = open(path, "wb")
+    except Exception:
+        _tts_child_log = subprocess.DEVNULL
+    return _tts_child_log
 
 
 def _write_child_record(pid: int, port: int, exe: str) -> None:
@@ -580,8 +617,8 @@ def auto_start_and_switch_tts(config):
                 cmd,
                 cwd=root_dir,
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=_open_child_log(),
+                stderr=subprocess.STDOUT,
                 **no_window_kwargs(),
             )
         except Exception as e:
@@ -601,8 +638,11 @@ def auto_start_and_switch_tts(config):
             process_manager.shutdown_all(budget=2.0)
             return
 
-        for _ in range(12):
-            time.sleep(5)
+        # api_v2 是先把模型加载完再监听端口，冷启动超过一分钟是常态：
+        # 等太短会误判成"起不来"，后面切模型权重那一步也跟着被跳过
+        deadline = time.time() + TTS_READY_TIMEOUT_SECONDS
+        while time.time() < deadline:
+            time.sleep(TTS_READY_POLL_SECONDS)
             try:
                 resp = httpx.get(f"{base_url}/docs", timeout=2)
                 if 200 <= resp.status_code < 400:
@@ -611,7 +651,8 @@ def auto_start_and_switch_tts(config):
             except Exception:
                 continue
         else:
-            print("TTS 服务在 60 秒内未就绪，请检查日志。")
+            print(f"TTS 服务在 {TTS_READY_TIMEOUT_SECONDS} 秒内未就绪，"
+                  f"启动输出见 {_child_log_path()}")
             return
 
         model_dir_path = Path(model_dir)

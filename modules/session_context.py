@@ -16,6 +16,7 @@ from modules.memory_store import MemoryManager, _MEMORY_FILE_RE, restore_session
 from modules.llm_helpers import RoleContext
 from modules.emotion_voices import EmotionManager
 from modules.config_loader import CONNECTION_PLATFORMS, CONNECTION_PLATFORM_NAMES
+from modules.config_presets import DEFAULT_PROFILE, profile_loader
 
 
 def list_known_sessions() -> list:
@@ -48,9 +49,10 @@ def list_known_sessions() -> list:
 
 
 def _log_hide_patterns() -> list:
-    if app_context.global_config is None:
+    config = app_context.active_config()
+    if config is None:
         return []
-    raw = str(app_context.global_config.get("webui_log_hide_patterns", "") or "")
+    raw = str(config.get("webui_log_hide_patterns", "") or "")
     return [line.strip() for line in raw.splitlines() if line.strip()]
 
 
@@ -62,7 +64,8 @@ def _log_hidden(line: str, patterns: Optional[list] = None) -> bool:
 
 
 def whitelist_ids() -> set:
-    raw = str(app_context.global_config.get("whitelist_ids", "") or "") if app_context.global_config else ""
+    config = app_context.active_config()
+    raw = str(config.get("whitelist_ids", "") or "") if config else ""
     return {item.strip() for item in re.split(r"[\s,，;；]+", raw) if item.strip()}
 
 
@@ -83,10 +86,11 @@ def _session_whitelisted(target_id) -> bool:
 
 
 def _allow_message(session_id: str) -> bool:
-    if app_context.global_config is None or not app_context.global_config.get("anti_spam_enabled", False):
+    config = app_context.active_config()
+    if config is None or not config.get("anti_spam_enabled", False):
         return True
-    win = float(app_context.global_config.get("anti_spam_window_seconds", 10) or 10)
-    cap = max(1, int(app_context.global_config.get("anti_spam_max_in_window", 5) or 5))
+    win = float(config.get("anti_spam_window_seconds", 10) or 10)
+    cap = max(1, int(config.get("anti_spam_max_in_window", 5) or 5))
     now = time.time()
     log = app_context._spam_log.setdefault(session_id, [])
     while log and now - log[0] > win:
@@ -96,30 +100,52 @@ def _allow_message(session_id: str) -> bool:
 
 
 def get_active_role() -> dict:
-    if app_context.global_config is None:
+    config = app_context.active_config()
+    if config is None:
         return {}
-    return app_context.global_config.roles.get(app_context.global_config.active_character, {}) or \
-        (next(iter(app_context.global_config.roles.values())) if app_context.global_config.roles else {})
+    roles = getattr(config, "roles", None) or {}
+    return roles.get(getattr(config, "active_character", ""), {}) or \
+        (next(iter(roles.values())) if roles else {})
 
 
 def get_active_ctx() -> RoleContext:
-    return RoleContext(app_context.global_config.config if app_context.global_config else {}, get_active_role())
+    config = app_context.active_config()
+    return RoleContext(config.config if config else {}, get_active_role())
 
 
 def reply_ctx_of(role: dict, overrides: Optional[dict] = None,
-                 session_id: str = "") -> RoleContext:
+                 session_id: str = "", client=None) -> RoleContext:
     """回复用的上下文：带上当前通道的能力位，提示词据此只讲这条通道做得到的动作。
 
-    给了 session_id 就按这条会话该走的连接取能力位（主动消息不在 for_session 里）；
-    没给就用当前正在发送的连接。
+    给了 session_id 就按这条会话该走的连接取能力位与配置（主动消息不在 for_session 里）；
+    给了 client 就按这条连接取（按角色生成、没有具体会话的主动内容）；
+    都没有就用当前正在发送的连接，配置同样跟随当前处理链路（消息链路里它已经是那条
+    连接绑定的配置）——否则接入方式绑了配置文件，回复却仍按主配置生成。
+    角色内容一律以这份配置里的同标识角色为准，
+    免得接入方式绑了配置文件、人设却还是主配置那份。
 
     能力位必须查**类**属性：NapCat 客户端的 __getattr__ 会给任意属性返回函数，
     hasattr / getattr 探不出真假。没声明的能力位一律按支持处理。
     """
-    active = None
-    if app_context.sender is not None:
-        active = app_context.sender.session_client(session_id) if session_id else app_context.sender._active_client()
-    return RoleContext(app_context.global_config.config, {**(role or {}), **(overrides or {})},
+    sender = app_context.sender
+    if session_id:
+        config = config_for_session(session_id)
+        pick = getattr(sender, "session_client", None) if sender is not None else None
+        active = pick(session_id) if callable(pick) else None
+    elif client is not None:
+        config = config_for_client(client)
+        active = client
+    else:
+        config = app_context.active_config()
+        pick = getattr(sender, "_active_client", None) if sender is not None else None
+        active = pick() if callable(pick) else None
+    config = config or app_context.global_config
+    if config is None:
+        return RoleContext({}, {**(role or {}), **(overrides or {})})
+    key = str((role or {}).get("character_key") or "")
+    if key:
+        role = (getattr(config, "roles", None) or {}).get(key, role)
+    return RoleContext(config.config, {**(role or {}), **(overrides or {})},
                        getattr(type(active), "capabilities", None))
 
 
@@ -269,6 +295,49 @@ def connection_role_key(config, connection_id: str) -> str:
     return ""
 
 
+def connection_config_profile(config, connection_id: str) -> str:
+    """这条接入方式绑定的配置文件名（没绑定返回空串，表示跟随主配置）。"""
+    target = str(connection_id or "")
+    if not target:
+        return ""
+    for conn in connections_of(config):
+        if str(conn.get("id")) == target:
+            return str(conn.get("config_profile") or "").strip()
+    return ""
+
+
+def config_for_connection(connection_id: str):
+    """这条接入方式该用的配置访问器；没绑配置文件或读不出来时用主配置。"""
+    base = app_context.global_config
+    if base is None:
+        return None
+    name = connection_config_profile(base, connection_id)
+    if not name or name == DEFAULT_PROFILE or app_context.memory_manager is None:
+        return base
+    try:
+        return profile_loader(app_context.memory_manager.data_path, name) or base
+    except Exception as e:
+        print(f"[配置文件] {name} 读不出来，这条接入方式改用主配置：{e}")
+        return base
+
+
+def config_for_client(client):
+    """这条客户端对应的接入方式该用的配置。"""
+    sender = app_context.sender
+    lookup = getattr(sender, "channel_key_of", None) if sender is not None else None
+    if client is None or not callable(lookup):
+        return app_context.global_config
+    return config_for_connection(lookup(client))
+
+
+def config_for_session(session_id: str):
+    """这条会话走的接入方式该用的配置（主动消息也按它选配置）。"""
+    sender = app_context.sender
+    lookup = getattr(sender, "session_channel_key", None) if sender is not None else None
+    key = lookup(session_id) if (callable(lookup) and session_id) else ""
+    return config_for_connection(key)
+
+
 def role_connection_snapshot(config) -> tuple:
     """接入方式快照，用来判断配置保存后是否需要重连。"""
     out = []
@@ -278,6 +347,7 @@ def role_connection_snapshot(config) -> tuple:
                     str(conn.get("ws_url") or ""), str(conn.get("token") or ""),
                     str(conn.get("app_id") or ""), str(conn.get("app_secret") or ""),
                     str(conn.get("bot_id") or ""),
+                    str(conn.get("config_profile") or ""),
                     connection_role_key(config, conn.get("id"))))
     return tuple(sorted(out))
 
@@ -313,25 +383,28 @@ def build_connection_profiles(config) -> List[dict]:
 def resolve_target_roles(user_text: str, is_private: bool,
                          source_role_key: str = "") -> List[dict]:
     """多角色路由：账号绑了角色就用它；否则群聊按消息中出现的角色名路由。"""
+    config = app_context.active_config()
+    if config is None:
+        return []
     key = str(source_role_key or "").strip()
     if key:
-        role = (app_context.global_config.roles or {}).get(key)
+        role = (getattr(config, "roles", None) or {}).get(key)
         if role:
             return [role]
     active = get_active_role()
     if not active:
         return []
-    if is_private or not app_context.global_config.get("multi_role_enabled", False):
+    if is_private or not config.get("multi_role_enabled", False):
         return [active]
     matched = []
-    for role in app_context.global_config.roles.values():
+    for role in (getattr(config, "roles", None) or {}).values():
         name = str(role.get("character_name", "")).strip()
         if name and name in user_text:
             matched.append(role)
     if not matched:
         return [active]
     try:
-        cap = max(1, int(app_context.global_config.get("multi_role_max_replies", 2)))
+        cap = max(1, int(config.get("multi_role_max_replies", 2)))
     except (TypeError, ValueError):
         cap = 2
     return matched[:cap]

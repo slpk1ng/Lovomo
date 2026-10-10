@@ -11,8 +11,9 @@ from typing import Optional, List
 from modules import app_context
 from modules.adapters import client_supports
 from modules.sender import (VoicePacer, voice_enabled_for, recall_delay_of,
+                            mute_seconds_of, mute_target_of, sent_action_receipts,
                             DEFAULT_RECALL_DELAY_SECONDS, RECALL_DENY)
-from modules.tts import synthesize_sentence
+from modules.tts import synthesize_sentence, strip_non_dialogue_text
 from modules.tts_service import ensure_tts_service
 from modules.llm_helpers import (
     DELIVERY_PLAIN,
@@ -62,7 +63,8 @@ async def _poke_with_receipt(sender, session_type, target_id, target) -> dict:
     if helper is not None:
         return await helper(session_type, target_id, target)
     ok = await sender.send_poke(session_type, target_id, target)
-    return {"action": "戳一戳", "ok": bool(ok), "at": time.time()}
+    return {"action": "戳一戳", "ok": bool(ok), "target": str(target or ""),
+            "at": time.time()}
 
 
 class SentenceSink:
@@ -70,9 +72,14 @@ class SentenceSink:
 
     def __init__(self, session_type, target_id, emotions, ctx, last_reply="", user_text="",
                  reply_id=None, allowed_at_ids=None, poke_target=None,
-                 recall_request="", at_names=None, speaker_id="", repeat_requested=False):
+                 recall_request="", at_names=None, speaker_id="", repeat_requested=False,
+                 speaker_role="", mute_ids=None, recall_other_id="",
+                 mute_done_ids=None, force_quote=False):
         self.session_type = session_type
         self.reply_id = reply_id
+        # 要回的那条消息已经被后来的消息刷下去时，由系统强制引用它，
+        # 不指望模型自己填 reply_to
+        self.force_quote = bool(force_quote)
         self.allowed_at_ids = {str(q) for q in (allowed_at_ids or [])}
         # 昵称映射只在这一层用来把台词里写成文字的 @ 认出来，不进提示词
         self.at_names = {str(q): str(n) for q, n in (at_names or {}).items()}
@@ -80,6 +87,14 @@ class SentenceSink:
         self.actions_pending = True
         self.poke_target = poke_target
         self.poke_pending = True
+        # 禁言 / 撤回别人的消息：目标由上层定好，整轮各只做一次
+        self.speaker_role = str(speaker_role or "")
+        self.mute_ids = [str(q) for q in (mute_ids or []) if str(q).strip()]
+        self.recall_other_id = str(recall_other_id or "")
+        # 系统路径本轮已禁言过的号码：模型再填同一个目标时不重复执行
+        self.mute_done_ids = {str(q) for q in (mute_done_ids or [])}
+        self.mute_pending = True
+        self.recall_other_pending = True
         # 模型要求撤回时：记下这条回复发出去的消息 id，收尾时按延迟挂撤回任务。
         # 主人明确让撤回（recall_request="next"）时同样生效，不看模型填没填。
         self.recall_pending = False
@@ -125,7 +140,7 @@ class SentenceSink:
         # 逐句重读既要保证一致，也省得每次都走一遍配置读取
         self.guard = repeat_guard_flags(ctx)
         self.thresholds = repeat_thresholds(ctx)
-        self.pacer = VoicePacer(bool(app_context.global_config.get("dynamic_sleep", True)))
+        self.pacer = VoicePacer(bool(app_context.active_config().get("dynamic_sleep", True)))
 
     def _looks_repeat(self, sentence: dict, flags: dict = None) -> bool:
         zh = str(sentence.get("zh") or "").strip()
@@ -185,10 +200,11 @@ class SentenceSink:
             if item is None:
                 return
             try:
-                if app_context.global_config and app_context.global_config.get("separate_send", False) \
-                        and (app_context.global_config.get("send_voice_separately", False)
-                             or app_context.global_config.get("text_separate", False)) \
-                        and app_context.global_config.get("separate_force_segment", True):
+                config = app_context.active_config()
+                if config and config.get("separate_send", False) \
+                        and (config.get("send_voice_separately", False)
+                             or config.get("text_separate", False)) \
+                        and config.get("separate_force_segment", True):
                     for piece in segment_for_tts([item]):
                         await self._send_one(piece)
                 else:
@@ -205,14 +221,14 @@ class SentenceSink:
                 # 合成一遍只是白白把这条回复拖慢几十秒
                 self._tts_ok = False
                 print("这条接入方式不支持语音，流式回复只发文字。")
-            elif not voice_enabled_for(app_context.global_config, self.session_type):
+            elif not voice_enabled_for(app_context.active_config(), self.session_type):
                 # 选择性发送语音：整条回复只掷一次，逐句合成时不会再变
                 self._tts_ok = False
             else:
-                self._tts_ok = await ensure_tts_service(app_context.global_config)
+                self._tts_ok = await ensure_tts_service(app_context.active_config())
                 if not self._tts_ok:
                     print("警告：TTS 服务不可用，流式回复降级为纯文本。")
-        return self._tts_ok and app_context.global_config.get("tts_reply_enabled", True)
+        return self._tts_ok and app_context.active_config().get("tts_reply_enabled", True)
 
     async def _speech_text(self, sentence: dict) -> str:
         """流式合成前的台词语言兜底：模型把展示语言填进台词字段时先重译。"""
@@ -220,9 +236,13 @@ class SentenceSink:
         target = str((self.ctx.get("text_lang", "") if self.ctx else "") or "").strip().lower()
         if not target or target == "auto" or not lang_text_broken(text, target):
             return text
-        source = strip_mention_placeholder(str(sentence.get("zh") or "").strip() or text)
+        # 旁白（原括号里的动作/表情）重译后括号会丢、变成普通句子被一起念出来：
+        # 翻译前先按语音的口径剔掉，只翻台词本身。
+        source = strip_mention_placeholder(strip_non_dialogue_text(
+            str(sentence.get("zh") or "").strip() or text, log=False))
         try:
-            fixed = await asyncio.wait_for(translate_to_lang(self.ctx, source, target),
+            fixed = await asyncio.wait_for(translate_to_lang(self.ctx, source, target,
+                                                             label="台词翻译"),
                                            timeout=30)
         except Exception as e:
             print(f"流式台词语言修复失败（忽略）: {type(e).__name__}: {e}")
@@ -234,12 +254,14 @@ class SentenceSink:
         return text
 
     async def _send_one(self, sentence: dict):
+        # 只有动作、没有台词的那一句：既没得念也没得发
+        shown = str(sentence.get("display") or sentence.get("zh") or "")
+        spoken = str(sentence.get("lang") or "")
         if app_context.sticker_mgr and self.sent == 0 and self.pending_sticker_emotion is None:
             self.pending_sticker_emotion = sentence.get("emotion", "")
-            self.pending_sticker_text = str(sentence.get("display")
-                                            or sentence.get("zh") or "")
+            self.pending_sticker_text = shown
         wav = None
-        if await self._tts_available():
+        if spoken.strip() and await self._tts_available():
             start = time.time()
             # 参数顺序：text=要念的台词(sentence["lang"])，emotion=情绪名。
             # 早期版本此处传反，情绪被当成台词、台词被当成情绪，
@@ -253,15 +275,15 @@ class SentenceSink:
             self.tts_ms += (time.time() - start) * 1000
             if wav:
                 self.tts_calls += 1
-        shown = str(sentence.get("display") or sentence.get("zh") or "")
         # 台词里写成普通文字的 @ 在这一句里就换成真正的@：字面写法可能出现在后面
         # 某一句上（动作字段只认第一句，字面 @ 不能跟着一起只认第一句）
         if apply_literal_mention(sentence, self.allowed_at_ids, self.at_names, self.speaker_id):
-            print("发送：台词里连着写的两个@，已换成真正的@。")
+            print("发送：台词里写成文字的@，已换成真正的@。")
             shown = str(sentence.get("display") or sentence.get("zh") or "")
         mentions = [str(q) for q in (sentence.get("mention_ids") or [])
                     if str(q) in self.allowed_at_ids]
-        reply_to = sentence.get("reply_to") is True and self.reply_id is not None
+        reply_to = (sentence.get("reply_to") is True or self.force_quote) \
+            and self.reply_id is not None
         # 这一句开始发之前的位置：发完用它切出"这一句自己那组消息"，撤回只撤这些
         mark = len(self.sent_ids)
         want_recall = (self.recall_request == "next"
@@ -272,6 +294,33 @@ class SentenceSink:
             # 戳一戳可能被通道能力挡下：把回执收下来，别让它无声消失
             self.action_receipts.append(await _poke_with_receipt(
                 app_context.sender, self.session_type, self.target_id, self.poke_target))
+        if self.mute_pending and sentence.get("mute"):
+            self.mute_pending = False
+            mute_target = mute_target_of(sentence, self.mute_ids, self.speaker_id)
+            if mute_target and str(mute_target) in self.mute_done_ids:
+                # 系统路径本轮已禁言过同一目标：不再重复执行，回执以系统那份为准
+                print(f"禁言：本轮系统已对 {mute_target} 执行过，台词里的 mute 不再重复执行。")
+            else:
+                # 禁言同样会被权限/通道能力挡下：回执照收，判定那边才知道真做没做成
+                self.action_receipts.append(await app_context.sender.mute_receipt(
+                    self.session_type, self.target_id, mute_target,
+                    mute_seconds_of(sentence), self.speaker_id, self.speaker_role))
+        if self.recall_other_pending and sentence.get("recall_other") is True:
+            self.recall_other_pending = False
+            # 主人要求撤的那条系统已经撤过了（recall_request=deny）时不再撤一遍：
+            # 消息已经不在了，第二遍必然失败，回执还会骗到判定那边
+            if self.recall_request != RECALL_DENY:
+                self.action_receipts.append(await app_context.sender.recall_other_receipt(
+                    self.session_type, self.target_id, self.recall_other_id,
+                    self.speaker_id, self.speaker_role))
+        if not shown.strip() and not spoken.strip():
+            # 这一句只有动作、没有台词：动作上面已经执行完，不发任何消息。
+            # 计入 sent 是为了不让上层以为"一句都没发出去"而把整段重发一遍
+            self.sent += 1
+            self.sent_sentences.append(sentence)
+            return
+        # 引用挂在这一句上：只有真的发出去了才算做到，回执交给"她有没有真做"的判定
+        quote_used = bool(self.actions_pending and reply_to)
         if wav:
             try:
                 # 节奏器只在"还有下一条语音要发"时才真正等：最后一句发完立刻返回，
@@ -281,11 +330,12 @@ class SentenceSink:
                 msg_group = app_context.sender.new_message_group()
                 ok = await app_context.sender.send_text(
                     self.session_type, self.target_id, shown,
-                    reply_id=self.reply_id if self.actions_pending and reply_to else None,
+                    reply_id=self.reply_id if quote_used else None,
                     at_ids=mentions,
                     group=msg_group)
                 self.actions_pending = False
                 self._note_send_result(ok, shown)
+                self._note_action_receipts(ok, quote_used, mentions)
                 self._track_sent_id()
                 await app_context.sender.send_voice(self.session_type, self.target_id, wav,
                                         group=msg_group)
@@ -294,12 +344,15 @@ class SentenceSink:
             finally:
                 Path(wav).unlink(missing_ok=True)
         else:
+            # 这一句没有语音：纯文字连着一句接一句蹦出来太快，按同一条节奏拉开
+            await app_context.sender.pace_text_only(self.session_type, self.target_id)
             ok = await app_context.sender.send_text(
                 self.session_type, self.target_id, shown,
-                reply_id=self.reply_id if self.actions_pending and reply_to else None,
+                reply_id=self.reply_id if quote_used else None,
                 at_ids=mentions)
             self.actions_pending = False
             self._note_send_result(ok, shown)
+            self._note_action_receipts(ok, quote_used, mentions)
             self._track_sent_id()
         self.sent += 1
         self.sent_sentences.append(sentence)
@@ -320,6 +373,11 @@ class SentenceSink:
             return
         self.unsent.append(str(shown or ""))
         print(f"流式发送：这句没发出去，已记为待重发：{str(shown or '')[:30]!r}")
+
+    def _note_action_receipts(self, ok: bool, quote_used: bool, at_ids) -> None:
+        """引用与@人挂在这一句上：真的发出去了才补回执，判定才知道做成了。"""
+        if ok:
+            self.action_receipts.extend(sent_action_receipts(quote_used, at_ids))
 
     def _track_sent_id(self) -> None:
         """记下刚发出去那条消息的 id（模型要求撤回时按它撤）。"""
@@ -405,8 +463,8 @@ def _tool_notes_from_trace(tool_trace) -> str:
     条数与单条字数可调：tool_notes_max_entries / tool_notes_max_chars。
     """
     try:
-        max_notes = max(1, int(app_context.global_config.get("tool_notes_max_entries", 4) or 4))
-        note_chars = max(100, int(app_context.global_config.get("tool_notes_max_chars", 500) or 500))
+        max_notes = max(1, int(app_context.active_config().get("tool_notes_max_entries", 4) or 4))
+        note_chars = max(100, int(app_context.active_config().get("tool_notes_max_chars", 500) or 500))
     except (AttributeError, TypeError, ValueError):
         max_notes, note_chars = 4, 500
     notes = []
@@ -547,7 +605,7 @@ def _append_missing_links(sentences, user_text, tool_trace, session_id: str = ""
     """
     if not sentences:
         return sentences
-    if not app_context.global_config.get("search_links_auto_append", True):
+    if not app_context.active_config().get("search_links_auto_append", True):
         return sentences
     if any(_URL_RE.search(str(s.get("display", "") or "")) for s in sentences):
         return sentences
@@ -590,7 +648,7 @@ def _append_missing_links(sentences, user_text, tool_trace, session_id: str = ""
             best = scored[0][0]
             picked = [url for score, url in scored if score >= best * 0.5]
     try:
-        limit = max(1, int(app_context.global_config.get("search_links_max", 3) or 3))
+        limit = max(1, int(app_context.active_config().get("search_links_max", 3) or 3))
     except (TypeError, ValueError):
         limit = 3
     picked = picked[:limit]
@@ -626,7 +684,9 @@ async def _sticker_judgement_from_llm(ctx: RoleContext, image_result: dict) -> O
         "（使用者发图时的语气，不是画面中角色此刻的情绪）。"
         "画面人物的动作、表情与文字往往指向互动用途（挑逗、撩、调戏、嘲讽、炫耀、"
         "撒娇等），要据此归类。"
-        "如果这张图其实是纯风景/空镜/静物/无文字无表情的随手拍，"
+        "如果这张图其实是屏幕截图或长图（画面里有界面元素：状态栏、播放控件、聊天气泡、"
+        "评论区、按钮等，或只是某张图被嵌在别的界面里），"
+        "或者它是纯风景/空镜/静物/无文字无表情的随手拍，"
         "或者画面阴森、恐怖、诡异、病态、压抑，且没有明确的互动用途，"
         "就回答 none 表示不适合当表情包，不要硬选一个分类。"
         f"{CATEGORY_DISAMBIGUATION}"
@@ -642,7 +702,8 @@ async def _sticker_judgement_from_llm(ctx: RoleContext, image_result: dict) -> O
         "category 为 none 时 name 留空。"
     )
     try:
-        result = await chat_once(ctx, [{"role": "user", "content": classify_prompt}])
+        result = await chat_once(ctx, [{"role": "user", "content": classify_prompt}],
+                                 label="表情分类")
     except Exception as e:
         print(f"表情分类失败: {type(e).__name__}: {e}")
         return None
@@ -706,18 +767,18 @@ async def generate_reply(ctx: RoleContext, emotions: dict, user_text: str, histo
     messages = build_chat_messages(ctx, user_text, history, emotions, extra_parts,
                                    trailing_notes=([image_identity_note(ctx)]
                                                    if images is not None
-                                                   and app_context.global_config.get("image_identity_guard_enabled", True)
+                                                   and app_context.active_config().get("image_identity_guard_enabled", True)
                                                    else None),
                                    speaker_labels=speaker_labels)
 
     # 工具调用路径（非流式，保证 tool_calls 正确处理）：无明确工具需求时走普通回复，避免误调
-    if app_context.tool_registry and app_context.global_config.get("tools_enabled", False) \
+    if app_context.tool_registry and app_context.active_config().get("tools_enabled", False) \
             and app_context.tool_registry.has_enabled_tools() and _tool_requested(user_text, ctx):
         app_context.tool_registry.begin_reply()
         result = await chat_with_tools(ctx, messages, app_context.tool_registry, stats=app_context.stats_mgr,
-                                       user_id=user_id, session_key=session_id)
+                                       user_id=user_id, session_key=session_id, label="回复生成")
         try:
-            tool_log_cap = int(app_context.global_config.get("tool_log_output_chars", 0) or 0)
+            tool_log_cap = int(app_context.active_config().get("tool_log_output_chars", 0) or 0)
         except (AttributeError, TypeError, ValueError):
             tool_log_cap = 0
         for t in result.get("tool_trace", []):
@@ -736,11 +797,11 @@ async def generate_reply(ctx: RoleContext, emotions: dict, user_text: str, histo
                 "tool_calls": len([t for t in result.get("tool_trace", []) if t.get("ok")])}
 
     # 流式路径
-    if app_context.global_config.get("streaming_enabled", False):
+    if app_context.active_config().get("streaming_enabled", False):
         return await generate_reply_stream(ctx, emotions, user_text, messages, on_sentence)
 
     # 普通路径
-    result = await chat_once(ctx, messages)
+    result = await chat_once(ctx, messages, label="回复生成")
     if app_context.stats_mgr:
         app_context.stats_mgr.record_llm(result["ms"])
     sentences = normalize_sentences(result["content"], ctx, emotions, user_text)
@@ -756,7 +817,7 @@ async def generate_reply_stream(ctx: RoleContext, emotions: dict, user_text: str
     start = time.time()
     error = None
     try:
-        async for chunk in stream_chat(ctx, messages):
+        async for chunk in stream_chat(ctx, messages, label="回复生成"):
             if chunk.get("first_token_ms") and first_ms is None:
                 first_ms = chunk["first_token_ms"]
             delta = chunk.get("delta") or ""
@@ -885,7 +946,7 @@ _REPEAT_GUARD_KEYS = {
 
 def repeat_thresholds(ctx=None) -> tuple:
     """(自重复系数, 复述用户系数)：重合度达到该值即判定为重复，越大越宽容。"""
-    src = ctx if ctx is not None else app_context.global_config
+    src = ctx if ctx is not None else app_context.active_config()
     values = []
     for key, fallback in (("repeat_guard_self_threshold", 0.85),
                           ("repeat_guard_user_threshold", 0.8)):
@@ -899,7 +960,7 @@ def repeat_thresholds(ctx=None) -> tuple:
 
 def repeat_guard_flags(ctx=None) -> dict:
     """读取四个防复读开关；取不到时按开启处理（保持原行为）。"""
-    src = ctx if ctx is not None else app_context.global_config
+    src = ctx if ctx is not None else app_context.active_config()
     flags = {}
     for name, key in _REPEAT_GUARD_KEYS.items():
         try:

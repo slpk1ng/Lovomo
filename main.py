@@ -206,7 +206,7 @@ from modules.llm_helpers import (RoleContext, build_chat_messages, chat_once,
                                 lang_text_broken, translate_to_lang,
                                 available_mimics, set_mimics_provider,
                                 model_list_endpoints, looks_like_full_endpoint,
-                                error_reply_text)
+                                error_reply_text, auto_load_local_models)
 # 回复生成管线已搬至 modules.reply_pipeline，此处再导出兼容旧引用
 from modules.reply_pipeline import (
     _URL_RE, _LINK_REQUEST_RE, _SEARCH_ENTRY_URL_RE, _SEARCH_ENTRY_ABS_RE,
@@ -247,12 +247,14 @@ from modules.asr import (start_job as start_asr_job, get_job as get_asr_job,
 from modules.tts_service import (process_manager, ensure_tts_service,
                                  auto_start_and_switch_tts, mark_exiting)
 from modules.tts_cloud import cloud_emotion_names, is_cloud_tts
-from modules.config_presets import (delete_preset as delete_config_preset,
-                                    list_presets as list_config_presets,
-                                    load_preset as load_config_preset,
+from modules.config_presets import (DEFAULT_PROFILE as DEFAULT_CONFIG_PROFILE,
+                                    delete_profile as delete_config_profile,
+                                    forget_profile_loaders,
+                                    list_profiles as list_config_profiles,
+                                    load_profile as load_config_profile,
                                     preset_dir as config_preset_dir,
-                                    save_preset as save_config_preset,
-                                    update_note as update_config_preset_note)
+                                    profile_loader as config_profile_loader,
+                                    save_profile as save_config_profile)
 # 窗口几何记忆与 WebView2 控件运行时已搬至 modules，此处再导出兼容旧引用
 from modules.window_geometry import (
     _GEOMETRY_VERSION,
@@ -377,6 +379,7 @@ from modules.session_context import (
     _parse_jitter_minutes,
     connections_of,
     connection_role_key,
+    config_for_connection,
     role_connection_snapshot,
     build_connection_profiles,
     resolve_target_roles,
@@ -551,6 +554,18 @@ async def main(stop_event: threading.Event = None):
                   "llm_model_name 配置是否与你的服务匹配。")
     except Exception as e:
         print(f"LLM 服务探测异常: {type(e).__name__}: {e}")
+
+    try:
+        preload_configs = [app_context.global_config]
+        for conn in connections_of(app_context.global_config):
+            if not conn.get("enabled", True):
+                continue
+            cfg = config_for_connection(str(conn.get("id") or ""))
+            if cfg is not None and cfg not in preload_configs:
+                preload_configs.append(cfg)
+        auto_load_local_models(preload_configs)
+    except Exception as e:
+        print(f"本地模型预加载异常: {type(e).__name__}: {e}")
 
     # 初始化功能模块
     db = DatabaseManager(app_context.memory_manager.data_path)

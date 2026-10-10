@@ -38,7 +38,8 @@ from modules.log_console import (
 from modules.security import (
     _API_KEY_KEYS, _CONNECTION_SECRET_KEYS, _SECRET_FIELD_KEYS,
     _WEBUI_PASSWORD_KEYS, _decrypt_api_keys, _decrypt_value,
-    _decrypt_webui_password, _encrypt_api_keys, _is_masked_value,
+    _decrypt_webui_password, _encrypt_api_keys, _encrypt_webui_password,
+    _is_kept_secret, _is_masked_value,
     _mask_preview, _password_matches, _scrub_plaintext_secrets, _scrub_value,
 )
 from modules.single_instance import _candidate_icon_paths
@@ -72,6 +73,7 @@ from modules.encounters import EncounterManager
 from modules.sender import MessageSender, VoicePacer, recall_delay_of, voice_enabled_for
 from modules.adapters import (build_client, client_supports, friendly_user_label,
                               ilink_login_qr, ilink_login_status, recent_ilink_target,
+                              qq_bind_create, qq_bind_poll,
                               make_event, _first as _adapter_first)
 from modules.ghmirror import DEFAULT_MIRRORS
 from modules.market import parse_market_repos
@@ -149,12 +151,14 @@ from modules.session_context import (
     _fetch_member_name, whitelist_ids,
     _log_hidden, _log_hide_patterns,
 )
-from modules.config_presets import (delete_preset as delete_config_preset,
-                                    list_presets as list_config_presets,
-                                    load_preset as load_config_preset,
+from modules.config_presets import (ConfigPresetError,
+                                    DEFAULT_PROFILE as DEFAULT_CONFIG_PROFILE,
+                                    delete_profile as delete_config_profile,
+                                    forget_profile_loaders,
+                                    list_profiles as list_config_profiles,
+                                    load_profile as load_config_profile,
                                     preset_dir as config_preset_dir,
-                                    save_preset as save_config_preset,
-                                    update_note as update_config_preset_note)
+                                    save_profile as save_config_profile)
 
 from modules.app_context import HAS_AIOHTTP
 if HAS_AIOHTTP:
@@ -759,12 +763,11 @@ class WebUIServer:
         r.add_post("/api/config/save", self.handle_save_config)
         r.add_get("/api/config/export", self.handle_export_config)
         r.add_post("/api/config/import", self.handle_import_config)
-        r.add_get("/api/config/presets", self.handle_config_presets_list)
-        r.add_post("/api/config/presets/save", self.handle_config_presets_save)
-        r.add_post("/api/config/presets/note", self.handle_config_presets_note)
-        r.add_post("/api/config/presets/apply", self.handle_config_presets_apply)
-        r.add_post("/api/config/presets/delete", self.handle_config_presets_delete)
-        r.add_post("/api/config/presets/open_dir", self.handle_config_presets_open_dir)
+        r.add_get("/api/config/profiles", self.handle_config_profiles_list)
+        r.add_post("/api/config/profiles/read", self.handle_config_profiles_read)
+        r.add_post("/api/config/profiles/save", self.handle_config_profiles_save)
+        r.add_post("/api/config/profiles/delete", self.handle_config_profiles_delete)
+        r.add_post("/api/config/profiles/open_dir", self.handle_config_profiles_open_dir)
         # 插件系统
         r.add_get("/api/plugins/list", self.handle_plugins_list)
         r.add_post("/api/plugins/upload", self.handle_plugins_upload)
@@ -826,6 +829,7 @@ class WebUIServer:
         r.add_get("/api/memory/export_all", self.handle_memory_export_all)
         # 统计
         r.add_get("/api/stats", self.handle_stats)
+        r.add_get("/api/token-stats", self.handle_token_stats)
         r.add_get("/api/performance", self.handle_performance)
         r.add_post("/api/mood/set", self.handle_mood_set)
         r.add_get("/api/companion/diary", self.handle_companion_diary)
@@ -1062,56 +1066,133 @@ class WebUIServer:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
     # ------------------------------------------------------------------
-    # 配置预设：导出成 data 下的一份 JSON，需要时一键切回
+    # 配置文件：整套配置按名字存成 data 下的 JSON，接入方式各用一份
     # ------------------------------------------------------------------
     def _config_preset_dir(self):
         return self.memory_manager.data_path
 
-    async def handle_config_presets_list(self, request):
+    def _config_profile_usage(self) -> dict:
+        """配置文件 → 正在用它的接入方式名字，供页面提示「谁在用」。"""
+        usage = {}
+        for conn in (self.config.get("connections", []) or []):
+            if not isinstance(conn, dict):
+                continue
+            name = str(conn.get("config_profile") or "").strip()
+            if not name or name == DEFAULT_CONFIG_PROFILE:
+                continue
+            label = str(conn.get("name") or conn.get("id") or "")
+            usage.setdefault(name, []).append(label)
+        return usage
+
+    def _masked_config(self, data: dict, hide_secrets: bool = False) -> dict:
+        """读配置给前端时的密钥处理。
+
+        hide_secrets=True（配置文件页）：密钥一律回空串 —— 那一页不显示也不改动密钥，
+        密钥只在设置页统一管理；否则回头尾打码预览，让设置页能看出「填过了」。
+        """
+        def render(value):
+            if not isinstance(value, str):
+                return value
+            return "" if hide_secrets else _mask_preview(value)
+
+        masked = {**self.config.default_config(), **(data or {})}
+        for key in _API_KEY_KEYS + _WEBUI_PASSWORD_KEYS:
+            value = masked.get(key)
+            if isinstance(value, dict):
+                masked[key] = {k: render(v) for k, v in value.items()}
+            elif value:
+                masked[key] = render(value)
+        return masked
+
+    def _write_config_profile(self, name: str, data: dict, rename_from: str = "") -> dict:
+        """把页面提交的配置写进配置文件。
+
+        密钥字段空着（或原样带回打码值）表示这一项没被改动，沿用这份配置文件里已有的
+        值 —— 配置文件页根本不显示密钥，没有这条规则的话改一个开关就会把密钥清空；
+        其余统一加密后再落盘。
+        """
+        payload = dict(data or {})
+        stored = {}
+        for source in (name, rename_from):
+            if not source or source == DEFAULT_CONFIG_PROFILE:
+                continue
+            try:
+                stored = load_config_profile(self._config_preset_dir(), source)
+                break
+            except ConfigPresetError:
+                continue
+        for key in _SECRET_FIELD_KEYS:
+            value = payload.get(key)
+            if isinstance(value, dict):
+                stored_keys = stored.get(key)
+                if not isinstance(stored_keys, dict):
+                    stored_keys = {}
+                payload[key] = {k: (stored_keys.get(k, "") if _is_kept_secret(v) else v)
+                                for k, v in value.items()} or stored_keys
+            elif _is_kept_secret(value):
+                payload[key] = stored.get(key, "")
+        _encrypt_api_keys(payload)
+        _encrypt_webui_password(payload)
+        profile = save_config_profile(self._config_preset_dir(), name, payload, rename_from)
+        forget_profile_loaders(self._config_preset_dir())
+        return profile
+
+    async def handle_config_profiles_list(self, request):
         try:
-            presets = list_config_presets(self._config_preset_dir())
-            return web.json_response({"success": True, "presets": presets})
+            profiles = list_config_profiles(self._config_preset_dir())
+            usage = self._config_profile_usage()
+            for item in profiles:
+                item["used_by"] = usage.get(item["name"], [])
+            return web.json_response({"success": True, "profiles": profiles,
+                                      "default": DEFAULT_CONFIG_PROFILE})
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
-    async def handle_config_presets_save(self, request):
+    async def handle_config_profiles_read(self, request):
+        """读一份配置文件的内容；default 返回当前主配置，页面可以直接照着改。
+
+        密钥字段一律回空串，并把字段名清单一起给前端：那一页不显示密钥，保存时前端
+        据此把空着的密钥项摘掉，服务端按「没提交就沿用原值」处理。
+        """
         try:
             payload = await request.json()
-            preset = save_config_preset(self._config_preset_dir(),
-                                        self._config_export_payload(),
-                                        payload.get("note", ""))
-            return web.json_response({"success": True, "preset": preset})
+            name = str(payload.get("name") or "")
+            if name == DEFAULT_CONFIG_PROFILE:
+                data = self.config.config or {}
+            else:
+                data = load_config_profile(self._config_preset_dir(), name)
+            return web.json_response({"success": True, "name": name,
+                                      "config": self._masked_config(data, hide_secrets=True),
+                                      "secret_keys": list(_SECRET_FIELD_KEYS),
+                                      "defaults": self.config.default_config()})
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
-    async def handle_config_presets_note(self, request):
+    async def handle_config_profiles_save(self, request):
         try:
             payload = await request.json()
-            preset = update_config_preset_note(self._config_preset_dir(),
-                                               payload.get("id", ""), payload.get("note", ""))
-            return web.json_response({"success": True, "preset": preset})
+            if not isinstance(payload.get("config"), dict):
+                return web.json_response({"success": False, "error": "配置内容格式错误"},
+                                         status=400)
+            profile = self._write_config_profile(str(payload.get("name") or ""),
+                                                 payload["config"],
+                                                 str(payload.get("rename_from") or ""))
+            return web.json_response({"success": True, "profile": profile})
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
-    async def handle_config_presets_apply(self, request):
+    async def handle_config_profiles_delete(self, request):
         try:
             payload = await request.json()
-            data = load_config_preset(self._config_preset_dir(), payload.get("id", ""))
-            self._apply_imported_config(data)
-            return web.json_response({"success": True, "message": "已切换回这份预设，配置已热重载生效！"})
+            name = delete_config_profile(self._config_preset_dir(),
+                                         payload.get("name", ""))
+            forget_profile_loaders(self._config_preset_dir())
+            return web.json_response({"success": True, "name": name})
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
-    async def handle_config_presets_delete(self, request):
-        try:
-            payload = await request.json()
-            preset_id = delete_config_preset(self._config_preset_dir(), payload.get("id", ""))
-            return web.json_response({"success": True, "id": preset_id})
-        except Exception as e:
-            return web.json_response({"success": False, "error": str(e)}, status=400)
-
-    async def handle_config_presets_open_dir(self, request):
-        """在资源管理器里打开预设目录，方便用户直接看/备份这些 JSON。"""
+    async def handle_config_profiles_open_dir(self, request):
+        """在资源管理器里打开配置文件目录，方便用户直接看/备份这些 JSON。"""
         try:
             work = config_preset_dir(self._config_preset_dir())
             work.mkdir(parents=True, exist_ok=True)
@@ -3101,29 +3182,8 @@ class WebUIServer:
                     scope = scopes.get(filename)
                     if scope is None:
                         continue
-                    character_key, sid, stype, target_id = scope
-                    if app_context.mood_mgr is not None:
-                        app_context.mood_mgr.delete_session(sid)
-                        app_context.mood_mgr.drop_diary_session(sid)
-                    forget_proactive_session(sid)
-                    if app_context.promise_mgr is not None:
-                        app_context.promise_mgr.drop_session(sid)
-                    if app_context.recall_mgr is not None:
-                        app_context.recall_mgr.drop_session(sid)
-                    # 关系进度按会话分开存，所以这个会话自己那条要跟着删。
-                    # 群聊只清这个群里的记录：同一个人可能同时在私聊里聊过，
-                    # 他在私聊里的关系与用户画像不该被牵连。
-                    if app_context.affection_mgr is not None:
-                        if stype == "private":
-                            app_context.affection_mgr.reset(character_key, str(target_id), sid)
-                        else:
-                            app_context.affection_mgr.drop_session(character_key, sid)
-                    # 私聊就是「和这个人聊过」的全部记录：连用户画像一起清掉，当成从没聊过
-                    if stype != "private":
-                        continue
-                    if app_context.profile_mgr is not None:
-                        app_context.profile_mgr.delete(str(target_id))
-                    private_users += 1
+                    if self._purge_session_state(scope):
+                        private_users += 1
                 if private_users:
                     print(f"已删除 {len(deleted)} 个会话记录：心情、日记、承诺与主动消息状态已清理，"
                           f"{private_users} 位用户的用户画像与关系进度一并清空。")
@@ -3132,6 +3192,57 @@ class WebUIServer:
             return web.json_response({"success": True, "deleted": deleted})
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    def _purge_session_state(self, scope) -> bool:
+        """清掉一个会话依附的状态，返回它是不是私聊会话。
+
+        私聊就是「和这个人聊过」的全部记录，连用户画像一起清掉，当成从没聊过；
+        群聊只清这个群自己的记录：同一个人可能同时在私聊里聊过，
+        他在私聊里的关系与用户画像不该被牵连。
+        """
+        character_key, sid, stype, target_id = scope
+        if app_context.mood_mgr is not None:
+            app_context.mood_mgr.delete_session(sid)
+            app_context.mood_mgr.drop_diary_session(sid)
+        forget_proactive_session(sid)
+        if app_context.promise_mgr is not None:
+            app_context.promise_mgr.drop_session(sid)
+        if app_context.recall_mgr is not None:
+            app_context.recall_mgr.drop_session(sid)
+        if app_context.affection_mgr is not None:
+            if stype == "private":
+                app_context.affection_mgr.reset(character_key, str(target_id), sid)
+            else:
+                app_context.affection_mgr.drop_session(character_key, sid)
+        if stype != "private":
+            return False
+        if app_context.profile_mgr is not None:
+            app_context.profile_mgr.delete(str(target_id))
+        return True
+
+    def _purge_connection_sessions(self, session_ids: list) -> int:
+        """删掉这些会话的聊天记录与依附状态，返回清掉的会话数。
+
+        session_channels.json 是「会话属于哪条接入方式」的唯一线索，
+        接入方式被删掉后这些会话再也发不出去，记录也不该继续留在界面上。
+        """
+        if not session_ids:
+            return 0
+        wanted = {str(sid) for sid in session_ids if str(sid)}
+        purged = 0
+        for f in app_context.memory_manager.data_path.glob("*.json"):
+            if not _is_memory_filename(f.name):
+                continue
+            sid = _memory_session_id(f.name)
+            if sid not in wanted:
+                continue
+            scope = self._deleted_session_scopes([f.name]).get(f.name)
+            if not self.memory_manager.delete_memory_file(f.name):
+                continue
+            if scope is not None:
+                self._purge_session_state(scope)
+            purged += 1
+        return purged
 
     def _deleted_session_scopes(self, filenames: list) -> dict:
         """被删记忆文件 → (角色, 会话ID, 会话类型, 目标ID)。
@@ -3624,6 +3735,22 @@ class WebUIServer:
             return web.json_response({"success": True, "mood": mood})
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_token_stats(self, request):
+        range_key = str(request.query.get("range", "30") or "30")
+        # 下钻：前端点击某天/某小时后带上具体窗口与粒度，只统计这个窗口
+        window = None
+        try:
+            start_q = request.query.get("start")
+            end_q = request.query.get("end")
+            if start_q and end_q:
+                window = (float(start_q), float(end_q))
+        except (TypeError, ValueError):
+            window = None
+        granularity = str(request.query.get("granularity", "") or "")
+        data = (app_context.stats_mgr.get_token_stats(range_key, window, granularity)
+                if app_context.stats_mgr else None) or {}
+        return web.json_response(data)
 
     async def handle_performance(self, request):
         perf = app_context.stats_mgr.get_performance() if app_context.stats_mgr else {}
@@ -4323,7 +4450,7 @@ class WebUIServer:
                             headers={"Cache-Control": "no-store"})
 
     async def handle_connection_login_qr(self, request):
-        """取一张扫码登录的二维码（目前只有微信 ClawBot 支持）。"""
+        """取一张扫码用的二维码：微信 ClawBot 扫码登录、QQ 官方机器人扫码绑定。"""
         try:
             payload = await request.json()
         except Exception:
@@ -4337,6 +4464,8 @@ class WebUIServer:
                 return web.json_response({"success": False, "error": "没有这条接入方式"},
                                          status=404)
             platform = str(conn.get("platform") or platform)
+        if platform == "qq_official":
+            return await self._qq_bind_start(conn_id)
         if platform != "wechat_clawbot":
             return web.json_response(
                 {"success": False,
@@ -4369,6 +4498,8 @@ class WebUIServer:
             payload = {}
         token = str(payload.get("token") or "").strip()
         state = _CONNECTION_LOGIN_STATE.get(token) or {}
+        if state.get("kind") == "qq_bind":
+            return await self._qq_bind_status(token, state)
         if not state.get("qrcode"):
             return web.json_response({"success": False, "error": "登录会话已失效，请重新取码"},
                                      status=400)
@@ -4388,27 +4519,81 @@ class WebUIServer:
         account_id = str(_adapter_first(data, "ilink_bot_id", "bot_id") or "")
         base_url = str(_adapter_first(data, "baseurl", "base_url") or "")
         conn_id = str(state.get("id") or "")
+        target = None
         if conn_id:
             data_cfg = self.config.config
-            for conn in (data_cfg.get("connections") or []):
-                if str(conn.get("id")) == conn_id:
-                    conn["bot_token"] = str(bot_token)
-                    if account_id:
-                        conn["account_id"] = account_id
-                    if base_url:
-                        conn["base_url"] = base_url
-                    # 重新登录等于换了一次会话：旧游标与旧 context_token 都不能再用
-                    conn["cursor"] = ""
-                    conn["context_tokens"] = {}
-                    break
-            self.config._atomic_save(data_cfg)
-            _CONNECTION_LOGIN_STATE.pop(token, None)
-            return web.json_response({"success": True, "confirmed": True,
-                                      "bot_id": account_id, "saved": True})
-        # 新建流程：凭据交给前端，随这条接入方式一起保存
+            target = next((c for c in (data_cfg.get("connections") or [])
+                           if str(c.get("id")) == conn_id), None)
+            if target is not None:
+                target["bot_token"] = str(bot_token)
+                if account_id:
+                    target["account_id"] = account_id
+                if base_url:
+                    target["base_url"] = base_url
+                # 重新登录等于换了一次会话：旧游标与旧 context_token 都不能再用
+                target["cursor"] = ""
+                target["context_tokens"] = {}
+                self.config._atomic_save(data_cfg)
+                _CONNECTION_LOGIN_STATE.pop(token, None)
+                return web.json_response({"success": True, "confirmed": True,
+                                          "bot_id": account_id, "saved": True})
+        # 这条接入方式已经不在（或本来就还没保存）：凭据交给前端随这条一起存。
+        # 这里绝不能回 saved=True —— 界面会显示"已登录"，磁盘上却什么都没有。
+        _CONNECTION_LOGIN_STATE.pop(token, None)
         return web.json_response({"success": True, "confirmed": True, "bot_id": account_id,
                                   "bot_token": str(bot_token), "base_url": base_url,
                                   "saved": False})
+
+    async def _qq_bind_start(self, conn_id: str):
+        """取一张 QQ 机器人的扫码绑定二维码（扫完自动拿回 AppID 与 AppSecret）。"""
+        try:
+            bind = await qq_bind_create()
+        except Exception as e:
+            return web.json_response(
+                {"success": False, "error": f"取二维码失败: {type(e).__name__}: {e}"},
+                status=400)
+        # 与微信那边一样用一次性 token 认这次绑定：新建时还没有接入方式 id
+        token = os.urandom(6).hex()
+        _CONNECTION_LOGIN_STATE[token] = {"kind": "qq_bind", "id": conn_id,
+                                          "task_id": bind["task_id"],
+                                          "bind_key": bind["bind_key"]}
+        return web.json_response({"success": True, "token": token,
+                                  "qr_content": bind["qr_content"]})
+
+    async def _qq_bind_status(self, token: str, state: dict):
+        """轮询 QQ 机器人扫码绑定；扫到就把 AppID / AppSecret 写回接入方式。"""
+        try:
+            result = await qq_bind_poll(str(state.get("task_id") or ""),
+                                        str(state.get("bind_key") or ""))
+        except Exception as e:
+            return web.json_response(
+                {"success": False, "error": f"查询扫码状态失败: {type(e).__name__}: {e}"},
+                status=400)
+        status = str(result.get("status") or "pending")
+        if status != "completed":
+            if status == "expired":
+                _CONNECTION_LOGIN_STATE.pop(token, None)
+            return web.json_response({"success": True, "confirmed": False,
+                                      "status": status, "platform": "qq_official"})
+        app_id = str(result.get("app_id") or "")
+        app_secret = str(result.get("app_secret") or "")
+        conn_id = str(state.get("id") or "")
+        _CONNECTION_LOGIN_STATE.pop(token, None)
+        if conn_id:
+            data_cfg = self.config.config
+            target = next((c for c in (data_cfg.get("connections") or [])
+                           if str(c.get("id")) == conn_id), None)
+            if target is not None:
+                target["app_id"] = app_id
+                target["app_secret"] = app_secret
+                self.config._atomic_save(data_cfg)
+                return web.json_response({"success": True, "confirmed": True,
+                                          "platform": "qq_official", "app_id": app_id,
+                                          "saved": True})
+        # 这条接入方式还没保存：凭据交给前端随这条一起存
+        return web.json_response({"success": True, "confirmed": True,
+                                  "platform": "qq_official", "app_id": app_id,
+                                  "app_secret": app_secret, "saved": False})
 
     async def handle_connection_selftest(self, request):
         """给这条接入方式最近说过话的人发一条自检消息，看看服务端到底怎么答。
@@ -4499,6 +4684,12 @@ class WebUIServer:
                 target = next((c for c in conns
                                if str(c.get("platform")) == platform
                                and connection_identity(platform, c) == identity), None)
+        if target is None and platform == "wechat_clawbot":
+            # 微信是先建一条空的、扫完码再回填凭据：还没有账号标识时认不出是同一个账号，
+            # 扫码回填会另起一条，界面里那条空的就永远显示「未登录（需扫码）」
+            target = next((c for c in conns
+                           if str(c.get("platform")) == platform
+                           and not c.get("bot_token")), None)
         if target is None:
             conn_id = conn_id or f"{platform}_{os.urandom(4).hex()}"
             target = {"id": conn_id, "platform": platform}
@@ -4507,6 +4698,9 @@ class WebUIServer:
         target["name"] = str(payload.get("name") or "").strip() \
             or CONNECTION_PLATFORM_NAMES[platform]
         target["enabled"] = bool(payload.get("enabled", True))
+        if "config_profile" in payload:
+            target["config_profile"] = (str(payload.get("config_profile") or "").strip()
+                                        or DEFAULT_CONFIG_PROFILE)
         for key in connection_defaults(platform):
             if key not in payload:
                 continue
@@ -4546,6 +4740,15 @@ class WebUIServer:
             if isinstance(role, dict) and str(role.get("connection_id") or "") == conn_id:
                 role.pop("connection_id", None)
         self.config._atomic_save(data)
+        purged = 0
+        if app_context.sender is not None:
+            purged = self._purge_connection_sessions(
+                app_context.sender.drop_channel_sessions(conn_id))
+        if purged:
+            return web.json_response(
+                {"success": True,
+                 "message": f"已删除，该接入方式将在几秒内自动断开，"
+                            f"它的 {purged} 个会话记录与数据已一并清空。"})
         return web.json_response({"success": True,
                                   "message": "已删除，该接入方式将在几秒内自动断开。"})
 

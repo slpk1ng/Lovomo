@@ -137,24 +137,66 @@ def transcribe_local(config, targets: List[Tuple[str, Path]], lang: str,
             watchdog.cancel()
             if proc.poll() is None:
                 proc.kill()
-        results = {}
-        for raw in _read_list_file(tmp_dir).splitlines():
-            parts = raw.split("|", 3)
-            if len(parts) < 4:
-                continue
-            key = mapping.get(Path(parts[0]).name)
-            text = parts[3].strip()
-            if key and text:
-                results[key] = text
+        results, rows, empty_rows, found = _collect_asr_results(tmp_dir, mapping)
         if not results:
-            # 一条都没认出来：脚本退出码/最后几行才是真正的原因（模型没下好、参数被拒、
-            # 缺依赖…），只回一句"未识别出文字"等于把问题藏起来
             detail = " / ".join(x for x in tail if x.strip())[:400]
+            if found and (not rows or empty_rows == rows):
+                # 脚本正常收尾（退出码 0）却没留下任何文字：短语音、静音、纯噪声，
+                # 或音频解不开。识别不出文字属于语音识别的正常结果，不能当成
+                # 脚本故障报错——调用方按「没转出文字」处理即可
+                if log:
+                    log(f"识别脚本没有给出文字（退出码 {proc.returncode}）："
+                        + (detail or "结果文件为空"))
+                return {}
+            if rows:
+                # 识别出了文字却一行都没对上输入文件：脚本的输出命名与读取端不一致
+                raise RuntimeError(
+                    f"ASR 脚本识别出了 {rows} 行结果但都没对上输入文件（退出码 "
+                    f"{proc.returncode}）")
+            # 压根没写出结果文件：模型没下好、参数被拒、缺依赖…
             raise RuntimeError(f"ASR 脚本没有产出结果（退出码 {proc.returncode}）"
                                + (f"：{detail}" if detail else ""))
         return results
     finally:
         _cleanup_tmp_dir(tmp_dir)
+
+
+def _collect_asr_results(tmp_dir: Path, mapping: Dict[str, str]) -> Tuple[dict, int, int, bool]:
+    """从脚本的输出目录收识别结果，返回 (结果, 结果行数, 空文本行数, 是否找到结果文件)。
+
+    标准位置是 <输出目录>/<输入目录名>.list；不同版本的 GPT-SoVITS 脚本
+    命名略有出入，找不到时按 *.list 兜底再扫一遍。脚本跑完却没识别出文字时
+    会写出一个空结果文件，那种情况要能和「压根没写出文件」区分开。
+    """
+    list_text = _read_list_file(tmp_dir)
+    found = bool(list_text)
+    if not list_text.strip():
+        for alt in sorted(tmp_dir.glob("*.list")):
+            try:
+                text = alt.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            found = True
+            if text.strip():
+                list_text = text
+                break
+    results: Dict[str, str] = {}
+    rows = empty_rows = 0
+    for raw in list_text.splitlines():
+        if not raw.strip():
+            continue
+        parts = raw.split("|", 3)
+        if len(parts) < 4:
+            continue
+        rows += 1
+        key = mapping.get(Path(parts[0]).name)
+        text = parts[3].strip()
+        if not text:
+            empty_rows += 1
+            continue
+        if key:
+            results[key] = text
+    return results, rows, empty_rows, found
 
 
 def _cleanup_tmp_dir(tmp_dir: Path) -> None:

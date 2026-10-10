@@ -95,6 +95,22 @@ def reply_probability(ctx, mood: float) -> float:
     return p
 
 
+# 概率回复：不看心情，直接按配置的一个固定概率决定这条消息回不回
+DEFAULT_REPLY_PROBABILITY = 0.5
+
+
+def fixed_reply_probability(ctx) -> Optional[float]:
+    """启用「概率回复」时返回那个固定概率（0~1），没启用返回 None。"""
+    try:
+        raw = ctx.get("reply_probability_enabled", None)
+    except Exception:
+        raw = None
+    if raw is None or raw == "" or not _truthy(raw):
+        return None
+    return clamp(_to_float(ctx.get("reply_probability", DEFAULT_REPLY_PROBABILITY),
+                           DEFAULT_REPLY_PROBABILITY), 0.0, 1.0)
+
+
 def _parse_key(key: str) -> tuple:
     parts = str(key).split("::")
     if len(parts) >= 3:
@@ -331,12 +347,14 @@ class MoodManager:
             self._save_diary()
         return changed
 
-    def get_diary(self, limit: int = 30) -> dict:
+    def get_diary(self, limit: int = 30, session_id: str = "") -> dict:
+        sid = str(session_id or "")
         out = {}
         for character_key, entries in self.diary.items():
             if not isinstance(entries, list):
                 continue
-            rows = [e for e in entries if isinstance(e, dict) and e.get("text")]
+            rows = [e for e in entries if isinstance(e, dict) and e.get("text")
+                    and (not sid or str(e.get("session_id") or "") == sid)]
             rows.sort(key=lambda e: str(e.get("date", "")), reverse=True)
             out[character_key] = rows[:max(1, int(limit or 30))]
         return out
@@ -613,7 +631,7 @@ async def _ask_judge(ctx: RoleContext, mood_mgr: MoodManager, session_id: str,
     if str(user_text or "").strip():
         instruction = f"对话中最后一条用户消息是：{user_text}\n" + instruction
     messages.append({"role": "user", "content": instruction})
-    result = await chat_once(ctx, messages)
+    result = await chat_once(ctx, messages, label="心情判定")
     return extract_json(result.get("content") or "")
 
 
@@ -640,6 +658,8 @@ async def judge_and_decide(ctx: RoleContext, mood_mgr: MoodManager, session_id: 
     want_mood = mood_enabled(ctx)
     want_judge = judge_enabled(ctx)
     want_affection = affection_enabled(ctx)
+    # 固定概率不依赖心情，也不依赖审判：只开了它时不必调用 LLM
+    fixed_prob = fixed_reply_probability(ctx)
     verdict = {"should_reply": True, "mood": mood, "mood_base": base,
                "mood_delta": None, "probability": 1.0,
                "gated": False, "llm_reply": True, "roll": None,
@@ -648,29 +668,34 @@ async def judge_and_decide(ctx: RoleContext, mood_mgr: MoodManager, session_id: 
                "affection_enabled": want_affection, "affection_delta": None,
                "confession": False, "romance": False, "acceptance": False,
                "breakup": False, "affection_committed": False}
-    if not want_judge and not want_mood and not want_affection:
-        return verdict                      # 三个开关都关：完全不调用 LLM
-    try:
-        obj = await _ask_judge(ctx, mood_mgr, session_id, user_text, history, user_id,
-                               want_mood=want_mood, want_affection=want_affection)
-    except Exception as e:
-        print(f"回复审判调用失败: {type(e).__name__}: {e}")
-        return verdict
-    if not isinstance(obj, dict):
-        return verdict
-    should_reply, delta = parse_judge(obj, ctx)
-    if want_affection:
-        aff_delta, confession, romance, acceptance = parse_affection(obj, ctx)
-        verdict["affection_delta"] = aff_delta
-        verdict["confession"] = confession
-        verdict["romance"] = romance
-        verdict["acceptance"] = acceptance
-        verdict["breakup"] = _flag(obj, "breakup", ("是", "分手", "绝交"))
-    if want_mood:
-        verdict["mood_delta"] = delta
-        if not want_judge:
-            return verdict                  # 只记心情，不拦回复
-    probability = reply_probability(ctx, mood) if want_mood else 1.0
+    if not want_judge and not want_mood and not want_affection and fixed_prob is None:
+        return verdict                      # 全部关闭：完全不调用 LLM
+    should_reply = True
+    if want_judge or want_mood or want_affection:
+        try:
+            obj = await _ask_judge(ctx, mood_mgr, session_id, user_text, history, user_id,
+                                   want_mood=want_mood, want_affection=want_affection)
+        except Exception as e:
+            print(f"回复审判调用失败: {type(e).__name__}: {e}")
+            return verdict
+        if not isinstance(obj, dict):
+            return verdict
+        should_reply, delta = parse_judge(obj, ctx)
+        if want_affection:
+            aff_delta, confession, romance, acceptance = parse_affection(obj, ctx)
+            verdict["affection_delta"] = aff_delta
+            verdict["confession"] = confession
+            verdict["romance"] = romance
+            verdict["acceptance"] = acceptance
+            verdict["breakup"] = _flag(obj, "breakup", ("是", "分手", "绝交"))
+        if want_mood:
+            verdict["mood_delta"] = delta
+            if not want_judge and fixed_prob is None:
+                return verdict              # 只记心情，不拦回复
+    if fixed_prob is not None:
+        probability = fixed_prob
+    else:
+        probability = reply_probability(ctx, mood) if want_mood else 1.0
     if probability > 0 and reply_floor > 0:
         probability = min(1.0, max(probability, reply_floor))
     if verdict.get("breakup"):
