@@ -610,7 +610,13 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
     if is_cloud_tts(config):
         # 云端不需要参考音频，情绪只用来查音色映射，因此不校验它是否在情绪表里
         return await synthesize_cloud(config, text, emotion, data_path, stats=stats)
-    default_voice = str(config.get("default_voice", "pingjing") or "pingjing")
+    default_voice = str(config.get("default_voice", "") or "").strip()
+    if default_voice not in emotions:
+        first = next(iter(emotions), "")
+        if default_voice:
+            _safe_print(f"TTS default_voice {default_voice!r} not found; fallback to first emotion "
+                        f"{first!r}. available={list(emotions.keys())}")
+        default_voice = first
     if emotion not in emotions:
         if emotion and emotion != default_voice:
             _safe_print(f"TTS emotion {emotion!r} not found; fallback to default_voice "
