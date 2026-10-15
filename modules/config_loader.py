@@ -565,8 +565,13 @@ class ConfigLoader:
             "asr_engine": "local",
             "asr_lang": "auto",
             "asr_base_url": "",
+            "asr_api_key": "",
+            "asr_api_style": "auto",
+            "asr_model": "",
             "asr_dashscope_model": "qwen3-asr-flash",
             "asr_local_model_size": "medium",
+            "asr_local_root": "",
+            "asr_local_engine": "auto",
             "timeout_seconds": 120,
             "prompt_text": "ふむ、おぬしが我輩のご主人か?",
             "prompt_lang": "ja",
@@ -966,6 +971,16 @@ class ConfigLoader:
             "webui_auth_ttl_minutes": 30,
             "webui_second_password": "",
             "webui_second_unlock_minutes": 30,
+            # HTTPS：手机浏览器只在 https 或 localhost 下给麦克风（通话插件要用），
+            # 开启后没有现成证书就自动生成一张自签证书（modules/webui_server.py）
+            # 纯展示键：设置页「访问地址」那一行不对应任何真实配置，
+            # 但前端 configMeta/configGroups 是按配置键声明的，这里给它一个占位
+            "webui_access_info": "",
+            "webui_https": False,
+            "webui_cert_file": "",
+            "webui_key_file": "",
+            # 监听在非本机地址却没设访问密码时，拒绝暴露到局域网（避免整站裸奔）
+            "webui_force_password": True,
             "webui_log_buffer_lines": 5000,
             "webui_log_tail_lines": 500,
             "log_max_size_mb": LOG_MAX_SIZE_MB_DEFAULT,

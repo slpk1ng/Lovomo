@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
-"""参考音频的语音识别：本地 GPT-SoVITS 自带 ASR 与线上 DashScope 两条通道。
+"""参考音频的语音识别：本地 GPT-SoVITS 自带 ASR 与线上接口两条通道。
 
 本地走 GPT-SoVITS 的 tools/asr 脚本（中文用达摩 ASR，其余语种与自动交给 Faster Whisper），
-线上走 DashScope 的 qwen3-asr-flash（OpenAI 兼容接口）。识别在后台线程里跑，
-前端轮询进度；识别结果写回与音频同名的 <音频名>.txt。
+线上有两种协议（看「识别接口风格」）：whisper 走标准的 <服务根>/audio/transcriptions
+转写接口（OpenAI Whisper、Groq、硅基流动 SenseVoice、本机 Speaches / whisper.cpp server
+这类都用它）；其余把音频直接喂给对话模型（DashScope 的 qwen3-asr-flash、Gemini、
+Qwen2-Audio 等）。识别在后台线程里跑，前端轮询进度；识别结果写回与音频同名的 <音频名>.txt。
 """
 import asyncio
 import base64
+import re
 import shutil
 import subprocess
 import tempfile
@@ -42,6 +45,11 @@ SCRIPT_BOOTSTRAP = (
     "runpy.run_path(script, run_name='__main__')"
 )
 DEFAULT_DASHSCOPE_MODEL = "qwen3-asr-flash"
+DEFAULT_WHISPER_API_MODEL = "whisper-1"
+# 服务根地址的版本段（…/v1、…/v1beta）：转写接口都在它下面
+_VERSION_SEG_RE = re.compile(r"/v\d+(?:\.\d+)*$")
+# 标准转写接口单次音频上限（OpenAI 25MB），留一点余量
+WHISPER_API_MAX_AUDIO_BYTES = 24 * 1024 * 1024
 # DashScope 兼容接口单次音频上限 10MB（base64 之后），留出编码膨胀的余量
 DASHSCOPE_MAX_AUDIO_BYTES = 7 * 1024 * 1024
 DASHSCOPE_TIMEOUT_SECONDS = 180.0
@@ -65,6 +73,82 @@ def normalize_engine(engine) -> str:
 def whisper_model_size(config) -> str:
     value = str(config.get("asr_local_model_size", "") or "").strip()
     return value if value in WHISPER_MODEL_SIZES else DEFAULT_WHISPER_SIZE
+
+
+def asr_api_key(config) -> str:
+    """线上识别用的密钥：优先「识别 API Key」，留空则跟随 LLM。"""
+    return (str(config.get("asr_api_key", "") or "").strip()
+            or str(config.get("llm_api_key", "") or "").strip())
+
+
+def asr_model_name(config, style=None) -> str:
+    """线上识别模型名：新键 asr_model 优先，回落旧的 asr_dashscope_model。
+
+    都没填时按接口风格给默认值：whisper 风格用 whisper-1，其余用 qwen3-asr-flash。
+    """
+    value = (str(config.get("asr_model", "") or "").strip()
+             or str(config.get("asr_dashscope_model", "") or "").strip())
+    if value:
+        return value
+    use_style = style if style is not None else config.get("asr_api_style", "auto")
+    if normalize_api_style(use_style) == "whisper":
+        return DEFAULT_WHISPER_API_MODEL
+    return DEFAULT_DASHSCOPE_MODEL
+
+
+def normalize_api_style(style) -> str:
+    """识别接口风格：auto / openai / dashscope / ollama / whisper。"""
+    value = str(style or "").strip().lower()
+    return value if value in ("auto", "openai", "dashscope", "ollama", "whisper") else "auto"
+
+
+def is_whisper_style(config) -> bool:
+    """是否走标准的 <服务根>/audio/transcriptions 转写接口。"""
+    return normalize_api_style(config.get("asr_api_style", "auto")) == "whisper"
+
+
+def transcriptions_endpoint(base_url: str) -> str:
+    """标准转写端点：<服务根>/audio/transcriptions（地址已带端点时原样返回）。"""
+    base = str(base_url or "").strip().rstrip("/")
+    if not base:
+        return ""
+    if base.lower().endswith("/audio/transcriptions"):
+        return base
+    normalized = chat_endpoint(base, "openai")
+    for suffix in ("/chat/completions", "/completions"):
+        if normalized.endswith(suffix):
+            normalized = normalized[: -len(suffix)]
+            break
+    # OpenAI 兼容服务的转写接口都在版本段下面（本机 whisper.cpp / Speaches 也认 /v1），
+    # 服务根地址没带版本段就补一个
+    if not _VERSION_SEG_RE.search(normalized):
+        normalized = f"{normalized}/v1"
+    return f"{normalized}/audio/transcriptions"
+
+
+def api_style_backend(style) -> str:
+    """把界面上的接口风格映射成 llm_helpers 认识的后端名。"""
+    return "ollama" if normalize_api_style(style) == "ollama" else "openai"
+
+
+def local_whisper_size(config) -> str:
+    """本地 Whisper 规格：「识别模型」填了合法规格就用它，否则用「本地识别模型规格」。"""
+    name = str(config.get("asr_model", "") or "").strip()
+    if name in WHISPER_MODEL_SIZES:
+        return name
+    return whisper_model_size(config)
+
+
+def local_asr_root(config) -> Optional[Path]:
+    """本地识别根目录：优先「识别根目录」，留空则沿用 GPT-SoVITS 目录。"""
+    raw = str(config.get("asr_local_root", "") or "").strip()
+    if raw:
+        path = Path(raw)
+        if path.is_dir():
+            return path
+        if path.is_file():
+            return path.parent
+    return resolve_sovits_root(config)
 
 
 def resolve_sovits_root(config) -> Optional[Path]:
@@ -91,13 +175,19 @@ def _runtime_python(root: Path) -> Optional[Path]:
 def transcribe_local(config, targets: List[Tuple[str, Path]], lang: str,
                      log=None) -> Dict[str, str]:
     """本地批量识别，返回 {key: 文字}；key 由调用方给定，未识别出的不在结果里。"""
-    root = resolve_sovits_root(config)
+    root = local_asr_root(config)
     if root is None:
-        raise RuntimeError("未配置 tts_start_script，无法定位 GPT-SoVITS 目录")
+        raise RuntimeError("未配置「识别根目录」/tts_start_script，无法定位本地 ASR 目录")
     python_exe = _runtime_python(root)
     if python_exe is None:
         raise RuntimeError(f"找不到 {root / 'runtime'} 下的 python，无法调用本地 ASR")
-    if lang in FUNASR_LANGS:
+    local_engine = str(config.get("asr_local_engine", "") or "").strip().lower()
+    if local_engine == "funasr":
+        # 达摩 ASR 只认中英；其它语种退中文，脚本内部还会自己判一次
+        script, script_lang = LOCAL_SCRIPTS["funasr"], (lang if lang in FUNASR_LANGS else "zh")
+    elif local_engine == "whisper":
+        script, script_lang = LOCAL_SCRIPTS["whisper"], lang
+    elif lang in FUNASR_LANGS:
         script, script_lang = LOCAL_SCRIPTS["funasr"], lang
     else:
         # Whisper 传 auto 让模型自己判语种；判成中文时脚本内部会转达摩 ASR
@@ -117,7 +207,7 @@ def transcribe_local(config, targets: List[Tuple[str, Path]], lang: str,
         cmd = [str(python_exe), "-c", SCRIPT_BOOTSTRAP, str(root), str(script_path),
                "-i", str(tmp_dir), "-o", str(tmp_dir), "-l", script_lang]
         if script == LOCAL_SCRIPTS["whisper"]:
-            cmd += ["-s", whisper_model_size(config)]
+            cmd += ["-s", local_whisper_size(config)]
         proc = subprocess.Popen(cmd, cwd=str(root), stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True,
                                 encoding="utf-8", errors="replace", **no_window_kwargs())
@@ -224,15 +314,15 @@ def _read_list_file(tmp_dir: Path) -> str:
 
 
 async def transcribe_dashscope(config, audio: Path, lang: str) -> str:
-    model = str(config.get("asr_dashscope_model", "") or "").strip() or DEFAULT_DASHSCOPE_MODEL
+    model = asr_model_name(config)
     base_url = (str(config.get("asr_base_url", "") or "").strip()
                 or str(config.get("llm_base_url", "") or "").strip())
-    endpoint = chat_endpoint(base_url, "openai")
+    endpoint = chat_endpoint(base_url, api_style_backend(config.get("asr_api_style", "auto")))
     if not endpoint:
-        raise RuntimeError("未配置 asr_base_url / llm_base_url，无法调用线上语音识别")
-    api_key = str(config.get("llm_api_key", "") or "").strip()
+        raise RuntimeError("未配置「识别服务地址」/llm_base_url，无法调用线上语音识别")
+    api_key = asr_api_key(config)
     if not api_key:
-        raise RuntimeError("未配置 llm_api_key，无法调用线上语音识别")
+        raise RuntimeError("未配置「识别 API Key」/llm_api_key，无法调用线上语音识别")
     raw = Path(audio).read_bytes()
     if len(raw) > DASHSCOPE_MAX_AUDIO_BYTES:
         raise RuntimeError(f"音频过大（{len(raw) / 1048576:.1f}MB），线上识别上限约 7MB")
@@ -259,6 +349,54 @@ async def transcribe_dashscope(config, audio: Path, lang: str) -> str:
     return str((choices[0].get("message") or {}).get("content") or "").strip()
 
 
+async def transcribe_whisper_api(config, audio: Path, lang: str) -> str:
+    """标准 <服务根>/audio/transcriptions 接口（OpenAI Whisper / Groq / SenseVoice 等）。
+
+    本地识别服务（Speaches、whisper.cpp server）通常不校验密钥，所以密钥留空也照发；
+    云端被 401/403 拒了会在报错里点明要填「识别 API Key」。
+    """
+    base_url = (str(config.get("asr_base_url", "") or "").strip()
+                or str(config.get("llm_base_url", "") or "").strip())
+    endpoint = transcriptions_endpoint(base_url)
+    if not endpoint:
+        raise RuntimeError("未配置「识别服务地址」/llm_base_url，无法调用线上语音识别")
+    api_key = asr_api_key(config)
+    raw = Path(audio).read_bytes()
+    if len(raw) > WHISPER_API_MAX_AUDIO_BYTES:
+        raise RuntimeError(f"音频过大（{len(raw) / 1048576:.1f}MB），标准识别接口上限约 24MB")
+    mime = AUDIO_MIMES.get(Path(audio).suffix.lower(), "audio/wav")
+    data = {"model": asr_model_name(config, "whisper")}
+    if lang != "auto":
+        data["language"] = lang
+    files = {"file": (Path(audio).name or "audio.wav", raw, mime)}
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    async with httpx.AsyncClient(timeout=DASHSCOPE_TIMEOUT_SECONDS, trust_env=False,
+                                 verify=verified_context()) as client:
+        resp = await client.post(endpoint, data=data, files=files, headers=headers)
+    if resp.status_code in (401, 403) and not api_key:
+        raise RuntimeError("识别服务拒绝了请求：本机识别服务可以留空密钥，"
+                           "云端要在「识别 API Key」里填密钥")
+    if resp.status_code != 200:
+        raise RuntimeError(f"HTTP {resp.status_code}: {str(resp.text)[:200]}")
+    payload = resp.json()
+    if isinstance(payload, dict):
+        text = payload.get("text")
+        if text is None:
+            # 有的服务（whisper.cpp server 的 verbose_json）只给分段
+            segments = payload.get("segments") or []
+            text = "".join(str(seg.get("text") or "")
+                           for seg in segments if isinstance(seg, dict))
+        return str(text or "").strip()
+    return str(payload or "").strip()
+
+
+async def transcribe_online(config, audio: Path, lang: str) -> str:
+    """线上识别的统一入口：whisper 风格走转写接口，其余把音频喂给对话模型。"""
+    if is_whisper_style(config):
+        return await transcribe_whisper_api(config, audio, lang)
+    return await transcribe_dashscope(config, audio, lang)
+
+
 async def transcribe_file(config, audio, lang=None) -> str:
     """识别单个音频文件，返回文字（识别不出来返回空串）。
 
@@ -269,7 +407,7 @@ async def transcribe_file(config, audio, lang=None) -> str:
     use_lang = normalize_lang(lang if lang is not None
                               else config.get("asr_lang", "auto"))
     if normalize_engine(config.get("asr_engine", "local")) == "dashscope":
-        return (await transcribe_dashscope(config, path, use_lang)).strip()
+        return (await transcribe_online(config, path, use_lang)).strip()
     key = str(path)
     texts = await asyncio.to_thread(transcribe_local, config, [(key, path)], use_lang)
     return str(texts.get(key, "") or "").strip()
@@ -339,7 +477,7 @@ class AsrJob:
     async def _run_dashscope(self):
         for target in self._targets:
             try:
-                text = await transcribe_dashscope(self._config, Path(target["audio"]), self.lang)
+                text = await transcribe_online(self._config, Path(target["audio"]), self.lang)
                 self._record(target, text, "" if text else "未识别出文字")
             except Exception as e:
                 self._record(target, "", f"{type(e).__name__}: {e}")

@@ -13,6 +13,10 @@
 
 - 侧栏收起：侧栏品牌行右侧新增「收起」按钮，收起时侧栏向左滑出、把横向空间让给内容，内容区左上角常驻一颗「展开」按钮随时叫回来；也支持 Ctrl / Cmd + B 快捷键，状态自动记住；≤760px 的窄屏（侧栏本来就是顶部横条）不显示这两颗按钮。
 
+- WebUI 访问地址与 HTTPS：「WebUI 设置」里新增「访问地址」一行，直接列出本机与局域网可以打开的地址、点一下即可复制，并显示当前是 http 还是 https、有没有设访问密码；新增「启用 HTTPS」——开启后自动生成一张 10 年自签证书（首次访问浏览器会提示不安全，继续访问即可），也可以自己填 PEM 证书与私钥；新增「非本机访问强制密码」——监听地址不是本机却没设「WebUI 访问密码」时，程序会拒绝暴露、只监听 127.0.0.1 并在日志里说明原因。
+
+- 语音识别：配置改成和大语言模型一致的样子，「可云可本地、不写死服务商」——「识别通道」选本地或线上；「语音识别模型」内置按服务商分组的常用识别模型（OpenAI whisper-1、Groq whisper-large-v3 系列、硅基流动 SenseVoice、阿里云百炼 qwen3-asr-flash / qwen2-audio-instruct、Google Gemini，本机一组是 Speaches / whisper.cpp 的模型名，本地一组是 Faster Whisper 规格 medium / large-v3 / large-v3-turbo），也可以点「🌐 服务列表」从识别服务直接拉取可用模型 ID（不再需要「📁 选文件夹」扫本地目录）；「识别服务地址」换成语音识别专用预设，只列真能跑的服务——OpenAI Whisper、Groq、硅基流动走标准的 /v1/audio/transcriptions 转写接口（新增「whisper」接口风格，本机识别服务留空密钥也能连），阿里云百炼与国际站、Google Gemini 走对话模型直接吃音频，另有本机 Speaches / faster-whisper-server、whisper.cpp server、vLLM / LM Studio、Ollama，留空则跟随 LLM 地址；新增「识别 API Key」（加密存储，留空跟随 LLM 密钥）；新增「识别接口风格」（auto / openai / dashscope / ollama / whisper，按服务自动判断）；本地通道新增「本地识别引擎」（auto / funasr / whisper）与「识别根目录」（默认沿用 GPT-SoVITS 目录，可指向别的识别项目）。
+
 #### 🛠 修复
 
 - 模型服务：修复本地服务返回 HTTP 500 时日志直接甩出一整页 HTML、看不出真实原因的问题 —— 现在会读出错误页标题与正文，并说明「返回 HTML 错误页」不等于「模型输出了 HTML」，附常见原因（模型未加载完、显存不足被卸载、服务不认 llm_extra_body 等）；服务端 5xx 会自动重试一次。

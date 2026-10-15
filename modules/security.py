@@ -8,7 +8,9 @@ from base64 import b64encode, b64decode
 from typing import Optional
 
 
-_API_KEY_KEYS = ("llm_api_key", "image_caption_api_key", "cloud_tts_api_key", "napcat_token", "web_search_api_keys", "plugin_publish_token")
+_API_KEY_KEYS = ("llm_api_key", "image_caption_api_key", "cloud_tts_api_key",
+                "asr_api_key", "napcat_token", "web_search_api_keys",
+                "plugin_publish_token")
 
 # WebUI 的两个密码：访问密码（登录）与二级密码（敏感操作前再验一次）
 _WEBUI_PASSWORD_KEYS = ("webui_password", "webui_second_password")

@@ -11,11 +11,13 @@ WebView2 运行时辅助取自 modules.webview_runtime，依赖方向单向。
 import asyncio
 import hashlib
 import io
+import ipaddress
 import json
 import logging
 import os
 import re
 import shutil
+import ssl
 import threading
 import time
 import zipfile
@@ -231,6 +233,10 @@ PUBLISH_STATE_TTL = 24 * 3600
 # 聊天测试台专用会话：与真实 QQ 会话隔离，方便随时清掉重测
 TEST_CHAT_SESSION = "webui_test"
 TEST_CHAT_USER = "webui_test"
+
+# 语音通话专用会话：与真实 QQ 会话、聊天测试台都隔离，留痕由通话面板自己控制
+CALL_SESSION = "webui_call"
+CALL_USER = "webui_call"
 # 角色档案导出/导入时随档案带走的角色字段
 _ROLE_EXPORT_KEYS = ("character_name", "character_key", "personality_prompt", "json_prompt",
                      "supplement_prompt", "default_voice", "ref_audio_root", "text_lang",
@@ -240,6 +246,164 @@ _ROLE_EXPORT_KEYS = ("character_name", "character_key", "personality_prompt", "j
 # 待办状态取值（与 TodoManager 使用的一致，供 WebUI 更新接口做白名单校验）
 TODO_STATUSES = ("pending", "done", "cancelled", "missed")
 
+
+# --- WebUI 的 HTTPS 与访问地址 -------------------------------------------
+# 手机浏览器只在 https 或 localhost 下把麦克风交给网页（通话插件要用），
+# 所以这里支持自签证书的 HTTPS；没有现成证书时现场生成一张长期自签证书。
+
+def _is_loopback_host(host) -> bool:
+    """只有本机能访问的监听地址算 loopback。0.0.0.0 / :: 是全网卡，不算。"""
+    text = str(host or "").strip().lower()
+    if text in ("", "localhost", "127.0.0.1", "::1", "[::1]"):
+        return True
+    try:
+        return ipaddress.ip_address(text).is_loopback
+    except ValueError:
+        return False
+
+
+def _lan_ipv4_addresses() -> List[str]:
+    """本机的局域网 IPv4 地址（给手机访问用），取不到返回空列表。"""
+    import socket
+    found: List[str] = []
+
+    def add(ip: str) -> None:
+        ip = str(ip or "").strip()
+        # 127.* 是本机回环，169.254.* 是链路本地地址（连不上），都不当作可用的局域网地址
+        if ip and not ip.startswith("127.") and not ip.startswith("169.254.") and ip not in found:
+            found.append(ip)
+
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            add(info[4][0])
+    except Exception:
+        pass
+    if not found:
+        # 某些系统解析不到主机名：连一个不存在的地址也能拿到出口网卡地址
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                sock.connect(("8.8.8.8", 80))
+                add(sock.getsockname()[0])
+            finally:
+                sock.close()
+        except Exception:
+            pass
+    return found
+
+
+def _cert_dir() -> Path:
+    return user_data_dir() / "webui_cert"
+
+
+def _ensure_self_signed_cert(hosts: List[str]) -> Optional[tuple]:
+    """生成自签证书，返回 (证书路径, 私钥路径)；缺 cryptography 或出错返回 None。"""
+    folder = _cert_dir()
+    cert_path = folder / "webui_cert.pem"
+    key_path = folder / "webui_key.pem"
+    if cert_path.is_file() and key_path.is_file():
+        return cert_path, key_path
+    try:
+        import datetime as _dt
+
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+    except Exception as e:
+        print(f"已开启 WebUI HTTPS，但缺少 cryptography，无法自动生成证书：{e}")
+        return None
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Lovomo"),
+                          x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Lovomo")])
+        alt = [x509.DNSName("localhost")]
+        seen = {"localhost"}
+        for item in ["127.0.0.1", "::1"] + list(hosts or []):
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            try:
+                alt.append(x509.IPAddress(ipaddress.ip_address(text)))
+            except ValueError:
+                alt.append(x509.DNSName(text))
+        now = _dt.datetime.now(_dt.timezone.utc)
+        cert = (x509.CertificateBuilder()
+                .subject_name(name).issuer_name(name)
+                .public_key(key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(now - _dt.timedelta(days=1))
+                .not_valid_after(now + _dt.timedelta(days=3650))
+                .add_extension(x509.SubjectAlternativeName(alt), critical=False)
+                .add_extension(x509.BasicConstraints(ca=True, path_length=None),
+                               critical=True)
+                .sign(key, hashes.SHA256()))
+        key_path.write_bytes(key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption()))
+        cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+        print(f"已生成 WebUI 自签证书（有效期 10 年）：{cert_path}")
+        return cert_path, key_path
+    except Exception as e:
+        print(f"生成 WebUI 自签证书失败：{type(e).__name__}: {e}")
+        return None
+
+
+def _build_ssl_context(config) -> Optional["ssl.SSLContext"]:
+    """按配置准备 HTTPS 上下文；没开 HTTPS 或证书不可用时返回 None（退回 http）。"""
+    if not bool(config.get("webui_https")):
+        return None
+    cert_text = str(config.get("webui_cert_file", "") or "").strip()
+    key_text = str(config.get("webui_key_file", "") or "").strip()
+    if cert_text or key_text:
+        if not (cert_text and key_text):
+            print("已开启 WebUI HTTPS，但证书或私钥只填了一半，本次仍以 http 启动")
+            return None
+        pair = (Path(cert_text), Path(key_text))
+    else:
+        pair = _ensure_self_signed_cert(_lan_ipv4_addresses())
+    if not pair:
+        print("已开启 WebUI HTTPS，但拿不到证书，本次仍以 http 启动")
+        return None
+    cert_path, key_path = Path(pair[0]), Path(pair[1])
+    if not (cert_path.is_file() and key_path.is_file()):
+        print(f"证书文件不存在：{cert_path} / {key_path}，本次仍以 http 启动")
+        return None
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(str(cert_path), str(key_path))
+        return ctx
+    except Exception as e:
+        print(f"加载 WebUI 证书失败：{type(e).__name__}: {e}，本次仍以 http 启动")
+        return None
+
+
+def _webui_access_urls(scheme: str, host: str, port: int) -> List[str]:
+    """当前监听地址对应的可访问 URL（绑定非本机时把局域网地址排在前，方便手机直接打开）。"""
+    urls: List[str] = []
+
+    def add(ip: str) -> None:
+        ip = str(ip or "").strip()
+        if not ip:
+            return
+        text = f"[{ip}]" if ":" in ip else ip
+        url = f"{scheme}://{text}:{port}"
+        if url not in urls:
+            urls.append(url)
+
+    if _is_loopback_host(host):
+        # 只监听本机：局域网地址根本连不上，列出来只会误导
+        add("127.0.0.1")
+        return urls
+    if str(host).strip() not in ("0.0.0.0", "::", "[::]"):
+        add(host)
+    for item in _lan_ipv4_addresses():
+        add(item)
+    add("127.0.0.1")
+    return urls
 
 
 class WebUIServer:
@@ -768,6 +932,8 @@ class WebUIServer:
         r.add_post("/api/config/profiles/save", self.handle_config_profiles_save)
         r.add_post("/api/config/profiles/delete", self.handle_config_profiles_delete)
         r.add_post("/api/config/profiles/open_dir", self.handle_config_profiles_open_dir)
+        # WebUI 当前的访问地址与安全状态（设置页「访问地址」那一行）
+        r.add_get("/api/webui/access", self.handle_webui_access)
         # 插件系统
         r.add_get("/api/plugins/list", self.handle_plugins_list)
         r.add_post("/api/plugins/upload", self.handle_plugins_upload)
@@ -823,6 +989,11 @@ class WebUIServer:
         r.add_post("/api/tts/voice_enrollment/delete", self.handle_voice_enrollment_delete)
         r.add_post("/api/asr/start", self.handle_asr_start)
         r.add_get("/api/asr/status", self.handle_asr_status)
+        r.add_post("/api/asr/scan_models", self.handle_asr_scan_models)
+        r.add_post("/api/asr/list_remote_models", self.handle_asr_list_remote_models)
+        # 语音通话（打电话）：开场状态 + 一轮对话
+        r.add_get("/api/call/status", self.handle_call_status)
+        r.add_post("/api/call/turn", self.handle_call_turn)
         # 聊天记录导入导出
         r.add_get("/api/memory/export", self.handle_memory_export)
         r.add_post("/api/memory/import", self.handle_memory_import)
@@ -2795,6 +2966,121 @@ class WebUIServer:
         return web.json_response({"ok": True, "path": str(dst), "name": safe,
                                   "orig_name": src.name, "cancelled": False})
 
+    # ---------------- 语音识别：本地模型扫描 / 服务模型列表 ----------------
+    @staticmethod
+    def _asr_model_keys(folder: Path, path: Path) -> List[str]:
+        """从一个本地识别模型文件/目录推出可填入「识别模型」的候选名。"""
+        keys: List[str] = []
+
+        def add(value) -> None:
+            text = str(value or "").strip()
+            if text and text not in keys:
+                keys.append(text)
+
+        if path.is_file():
+            name = path.name
+            lowered = name.lower()
+            if lowered.endswith(".gguf"):
+                add(re.sub(r"\.gguf$", "", name, flags=re.IGNORECASE))
+            if lowered.startswith("ggml-") and lowered.endswith(".bin"):
+                add(re.sub(r"^ggml-", "", name, flags=re.IGNORECASE)[:-4])
+            return keys
+        try:
+            rel = path.relative_to(folder)
+        except ValueError:
+            rel = path
+        parts = [p for p in rel.parts if p]
+        if parts:
+            add(parts[-1])
+        # models--Systran--faster-whisper-large-v3 → large-v3
+        for part in reversed(parts):
+            lowered = part.lower()
+            if "whisper" in lowered:
+                add(re.sub(r"^models--[^-]+--(faster-)?whisper-", "", lowered))
+                break
+        add(path.name)
+        return keys
+
+    async def handle_asr_scan_models(self, request):
+        """扫描文件夹里的本地识别模型：faster-whisper / FunASR / whisper.cpp / GGUF。"""
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "参数错误"}, status=400)
+        folder = str(payload.get("folder", "") or "").strip()
+        root = Path(folder)
+        if not folder or not root.is_dir():
+            return web.json_response({"ok": False, "error": "文件夹不存在"}, status=400)
+        markers = ("model.bin", "model.pt", "model.onnx", "config.json")
+        models = []
+        try:
+            for child in sorted(root.rglob("*")):
+                if child.is_dir():
+                    if any((child / m).exists() for m in markers):
+                        models.append({"file": child.name, "keys": self._asr_model_keys(root, child)})
+                elif child.suffix.lower() in (".gguf", ".bin"):
+                    keys = self._asr_model_keys(root, child)
+                    if keys:
+                        models.append({"file": child.name, "keys": keys})
+            return web.json_response({"ok": True, "models": models})
+        except Exception as e:
+            return web.json_response({"ok": False, "error": f"扫描失败: {e}"}, status=500)
+
+    async def handle_asr_list_remote_models(self, request):
+        """从识别服务拉取可用模型列表（Ollama 的 /api/tags 或 OpenAI 兼容的 /models）。"""
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "参数错误"}, status=400)
+        base = str(payload.get("base_url", "") or "").strip().rstrip("/")
+        if not base:
+            base = str(self.config.get("asr_base_url", "") or "").strip().rstrip("/")
+        if not base:
+            base = str(self.config.get("llm_base_url", "") or "").strip().rstrip("/")
+        if not base:
+            return web.json_response(
+                {"ok": False, "error": "服务地址为空：请先填「识别服务地址」"}, status=400)
+        style = str(payload.get("backend", "") or "").strip().lower()
+        if style not in ("auto", "openai", "dashscope", "ollama"):
+            style = str(self.config.get("asr_api_style", "auto") or "auto").strip().lower()
+        backend = "ollama" if style == "ollama" else "openai"
+        api_key = (str(self.config.get("asr_api_key", "") or "").strip()
+                   or str(self.config.get("llm_api_key", "") or "").strip())
+        headers = {}
+        if backend != "ollama" and api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        tried = []
+        for url in model_list_endpoints(base, backend):
+            try:
+                async with httpx.AsyncClient(timeout=10, trust_env=False, headers=headers,
+                                             verify=verified_context()) as client:
+                    resp = await client.get(url)
+            except Exception as e:
+                tried.append(f"{url} → {type(e).__name__}: {e}")
+                continue
+            if resp.status_code >= 400:
+                tried.append(f"{url} → HTTP {resp.status_code} {_brief_response(resp)}")
+                continue
+            try:
+                data = resp.json()
+            except Exception:
+                tried.append(f"{url} → 响应不是 JSON {_brief_response(resp)}")
+                continue
+            if backend == "ollama":
+                ids = [str(m.get("name") or m.get("model") or "") for m in data.get("models", [])]
+            else:
+                ids = [str(m.get("id") or "") for m in data.get("data", [])]
+            ids = [i for i in ids if i]
+            if not ids:
+                tried.append(f"{url} → 响应里没有模型列表 {_brief_response(resp)}")
+                continue
+            return web.json_response({"ok": True, "models": ids})
+        error = "获取模型列表失败：\n" + "\n".join(tried)
+        if looks_like_full_endpoint(base):
+            error += ("\n\n当前地址看起来是带业务路径的接口（…/services/xxx/xxx）。"
+                      "请填服务根地址，例如 https://dashscope.aliyuncs.com/compatible-mode/v1。")
+        return web.json_response({"ok": False, "error": error}, status=400)
+
     async def handle_scan_models(self, request):
         """扫描文件夹里的 .gguf 模型，返回可填入 llm_model_name 的候选标识符。
 
@@ -3883,6 +4169,190 @@ class WebUIServer:
                                "partner": aff_rec["partner"]}
                               if aff_rec is not None else None)})
 
+    # ---------------- 语音通话（打电话） ----------------
+    async def handle_call_status(self, request):
+        """通话面板开场信息：可选角色、当前语音引擎、留痕档位。"""
+        roles = getattr(self.config, "roles", None) or {}
+        return web.json_response({
+            "ok": True,
+            "session_id": CALL_SESSION,
+            "characters": [{"key": key,
+                            "name": (role or {}).get("character_name") or key}
+                           for key, role in roles.items()],
+            "asr_engine": self.config.get("asr_engine", "local"),
+            "tts_backend": self.config.get("tts_backend", "") or "local",
+            "retention_options": ["none", "text", "full"],
+            "default_retention": "text",
+            "remember_default": True,
+        })
+
+    async def handle_call_turn(self, request):
+        """通话一轮：音频（或文字）→ 识别 → 角色回复 → 合成语音 → 回 base64 wav。
+
+        和聊天测试台共用「审判 → 生成 → 心情/好感落盘」链路，只把会话换成本通话专用。
+        留痕三档：none 不写记忆、text 只写文字、full 再另存一份原始录音。
+        """
+        import tempfile
+        from modules.asr import transcribe_file
+
+        tmp_dir = None
+        try:
+            try:
+                payload = await request.json()
+            except Exception:
+                return web.json_response({"ok": False, "error": "参数错误"}, status=400)
+            character_key = str(payload.get("character_key", "") or "").strip()
+            text = str(payload.get("text", "") or "").strip()
+            audio_b64 = str(payload.get("audio", "") or "")
+            lang = str(payload.get("lang", "auto") or "auto")
+            retention = str(payload.get("retention", "text") or "text").strip().lower()
+            if retention not in ("none", "text", "full"):
+                retention = "text"
+            remember = bool(payload.get("remember", True))
+            # 逐句合成开关：multi 默认开，最多念 3 句；multi=false 或 max_sentences=1 时只念第一句
+            multi = bool(payload.get("multi", True))
+            try:
+                max_sentences = int(payload.get("max_sentences") or 3)
+            except Exception:
+                max_sentences = 3
+            max_sentences = max(1, min(3, max_sentences))
+            if not multi:
+                max_sentences = 1
+            role = (getattr(self.config, "roles", None) or {}).get(character_key)
+            if role is None:
+                return web.json_response({"ok": False, "error": "角色不存在"}, status=400)
+            mem = role_memory(role)
+            if mem is None:
+                return web.json_response({"ok": False, "error": "角色记忆不可用"}, status=400)
+            # 文字优先；没带文字才拿录音去识别。录音落在临时目录，最后连目录一起清，
+            # 所以 text/none 档天然不留音频文件。
+            raw_audio_path = None
+            if not text and audio_b64:
+                tmp_dir = tempfile.mkdtemp(prefix="lovomo_call_")
+                raw_audio_path = Path(tmp_dir) / "input.wav"
+                raw_audio_path.write_bytes(b64decode(audio_b64))
+                text = str(await transcribe_file(self.config.config, raw_audio_path, lang) or "").strip()
+            if not text:
+                return web.json_response({"ok": False, "error": "没能听清这句话，再说一次试试"})
+            session_id = CALL_SESSION
+            user_id = CALL_USER
+            # 写记忆看两处：勾了「记住这次通话」，或留痕档不是 none
+            write_text = bool(remember) or retention != "none"
+            lock = app_context._SESSION_LOCKS.setdefault(f"{session_id}::{character_key}",
+                                                         asyncio.Lock())
+            async with lock:
+                ctx = RoleContext(self.config.config, role)
+                emotions = get_role_emotions(role)
+                history = mem.load_history(session_id)
+                extra_parts = []
+                verdict = None
+                if app_context.mood_mgr is not None and (judge_enabled(ctx) or mood_enabled(ctx)):
+                    try:
+                        verdict = await asyncio.wait_for(
+                            judge_and_decide(ctx, app_context.mood_mgr, session_id, text, history,
+                                             user_id=user_id,
+                                             reply_floor=(app_context.affection_mgr.stage_reply_floor(
+                                                 character_key, user_id, session_id)
+                                                 if app_context.affection_mgr is not None else 0.0)),
+                            timeout=30)
+                    except Exception as e:
+                        print(f"语音通话：审判失败（忽略）: {type(e).__name__}: {e}")
+                mood_now = current_mood(ctx, app_context.mood_mgr, session_id, user_id) \
+                    if app_context.mood_mgr is not None else None
+                if app_context.mood_mgr is not None:
+                    _tier, mood_note = mood_style(ctx, mood_now)
+                    if mood_note:
+                        extra_parts.append(mood_note)
+                if app_context.affection_mgr is not None and affection_enabled(ctx):
+                    aff_note = app_context.affection_mgr.build_note(ctx, user_id, label="通话用户",
+                                                        session_id=session_id)
+                    if aff_note:
+                        extra_parts.append(aff_note)
+                reply = await asyncio.wait_for(
+                    generate_reply(ctx, emotions, text, history, None, extra_parts,
+                                   user_id, session_id=session_id),
+                    timeout=max(90.0, float(self.config.get("llm_timeout", 120) or 120) + 60.0))
+                reply = reply or {}
+                raw_sentences = [s for s in (reply.get("sentences") or [])
+                                 if isinstance(s, dict)]
+                sentences = [{"zh": str(s.get("zh") or s.get("display") or ""),
+                              "emotion": str(s.get("emotion") or ""),
+                              "lang": str(s.get("lang") or "")}
+                             for s in raw_sentences]
+                zh_text = "".join(s["zh"] for s in sentences)
+                if write_text:
+                    history.append({"role": "user", "content": text, "sender_id": user_id,
+                                    "sender_name": "通话用户", "timestamp": time.time()})
+                    history.append({"role": "assistant", "content": zh_text, "timestamp": time.time(),
+                                    "speaker": role.get("character_name", character_key),
+                                    "emotion": sentences[0]["emotion"] if sentences else ""})
+                    mem.save_session_data(session_id, {"history": history})
+                    # 承诺追踪与真实消息同链路：台词命中承诺字样就提取入库
+                    if app_context.promise_mgr is not None \
+                            and bool(self.config.get("promise_enabled", True)) \
+                            and PROMISE_HINT_RE.search(zh_text):
+                        await _extract_and_store_promise(ctx, session_id, user_id, zh_text)
+                if app_context.mood_mgr is not None and verdict is not None:
+                    commit_mood(ctx, app_context.mood_mgr, session_id, verdict, user_id=user_id)
+                if app_context.affection_mgr is not None \
+                        and verdict is not None and verdict.get("affection_enabled") \
+                        and verdict.get("affection_delta") is not None:
+                    app_context.affection_mgr.apply_delta(character_key, user_id,
+                                              verdict.get("affection_delta"),
+                                              confession=bool(verdict.get("confession")),
+                                              romance=bool(verdict.get("romance")),
+                                              acceptance=bool(verdict.get("acceptance")),
+                                              reply_text=zh_text,
+                                              session_id=session_id)
+                # 逐句合成：前 max_sentences 句依次念，优先原文台词（lang），没有原文再念中文。
+                # audios 逐句给 {text, emotion, data}；audio 保留第一句，兼容老前端。
+                audios = []
+                for raw in raw_sentences[:max_sentences]:
+                    spoken_text = str(raw.get("lang") or "").strip() \
+                        or str(raw.get("zh") or raw.get("display") or "").strip()
+                    if not spoken_text:
+                        continue
+                    try:
+                        wav_path = await synthesize_sentence(
+                            ctx, spoken_text, str(raw.get("emotion") or ""), emotions,
+                            app_context.memory_manager.data_path,
+                            stats=app_context.stats_mgr)
+                        if wav_path:
+                            audios.append({
+                                "text": spoken_text,
+                                "emotion": str(raw.get("emotion") or ""),
+                                "data": b64encode(Path(wav_path).read_bytes()).decode("ascii"),
+                            })
+                    except Exception as e:
+                        print(f"语音通话：合成失败（忽略）: {type(e).__name__}: {e}")
+                audio_out = audios[0]["data"] if audios else ""
+                # full 档才留原始录音，文件名带时间戳；text/none 档什么都不留
+                retained_audio = False
+                if retention == "full" and raw_audio_path is not None:
+                    calls_dir = Path(app_context.memory_manager.data_path) / "calls"
+                    calls_dir.mkdir(parents=True, exist_ok=True)
+                    safe_key = re.sub(r"[^A-Za-z0-9_.-]", "_", character_key) or "role"
+                    keep = calls_dir / (time.strftime("%Y%m%d_%H%M%S") + "_" + safe_key + ".wav")
+                    shutil.copyfile(raw_audio_path, keep)
+                    retained_audio = True
+                return web.json_response({
+                    "ok": True,
+                    "text": text,
+                    "reply": zh_text,
+                    "sentences": sentences,
+                    "audios": audios,
+                    "audio": audio_out,
+                    "audio_mime": "audio/wav",
+                    "session_id": session_id,
+                    "retained": {"text": bool(write_text), "audio": retained_audio},
+                })
+        except Exception as e:
+            return web.json_response({"ok": False,
+                                      "error": f"{type(e).__name__}: {e}"}, status=400)
+        finally:
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
     async def handle_test_history(self, request):
         character_key = str(request.query.get("character_key", "") or "").strip()
         role = (getattr(self.config, "roles", None) or {}).get(character_key)
@@ -4962,6 +5432,33 @@ class WebUIServer:
         return await _local_file_response(
             target, MIME_BY_EXT.get(target.suffix.lower(), "application/octet-stream"))
 
+    async def handle_webui_access(self, request):
+        """当前 WebUI 的访问地址与安全状态（设置页「访问地址」那一行用）。"""
+        configured_https = bool(self.config.get("webui_https"))
+        scheme = str(getattr(self, "scheme", "") or ("https" if configured_https else "http"))
+        host = str(getattr(self, "host", "") or self.config.get("webui_host", "127.0.0.1"))
+        try:
+            port = int(getattr(self, "port", 0) or self.config.get("webui_port", 11500))
+        except (TypeError, ValueError):
+            port = 11500
+        cert_text = str(self.config.get("webui_cert_file", "") or "").strip()
+        return web.json_response({
+            "ok": True,
+            "scheme": scheme,
+            "host": host,
+            "port": port,
+            "running": getattr(self, "runner", None) is not None,
+            "urls": _webui_access_urls(scheme, host, port),
+            "https": scheme == "https",
+            "https_configured": configured_https,
+            "cert_file": cert_text or str(_cert_dir() / "webui_cert.pem"),
+            "self_signed": not cert_text,
+            "password_set": bool(str(self.config.get("webui_password", "") or "")),
+            "second_password_set": bool(str(self.config.get("webui_second_password", "") or "")),
+            "force_password": bool(self.config.get("webui_force_password", True)),
+            "lan_exposed": not _is_loopback_host(host),
+        })
+
     async def start(self):
         host = self.config.get("webui_host", "127.0.0.1")
         base_port = int(self.config.get("webui_port", 11500))
@@ -4969,18 +5466,34 @@ class WebUIServer:
             print("未安装 aiohttp，WebUI 不可用")
             return
 
+        # 暴露到本机以外却没有访问密码时，整站（聊天记录、删除、发布、插件安装）
+        # 对同网段任何人都敞开，所以这里直接退回只监听本机
+        password = str(self.config.get("webui_password", "") or "")
+        if bool(self.config.get("webui_force_password", True)) and not password                 and not _is_loopback_host(host):
+            print(f"⚠ WebUI 监听地址是 {host}，但没有设置「WebUI 访问密码」："
+                  "已改为只允许本机访问（127.0.0.1）。"
+                  "请在设置页填好密码后重启程序，或关掉「非本机访问强制密码」。")
+            host = "127.0.0.1"
+        ssl_context = _build_ssl_context(self.config)
+        scheme = "https" if ssl_context is not None else "http"
+
         # 尝试多个端口，若被占用则自动递增，最多尝试 10 次
         max_tries = 10
         for attempt in range(max_tries):
             port = base_port + attempt
             try:
-                print(f"正在启动 WebUI：http://{host}:{port}")
+                print(f"正在启动 WebUI：{scheme}://{host}:{port}")
                 runner = web.AppRunner(self.app)
                 await runner.setup()
-                site = web.TCPSite(runner, host, port)
+                site = web.TCPSite(runner, host, port, ssl_context=ssl_context)
                 await site.start()
-                print(f"WebUI 已启动：http://{host}:{port}")
+                self.scheme = scheme
+                self.host = host
+                self.port = port
                 self.runner = runner
+                print("WebUI 已启动：" + "  ".join(_webui_access_urls(scheme, host, port)))
+                if scheme == "https":
+                    print("HTTPS 用的是自签证书，浏览器会提示不安全，选择继续访问即可。")
                 # 若使用了非默认端口，更新配置
                 if port != base_port:
                     self.config.config["webui_port"] = port
