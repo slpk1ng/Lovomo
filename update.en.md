@@ -1,5 +1,26 @@
 [简体中文](update.md) · English
 
+### v1.2.5.0
+
+
+#### ✨ Added
+
+- Interface refresh: the settings page is now a card-based single-column list — every group is a rounded white card, each row inside puts the title and its description on the left and the control on the right, and only a hairline separates one row from the next; spacing is roomier overall, and narrow screens stack each row vertically.
+
+- Collapsible sidebar: a collapse button now sits at the right end of the sidebar's brand row; collapsing slides the sidebar out to the left and hands the horizontal space back to the content, while an always-there expand button in the content area's top-left corner brings it back. Ctrl / Cmd + B toggles it as well, the state is remembered, and on screens 760px and narrower (where the sidebar is already a top bar) neither button is shown.
+
+#### 🛠 Fixed
+
+- Model service: fixed a local service's HTTP 500 dumping a whole page of HTML into the log with no clue as to the real cause — the error page's title and body are now read out, together with a note that "returning an HTML error page" is not the same as "the model output HTML", plus the usual causes (model not fully loaded, evicted for lack of VRAM, service rejecting llm_extra_body and so on); server 5xx replies are retried once automatically.
+
+- Local models: fixed a trailing extra JSON fragment in llm_extra_body raising "Extra data: line 1 column 18" and causing the whole value to be ignored — the first complete JSON object is now used and the surplus is only mentioned once in the log.
+
+- QQ official bot: fixed the frequent "connection closed" reconnects — the heartbeat now follows the interval the gateway sends in HELLO instead of a hard-coded 30 seconds, a failed heartbeat send is no longer swallowed silently, and reconnect / invalid-session signals and close frames write their reason and close code to the log.
+
+- Statistics panel: fixed line-chart legends with long names being drawn past the canvas so the values were invisible — the legend now wraps, individual names are truncated with an ellipsis, and the hover tooltip is placed against its own measured width instead of overflowing off the right edge of the screen.
+
+- Repeated requests: switching sidebar panels no longer re-downloads everything on every visit — a panel's result is reused while it is fresh (10 seconds to 5 minutes, depending on the panel), any write invalidates it immediately, and concurrent GETs to the same endpoint are merged into one request; the Advanced features page, which used to fire five requests at once when opened, no longer repeats them inside that window.
+
 ### v1.2.4.0
 
 
@@ -613,14 +634,6 @@
 - Write endpoints gained cross-site request blocking (an Origin/Referer inconsistent with the Host is refused), so a third-party page in the browser can no longer use the cookie to operate the local console directly; command-line / script access is unaffected.
 
 - A single abnormal configuration field (such as `ref_audio_root` being `null`) no longer marks the whole config.json as corrupt and resets it; a failed API key decryption keeps the original ciphertext instead of writing an empty string.
-
-- Model service: fixed a local service's HTTP 500 dumping a whole page of HTML into the log with no clue as to the real cause — the error page's title and body are now read out, together with a note that "returning an HTML error page" is not the same as "the model output HTML", plus the usual causes (model not fully loaded, evicted for lack of VRAM, service rejecting llm_extra_body and so on); server 5xx replies are retried once automatically.
-
-- Local models: fixed a trailing extra JSON fragment in llm_extra_body raising "Extra data: line 1 column 18" and causing the whole value to be ignored — the first complete JSON object is now used and the surplus is only mentioned once in the log.
-
-- QQ official bot: fixed the frequent "connection closed" reconnects — the heartbeat now follows the interval the gateway sends in HELLO instead of a hard-coded 30 seconds, a failed heartbeat send is no longer swallowed silently, and reconnect / invalid-session signals and close frames write their reason and close code to the log.
-
-- Statistics panel: fixed line-chart legends with long names being drawn past the canvas so the values were invisible — the legend now wraps, individual names are truncated with an ellipsis, and the hover tooltip is placed against its own measured width instead of overflowing off the right edge of the screen.
 
 
 #### ⚡ Improved

@@ -1217,8 +1217,18 @@ def g3():
 
 def g4():
     """切页要触发加载：插件市场页拉市场 + 发布面板，插件页拉已装列表。"""
-    return ("if (panelId === 'plugins') { loadPluginsPage(); loadPublishPanel(); }" in HTML_SRC
-            and "if (panelId === 'installed-plugins') loadInstalledPlugins();" in HTML_SRC
+    # 去重复请求改版后，switchPanel 里逐个 if 的写法收进了 PANEL_LOADERS 表，
+    # 由 runPanelLoader(panelId) 统一调度 + 新鲜度缓存，这里改为校验这张映射表本身。
+    i = HTML_SRC.find("const PANEL_LOADERS = {")
+    if i < 0:
+        return False
+    block = HTML_SRC[i:HTML_SRC.find("};", i)]
+    if "plugins: () => Promise.all([loadPluginsPage(), loadPublishPanel()])" not in block:
+        return False
+    if "'installed-plugins': () => loadInstalledPlugins()" not in block:
+        return False
+    # 表建了还得真有人用，否则切页什么都不拉
+    return ("runPanelLoader(panelId);" in HTML_SRC
             and "loadPublishPanel()" in HTML_SRC)
 
 
@@ -1732,7 +1742,7 @@ def j8b():
     for k in ('id="panel-plugin-webui"', 'id="plugin-webui-host"',
               "function openPluginWebui", "function closePluginWebui",
               "function loadPluginWebuiPage", "function mountPluginWebui",
-              "panelId === 'plugin-webui'"):
+              "'plugin-webui': () => loadPluginWebuiPage()"):
         if k not in HTML_SRC:
             return False
     # 入口在卡片上，紧跟在「打开功能页」右边，且只在插件真有 webui.html 时出现
@@ -2140,7 +2150,8 @@ def i12f():
     if i < 0 or "switchPanel('app-releases')" not in HTML_SRC[i:i + 300]:
         return False
     # 切页时要记得拉 Releases（漏了就是"打开一片空白"）
-    if "if (panelId === 'app-releases') loadReleases(false);" not in HTML_SRC:
+    # 切页拉取同样收进了 PANEL_LOADERS 表
+    if "'app-releases': () => loadReleases(false)" not in HTML_SRC:
         return False
     # 插件历史页里不能再有项目历史版本那一节
     i = HTML_SRC.find('id="panel-plugin-history"')

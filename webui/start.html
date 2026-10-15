@@ -1938,16 +1938,188 @@
             -webkit-user-select: text !important;
             user-select: text !important;
         }
+
+        /* ═══════════════════════════════════════════════════════════════════
+           V4 卡片化 + 留白层（参考「设置页」形态）
+             · 分组一律白底圆角卡；组内每行 = 左「标题 + 说明」/ 右「控件」，
+               行与行之间只有一条极细的分隔线；
+             · 侧栏可折叠：收起时向左滑出并把横向空间让给内容，内容区左上角
+               常驻一颗展开按钮；状态存 localStorage，≤760px 不参与折叠。
+           本层纯样式，删掉即可回滚（buildConfigRow 把说明放进 .field-label 是一处 JS 配套）。
+           ═══════════════════════════════════════════════════════════════════ */
+
+        /* ---------- 4.1 分组卡：更大内边距、更轻描边与阴影 ---------- */
+        .config-group,
+        .section-block {
+            background: var(--surface);
+            border: 1px solid var(--line);
+            border-radius: var(--radius-card);
+            box-shadow: var(--shadow-xs);
+            padding: var(--sp-6) var(--sp-6) var(--sp-5);
+            margin-bottom: var(--sp-6);
+        }
+        .config-group > h3,
+        .section-block > h3 {
+            font-size: var(--fs-lg);
+            font-weight: var(--fw-semibold);
+            color: var(--ink);
+            padding-bottom: var(--sp-3);
+            margin-bottom: var(--sp-5);
+            border-bottom: 1px solid var(--line);
+        }
+        .config-group > h4.config-subtitle {
+            margin: var(--sp-5) 0 var(--sp-2);
+            padding-top: var(--sp-2);
+            font-size: var(--fs-base);
+            color: var(--ink-2);
+        }
+
+        /* ---------- 4.2 配置页：单列清单，行 = 左「标题+说明」/ 右「控件」 ---------- */
+        .config-form { max-width: 1040px; }
+        @media (min-width: 1181px) {
+            /* 锚点导航占着左上角，表单必须给它留出位置，否则导航压住表单 */
+            .config-form {
+                --nav-reserve: 204px;
+                max-width: calc(var(--nav-reserve) + 1040px);
+                padding-left: var(--nav-reserve);
+            }
+        }
+        /* 收掉 V3 的多列网格：一行一个字段，右侧控件对齐成一列 */
+        .config-group { display: block; }
+        .config-group > .form-row {
+            display: flex;
+            flex-direction: row;
+            align-items: center;
+            gap: var(--sp-6);
+            padding: var(--sp-4) 0;
+            margin: 0;
+            border-top: 1px solid var(--line);
+            min-width: 0;
+        }
+        .config-group > h3 + .form-row,
+        .config-group > .config-subtitle + .form-row,
+        .config-group > .sub-desc + .form-row,
+        .config-group > .form-row:first-of-type { border-top: none; }
+        /* 左列：标题 + 说明（说明由 buildConfigRow 放进 .field-label） */
+        .config-group > .form-row > .field-label {
+            flex: 1 1 auto;
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 3px;
+        }
+        .config-group > .form-row > .field-label > label {
+            width: auto;
+            padding-top: 0;
+            font-size: var(--fs-base);
+            font-weight: var(--fw-medium);
+            color: var(--ink);
+        }
+        .config-group > .form-row .field-label .field-desc {
+            margin: 0;
+            font-size: var(--fs-xs);
+            color: var(--ink-3);
+            line-height: var(--lh-normal);
+        }
+        /* 右列：控件。固定一档宽度，整页输入框的右边线才会对齐 */
+        .config-group > .form-row > .field-wrapper {
+            flex: 0 1 320px;
+            min-width: 200px;
+            display: flex;
+            flex-direction: column;
+            gap: var(--sp-1);
+            align-items: stretch;
+        }
+        /* 开关字段：控件是拨动卡，按内容宽度贴右即可 */
+        .config-group > .form-row:has(.enable-card) > .field-wrapper { flex: 0 0 auto; min-width: 0; }
+        /* 多行文本：标题在上、控件通栏，长文本才有地方写 */
+        .config-group > .form-row:has(textarea) {
+            flex-direction: column;
+            align-items: stretch;
+            gap: var(--sp-2);
+        }
+        .config-group > .form-row:has(textarea) > .field-wrapper { flex: 1 1 auto; min-width: 0; }
+        .config-group > .form-row > .field-wrapper > .field-hint { text-align: right; }
+        .config-group > .form-row:has(textarea) > .field-wrapper > .field-hint { text-align: left; }
+        @media (max-width: 900px) {
+            .config-group > .form-row { flex-direction: column; align-items: stretch; gap: var(--sp-2); }
+            .config-group > .form-row > .field-wrapper { flex: 1 1 auto; min-width: 0; }
+        }
+
+        /* ---------- 4.3 侧栏折叠：向左滑出，横向空间让给内容 ---------- */
+        :root { --content-left: var(--sidebar-w); }
+        .sidebar { transition: margin-left 0.30s var(--ease), opacity 0.24s var(--ease); }
+        body.sidebar-collapsed { --content-left: 0px; }
+        body.sidebar-collapsed .sidebar {
+            margin-left: calc(-1 * var(--sidebar-w));
+            opacity: 0;
+            pointer-events: none;
+        }
+        .anchor-nav { left: calc(var(--content-left) + 18px); }
+        /* 收起后左上角是展开按钮，锚点导航往下让一格 */
+        body.sidebar-collapsed .anchor-nav { top: 62px; }
+        @media (min-width: 761px) {
+            body.sidebar-collapsed .main-content { padding-left: 64px; }
+        }
+
+        /* 侧栏品牌行右侧的「收起」按钮 */
+        .sidebar-toggle {
+            flex: 0 0 auto;
+            margin-left: auto;
+            width: 30px; height: 30px;
+            display: inline-flex; align-items: center; justify-content: center;
+            border: none; border-radius: var(--radius-ctl);
+            background: rgba(255, 255, 255, 0.16);
+            color: #fff;
+            cursor: pointer;
+            transition: background 0.16s var(--ease), transform 0.16s var(--ease);
+        }
+        .sidebar-toggle:hover { background: rgba(255, 255, 255, 0.30); }
+        .sidebar-toggle:active { transform: scale(0.92); }
+        .sidebar-toggle .ic { width: 17px; height: 17px; }
+
+        /* 收起后内容区左上角的常驻「展开」按钮 */
+        .sidebar-expand-btn {
+            position: fixed; top: 14px; left: 14px;
+            z-index: var(--z-sticky);
+            width: 34px; height: 34px;
+            display: none; align-items: center; justify-content: center;
+            border: 1px solid var(--line);
+            border-radius: var(--radius-ctl);
+            background: var(--surface);
+            color: var(--ink-2);
+            box-shadow: var(--shadow-sm);
+            cursor: pointer;
+            transition: background 0.16s var(--ease), color 0.16s var(--ease),
+                        border-color 0.16s var(--ease), transform 0.16s var(--ease);
+        }
+        body.sidebar-collapsed .sidebar-expand-btn { display: inline-flex; }
+        .sidebar-expand-btn:hover {
+            color: var(--brand-dark);
+            border-color: var(--brand);
+            transform: translateY(-1px);
+        }
+        .sidebar-expand-btn .ic { width: 18px; height: 18px; }
+        /* 窄屏侧栏是顶部横向导航条，没有「折叠」这一说 */
+        @media (max-width: 760px) {
+            .sidebar-toggle, .sidebar-expand-btn { display: none !important; }
+            body.sidebar-collapsed .sidebar { margin-left: 0; opacity: 1; pointer-events: auto; }
+            body.sidebar-collapsed .main-content { padding-left: 12px; }
+            .config-group, .section-block { padding: 16px 14px; }
+        }
     </style>
 </head>
 <body>
-    <div class="sidebar">
+    <div class="sidebar" id="sidebar">
         <div class="logo" id="logo-btn" title="程序历史版本">
             <span class="logo-mark" aria-hidden="true"><img class="ic" src="/favicon.ico" alt=""></span>
             <span class="logo-text">
                 <span class="logo-name">Lovomo</span>
                 <span class="logo-version" id="logo-version"></span>
             </span>
+            <button type="button" class="sidebar-toggle" id="sidebar-collapse-btn"
+                    data-icon="chevronLeft" data-icon-only title="收起侧栏" aria-label="收起侧栏"
+                    aria-controls="sidebar" aria-expanded="true"></button>
         </div>
         <div class="menu-item active" data-panel="config" data-icon="sliders">配置文件</div>
         <div class="menu-item" data-panel="connections" data-icon="swap">接入方式</div>
@@ -1968,6 +2140,9 @@
         </div>
     </div>
     <div class="main-content">
+        <button type="button" class="sidebar-expand-btn" id="sidebar-expand-btn"
+                data-icon="chevronRight" data-icon-only title="展开侧栏" aria-label="展开侧栏"
+                aria-controls="sidebar" aria-expanded="false"></button>
         <div class="panel active" id="panel-config">
             <div class="config-form">
                 <div id="config-groups"></div>
@@ -3097,6 +3272,8 @@
         const I18N_ATTRS = ['title', 'placeholder', 'alt', 'aria-label'];
 
         const I18N_EN = {
+            "收起侧栏": "Collapse sidebar",
+            "展开侧栏": "Show sidebar",
             "· 难度调高以后她还是很难靠近": "· She is still hard to get close to at a higher difficulty",
             "：这是设计而不是故障 —— 难度越高，角色越是一个独立而自洽的人：有自己的目标、底线、执念与拒绝权，礼物、情话与长时间陪伴都换不走她的心，需要你理解她的过去、尊重她的底线、在关键节点做出符合她逻辑的选择；她也可能到最后也没有选择你。想让她好说话一些就调到「简单」，想保留好感节奏但别那么难就调「普通」。": ": that is by design, not a fault — the higher the level, the more self-consistent the character is, with her own goals, boundaries, obsessions and the right to refuse; gifts, sweet talk and long company do not buy her heart, and it takes understanding her past, respecting her limits and making choices that fit her logic at the decisive moments, and she may end up not choosing you at all. Switch to Easy to make her easier to approach, or keep Normal for the usual affection pace without the extra difficulty.",
             "简单 / 普通 / 困难 / 极难，决定角色有多“不好拿下”，默认普通": "Easy / Normal / Hard / Very hard — how hard the character is to win over; Normal by default",
@@ -5399,7 +5576,11 @@
             chart: '<path d="M3 20.5h18"/><rect x="4.8" y="11" width="3.6" height="7" rx="1"/><rect x="10.2" y="5" width="3.6" height="13" rx="1"/><rect x="15.6" y="14" width="3.6" height="4" rx="1"/>',
             sparkles: '<path d="M11 3.5l1.7 4.6 4.6 1.7-4.6 1.7L11 16.1 9.3 11.5 4.7 9.8l4.6-1.7z"/><path d="M18.5 15l.7 1.9 1.9.7-1.9.7-.7 1.9-.7-1.9-1.9-.7 1.9-.7z"/>',
             terminal: '<rect x="3.5" y="5.5" width="17" height="13" rx="2"/><path d="m7.5 10 2.5 2.5-2.5 2.5"/><path d="M12.5 15h4"/>',
-            book: '<path d="M12 7.5v12.5"/><path d="M12 7.5A3 3 0 0 0 9 4.5H4.5v12H9a3 3 0 0 1 3 3"/><path d="M12 7.5a3 3 0 0 1 3-3h4.5v12H15a3 3 0 0 0-3 3"/>'
+            book: '<path d="M12 7.5v12.5"/><path d="M12 7.5A3 3 0 0 0 9 4.5H4.5v12H9a3 3 0 0 1 3 3"/><path d="M12 7.5a3 3 0 0 1 3-3h4.5v12H15a3 3 0 0 0-3 3"/>',
+            /* 侧栏收起 / 展开 */
+            chevronLeft: '<path d="M14.5 6 8.5 12l6 6"/>',
+            chevronRight: '<path d="M9.5 6l6 6-6 6"/>',
+            chevronDown: '<path d="M6 9.5l6 6 6-6"/>'
         };
 
         function icon(name, extraClass) {
@@ -6042,7 +6223,67 @@
             }
             return retry;
         }
-        async function apiGet(path) {
+        /* ---------- 请求去重 + 面板新鲜度缓存 ----------
+         * 两件事都只为一个目标：同一份数据不要反复拉。
+         *  · apiGet 去重：同一个 GET 已经在飞行时，后来的调用复用同一个 Promise；
+         *  · 面板缓存：几秒内来回切面板不重拉（TTL 见 PANEL_TTL_MS）。
+         * 只对 GET 去重——POST 这类有副作用的请求绝不能合并。 */
+        const apiGetInFlight = new Map();
+        const PANEL_TTL_MS = {
+            chat: 10000, 'test-chat': 10000, tasks: 10000, stats: 10000,
+            audio: 60000, connections: 60000,
+            plugins: 120000, 'installed-plugins': 120000,
+            'plugin-history': 120000, 'plugin-webui': 120000,
+            advanced: 300000, 'app-releases': 300000
+        };
+        const panelLoadedAt = Object.create(null);
+        function markPanelLoaded(panelId) { panelLoadedAt[panelId] = Date.now(); }
+        function invalidatePanel(panelId) { if (panelId) delete panelLoadedAt[panelId]; }
+        /* 写操作之后谁都不敢保证列表与统计还准：直接把所有面板标记成待重拉 */
+        function invalidatePanelCache() {
+            for (const k of Object.keys(panelLoadedAt)) delete panelLoadedAt[k];
+        }
+        function panelFresh(panelId) {
+            const ttl = PANEL_TTL_MS[panelId];
+            if (!ttl) return false;
+            const at = panelLoadedAt[panelId];
+            return !!at && (Date.now() - at) < ttl;
+        }
+        /* switchPanel 里每个面板各自的拉取动作收在这一张表里 */
+        const PANEL_LOADERS = {
+            chat: () => loadChatList(),
+            'test-chat': () => loadTestChat(),
+            audio: () => loadAudioPage(),
+            tasks: () => loadTasksPage(),
+            stats: () => loadStatsPage(),
+            connections: () => loadConnections(),
+            advanced: () => loadAdvancedPage(),
+            plugins: () => Promise.all([loadPluginsPage(), loadPublishPanel()]),
+            'installed-plugins': () => loadInstalledPlugins(),
+            'plugin-history': () => loadPluginHistoryPage(),
+            'plugin-webui': () => loadPluginWebuiPage(),
+            'app-releases': () => loadReleases(false)
+        };
+        function runPanelLoader(panelId) {
+            const loader = PANEL_LOADERS[panelId];
+            if (!loader || panelFresh(panelId)) return;
+            // 只有成功才算「新鲜」，失败要留给下一次进入重试的机会
+            Promise.resolve()
+                .then(() => loader())
+                .then(() => markPanelLoaded(panelId))
+                .catch(e => { console.warn('[panel] 加载失败：' + panelId, e); });
+        }
+        function apiGet(path) {
+            const key = String(path);
+            const running = apiGetInFlight.get(key);
+            if (running) return running;
+            const p = apiGetUncached(key).finally(() => {
+                if (apiGetInFlight.get(key) === p) apiGetInFlight.delete(key);
+            });
+            apiGetInFlight.set(key, p);
+            return p;
+        }
+        async function apiGetUncached(path) {
             const resp = await fetchGuarded(`${API_BASE}/${path}`);
             authOrThrow(resp);
             if (!resp.ok) {
@@ -6064,6 +6305,7 @@
                 try { const p = await resp.json(); if (p && p.error) msg = p.error; } catch (e) {}
                 throw new Error(msg);
             }
+            invalidatePanelCache();
             return await resp.json();
         }
         async function apiPostForm(path, formData) {
@@ -6074,6 +6316,7 @@
                 try { const p = await resp.json(); if (p && p.error) msg = p.error; } catch (e) {}
                 throw new Error(msg);
             }
+            invalidatePanelCache();
             return await resp.json();
         }
         // 桌面窗口模式下服务端已弹系统保存框写盘（WebView2 默认禁止页面下载，
@@ -7296,18 +7539,9 @@
             document.getElementById('profile-float-actions').classList.toggle('active', panelId === 'profiles');
             document.getElementById('plugin-apply-bar')
                 .classList.toggle('active', panelId === 'plugin-page');
-            if (panelId === 'chat') loadChatList();
-            if (panelId === 'test-chat') loadTestChat();
-            if (panelId === 'audio') loadAudioPage();
-            if (panelId === 'tasks') loadTasksPage();
-            if (panelId === 'stats') loadStatsPage();
-            if (panelId === 'connections') loadConnections();
-            if (panelId === 'advanced') loadAdvancedPage();
-            if (panelId === 'plugins') { loadPluginsPage(); loadPublishPanel(); }
-            if (panelId === 'installed-plugins') loadInstalledPlugins();
-            if (panelId === 'plugin-history') loadPluginHistoryPage();
-            if (panelId === 'plugin-webui') loadPluginWebuiPage();
-            if (panelId === 'app-releases') loadReleases(false);
+            // 面板数据统一走新鲜度缓存：几秒内来回切面板复用上一次的结果，
+            // 不再每切一次就把整包数据重拉一遍
+            runPanelLoader(panelId);
             if (panelId === 'logs') startLogPolling();
             else stopLogPolling();
             if (panelId !== 'stats') stopPerfPolling();
@@ -7328,6 +7562,54 @@
                 }
             });
         });
+
+        /* ---------- 侧栏折叠 ----------
+         * 收起 = 侧栏向左滑出并让出横向空间，内容区左上角常驻一颗展开按钮。
+         * 状态记忆在 localStorage，下次打开保持原样；≤760px 时侧栏是顶部横条，
+         * 那两个按钮由 CSS 直接隐藏，这里不做特殊处理。 */
+        const SIDEBAR_COLLAPSE_KEY = 'lovomo_sidebar_collapsed';
+        function sidebarCollapsed() {
+            return document.body.classList.contains('sidebar-collapsed');
+        }
+        function applySidebarCollapsed(collapsed, persist) {
+            document.body.classList.toggle('sidebar-collapsed', !!collapsed);
+            const collapseBtn = document.getElementById('sidebar-collapse-btn');
+            if (collapseBtn) collapseBtn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+            const expandBtn = document.getElementById('sidebar-expand-btn');
+            if (expandBtn) expandBtn.setAttribute('aria-expanded', collapsed ? 'true' : 'false');
+            if (persist) {
+                try { localStorage.setItem(SIDEBAR_COLLAPSE_KEY, collapsed ? '1' : '0'); } catch (e) {}
+            }
+        }
+        function toggleSidebar() {
+            applySidebarCollapsed(!sidebarCollapsed(), true);
+        }
+        (function initSidebarCollapsed() {
+            let saved = null;
+            try { saved = localStorage.getItem(SIDEBAR_COLLAPSE_KEY); } catch (e) {}
+            applySidebarCollapsed(saved === '1', false);
+        })();
+        (function bindSidebarCollapse() {
+            const collapseBtn = document.getElementById('sidebar-collapse-btn');
+            // 品牌区整块绑的是「程序历史版本」弹窗，折叠按钮得把点击拦住，
+            // 否则收起侧栏会顺手弹出历史版本
+            if (collapseBtn) collapseBtn.addEventListener('click', (ev) => {
+                ev.stopPropagation();
+                toggleSidebar();
+            });
+            const expandBtn = document.getElementById('sidebar-expand-btn');
+            if (expandBtn) expandBtn.addEventListener('click', () => toggleSidebar());
+            // Ctrl/Cmd+B：和大多数编辑器一致
+            document.addEventListener('keydown', (ev) => {
+                if (!(ev.ctrlKey || ev.metaKey) || ev.shiftKey || ev.altKey) return;
+                if (ev.key !== 'b' && ev.key !== 'B') return;
+                const el = ev.target;
+                if (el && (el.isContentEditable
+                    || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName || ''))) return;
+                ev.preventDefault();
+                toggleSidebar();
+            });
+        })();
 
         function setPluginMenuChevron(open) {
             const chevron = document.getElementById('plugin-menu-chevron');
@@ -7828,15 +8110,20 @@
                 optMark.textContent = '【可选】';
                 label.appendChild(optMark);
             }
-            row.appendChild(label);
-            const wrapper = document.createElement('div');
-            wrapper.className = 'field-wrapper';
+            // 左列：标题 + 说明。说明跟在标题下面（而不是控件下面），
+            // 这一行就成了「左标题说明 / 右控件」，和设置页的清单形态一致。
+            const labelBox = document.createElement('div');
+            labelBox.className = 'field-label';
+            labelBox.appendChild(label);
             if (meta.description) {
                 const desc = document.createElement('div');
                 desc.className = 'field-desc';
                 desc.textContent = meta.description;
-                wrapper.appendChild(desc);
+                labelBox.appendChild(desc);
             }
+            row.appendChild(labelBox);
+            const wrapper = document.createElement('div');
+            wrapper.className = 'field-wrapper';
             const controlRow = document.createElement('div');
             controlRow.style.cssText = 'display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap;';
             if (meta.type === 'boolean') {

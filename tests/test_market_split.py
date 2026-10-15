@@ -534,11 +534,20 @@ def h4():
 def i1():
     """程序历史版本已搬到独立面板，由 logo（Lovomo + 版本号）进入。"""
     for need in ('id="panel-app-releases"', 'id="logo-btn"',
-                 "switchPanel('app-releases')",
-                 "if (panelId === 'app-releases') loadReleases(false);"):
+                 "switchPanel('app-releases')"):
         if need not in HTML_SRC:
             print("      前端缺少:", need)
             return False
+    # 去重复请求改版后，switchPanel 里逐个 if 的写法收进了 PANEL_LOADERS 表，
+    # 这里改为校验这张映射表里还挂着程序历史版本的加载动作
+    i = HTML_SRC.find("const PANEL_LOADERS = {")
+    if i < 0:
+        print("      前端缺少:", "const PANEL_LOADERS = {")
+        return False
+    block = HTML_SRC[i:HTML_SRC.find("};", i)]
+    if "'app-releases': () => loadReleases(false)" not in block:
+        print("      前端缺少:", "'app-releases': () => loadReleases(false)")
+        return False
     return True
 
 
