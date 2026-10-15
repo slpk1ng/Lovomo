@@ -2042,6 +2042,10 @@
             margin-left: auto;
             align-items: flex-end;
         }
+        /* 控件列靠右：数值框 / 下拉框这类按内容撑开的控件与右侧复位按钮连成一组贴在最右 */
+        .config-group > .form-row .field-control,
+        .config-form .field-control { justify-content: flex-end; }
+
         .config-group > .form-row .enable-card {
             width: auto;
             min-width: 0;
@@ -7027,12 +7031,13 @@
             return appDialogOpen({title: title || '确认', message, okText: '确定'});
         }
 
-        /* 三选一：确定 = 清理（关系 + 画像一起清），第二个按钮 = 不清理（保留），取消 = 什么都不做 */
+        /* 三选一：确定 = 不清理（保留关系与画像，默认的无害选项），第二个按钮 = 清理关系与画像（不可逆），取消 = 什么都不做 */
         function uiConfirmClean(message, title) {
             return appDialogOpen({title: title || '删除会话', message,
-                                  okText: '清理关系与画像',
-                                  altText: '不清理（保留关系与画像）',
-                                  altValue: 'keep'});
+                                  okText: '不清理（保留关系与画像）',
+                                  altText: '清理关系与画像',
+                                  altValue: 'clean',
+                                  altClass: 'btn-red'});
         }
 
         function uiPrompt(message, defaultValue, title) {
@@ -8232,6 +8237,7 @@
             const wrapper = document.createElement('div');
             wrapper.className = 'field-wrapper';
             const controlRow = document.createElement('div');
+            controlRow.className = 'field-control';
             controlRow.style.cssText = 'display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap;';
             if (meta.type === 'boolean') {
                 const checkboxWrapper = document.createElement('label');
@@ -8415,7 +8421,7 @@
                 resetBtn.textContent = '↺';
                 resetBtn.title = '恢复默认值：' + defaults[key];
                 resetBtn.style.cssText = 'width:20px;height:20px;min-width:20px;flex:0 0 auto;'
-                    + 'font-size: var(--fs-sm);line-height:1;padding:0;margin-left:auto;cursor:pointer;'
+                    + 'font-size: var(--fs-sm);line-height:1;padding:0;margin-left:0;cursor:pointer;'
                     + 'border-radius:50%;border:1px solid #888;background:transparent;color:#888;';
                 resetBtn.addEventListener('click', () => applyFieldValue(key, defaults[key], scope));
                 controlRow.appendChild(resetBtn);
@@ -9312,10 +9318,11 @@
             const choice = await uiConfirmClean(
                 `确定删除选中的 ${selectedFiles.size} 个文件？\n` +
                 `两种删法都会清掉该会话的心情、心情日记、承诺与主动消息状态，删掉就无法恢复。\n` +
-                `「清理关系与画像」= 连这位用户（群聊里是每位成员）的关系进度与用户画像一起清空，回到「陌生」；\n` +
-                `「不清理」= 只删会话记录，关系进度与用户画像原样保留。`);
+                `「不清理（保留关系与画像）」（默认）= 只删会话记录，关系进度与用户画像原样保留；\n` +
+                `「清理关系与画像」（红色，不可逆）= 连这位用户（群聊里是每位成员）的关系进度与用户画像一起清空，回到「陌生」。`);
             if (!choice) return;
-            const cleanAffection = choice === true;
+            /* 主按钮（确定）= 不清理；红色次按钮 = 清理，返回 'clean' */
+            const cleanAffection = choice === 'clean';
             try {
                 const files = Array.from(selectedFiles);
                 const result = await apiPost('api/delete', { files, clean_affection: cleanAffection });

@@ -7,7 +7,7 @@
 
 - Interface refresh: the settings page is now a card-based list — every group is a rounded white card, each row inside puts the title and its description on the left and the control on the right, and only a hairline separates one row from the next; spacing is roomier overall, wide screens fit two fields per row, and narrow screens stack each row vertically.
 
-- Sidebar and settings polish: while the sidebar is open only the collapse button at the right end of the brand row stays visible; once collapsed, an expand button waits in the content area's top-left corner (clicking slides the sidebar out to the left, clicking again slides it back, and so on). Every settings row now keeps just the switch itself pinned to its far right, descriptions and hints wrap instead of running off the screen, number-only fields grow to fit their content (about four digits by default, capped at 140px), and wide screens fit two fields per row.
+- Sidebar and settings polish: while the sidebar is open only the collapse button at the right end of the brand row stays visible; once collapsed, an expand button waits in the content area's top-left corner (clicking slides the sidebar out to the left, clicking again slides it back, and so on). Controls sit flush right (a number field or dropdown now packs together with the reset button on its right instead of floating mid-row), every settings row keeps just the switch itself pinned to its far right, descriptions and hints wrap instead of running off the screen, number-only fields grow to fit their content (about four digits by default, capped at 140px), and wide screens fit two fields per row.
 
 - Statistics and scheduled-task panels: an always-there refresh button in the bottom-right corner drops that panel's cache and reloads it on click.
 
@@ -25,7 +25,7 @@
 
 - Repeated requests: switching sidebar panels no longer re-downloads everything on every visit — a panel's result is reused while it is fresh (10 seconds to 5 minutes, depending on the panel), any write invalidates it immediately, and concurrent GETs to the same endpoint are merged into one request; the Advanced features page, which used to fire five requests at once when opened, no longer repeats them inside that window.
 
-- Deleting a session: there used to be just one way to delete; the dialog now offers two choices — "clear relations & profile" (wiping relationship progress and the user profile back to "stranger", per user for private chats and per member for group chats) or "keep them" (only the session records go, relationship progress and profiles stay exactly as they are).
+- Deleting a session: there used to be just one way to delete; the dialog now offers two choices — "clear relations & profile" (wiping relationship progress and the user profile back to "stranger", per user for private chats and per member for group chats) or "keep them" (only the session records go, relationship progress and profiles stay exactly as they are; "keep them" is the default button and "clear relations & profile" is a red secondary one, so an irreversible wipe can never be one stray click away).
 
 ### v1.2.4.0
 
