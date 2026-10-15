@@ -23,13 +23,17 @@ from modules.companion_tasks import (background_ready, mood_diary_note,
                                      ACTION_NOW_HINT, _mood_bounds_now)
 from modules.config_loader import typing_client
 from modules.llm_helpers import (RoleContext, build_speaker_labels, identity_note,
+                                 chat_once, extract_json,
                                  recent_user_ids, wants_mention_request,
                                  wants_quote_request, wants_repeat_request,
                                  sentence_actions_note, action_receipts_note,
+                                 _ACTION_FAIL_REASONS,
                                  speaker_labeled_lines,
                                  MENTION_ALL_ID,
                                  MENTION_PLACEHOLDER, strip_mention_placeholder,
                                  POKE_MESSAGE_TEXT, recall_request_kind,
+                                 wants_mute_request, wants_self_mute,
+                                 mute_request_seconds,
                                  image_self_claim, IMAGE_CLAIM_WARNING,
                                  record_sent_links, urls_in_text, error_reply_text,
                                  repair_sentence_lang)
@@ -42,7 +46,8 @@ from modules.media_cache import (pick_media_source, refresh_image_urls,
                                  _diary_recognition_note)
 from modules.mood import (clamp, commit_mood, current_mood, judge_and_decide,
                           judge_enabled, mood_enabled, mood_style,
-                          affection_enabled, stored_mood)
+                          affection_enabled, stored_mood,
+                          fixed_reply_probability)
 from modules.promises import PROMISE_HINT_RE
 from modules.proactive_state import save_proactive_state
 from modules.sender import RECALL_DENY, can_recall_others
@@ -59,7 +64,7 @@ from modules.reply_pipeline import (SentenceSink, generate_reply, _spawn,
 from modules.session_context import (_session_whitelisted, _allow_message,
                                      get_active_ctx, reply_ctx_of,
                                      get_role_emotions, resolve_target_roles,
-                                     _fetch_member_name)
+                                     config_for_client, _fetch_member_name)
 from modules.tts_service import ensure_tts_service
 from modules.webui_common import (_dispatch_plugin_command,
                                   _dispatch_plugin_message, _plugin_runtime)
@@ -68,6 +73,9 @@ from napcat import (PrivateMessageEvent, GroupMessageEvent, Text, Record,
 
 
 _SESSION_PENDING: Dict[str, dict] = {}
+# 每个会话最近收到的那条消息 id（含没被@、不回复的群消息）：回复生成完时发现
+# 已经不是要回的那条了，说明那条被别人的消息刷下去了，得引用它再回
+_SESSION_LAST_INCOMING: Dict[str, str] = {}
 # 连发消息的等待窗口：收到一条后先等这么久，期间又来消息就重新计时，
 # 等对方把话说完再回。窗口太短会变成「说一句回一句」，对方还没打完就抢答。
 _COALESCE_WINDOW = 1.2
@@ -136,7 +144,7 @@ def _extract_event_info(event, client) -> Optional[dict]:
         group_id = event.group_id
         sender_id = getattr(event.sender, "user_id", None) or "0"
         session_id = f"group_{group_id}"
-        if app_context.global_config.get("isolated_session", False):
+        if app_context.active_config().get("isolated_session", False):
             session_id = f"group_{group_id}_{sender_id}"
     silent = False
     if not is_private and not at_bot:
@@ -144,11 +152,11 @@ def _extract_event_info(event, client) -> Optional[dict]:
         # 才能知道引用的是不是机器人（是则视同 @）。引用他人消息的做法是在
         # process_message 里、回查之后再按同一套配置拦下。
         if reply_seg is None:
-            if app_context.global_config.get("only_private", False):
+            if app_context.active_config().get("only_private", False):
                 return None
             # 没被@的群消息不回复，但仍要记进历史：模型下一条被@时才有上下文，
             # 聊天记录页也要能看到这些消息。
-            silent = bool(app_context.global_config.get("group_need_at", True))
+            silent = bool(app_context.active_config().get("group_need_at", True))
     if not user_text and not has_image and not has_voice and not forward_ids:
         return None
     return {"session_id": session_id, "event": event, "client": client,
@@ -281,6 +289,91 @@ def _queue_unaddressed_message(session_id: str, text: str, has_image: bool,
         pass
 
 
+# 智能回复：先判断对方说完了没，判定为「还没说完」时最多再等这么久；
+# 这段时间内没有新消息就直接回复。轮询间隔决定来了新消息后多久重新判定。
+DEFAULT_SMART_REPLY_DELAY_SECONDS = 10.0
+_SMART_REPLY_POLL_SECONDS = 0.5
+_SMART_REPLY_JUDGE_TIMEOUT = 20.0
+# 配置里没填提示词时用的判定指令
+DEFAULT_SMART_REPLY_PROMPT = (
+    "判断对话中最后一条用户消息是不是已经说完了。"
+    "话说到一半（末尾是逗号、顿号、省略号或连接词，明显还有下半句）、"
+    "正在分多条补充、列举或描述尚未结束，都算没说完；"
+    "否则算说完了。只输出一个 JSON 对象：{\"finished\": true 或 false}，"
+    "禁止输出任何其它文字、解释或 Markdown。"
+)
+
+
+def _config_flag(key: str, default: bool = False) -> bool:
+    config = app_context.active_config()
+    raw = config.get(key, default) if config else default
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("true", "1", "yes", "y", "on", "是", "开启")
+
+
+def smart_reply_enabled() -> bool:
+    return _config_flag("smart_reply_enabled", False)
+
+
+def _smart_reply_delay() -> float:
+    config = app_context.active_config()
+    raw = config.get("smart_reply_delay_seconds", DEFAULT_SMART_REPLY_DELAY_SECONDS) \
+        if config else DEFAULT_SMART_REPLY_DELAY_SECONDS
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return DEFAULT_SMART_REPLY_DELAY_SECONDS
+
+
+def _parse_finished(raw) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    text = str(raw or "").strip().lower()
+    if text in ("false", "0", "no", "n", "off", "没说完", "否"):
+        return False
+    return True
+
+
+async def _user_finished_speaking(pending: dict) -> bool:
+    """问一次模型「对方说完了没」；问不出来时按说完了处理，不拖着回复不发。"""
+    text = str(pending.get("text") or "").strip()
+    if not text:
+        return True
+    ctx = get_active_ctx()
+    prompt = str(ctx.get("smart_reply_prompt", "") or "").strip() or DEFAULT_SMART_REPLY_PROMPT
+    messages = [{"role": "system", "content": prompt},
+                {"role": "user", "content": f"对话中最后一条用户消息是：{text}"}]
+    try:
+        result = await asyncio.wait_for(chat_once(ctx, messages, label="智能回复判定"),
+                                        timeout=_SMART_REPLY_JUDGE_TIMEOUT)
+    except Exception as e:
+        print(f"智能回复判定失败，按「说完了」处理: {type(e).__name__}: {e}")
+        return True
+    obj = extract_json((result or {}).get("content") or "")
+    if not isinstance(obj, dict):
+        return True
+    return _parse_finished(obj.get("finished", True))
+
+
+async def _smart_reply_hold(pending: dict) -> bool:
+    """智能回复的等待判定：返回 True 表示还要继续等，False 表示可以回复了。
+
+    判定结果按「这批消息的最后一条」缓存：期间又来了消息就重新判定一次。
+    """
+    if not smart_reply_enabled():
+        return False
+    last_at = float(pending.get("last_at") or 0)
+    if float(pending.get("smart_judged_at") or 0) != last_at:
+        pending["smart_judged_at"] = last_at
+        pending["smart_until"] = 0.0
+        if not await _user_finished_speaking(pending):
+            pending["smart_until"] = time.monotonic() + _smart_reply_delay()
+            print("智能回复：判断对方还没说完，先等一会儿；期间没有新消息就直接回复。")
+    until = float(pending.get("smart_until") or 0)
+    return bool(until) and time.monotonic() < until
+
+
 async def _fetch_user_nickname(client, user_id: str, group_id=None) -> str:
     """戳一戳通知里没有昵称：单独问一次，别把 QQ 号当成昵称写进用户画像。"""
     if group_id:
@@ -320,6 +413,15 @@ async def _poke_to_message_event(event, client):
 
 async def handle_message_event(event, client):
     app_context.napcat_client = client
+    # 这条接入方式绑了配置文件时，整条处理链路（会话判定、提示词、发送）都用那份配置
+    token = app_context.set_active_config(config_for_client(client))
+    try:
+        await _dispatch_message_event(event, client)
+    finally:
+        app_context.reset_active_config(token)
+
+
+async def _dispatch_message_event(event, client):
     if isinstance(event, (FriendPokeEvent, GroupPokeEvent)):
         event = await _poke_to_message_event(event, client)
         if event is None:
@@ -327,6 +429,9 @@ async def handle_message_event(event, client):
     info = _extract_event_info(event, client)
     if info is None:
         return
+    incoming_mid = str(getattr(event, "message_id", "") or "")
+    if incoming_mid:
+        _SESSION_LAST_INCOMING[info["session_id"]] = incoming_mid
     # 记住这条会话是从哪条接入方式来的：主动消息、提醒才知道该往哪条发
     if app_context.sender is not None:
         app_context.sender.remember_session(info.get("session_id"), client)
@@ -384,6 +489,10 @@ async def handle_message_event(event, client):
                 if idle < _COALESCE_WINDOW:
                     await asyncio.sleep(_COALESCE_WINDOW - idle)
                     continue
+                # 智能回复：判断对方说完没有，没说完就再等一段
+                if await _smart_reply_hold(pending):
+                    await asyncio.sleep(_SMART_REPLY_POLL_SECONDS)
+                    continue
                 pending = _SESSION_PENDING.pop(session_id, None)
                 if pending is None:
                     break
@@ -393,6 +502,28 @@ async def handle_message_event(event, client):
             print(f"会话 {session_id} 消息处理异常: {type(e).__name__}: {e}")
         finally:
             _SESSION_PENDING.pop(session_id, None)
+
+
+def _mute_candidates(at_ids, quoted_user_id, speaker_id, bot_id,
+                     recent_other_id="", self_request=False) -> list:
+    """这一轮允许禁言的号码，按「这一轮针对谁」排序：
+    @到的人 → 被引用的人 → 刚刚在说话的那个人 → 主人自己（仅当他明说要禁言自己）。
+
+    名单之外的号码一律不认，免得模型编一个号就把无辜群成员禁言了。
+    主人自己开口要求禁言时他不在名单里：他说的是「他」，把提要求的人自己禁掉是
+    明显的错人（表现就是主人当场反问「不是禁言我」）。
+    """
+    candidates = [str(q) for q in (at_ids or [])
+                  if str(q).isdigit() and str(q) != str(bot_id)]
+    for extra in (quoted_user_id, recent_other_id):
+        value = str(extra or "")
+        if value.isdigit() and value != str(bot_id) and value not in candidates:
+            candidates.append(value)
+    requester = str(speaker_id or "")
+    if self_request and requester.isdigit() and requester != str(bot_id) \
+            and requester not in candidates:
+        candidates.append(requester)
+    return candidates
 
 
 async def _process_message_event(event, client, merged: Optional[dict] = None):
@@ -411,14 +542,17 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
         session_type = "group"
         target_id = group_id
         session_id = f"group_{group_id}"
-        if app_context.global_config.get("isolated_session", False):
+        if app_context.active_config().get("isolated_session", False):
             session_id = f"group_{group_id}_{sender_id}"
 
     sender_name = getattr(event.sender, "nickname", None) or str(sender_id)
     # 用户画像的昵称默认就是对方的 QQ 昵称：只在还没有昵称时补上，之后不会被自动改写
-    if app_context.profile_mgr is not None and app_context.global_config.get("profiles_enabled", False):
+    if app_context.profile_mgr is not None and app_context.active_config().get("profiles_enabled", False):
         app_context.profile_mgr.remember_nickname(sender_id, getattr(event.sender, "nickname", ""))
     incoming_message_id = getattr(event, "message_id", None)
+    # 本轮发言者在群里的角色（owner/admin/member）：禁言与撤回别人的消息要靠它判权限，
+    # 带上就不用为了判权限再多查两次群成员资料
+    sender_role = str(getattr(getattr(event, "sender", None), "role", "") or "")
     user_text = ""
     has_image = False
     image_urls = []
@@ -525,9 +659,9 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                 at_names[qq] = ""
 
     if not is_private and not at_bot:
-        if app_context.global_config.get("only_private", False):
+        if app_context.active_config().get("only_private", False):
             return
-        if app_context.global_config.get("group_need_at", True):
+        if app_context.active_config().get("group_need_at", True):
             # 引用他人消息、又没@机器人：不回复，但消息要记进历史
             _remember_unaddressed_message(session_id, user_text, has_image,
                                           sender_id, sender_name, has_voice)
@@ -621,8 +755,8 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
     })
 
     # 待办提取（后台异步，不阻塞回复）
-    if app_context.global_config.get("todo_enabled", False) and app_context.todo_mgr:
-        mode = app_context.global_config.get("todo_extract_mode", "regex")
+    if app_context.active_config().get("todo_enabled", False) and app_context.todo_mgr:
+        mode = app_context.active_config().get("todo_extract_mode", "regex")
         if mode == "regex":
             found = app_context.todo_mgr.extract_sync(user_text)
             for content, remind_ts in found:
@@ -643,11 +777,13 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
 
     source_role_key = app_context.ROLE_CONNECTIONS.get(id(client), "")
     target_roles = resolve_target_roles(user_text, is_private, source_role_key)
-    max_total = max(1, int(app_context.global_config.get("multi_role_max_total", 6)))
+    max_total = max(1, int(app_context.active_config().get("multi_role_max_total", 6)))
     total_replies = 0
     first_reply_done = False
     # 最近一条真正发出去的回复（角色 + 台词）：回复之后要据此判断她有没有真动手
     replied: Dict = {}
+    # 本轮已由系统禁言过的号码：任务推进的接话轮同样不能对同一目标重复禁言
+    mute_state: Dict = {"done_ids": []}
 
     def _dispatch_reply_done(info: dict) -> None:
         """通知插件"这一轮 LLM 回复已经发完"。插件系统没启用就什么都不做。"""
@@ -675,6 +811,16 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
             # 先备好上下文与图片：审判判定"不回复"时也要能补记画面描述（见下）
             extra_parts = []
             jealousy_rival = ""
+            # 编号表按完整历史算一次，供提示词、历史窗口、系统动作说明与@候选共用：
+            # 历史窗口开了摘要后只是尾部几条，若在窗口里重新编号，同一标签会指向不同的人
+            speaker_labels = build_speaker_labels(history)
+            # 系统路径替她做掉的动作（主人要求撤回被引用/最近那条）也要记成回执：
+            # 只写进【本轮动作】提示词的话，判定那边只看到她台词里说「撤了」，
+            # 会以为她只是在嘴上答应
+            system_receipts: List[dict] = []
+            # 系统路径本轮已禁言过的号码：发送层据此不重复执行模型再填的同一动作
+            # （任务推进的接话轮通过 overrides 接着沿用这份名单）
+            mute_done_ids: List[str] = [str(q) for q in ((overrides or {}).get("mute_done_ids") or [])]
             # 主人明确要求撤回时不能指望模型填字段（它常常只在嘴上答应）：
             # 要撤的是她刚发过的那条就在这里立刻撤掉，要撤的是即将发出的这条
             # 则交给发送层，等回复发出去之后再撤。
@@ -683,35 +829,105 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
             # 只能是"别撤新回复"：否则模型顺着「撤回这条」把 recall 填成 true，撤掉的
             # 是它刚发出的新话，看着像撤错了对象
             send_recall_request = RECALL_DENY if recall_mode == "prev" else recall_mode
+            # 撤回别人的消息要撤的那一条：引用了谁的消息就撤谁，没引用就撤本轮触发消息
+            quoted_mid = str((quoted or {}).get("message_id") or "")
+            recall_other_id = quoted_mid or str(incoming_message_id or "")
+            # 「他」指的是刚刚在说话的那个人，不是提要求的主人自己：把主人塞进候选
+            # 会让「禁言他」变成「禁言我」（主人当场就会反问「不是禁言我」）
+            self_mute = wants_self_mute(own_text) if gate_reply else False
+            recent_other_id = next(
+                (q for q in recent_user_ids(history[-10:], limit=4,
+                                            exclude=str(client.self_id))
+                 if q != str(sender_id)), "")
+            mute_ids = _mute_candidates(at_ids, (quoted or {}).get("user_id"),
+                                        sender_id, client.self_id,
+                                        recent_other_id, self_mute)
             if recall_mode == "prev":
                 # 主人引用了机器人发过的某条消息说「撤回这条」：要撤的就是被引用的
                 # 那条，而不是最近发出去的那条（否则撤掉的是别的话，看着像撤错了）
-                quoted_mid = str((quoted or {}).get("message_id") or "")
                 quoted_own = str((quoted or {}).get("user_id") or "") == str(client.self_id)
+                allowed = False
                 if quoted_mid:
                     # 撤别人的消息要管理员权限：请求的人和机器人自己都得是管理员或群主，
                     # 否则一般群成员能借她的号删掉别人的消息
                     allowed = quoted_own or (not is_private and await can_recall_others(
-                        client, target_id, sender_id,
-                        str(getattr(event.sender, "role", "") or "")))
+                        client, target_id, sender_id, sender_role))
                     done = await app_context.sender.recall_message(
                         session_type, target_id, quoted_mid) if allowed else 0
                 else:
                     done = await app_context.sender.recall_recent(session_type, target_id)
                 print(f"撤回：主人要求撤回上一条，已撤回 {done} 条消息。")
+                system_receipts.append({
+                    "action": "撤回别人的消息" if (quoted_mid and not quoted_own) else "撤回",
+                    "ok": bool(done), "count": done or None,
+                    "reason": "" if done else (
+                        "denied" if (quoted_mid and not allowed) else "error"),
+                    "at": time.time()})
                 if done:
                     extra_parts.append(
                         "【本轮动作】主人这条消息是在要求撤回消息，系统已经撤掉了；"
                         "你只要自然地回一句就好，不要在台词里写「（撤回）」这类动作描述。")
                 else:
+                    # 撤不成只有两种原因：权限不够，或撤回接口本身失败。写明真实原因，
+                    # 免得模型自己往「消息太旧」「超时」上猜
+                    why = ("：主人没有撤回别人消息的管理权限"
+                           if quoted_mid and not allowed else "")
                     extra_parts.append(
-                        "【本轮动作】主人这条消息是在要求撤回消息，但系统没能撤掉"
-                        "（那条不是你说的话、你没有撤别人消息的权限，或者已经过去太久）；"
-                        "你只要如实回一句就好，不要说已经撤掉了。")
+                        f"【本轮动作】主人这条消息是在要求撤回消息，但系统这次没撤成{why}；"
+                        "你只要如实回一句就好，不要说已经撤掉了，也不要自己猜原因"
+                        "（别说消息太旧、超时这类话）。")
             elif recall_mode:
                 extra_parts.append(
                     "【本轮动作】主人这条消息是在要求撤回消息，系统已经处理；"
                     "你只要自然地回一句就好，不要在台词里写「（撤回）」这类动作描述。")
+            # 主人明确吩咐禁言时同样不能指望模型填字段（它常常只在嘴上答应，甚至谎报
+            # 「已成功禁言…」）：@ 了谁就禁谁（@ 了几个就禁几个），没 @ 就是刚刚说话的
+            # 那个人，明说要禁言自己时才是他本人 —— 直接执行，别让她答应一句再拖着
+            at_targets = [str(q) for q in at_ids
+                          if str(q) != str(client.self_id)
+                          and (str(q) != str(sender_id) or self_mute)]
+            if gate_reply and not is_private \
+                    and app_context.active_config().get("mute_enabled", True) \
+                    and wants_mute_request(own_text):
+                if self_mute:
+                    targets = [str(sender_id)]
+                elif at_targets:
+                    targets = at_targets
+                else:
+                    targets = [recent_other_id] if recent_other_id else []
+                if targets:
+                    mute_receipts = [await app_context.sender.mute_receipt(
+                        session_type, target_id, target,
+                        mute_request_seconds(own_text), sender_id, sender_role)
+                        for target in targets]
+                    system_receipts.extend(mute_receipts)
+                    mute_done_ids = [str(t) for t in targets]
+                    mute_state["done_ids"] = list(mute_done_ids)
+                    # 对象要写成她认识的编号标签：不写是谁被禁了，她下一句就会
+                    # 认错人（把「禁言了谁」安到当前发言者或主人头上）；
+                    # 多个目标时逐人写结果，免得一部分成功被她说成"都处理了"
+                    outcome = "；".join(
+                        f"{speaker_labels.get(str(t)) or f'QQ:{t}'} "
+                        + ("已禁言" if r.get("ok")
+                           else f"没禁成（{_ACTION_FAIL_REASONS.get(str(r.get('reason') or ''), '失败')}）")
+                        for t, r in zip(targets, mute_receipts))
+                    print(f"禁言：主人这条消息在要求禁言，结果 {outcome}。")
+                    if all(r.get("ok") for r in mute_receipts):
+                        extra_parts.append(
+                            f"【本轮动作】主人这条消息是在要求禁言，系统已经把 "
+                            f"{outcome}；你只要自然地回一句就好，"
+                            "不要在台词里宣布结果"
+                            "（「已成功禁言…」这类话一律不要写）。")
+                    else:
+                        extra_parts.append(
+                            f"【本轮动作】主人这条消息是在要求禁言，结果：{outcome}；"
+                            "你只要如实回一句就好，禁成的可以说已处理，"
+                            "没禁成的那个人要如实说明没禁成，"
+                            "不要把没禁成的也说成已经禁言了，也不要自己猜原因。")
+                else:
+                    extra_parts.append(
+                        "【本轮动作】主人这条消息是在要求禁言，但没说清是谁；"
+                        "你只要反问一句要禁言谁就好，不要自己挑一个人禁言。")
             # 奇遇 / 吃醋只认用户真的发来的消息；多角色自动接话轮不参与
             if gate_reply:
                 if app_context.encounter_mgr is not None:
@@ -722,8 +938,8 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                             f"【今日奇遇】你今天遇到了这样一件事：{adventure} "
                             "自然地找机会把它讲给对方听，可以顺势展开成一段小剧情。")
                         print(f"奇遇：{ctx.character_key} 今天的奇遇已带入本轮回复。")
-                if _to_float(app_context.global_config.get("mood_jealousy_penalty", 0), 0) != 0 \
-                        and bool(app_context.global_config.get("mood_enabled", True)):
+                if _to_float(app_context.active_config().get("mood_jealousy_penalty", 0), 0) != 0 \
+                        and bool(app_context.active_config().get("mood_enabled", True)):
                     jealousy_rival = _detect_rival_mention(trigger_text, ctx.character_key)
                     if jealousy_rival:
                         extra_parts.append(
@@ -734,9 +950,6 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
             allowed_at_ids = set() if is_private else {MENTION_ALL_ID}
             if not is_private:
                 allowed_at_ids.update(q for q in at_ids if q != str(client.self_id))
-            # 编号表按完整历史算一次，供提示词、历史窗口与@候选共用：
-            # 历史窗口开了摘要后只是尾部几条，若在窗口里重新编号，同一标签会指向不同的人
-            speaker_labels = build_speaker_labels(history)
             if not is_private:
                 current_label = speaker_labels.get(str(sender_id), "")
                 extra_parts.append(
@@ -789,7 +1002,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                     "【本轮要求】主人本条消息明确要求你复述/重复他指定的内容："
                     "按他的要求原样说出来即可，【禁止复读】这一轮不适用。")
             use_history = history
-            if app_context.global_config.get("summary_enabled", False) and meta.get("summary"):
+            if app_context.active_config().get("summary_enabled", False) and meta.get("summary"):
                 summary_text = background_ready(meta["summary"])
                 if not summary_text:
                     # 摘要不能用时绝不能只留最近几条：那等于把更早的上下文整个丢掉
@@ -802,7 +1015,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                     extra_parts.append(
                         f"【早期对话摘要（客观背景，不是台词）】{summary_text}"
                         "（身份、称呼与关系只以带说话人标签的原始消息为准）")
-            if app_context.global_config.get("dynamic_context_enabled", False) and meta.get("topic"):
+            if app_context.active_config().get("dynamic_context_enabled", False) and meta.get("topic"):
                 topic_text = background_ready(meta["topic"])
                 if not topic_text:
                     print("会话话题疑似角色口吻（旧版本生成），本轮不注入，等下次重新整理。")
@@ -812,7 +1025,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
             diary_note = _diary_recognition_note(ctx, user_text)
             if diary_note:
                 extra_parts.append(diary_note)
-            if app_context.profile_mgr and app_context.global_config.get("profiles_enabled", False):
+            if app_context.profile_mgr and app_context.active_config().get("profiles_enabled", False):
                 p = app_context.profile_mgr.build_injection(sender_id)
                 if p:
                     extra_parts.append(p)
@@ -820,20 +1033,16 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                 lex = app_context.lexicon_mgr.build_injection()
                 if lex:
                     extra_parts.append(lex)
-            if app_context.rag_mgr and app_context.global_config.get("rag_enabled", False):
+            if app_context.rag_mgr and app_context.active_config().get("rag_enabled", False):
                 rc = await app_context.rag_mgr.build_context(user_text)
                 if rc:
                     extra_parts.append(rc)
             try:
-                repeat_rounds = max(1, int(app_context.global_config.get("repeat_guard_rounds", 3) or 3))
+                repeat_rounds = max(1, int(app_context.active_config().get("repeat_guard_rounds", 3) or 3))
             except (TypeError, ValueError):
                 repeat_rounds = 3
             repeat_flags = repeat_guard_flags(ctx)
             recent_replies = _recent_assistant_replies(history, repeat_rounds)
-            # 自动接话那一轮是"把刚发出去的那条重做一遍"：它本来就该跟被替换的那条像，
-            # 拿它当比对参照只会反复重生成；把它从参照里去掉，其余历史照常比对
-            if overrides and overrides.get("skip_latest_reply") and recent_replies:
-                recent_replies = recent_replies[1:]
             last_reply = recent_replies[0] if recent_replies else ""
             if recent_replies and repeat_flags["compare_self"]:
                 block = "\n".join(f"{i + 1}. {r[:200]}" for i, r in enumerate(recent_replies))
@@ -854,7 +1063,8 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
             # 开关判定必须走 mood 模块的兼容层：旧配置缺这两个键时以"是否配置了提示词"为准，
             # 直接读配置会漏判，且字符串 "false" 会被当成真值
             if gate_reply and app_context.mood_mgr is not None \
-                    and (judge_enabled(ctx) or mood_enabled(ctx)):
+                    and (judge_enabled(ctx) or mood_enabled(ctx)
+                         or fixed_reply_probability(ctx) is not None):
                 reply_floor = app_context.affection_mgr.stage_reply_floor(
                     ctx.character_key, sender_id, session_id) \
                     if app_context.affection_mgr is not None else 0.0
@@ -930,7 +1140,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                           f"关系性质：{aff_now['nature']}）。")
 
             # 心情日记：她自己写的东西，她记得写过，但不知道别人也能看到
-            diary_note = mood_diary_note(ctx)
+            diary_note = mood_diary_note(ctx, session_id)
             if diary_note:
                 extra_parts.append(diary_note)
 
@@ -944,22 +1154,37 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                     extra_parts.append(recall_block)
 
             # 角色常常只答应不动手（一直"这就开始"）：先把"不许空转"摆到她面前
-            if app_context.global_config.get("unfinished_action_enabled", True):
+            if app_context.active_config().get("unfinished_action_enabled", True):
                 extra_parts.append(ACTION_NOW_HINT)
 
+            # 要回的那条被后来的消息刷下去了：这一轮强制引用它，免得回复看着像在答别人
+            pushed_down = bool(incoming_message_id) and \
+                _SESSION_LAST_INCOMING.get(session_id, "") not in ("", str(incoming_message_id))
+            # 私聊引用只有声明了 quote_private 的通道发得出来（NapCat 私聊不带 Reply 段）
+            quote_reply_id = incoming_message_id if (
+                incoming_message_id and (not is_private
+                                         or client_supports(client, "quote_private",
+                                                            default=False))) else None
+            if pushed_down and quote_reply_id:
+                print(f"引用：要回的那条消息已被后来的消息刷下去，"
+                      f"本轮回复改为引用它（{quote_reply_id}）。")
             # 允许@的成员的昵称：只在发送层用来认出台词里写成文字的「@某人」
             allowed_at_names = {q: n for q, n in at_names.items()
                                 if n and q in allowed_at_ids}
             sink = None
-            if app_context.global_config.get("streaming_enabled", False) and not first_reply_done:
+            if app_context.active_config().get("streaming_enabled", False) and not first_reply_done:
                 sink = SentenceSink(
                     session_type, target_id, emotions, ctx, recent_replies,
                     "" if has_image else user_text,
-                    reply_id=incoming_message_id if not is_private else None,
+                    reply_id=quote_reply_id,
                     allowed_at_ids=list(allowed_at_ids) if not is_private else [],
                     poke_target=sender_id, recall_request=send_recall_request,
                     at_names=allowed_at_names, speaker_id=sender_id,
-                    repeat_requested=repeat_requested)
+                    repeat_requested=repeat_requested,
+                    speaker_role=sender_role, mute_ids=mute_ids,
+                    recall_other_id=recall_other_id,
+                    mute_done_ids=mute_done_ids,
+                    force_quote=pushed_down)
 
             async def _generate(ctx_used, history_used, parts, on_sentence=None):
                 return await asyncio.wait_for(
@@ -1089,7 +1314,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                         reply = retried
                         break
 
-            if has_image and app_context.global_config.get("image_identity_guard_enabled", True) \
+            if has_image and app_context.active_config().get("image_identity_guard_enabled", True) \
                     and image_self_claim("".join(s.get("zh", "") for s in reply["sentences"])):
                 print("图片身份规则：回复把用户发来的图当成了角色自己，重新生成。")
                 fixed = None
@@ -1148,6 +1373,10 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
 
             if sink is None or sink.sent == 0:
                 await repair_sentence_lang(reply.get("sentences", []), ctx)
+                # 强制引用的那条消息：批量发送只认句子字段，补在第一句上
+                if pushed_down and quote_reply_id and reply.get("sentences") \
+                        and not reply["sentences"][0].get("reply_to"):
+                    reply["sentences"][0]["reply_to"] = True
 
             # ====== 上下文互通核心逻辑：回填识图模型的画面描述 ======
             if has_image:
@@ -1177,9 +1406,9 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
             # 吃醋：本轮消息提到了别的角色，心情按配置额外扣一点
             if jealousy_rival and app_context.mood_mgr is not None:
                 try:
-                    penalty = abs(_to_float(app_context.global_config.get("mood_jealousy_penalty", 5), 5.0))
+                    penalty = abs(_to_float(app_context.active_config().get("mood_jealousy_penalty", 5), 5.0))
                     lo, hi = _mood_bounds_now()
-                    cur = stored_mood(RoleContext(app_context.global_config.config, role),
+                    cur = stored_mood(RoleContext(app_context.active_config().config, role),
                                       app_context.mood_mgr, session_id, user_id=mood_user)
                     app_context.mood_mgr.set_mood(session_id, ctx.character_key,
                                       clamp(cur - penalty, lo, hi),
@@ -1191,15 +1420,19 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
             tts_calls_result = sink.tts_calls if sink is not None else 0
             send_result = {}
             send_options = {
-                "reply_id": incoming_message_id if not is_private else None,
+                "reply_id": quote_reply_id,
                 "allowed_at_ids": list(allowed_at_ids) if not is_private else [],
                 "poke_target": sender_id,
                 "recall_request": send_recall_request,
                 "at_names": allowed_at_names,
                 "speaker_id": sender_id,
+                "speaker_role": sender_role,
+                "mute_ids": mute_ids,
+                "recall_other_id": recall_other_id,
+                "mute_done_ids": mute_done_ids,
             }
             # 语音要看这条接入方式支不支持：微信 ClawBot / QQ 官方只能发文字
-            allow_voice = bool(app_context.global_config.get("tts_reply_enabled", True)) \
+            allow_voice = bool(app_context.active_config().get("tts_reply_enabled", True)) \
                 and client_supports(client, "voice")
             if sink is not None:
                 if sink.sent == 0:
@@ -1216,6 +1449,13 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
             # 流式路径逐句发、批量路径按分开发送逐条发：两种都从实际发出的文本取
             sent_texts = (sink.sent_texts if sink is not None and sink.sent
                           else send_result.get("sent_texts") or [])
+            # 动作回执在发送完成后立刻收拢：入库与"她有没有真做"的判定都用这一份
+            receipts: List[dict] = []
+            if sink is not None:
+                receipts.extend(sink.action_receipts)
+            receipts.extend(send_result.get("action_receipts") or [])
+            receipts.extend(system_receipts)
+            receipts_note = action_receipts_note(receipts, speaker_labels)
 
             sent_now = urls_in_text("".join(str(s.get("display", "") or "")
                                             for s in reply["sentences"]))
@@ -1248,7 +1488,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                         for s in reply["sentences"]))
 
             # 承诺追踪：角色台词里出现承诺字样时，后台跑一次 LLM 提取（不阻塞发送）
-            if app_context.promise_mgr is not None and bool(app_context.global_config.get("promise_enabled", True)) \
+            if app_context.promise_mgr is not None and bool(app_context.active_config().get("promise_enabled", True)) \
                     and PROMISE_HINT_RE.search(zh_text):
                 _spawn(_extract_and_store_promise(ctx, session_id, sender_id, zh_text))
             speaker = role.get("character_name", ctx.character_key)
@@ -1265,6 +1505,10 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                          "emotion": reply["sentences"][0].get("emotion", "")}
                 if tool_notes and index == len(parts) - 1:
                     entry["tool_notes"] = tool_notes
+                # 动作回执跟着最后一条入库：下一轮模型才知道上一轮对谁做了什么、
+                # 谁做成了谁没做成，不会把失败的说成成功、也不会认错对象
+                if receipts_note and index == len(parts) - 1:
+                    entry["action_notes"] = receipts_note
                 history.append(entry)
             # 表情包随消息发出后也进缓存：记录页用真实图片展示，清除缓存后退回文字
             try:
@@ -1289,7 +1533,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                 # 图片已经被真正看过并回复过了，不必再为后续追问重跑识图
                 _clear_pending_image(session_id)
 
-            if app_context.stats_mgr and app_context.global_config.get("stats_enabled", True) and app_context.db is not None:
+            if app_context.stats_mgr and app_context.active_config().get("stats_enabled", True) and app_context.db is not None:
                 app_context.db.record_interaction(
                     session_type, session_id, sender_id, sender_name,
                     role.get("character_key", ""), reply["sentences"][0].get("emotion", ""),
@@ -1303,18 +1547,18 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
             if not first_reply_done and has_image:
                 _spawn_sticker_capture(ctx, reply, image_sources)
 
-            if app_context.profile_mgr and app_context.global_config.get("profiles_enabled", False) and \
-                    app_context.global_config.get("profiles_auto_extract", False) and not first_reply_done:
+            if app_context.profile_mgr and app_context.active_config().get("profiles_enabled", False) and \
+                    app_context.active_config().get("profiles_auto_extract", False) and not first_reply_done:
                 _spawn(app_context.profile_mgr.extract_from_dialog(ctx, trigger_text, zh_text, sender_id))
             sent_count = len(sent_texts) or len(send_result.get("message_ids") or [])
-            receipts = (list(sink.action_receipts) if sink is not None
-                        else list(send_result.get("action_receipts") or []))
+            # 流式 sink 与批量发送是"二选一"的：谁真发了消息，回执就在谁那儿，
+            # 两边都收一遍才不会漏（含系统路径替她做掉的那些动作）
             replied.update({
                 "role": role, "text": zh_text,
                 # 声明的动作字段、动作执行回执与实际发出的条数：
                 # 判定"她是不是只嘴上答应"要用真回执，不能只看声明
                 "actions": sentence_actions_note(reply["sentences"]),
-                "receipts": action_receipts_note(receipts),
+                "receipts": receipts_note,
                 "sent": f"{sent_count} 条文本" + ("、含语音" if tts_calls_result else "、无语音"),
             })
             first_reply_done = True
@@ -1328,12 +1572,14 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
         不需要主人再说一句「快开始」。只有主人这条消息在催结果、或要求了一个具体动作时才判，
         普通闲聊不会凭空多出一条回复。判定说不出"还差什么"时也不接。
         """
-        if not app_context.global_config.get("unfinished_action_enabled", True):
+        if not app_context.active_config().get("unfinished_action_enabled", True):
             return
         role = replied.get("role")
         if role is None or not str(replied.get("text") or "").strip():
             return
-        if not wants_task_action(user_text):
+        # 判据只看主人自己打的字：user_text 已经拼上引用/转发内容，
+        # 拿它判会把别人说的话当成主人的要求，凭空多催一轮
+        if not wants_task_action(own_text):
             return
         character_key = str(role.get("character_key") or "")
         for _ in range(_TASK_CONTINUE_ROUNDS):
@@ -1344,7 +1590,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                 print(f"任务推进：{character_key} 明确拒绝了这件事，不再催。")
                 return
             context_lines = speaker_labeled_lines(history, limit=6)
-            progress = await check_task_progress(reply_ctx_of(role), user_text,
+            progress = await check_task_progress(reply_ctx_of(role), own_text,
                                                  str(replied.get("text") or ""),
                                                  str(replied.get("actions") or ""),
                                                  str(replied.get("sent") or ""),
@@ -1360,19 +1606,24 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
             receipts = str(replied.get("receipts") or "")
             # 判定子调用给的是"该怎么做、用哪个动作"，这里原样交给她照着做
             how = "；".join(steps) if steps else action
+            receipt_note = f"系统回执：{receipts}。" if receipts else ""
+            if receipts and "失败" in receipts:
+                receipt_note += "被挡下的动作这轮做不了。"
             trigger = ("（系统提示：你上一条回复只是在答应，并没有真的把这件事做出来。"
                        + (f"主人要的是：{task}。" if task else "")
                        + (f"接下来照这么做：{how}。" if how else "")
                        # 动作被上限/接入方式挡下时，真实结果是"没做成"：
                        # 让她如实说明或换个方式，而不是装作做过、也不是重复同一个动作
-                       + (f"系统回执：{receipts}。被挡下的动作这轮做不了。"
-                          if "失败" in receipts else "")
-                       + "现在就直接做出来，不要再答应一次、不要再问一句、也不要只说准备。）")
+                       + receipt_note
+                       + "现在就直接做出来，不要再答应一次、不要再问一句、也不要只说准备。"
+                         "这段是系统说明，不要把它抄进回复里。）")
             print(f"任务推进：{character_key} 上一条只答应没动手，接着让她把内容做出来。")
             # 这一轮就是要她把刚说过的那件事真正做出来，台词本来就该跟上一条接近：
-            # 关掉"和自己历史台词比对"的防复读，否则会被判重复、反复重生成
+            # 关掉"和自己历史台词比对"的防复读，否则会被判重复、反复重生成；
+            # 已禁言名单一起带下去，接话轮不会对同一目标再禁一遍
             if not await process_role_reply(role, trigger, overrides={
-                    "skip_latest_reply": True}):
+                    "repeat_guard_compare_self": False,
+                    "mute_done_ids": list(mute_state["done_ids"])}):
                 return
 
     # 会话回忆：检索与本轮消息相关的往事。与审判并发跑，取回时通常已经完成，
@@ -1380,7 +1631,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
     recall_task = None
     if app_context.recall_mgr is not None and app_context.recall_mgr.enabled():
         try:
-            win = max(0, int(app_context.global_config.get("history_length", 8) or 0))
+            win = max(0, int(app_context.active_config().get("history_length", 8) or 0))
         except (TypeError, ValueError):
             win = 8
         recent = [m for m in (history[-win:] if win else []) if isinstance(m, dict)]
@@ -1394,7 +1645,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
     if typing is not None:
         typing.begin_typing(target_id)
     try:
-        if not await ensure_tts_service(app_context.global_config):
+        if not await ensure_tts_service(app_context.active_config()):
             print("警告：TTS 服务不可用，将降级为纯文本。")
 
         for role in target_roles:
@@ -1402,8 +1653,8 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                 break
             await process_role_reply(role, user_text, gate_reply=True, own_text=own_text)
 
-        rounds = int(app_context.global_config.get("multi_role_auto_rounds", 0) or 0)
-        if app_context.global_config.get("multi_role_enabled", False) and rounds > 0 and len(target_roles) > 1:
+        rounds = int(app_context.active_config().get("multi_role_auto_rounds", 0) or 0)
+        if app_context.active_config().get("multi_role_enabled", False) and rounds > 0 and len(target_roles) > 1:
             for _ in range(rounds):
                 for role in target_roles:
                     if total_replies >= max_total:
@@ -1427,7 +1678,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
             typing.end_typing(target_id)
 
     await asyncio.to_thread(app_context.memory_manager.cleanup_voice_cache,
-                            app_context.global_config.get("max_voice_cache", 20))
+                            app_context.active_config().get("max_voice_cache", 20))
     if total_replies > 0:
         _spawn(post_reply_context_tasks(session_id, get_active_ctx()))
     else:

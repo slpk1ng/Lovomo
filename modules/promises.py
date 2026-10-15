@@ -101,7 +101,7 @@ async def extract_promise(ctx: RoleContext, reply_text: str) -> Optional[str]:
         return None
     messages = [{"role": "system", "content": EXTRACT_SYSTEM},
                 {"role": "user", "content": f"角色台词：{reply_text}\n请判断并输出 JSON。"}]
-    result = await chat_once(ctx, messages)
+    result = await chat_once(ctx, messages, label="承诺提取")
     obj = extract_json(result.get("content") or "")
     if isinstance(obj, dict):
         promise = str(obj.get("promise") or "").strip()

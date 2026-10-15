@@ -33,11 +33,18 @@ _ADDED_COLUMNS = {
         # 该条待办是否合成语音；NULL = 跟随配置项 todo_voice
         "use_voice": "INTEGER",
     },
+    "llm_usage": {
+        # 消耗这些 token 的模型名；老记录没有就留空
+        "model": "TEXT DEFAULT ''",
+        # 这次调用打向的是本地推理（1）还是云端服务（0）
+        "local": "INTEGER DEFAULT 0",
+    },
 }
 
 _INDEXES = (
     ("idx_interactions_ts", "interactions", "ts"),
     ("idx_todos_status", "todos", "status"),
+    ("idx_llm_usage_ts", "llm_usage", "ts"),
 )
 
 
@@ -150,6 +157,16 @@ class DatabaseManager:
                     status TEXT DEFAULT 'pending',
                     source TEXT DEFAULT 'auto'
                 );
+                CREATE TABLE IF NOT EXISTS llm_usage (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,
+                    label TEXT,
+                    prompt_tokens INTEGER DEFAULT 0,
+                    completion_tokens INTEGER DEFAULT 0,
+                    total_tokens INTEGER DEFAULT 0,
+                    model TEXT DEFAULT '',
+                    local INTEGER DEFAULT 0
+                );
             """)
             self._ensure_columns_and_indexes(conn)
             conn.commit()
@@ -194,6 +211,20 @@ class DatabaseManager:
             )
         except Exception as e:
             print(f"记录交互统计失败: {e}")
+
+    # ---------- token 用量 ----------
+    def record_llm_usage(self, label, prompt_tokens, completion_tokens, total_tokens,
+                         model: str = "", local: bool = False):
+        try:
+            self.execute(
+                "INSERT INTO llm_usage (ts, label, prompt_tokens, completion_tokens,"
+                " total_tokens, model, local) VALUES (?,?,?,?,?,?,?)",
+                (time.time(), str(label or ""), int(prompt_tokens or 0),
+                 int(completion_tokens or 0), int(total_tokens or 0),
+                 str(model or ""), 1 if local else 0)
+            )
+        except Exception as e:
+            print(f"记录 token 用量失败: {e}")
 
     def close(self):
         with self._lock:

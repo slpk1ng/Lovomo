@@ -11,6 +11,7 @@
 运行: python tests/test_recall_poke_text.py     （全通过退出码 0）
 """
 import asyncio
+import inspect
 import io
 import json
 import os
@@ -226,6 +227,9 @@ def t2_poke_reaches_send():
             def _active_client(self):
                 return StubTextOnlyClient()
 
+            async def pace_text_only(self, session_type, target_id):
+                return None
+
             async def send_text(self, session_type, target_id, text, **kwargs):
                 seen.setdefault("texts", []).append(text)
                 return True
@@ -364,6 +368,9 @@ def t5_recall_stream():
             def _active_client(self):
                 return StubTextOnlyClient()
 
+            async def pace_text_only(self, session_type, target_id):
+                return None
+
             async def send_text(self, session_type, target_id, text, **kwargs):
                 return True
 
@@ -419,7 +426,9 @@ def t6_recall_request():
     def detects_prev():
         return (kind("撤回刚才那条") == "prev"
                 and kind("把那条撤回") == "prev"
-                and kind("撤回这条") == "prev")
+                and kind("撤回这条") == "prev"
+                and kind("把[@张三(QQ:10001)] 刚才那条撤回") == "prev"
+                and kind("撤回[@张三(QQ:10001)] 发的那条") == "prev")
 
     def detects_late_push():
         # 「还没撤回」是在催这一步没做，不是「别撤回」
@@ -513,7 +522,7 @@ def t7_prompts():
     def recall_rule_has_example():
         cfg = M.ConfigLoader.default_config()
         text = LH.build_system_prompt(LH.RoleContext(cfg, {}), {})
-        return "\"recall\": true" in text and "主人明确让你撤回时" in text
+        return "\"recall\": true" in text and "想故意发一句逗主人一下再撤掉" in text
 
     def poke_rule_forbids_text():
         cfg = M.ConfigLoader.default_config()
@@ -764,6 +773,93 @@ def t13_poke_no_throttle():
     check("通道不支持时仍然给失败回执", unsupported_channel_still_receipts)
 
 
+# ---------------------------------------------------------------------------
+# T14 逐字写法里的分隔符
+# ---------------------------------------------------------------------------
+def t14_per_char_separators():
+    section("T14 逐字写法里的分隔符")
+
+    def zh_collapsed():
+        return (LH.collapse_per_char_separators("你、你、你、本、座、才、不、跟、着、你、闹、呢！")
+                == "你你你本座才不跟着你闹呢！")
+
+    def newline_collapsed():
+        return LH.collapse_per_char_separators("不\n\n是\n\n这\n\n样") == "不是这样"
+
+    def ja_collapsed():
+        return (LH.collapse_per_char_separators("ひ、と、つ、ず、つ、ゆ、っ、く、り、出、す、の、か？")
+                == "ひとつずつゆっくり出すのか？")
+
+    def enumeration_kept():
+        return (LH.collapse_per_char_separators("苹果、香蕉、梨") == "苹果、香蕉、梨"
+                and LH.collapse_per_char_separators("今天、明天、后天、大后天")
+                == "今天、明天、后天、大后天")
+
+    def placeholder_kept():
+        return (LH.collapse_per_char_separators(f"{LH.MENTION_PLACEHOLDER}、快、出、来、啊")
+                == f"{LH.MENTION_PLACEHOLDER}快出来啊")
+
+    def normalize_collapses_all_fields():
+        s = LH.normalize_single({"zh": "一、个、一、个、慢、慢、发、对、吧？",
+                                 "ja": "ひ、と、つ、ず", "emotion": "pingjing",
+                                 "delivery": "chars"}, ctx_of(), EMOTIONS, "在吗")
+        return (s["zh"] == "一个一个慢慢发对吧？" and s["lang"] == "ひとつず"
+                and s["display"] == "一个一个慢慢发对吧？" and s.get("delivery") == "chars")
+
+    check("顿号隔开的字还原成一句", zh_collapsed)
+    check("换行隔开的字还原成一句", newline_collapsed)
+    check("日文台词同样还原（送合成前）", ja_collapsed)
+    check("正常的列举不受影响", enumeration_kept)
+    check("@ 占位符在还原后仍然完整", placeholder_kept)
+    check("三个文本字段一起还原、delivery 仍然生效", normalize_collapses_all_fields)
+
+
+# ---------------------------------------------------------------------------
+# T15 撤回与发送形态的提示词
+# ---------------------------------------------------------------------------
+def t15_prompt_wording():
+    section("T15 撤回与发送形态提示词")
+
+    def recall_prompt():
+        cfg = M.ConfigLoader.default_config()
+        cfg["recall_enabled"] = True
+        return LH.build_system_prompt(LH.RoleContext(cfg, {}), {})
+
+    def no_longer_refuses_others():
+        text = recall_prompt()
+        return "系统撤不掉" not in text and "撤不了别人的消息" not in text
+
+    def field_recalls_own_reply_only():
+        # recall 是发送字段，只能撤她自己刚发的那条，不能写成能撤别人的消息
+        text = recall_prompt()
+        return ("它撤的是**你自己刚发出去的这条回复**" in text
+                and "是别人发的照样撤得掉" not in text)
+
+    def master_request_needs_no_field():
+        # 主人让她撤回某条时不该填 recall（prev 分支会强制 DENY），要撤别人的消息走 recall_other
+        text = recall_prompt()
+        return "时不用你填 recall" in text and "要撤别人的消息请填 recall_other 字段" in text
+
+    def excuses_forbidden():
+        text = recall_prompt()
+        return "消息太旧" in text and "已经超时" in text
+
+    def delivery_forbids_separators():
+        return "绝对不要在台词里把字用顿号或换行隔开" in recall_prompt()
+
+    def failure_note_drops_stale_reason():
+        # 撤不成时回灌给模型的说明不能再提「太久了」这类原因，否则它会照着重述
+        src = inspect.getsource(M._process_message_event)
+        return "已经过去太久" not in src and "这次没撤成" in src
+
+    check("撤回提示词不再说撤不了别人的消息", no_longer_refuses_others)
+    check("撤回字段只撤她自己刚发的那条", field_recalls_own_reply_only)
+    check("主人要求撤回时她不用填 recall", master_request_needs_no_field)
+    check("撤回提示词把「太旧 / 超时」列为不该说的理由", excuses_forbidden)
+    check("发送形态提示词禁止用顿号/换行表达逐字", delivery_forbids_separators)
+    check("撤回失败说明不再给「太久了」这种理由", failure_note_drops_stale_reason)
+
+
 def main():
     print("=" * 70)
     print("撤回消息与「戳一戳写成文字」测试")
@@ -778,7 +874,8 @@ def main():
                    t4_recall_send, t5_recall_stream, t6_recall_request,
                    t7_prompts, t8_judge_log, t9_action_field_leak,
                    t10_mention_placement, t11_recall_others_permission,
-                   t12_task_refusal, t13_poke_no_throttle):
+                   t12_task_refusal, t13_poke_no_throttle,
+                   t14_per_char_separators, t15_prompt_wording):
             try:
                 fn()
             except Exception as e:

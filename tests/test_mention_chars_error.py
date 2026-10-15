@@ -221,6 +221,27 @@ def t1_apply_literal_mention():
         return not LH.apply_literal_mention(s, [USER_ID, LH.MENTION_ALL_ID], {}, USER_ID) \
             and "mention_ids" not in s and s["zh"] == text
 
+    def single_at_with_qq_converted():
+        # 模型照抄历史里的「@昵称(QQ:号)」时常只写一个 @，后面跟的却是可@成员的 QQ 号
+        text = f"@{USER_ID} 好啦好啦"
+        s = {"zh": text, "display": text}
+        ok = LH.apply_literal_mention(s, [USER_ID], {}, "")
+        return ok and s["mention_ids"] == [USER_ID] \
+            and s["zh"] == f"{LH.MENTION_PLACEHOLDER} 好啦好啦" and s["display"] == s["zh"]
+
+    def single_at_unknown_qq_untouched():
+        text = "@999999 好啦好啦"
+        s = {"zh": text, "display": text}
+        return not LH.apply_literal_mention(s, [USER_ID], {}, "") \
+            and "mention_ids" not in s and s["zh"] == text
+
+    def email_left_alone():
+        # @ 后面接域名的是邮箱，不是 QQ 号：号码再像也不动它
+        text = "发到 me@10001.com 就行"
+        s = {"zh": text, "display": text}
+        return not LH.apply_literal_mention(s, ["10001"], {}, "") \
+            and "mention_ids" not in s and s["zh"] == text
+
     def all_members_written_out():
         s = {"zh": "@@所有人 快来看", "display": "@@所有人 快来看"}
         ok = LH.apply_literal_mention(s, [USER_ID], {}, USER_ID)
@@ -246,6 +267,9 @@ def t1_apply_literal_mention():
     check("重复调用不会重复改写", idempotent)
     check("台词里没有 @ 时不动它", no_at_untouched)
     check("单个 @ 一律当普通文字", single_at_left_alone)
+    check("单个 @ 后跟可@成员的 QQ 号时还原成真 @", single_at_with_qq_converted)
+    check("单个 @ 后跟不认识号码时不动它", single_at_unknown_qq_untouched)
+    check("邮箱地址里的 @ 不动它", email_left_alone)
     check("@@所有人 换成真@全体成员", all_members_written_out)
     check("同一句里单个 @ 不动、两个 @ 照常还原", single_at_beside_double_at)
 
@@ -348,6 +372,20 @@ def t3_real_at_segment():
         texts = [t for m in client.messages for t in text_segments(m)]
         return texts == [" 主人真坏"]
 
+    def batch_path_action_receipts():
+        # 引用与@人挂在消息上：发出去了就得留回执，判定才不会把做过的当成没做
+        sender, _client = build_sender("batch_at_receipts")
+
+        async def flow():
+            return await sender.send_reply(
+                "group", GROUP_ID, [sentence("@@主人真坏", reply_to=True)],
+                EMOTIONS, ctx_of(), use_voice=False, reply_id="555",
+                allowed_at_ids=[USER_ID], speaker_id=USER_ID)
+
+        receipts = {r.get("action"): r for r in (run(flow()).get("action_receipts") or [])}
+        return (receipts.get("引用", {}).get("ok") is True
+                and receipts.get("@人", {}).get("ok") is True)
+
     def mid_placeholder_at_has_space():
         sender, client = build_sender("mid_at_space")
 
@@ -367,6 +405,7 @@ def t3_real_at_segment():
     check("没有可@对象时不发 at 段", private_no_at)
     check("@ 挂在句首时与正文之间留空格", batch_path_at_has_space)
     check("@ 在句中时与后面正文之间留空格", mid_placeholder_at_has_space)
+    check("整条发送时引用与@人都留下回执", batch_path_action_receipts)
 
 
 # ---------------------------------------------------------------------------
@@ -487,6 +526,9 @@ def t7_stream_sink():
             def new_message_group(self):
                 return 1
 
+            async def pace_text_only(self, session_type, target_id):
+                return None
+
             async def send_text(self, session_type, target_id, text, **kwargs):
                 seen["text"] = text
                 seen["at_ids"] = kwargs.get("at_ids")
@@ -513,7 +555,9 @@ def t7_stream_sink():
             M.global_config = saved_cfg
             M.app_context.global_config = M.global_config
         return (seen.get("at_ids") == [USER_ID]
-                and LH.MENTION_PLACEHOLDER in seen.get("text", ""))
+                and LH.MENTION_PLACEHOLDER in seen.get("text", "")
+                and any(r.get("action") == "@人" and r.get("ok")
+                        for r in sink.action_receipts))
 
     def stream_keeps_plain_text():
         _sender, _client = build_sender("stream_plain")
@@ -524,6 +568,9 @@ def t7_stream_sink():
 
             def _active_client(self):
                 return TextOnlyCapClient()
+
+            async def pace_text_only(self, session_type, target_id):
+                return None
 
             async def send_text(self, session_type, target_id, text, **kwargs):
                 seen["text"] = text
@@ -552,7 +599,7 @@ def t7_stream_sink():
             M.app_context.global_config = M.global_config
         return seen.get("text") == "主人真坏" and seen.get("at_ids") == []
 
-    check("流式首句把裸 @ 换成真 at", stream_converts_literal_at)
+    check("流式首句把裸 @ 换成真 at 并留下回执", stream_converts_literal_at)
     check("流式路径没有 @ 时不发 at 段", stream_keeps_plain_text)
 
 

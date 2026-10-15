@@ -2067,13 +2067,31 @@ def i12d():
     return "switchPanel('installed-plugins')" in HTML_SRC[k:k + 900]
 
 
+def i12g():
+    "配置文件页要有真实入口：设置页锚点导航顶部的「配置文件」，以及返回设置。"
+    if 'id="panel-profiles"' not in HTML_SRC:
+        return False
+    for need in ("async function openProfilesPanel",
+                 "async function loadProfileConfig",
+                 "async function saveProfileConfig",
+                 "{ title: '配置文件', onClick: () => switchPanel('profiles') }"):
+        if need not in HTML_SRC:
+            return False
+    return ("getElementById('profile-back-btn').addEventListener('click', () => switchPanel('config'))"
+            in HTML_SRC
+            and "getElementById('profile-save-btn').addEventListener('click', saveProfileConfig)"
+            in HTML_SRC)
+
+
 def i12c():
     "用户能点到的面板必须在左侧栏有导航项（二级页显式豁免）。"
     import re
     # 二级页面：由插件卡片点进去（功能页 / 历史更新页）、由左上角
-    # 「Lovomo + 版本号」点进去（程序历史版本），都不在侧边栏。
-    # 豁免它们的前提是**入口真的存在** —— i12e / i12f 专门检查这一点。
-    secondary = {"plugin-page", "plugin-history", "plugin-webui", "app-releases"}
+    # 「Lovomo + 版本号」点进去（程序历史版本）、由设置页锚点导航顶部的
+    # 「配置文件」点进去（配置文件页），都不在侧边栏。
+    # 豁免它们的前提是**入口真的存在** —— i12e / i12f / i12g 专门检查这一点。
+    secondary = {"plugin-page", "plugin-history", "plugin-webui", "app-releases",
+                 "profiles"}
     panels = set(re.findall(r'id="panel-([a-z-]+)"', HTML_SRC)) - secondary
     navs = set(re.findall(r'class="menu-item[^"]*"\s+data-panel="([a-z-]+)"', HTML_SRC))
     missing = sorted(p for p in panels if p not in navs)
@@ -3057,6 +3075,7 @@ check("目录删除带重试", i10)
 check("插件清单 panel 段被规范化", i11)
 check("已装插件成页渲染（无弹窗、无独立日志区）", i12)
 check("每个面板都有入口能打开（无死页面）", i12c)
+check("配置文件页由设置页锚点导航进入", i12g)
 check("程序历史版本页由左上角 logo 进入", i12f)
 check("插件市场与插件是两个独立面板", i12d)
 check("市场页上传/打开目录/刷新市场都绑了事件", i12b)

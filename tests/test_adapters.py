@@ -185,7 +185,10 @@ def t_ilink():
           lambda: recent_ilink_target(order.snapshot()) == "A@im.wechat"
           and recent_ilink_target({"context_tokens": {}}) == "")
 
-    # 服务端不认 context_token（ret=-2）：去掉 token 再发一次，并丢掉缓存
+    # 服务端不认 context_token（ret=-2）：去掉 token 再发一次；缓存里的 token 不抹掉
+    # （这个码和限流共用，抹掉只会让之后每次都只能"无 token 发送"），
+    # 而"收下却没回执"的那条先留着，等 token 刷新后补发
+    client._pending.clear()
     tokens = []
 
     async def stale_post(path, payload, timeout=45, log_result=False):
@@ -198,9 +201,68 @@ def t_ilink():
 
     client._post = stale_post
     run(client.send_private_msg("o9cq800kum@im.wechat", [napcat.Text(text="再来")]))
-    check("context_token 被拒后去掉 token 重发",
+    check("context_token 被拒后去掉 token 重发，token 仍留在缓存里",
           lambda: tokens == ["CTX-1", ""]
-          and client._contexts.get("o9cq800kum@im.wechat") is None)
+          and client._contexts.get("o9cq800kum@im.wechat") == "CTX-1")
+    check("没投递出去的这条先留着，不当成发送成功",
+          lambda: client._pending.get("o9cq800kum@im.wechat") == ["再来"])
+
+    # 对方再说话会带来新的 context_token：下一次发送先把留着的那条补上（顺序不变）
+    client.to_event({"from_user_id": "o9cq800kum@im.wechat", "context_token": "CTX-2",
+                     "item_list": [{"type": 1, "text_item": {"text": "在吗"}}]})
+    flushed = []
+
+    async def ok_post(path, payload, timeout=45, log_result=False):
+        if path.endswith("getconfig") or path.endswith("sendtyping"):
+            return {"ret": 0}
+        flushed.append((payload["msg"].get("context_token"),
+                        payload["msg"]["item_list"][0]["text_item"]["text"]))
+        return {"ret": 0, "message_id": "M-9"}
+
+    client._post = ok_post
+    run(client.send_private_msg("o9cq800kum@im.wechat", [napcat.Text(text="新回复")]))
+    check("token 刷新后先补发留着的，再发新消息",
+          lambda: flushed == [("CTX-2", "再来"), ("CTX-2", "新回复")]
+          and not client._pending.get("o9cq800kum@im.wechat"))
+
+    # 补发失败（还是没回执）时继续留着，别把内容吃掉
+    async def still_no_id_post(path, payload, timeout=45, log_result=False):
+        if path.endswith("getconfig") or path.endswith("sendtyping"):
+            return {"ret": 0}
+        return {"ret": 0}
+
+    client._post = still_no_id_post
+    run(client.send_private_msg("o9cq800kum@im.wechat", [napcat.Text(text="再来一条")]))
+    check("补发拿不到投递回执时继续留着",
+          lambda: client._pending.get("o9cq800kum@im.wechat") == ["再来一条"])
+
+    # 对方一说话就带来新的 context_token：攒着的主动消息立刻补发，且排在这次回复前面
+    q = ILinkClient({"id": "wx3", "bot_token": "tk"})
+    q._contexts["U@im.wechat"] = "OLD"
+    q._hold_pending("U@im.wechat", "攒着的主动消息")
+    flushed_calls = []
+
+    async def queue_post(path, payload, timeout=45, log_result=False):
+        if path.endswith("getupdates"):
+            return {"ret": 0, "msgs": [{"from_user_id": "U@im.wechat",
+                                        "context_token": "NEW", "msg_id": "m1",
+                                        "item_list": [{"type": 1,
+                                                       "text_item": {"text": "在吗"}}]}]}
+        flushed_calls.append((payload["msg"].get("context_token"),
+                              payload["msg"]["item_list"][0]["text_item"]["text"]))
+        return {"ret": 0, "message_id": "M-1"}
+
+    q._post = queue_post
+
+    async def drain_one_event():
+        async for event in q:
+            if event is not None:
+                break
+
+    run(drain_one_event())
+    check("收到新消息时先把攒着的补发（排在回复前），补完就清空",
+          lambda: flushed_calls == [("NEW", "攒着的主动消息")]
+          and not q._pending.get("U@im.wechat"))
 
     check("微信群聊暂不支持发送",
           lambda: run(_expect_not_implemented(client)))
@@ -241,24 +303,23 @@ def t_qqbot():
           lambda: client.to_event("GUILD_CREATE", {}) is None
           and client.to_event("C2C_MESSAGE_CREATE", {}) is None)
 
-    calls = {}
+    calls = []
 
-    async def fake_ensure():
-        return None
+    async def fake_api(method, path, body=None):
+        calls.append((method, path, dict(body or {})))
+        return {"id": f"M-{len(calls)}"}
 
-    async def fake_post_message(path, text, message_id=""):
-        calls["path"] = path
-        calls["text"] = text
-
-    client._ensure_token = fake_ensure
-    client._post_message = fake_post_message
+    client._api = fake_api
     run(client.send_private_msg("OPENID-A", [napcat.Text(text="在的")]))
     check("QQ 单聊回复走 /v2/users/{openid}/messages",
-          lambda: calls["path"] == "/v2/users/OPENID-A/messages"
-          and calls["text"] == "在的")
+          lambda: calls[-1][0] == "POST"
+          and calls[-1][1] == "/v2/users/OPENID-A/messages"
+          and calls[-1][2].get("msg_type") == 0
+          and calls[-1][2].get("content") == "在的")
     run(client.send_group_msg("G-1", [napcat.Text(text="早")]))
     check("QQ 群回复走 /v2/groups/{group_openid}/messages",
-          lambda: calls["path"] == "/v2/groups/G-1/messages" and calls["text"] == "早")
+          lambda: calls[-1][1] == "/v2/groups/G-1/messages"
+          and calls[-1][2].get("content") == "早")
 
     check("沙箱开关决定接口域名",
           lambda: "sandbox" in QQBotClient({"sandbox": True}).api_base
@@ -266,6 +327,102 @@ def t_qqbot():
 
     check("Access Token 请求体带上 AppID 与 AppSecret",
           lambda: run(_token_payload()) == {"appId": "102000000", "clientSecret": "s"})
+
+
+def t_qqbot_official_actions():
+    """QQ 官方机器人：引用、撤回、语音/图片、以及一条回复最多 5 条。"""
+    from modules.adapters import client_reply_limit
+    client = QQBotClient({"id": "qq1", "app_id": "102000000", "app_secret": "s"})
+    calls = []
+
+    async def fake_api(method, path, body=None):
+        calls.append((method, path, dict(body or {})))
+        return {"id": f"M-{len(calls)}",
+                "ext_info": {"ref_idx": f"REFIDX-{len(calls)}"}}
+
+    client._api = fake_api
+    client.to_event("GROUP_AT_MESSAGE_CREATE",
+                    {"id": "IN-1", "content": "在吗", "group_openid": "G-1",
+                     "author": {"member_openid": "OPENID-B"},
+                     "message_scene": {"ext": ["msg_idx=REFIDX-IN-1"]}})
+    run(client.send_group_msg("G-1", [napcat.Reply(id="IN-1"),
+                                      napcat.Text(text="在的")]))
+    first = calls[-1][2]
+    check("QQ 群回复带引用时挂上 msg_id / msg_seq / message_reference",
+          lambda: first.get("msg_id") == "IN-1" and first.get("msg_seq") == 1
+          and (first.get("message_reference") or {}).get("message_id") == "REFIDX-IN-1")
+
+    # 同一条被动回复拆成文字+语音+图片：后面的几条要继续挂同一个 msg_id
+    run(client.send_group_msg("G-1", [napcat.Text(text="还有一句")]))
+    check("同一条被动回复的后续消息接着挂同一个 msg_id 并递增 msg_seq",
+          lambda: calls[-1][2].get("msg_id") == "IN-1"
+          and calls[-1][2].get("msg_seq") == 2
+          and "message_reference" not in calls[-1][2])
+
+    check("一次被动回复满 5 条后，剩下的按主动消息继续发出去",
+          lambda: _qq_limit_spills_out(client, calls))
+
+    check("撤回自己发的消息走 DELETE 且带上会话路径",
+          lambda: run(_qq_delete(client, calls)) is None
+          and calls[-1][0] == "DELETE"
+          and calls[-1][1].startswith("/v2/groups/G-1/messages/"))
+
+    check("这条通道声明了 5 条上限", lambda: client_reply_limit(client) == 5)
+
+
+def t_qqbot_voice_text():
+    """文字与语音在同一段里时，文字单独发一条：msg_type=7 不显示 content。"""
+    import modules.adapters as A
+    client = QQBotClient({"id": "qq1", "app_id": "102000000", "app_secret": "s"})
+    calls = []
+    uploads = []
+
+    async def fake_api(method, path, body=None):
+        calls.append((method, path, dict(body or {})))
+        return {"id": f"M-{len(calls)}"}
+
+    async def fake_upload(scope, target, path, file_type):
+        uploads.append((path, file_type))
+        return f"FILE-{len(uploads)}"
+
+    saved = A._voice_silk_bytes
+    A._voice_silk_bytes = lambda path: b"silk"
+    client._api = fake_api
+    client._upload_media = fake_upload
+    try:
+        client.to_event("GROUP_AT_MESSAGE_CREATE",
+                        {"id": "IN-1", "content": "在吗", "group_openid": "G-1",
+                         "author": {"member_openid": "OPENID-B"}})
+        run(client.send_group_msg("G-1", [napcat.Text(text="在的"),
+                                          napcat.Record(file="a.wav")]))
+    finally:
+        A._voice_silk_bytes = saved
+
+    check("文字与语音各发一条消息", lambda: len(calls) == 2)
+    check("文字按纯文本消息发",
+          lambda: calls[0][2].get("msg_type") == 0
+          and calls[0][2].get("content") == "在的")
+    check("语音按富媒体消息发且不带文字",
+          lambda: calls[1][2].get("msg_type") == 7
+          and calls[1][2].get("content") == A.QQ_MEDIA_CONTENT)
+    check("语音仍按富媒体的语音类型上传",
+          lambda: bool(uploads) and uploads[0][1] == 3)
+
+
+def _qq_limit_spills_out(client, calls) -> bool:
+    """同一条被动回复最多 5 条：名额用完后，后面的改按主动消息接着发出去。"""
+    before = len(calls)
+    for _ in range(4):
+        run(client.send_group_msg("G-1", [napcat.Text(text="继续")]))
+    after = [c[2] for c in calls[before:]]
+    return (len(after) == 4
+            and [p.get("msg_seq") for p in after[:3]] == [3, 4, 5]
+            and all(p.get("msg_id") == "IN-1" for p in after[:3])
+            and all("msg_id" not in p and "msg_seq" not in p for p in after[3:]))
+
+
+async def _qq_delete(client, calls):
+    await client.delete_msg(message_id="M-1")
 
 
 async def _token_payload():
@@ -310,12 +467,20 @@ def t_labels_and_caps():
           lambda: friendly_user_label("", "1905332561") == "1905332561")
 
     from main import client_supports
-    check("微信/QQ 接入方式声明为只能发文字",
+    check("微信 ClawBot 声明为只能发文字",
           lambda: not client_supports(ILinkClient({}), "voice")
-          and not client_supports(QQBotClient({}), "voice")
-          and not client_supports(QQBotClient({}), "sticker"))
+          and not client_supports(ILinkClient({}), "sticker"))
+    check("QQ 官方机器人声明了语音/图片/引用/撤回",
+          lambda: all(client_supports(QQBotClient({}), f)
+                      for f in ("voice", "image", "quote", "recall")))
+    check("QQ 官方机器人没有的能力（@/戳一戳/撤回别人的消息/禁言）声明为不支持",
+          lambda: not any(client_supports(QQBotClient({}), f)
+                          for f in ("mention", "poke", "recall_other", "mute")))
     check("没有声明的客户端默认支持（NapCat 那种）",
           lambda: client_supports(object(), "voice"))
+    check("私聊引用要显式声明：没声明的通道按不支持处理",
+          lambda: not client_supports(object(), "quote_private", default=False)
+          and not client_supports(QQBotClient({}), "quote_private", default=False))
 
 
 def t_poll_tolerance():
@@ -628,6 +793,13 @@ def t_text_only_pacing():
         for line in ("一", "二", "三"):
             voice_marks.append(_time.monotonic())
             run(voicey.send_text("private", "u1", line))
+
+        forced = sender_mod.MessageSender(Cfg({}), None)
+        forced.client = VoiceCapable()
+        forced_marks = []
+        for _ in range(3):
+            forced_marks.append(_time.monotonic())
+            run(forced.pace_text_only("private", "u1"))
     finally:
         sender_mod.TEXT_ONLY_SEND_MIN_GAP, sender_mod.TEXT_ONLY_SEND_GAP_JITTER = old_gap, old_jitter
 
@@ -639,6 +811,9 @@ def t_text_only_pacing():
           lambda: len(voicey.client.sent) == 3
           and voice_marks[1] - voice_marks[0] < 0.04
           and voice_marks[2] - voice_marks[1] < 0.04)
+    check("整条回复没有语音时，能发语音的通道也按同一条节奏发",
+          lambda: forced_marks[1] - forced_marks[0] < 0.04
+          and forced_marks[2] - forced_marks[1] >= 0.04)
 
 
 def t_factory():
@@ -652,6 +827,8 @@ if __name__ == "__main__":
     t_segments()
     t_ilink()
     t_qqbot()
+    t_qqbot_official_actions()
+    t_qqbot_voice_text()
     t_labels_and_caps()
     t_session_timeout()
     t_poll_tolerance()

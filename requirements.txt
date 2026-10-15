@@ -16,3 +16,4 @@ qrcode
 cryptography
 tzdata
 pypdf
+silk-python==0.2.8

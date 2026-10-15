@@ -29,7 +29,7 @@ except Exception:
 
 import main as M
 import modules.llm_helpers as LH
-from modules.adapters import segments_to_text
+from modules.adapters import segment_to_dict, segments_to_text
 from modules.sender import (DELIVERY_CHAR_GAP_SECONDS, DELIVERY_MAX_MESSAGES,
                             MessageSender, voice_enabled_for)
 
@@ -67,12 +67,15 @@ class StubNapCat:
 
     def __init__(self):
         self.texts = []
+        self.segments = []
 
     async def send_private_msg(self, user_id=0, message=None):
         self.texts.append(segments_to_text(message))
+        self.segments.append(list(message or []))
 
     async def send_group_msg(self, group_id=0, message=None):
         self.texts.append(segments_to_text(message))
+        self.segments.append(list(message or []))
 
     async def friend_poke(self, **kwargs):
         return None
@@ -89,6 +92,9 @@ class StubSender:
 
     def _active_client(self):
         return StubTextOnlyClient()
+
+    async def pace_text_only(self, session_type, target_id):
+        return None
 
     async def send_text(self, session_type, target_id, text, **kwargs):
         self.texts.append(str(text))
@@ -116,7 +122,7 @@ class StubVoiceSender:
         return StubVoiceClient()
 
 
-def build_sender(name: str, **overrides):
+def build_sender(name: str, client_cls=StubNapCat, **overrides):
     work = TMP_ROOT / name
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
@@ -129,7 +135,7 @@ def build_sender(name: str, **overrides):
     config.config.update(overrides)
     config.roles = config._parse_roles()
     sender = MessageSender(config, M.MemoryManager(config))
-    client = StubNapCat()
+    client = client_cls()
     sender.client = client
     return config, sender, client
 
@@ -394,6 +400,120 @@ def t5_voice_mode():
     check("流式路径同样按语音发送方式跳过 TTS", sink_skips_tts)
 
 
+# ---------------------------------------------------------------------------
+# T6 条数上限：逐句分开发，超出由适配器转主动消息
+# ---------------------------------------------------------------------------
+def t6_reply_limit_separate():
+    section("T6 条数上限")
+
+    class StubLimitedClient(StubNapCat):
+        """声明一次回复最多 5 条消息的通道（QQ 官方机器人就是这样）。"""
+        reply_message_limit = 5
+
+    counter = {"n": 0}
+
+    async def fake_tts(*_args, **_kwargs):
+        import wave
+        counter["n"] += 1
+        path = TMP_ROOT / "reply_limit" / f"say{counter['n']}.wav"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(b"\x00\x00" * 1600)
+        return path
+
+    def _reply(sender, config, count):
+        import modules.sender as S
+        saved = S.synthesize_sentence
+        S.synthesize_sentence = fake_tts
+        try:
+            return run(sender.send_reply(
+                "private", USER_ID, [sentence(f"{i}。") for i in range(count)],
+                {}, M.RoleContext(config.config), use_voice=True))
+        finally:
+            S.synthesize_sentence = saved
+
+    def over_limit_keeps_separate():
+        # 3 句 × 2 = 6 超上限：不再合并，仍逐句「文字 + 语音」各一条，
+        # 超出的条数由适配器改按主动消息发出去
+        config, sender, client = build_sender(
+            "reply_limit_over", client_cls=StubLimitedClient,
+            separate_send=True, send_voice_separately=True, dynamic_sleep=False)
+        _reply(sender, config, 3)
+        kinds = [[segment_to_dict(s)["type"] for s in segs] for segs in client.segments]
+        return kinds == [["text"], ["record"]] * 3
+
+    def within_limit_keeps_two():
+        config, sender, client = build_sender(
+            "reply_limit_under", separate_send=True, send_voice_separately=True,
+            dynamic_sleep=False)
+        _reply(sender, config, 2)
+        kinds = [[segment_to_dict(s)["type"] for s in segs] for segs in client.segments]
+        return kinds == [["text"], ["record"], ["text"], ["record"]]
+
+    def way_over_limit_keeps_separate():
+        config, sender, client = build_sender(
+            "reply_limit_many", client_cls=StubLimitedClient,
+            separate_send=True, send_voice_separately=True, dynamic_sleep=False)
+        _reply(sender, config, 6)
+        kinds = [[segment_to_dict(s)["type"] for s in segs] for segs in client.segments]
+        return kinds == [["text"], ["record"]] * 6
+
+    check("超上限时仍逐句文字与语音各一条", over_limit_keeps_separate)
+    check("没超上限时文字与语音分两条", within_limit_keeps_two)
+    check("远超上限也不合并", way_over_limit_keeps_separate)
+
+
+# ---------------------------------------------------------------------------
+# T7 发送超时：重试次数与"结果未知"
+# ---------------------------------------------------------------------------
+def t7_timeout_retry():
+    section("T7 发送超时")
+
+    class StubTimeoutNapCat(StubNapCat):
+        def __init__(self):
+            super().__init__()
+            self.attempts = 0
+
+        async def send_private_msg(self, user_id=0, message=None):
+            self.attempts += 1
+            raise TimeoutError("NTEvent Timeout")
+
+    class StubDnsNapCat(StubNapCat):
+        async def send_private_msg(self, user_id=0, message=None):
+            raise RuntimeError("Cannot connect to host")
+
+    def retries_once_by_default():
+        config, sender, client = build_sender("timeout_retry",
+                                              client_cls=StubTimeoutNapCat, send_retry=1)
+        ok = run(sender.send_text("private", USER_ID, "你好呀。"))
+        return (ok is False and client.attempts == 2
+                and sender.last_send_uncertain is True)
+
+    def send_once_attempts_once():
+        config, sender, client = build_sender("timeout_once",
+                                              client_cls=StubTimeoutNapCat, send_retry=1)
+
+        async def flow():
+            with sender.send_once():
+                return await sender.send_text("private", USER_ID, "你好呀。")
+
+        ok = run(flow())
+        return (ok is False and client.attempts == 1
+                and sender.last_send_uncertain is True)
+
+    def connect_error_is_certain():
+        config, sender, client = build_sender("timeout_dns", client_cls=StubDnsNapCat)
+        ok = run(sender.send_text("private", USER_ID, "你好呀。"))
+        return ok is False and sender.last_send_uncertain is False
+
+    check("超时按配置重试一次", retries_once_by_default)
+    check("send_once() 里超时只发一次", send_once_attempts_once)
+    check("连不上不算结果未知", connect_error_is_certain)
+
+
 def main():
     print("=" * 70)
     print("发送形态（delivery）测试")
@@ -404,7 +524,8 @@ def main():
     saved_global, M.global_config = M.global_config, M.ConfigLoader.default_config()
     M.app_context.global_config = M.global_config
     try:
-        for fn in (t1_parse, t2_send, t3_stream_yield, t4_prompt, t5_voice_mode):
+        for fn in (t1_parse, t2_send, t3_stream_yield, t4_prompt, t5_voice_mode,
+                   t6_reply_limit_separate, t7_timeout_retry):
             try:
                 fn()
             except Exception as e:

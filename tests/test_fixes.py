@@ -1120,7 +1120,7 @@ def f_thinking_never_spoken():
     # --- 主动消息：思考污染 + 超长输出都必须被拦下 ---
     import modules.jobs as J
 
-    async def fake_text(ctx, system, user_prompt, max_tokens=512):
+    async def fake_text(ctx, system, user_prompt, max_tokens=512, **kwargs):
         return "The user asks me to say something. We need to be casual.\n主人，好久不见。"
     orig_text = J.generate_text_reply
     J.generate_text_reply = fake_text
@@ -1138,7 +1138,7 @@ def f_thinking_never_spoken():
                  "要是累了就早点休息，我在这儿等你回来。"
                  "外面风挺大的，回来路上小心一点，别又着凉了。") * 2
 
-    async def long_text(ctx, system, user_prompt, max_tokens=512):
+    async def long_text(ctx, system, user_prompt, max_tokens=512, **kwargs):
         return long_line
     J.generate_text_reply = long_text
     try:
@@ -1149,7 +1149,7 @@ def f_thinking_never_spoken():
     finally:
         J.generate_text_reply = orig_text
 
-    async def no_mark_text(ctx, system, user_prompt, max_tokens=512):
+    async def no_mark_text(ctx, system, user_prompt, max_tokens=512, **kwargs):
         return "主人" * 200
     J.generate_text_reply = no_mark_text
     try:
@@ -1160,7 +1160,7 @@ def f_thinking_never_spoken():
         J.generate_text_reply = orig_text
 
     # 内嵌 think 块（无元叙述特征）也必须被拦下：这是实际事故的形态
-    async def inline_block(ctx, system, user_prompt, max_tokens=512):
+    async def inline_block(ctx, system, user_prompt, max_tokens=512, **kwargs):
         return (f"{T}用户希望我主动开口，我要想一个自然的话题。"
                 f"考虑天气、考虑主人的工作、考虑最近的话题……{TC}"
                 "主人，最近工作忙不忙？记得按时吃饭哦。")
@@ -1173,7 +1173,7 @@ def f_thinking_never_spoken():
         J.generate_text_reply = orig_text
 
     # 模型正常但偏长：截断到上限，避免一分钟语音
-    async def medium_text(ctx, system, user_prompt, max_tokens=512):
+    async def medium_text(ctx, system, user_prompt, max_tokens=512, **kwargs):
         return "主人，" + "今天的风很温柔，" * 20
     J.generate_text_reply = medium_text
     try:
@@ -1184,7 +1184,7 @@ def f_thinking_never_spoken():
     finally:
         J.generate_text_reply = orig_text
 
-    async def tagged_text(ctx, system, user_prompt, max_tokens=512):
+    async def tagged_text(ctx, system, user_prompt, max_tokens=512, **kwargs):
         return f"{T}用户希望我主动开口，我需要思考。{TC}主人，好久没说话了。"
     J.generate_text_reply = tagged_text
     try:
@@ -1198,7 +1198,7 @@ def f_thinking_never_spoken():
     check("纯文本侧仍能从 think 标签里抢救出台词",
           lambda: _st(f"{T}思考{TC}主人，好久没说话了。") == "主人，好久没说话了。")
 
-    async def normal_text(ctx, system, user_prompt, max_tokens=512):
+    async def normal_text(ctx, system, user_prompt, max_tokens=512, **kwargs):
         return "主人，好久没说话了，在忙吗？"
     J.generate_text_reply = normal_text
     try:
@@ -1288,6 +1288,46 @@ def g_sticker_capture_gate():
           lambda: "sajiao" not in ST.category_candidates({"stickers_dir": str(lib)}))
     (lib / "sajiao").rmdir()
 
+    check("判定指令点名否决界面/页面截图",
+          lambda: "截图" in instr and "状态栏" in instr and "聊天气泡" in instr
+          and "评论区" in instr)
+    check("判定指令要求表情包得是单一画面形态",
+          lambda: "单一画面" in instr)
+
+    # 「不要只看画面」：截图里往往嵌着一张有趣的图，只看内容会被它骗过去，
+    # 所以落盘前再按整张图的形状拦一道（手机/桌面截图的长宽比）
+    import io as _io
+    from PIL import Image as _PILImage
+    from modules.stickers import StickerManager, auto_capture_image
+
+    def _img_bytes(size, color):
+        buf = _io.BytesIO()
+        _PILImage.new("RGB", size, color).save(buf, format="JPEG")
+        return buf.getvalue()
+
+    phone_shot = _img_bytes((360, 800), (20, 20, 20))
+    square_meme = _img_bytes((200, 200), (200, 30, 30))
+    check("手机截图的长宽比被认出来",
+          lambda: ST.screen_shot_size(phone_shot) == (360, 800))
+    check("方形表情包不会被误判成截图",
+          lambda: ST.screen_shot_size(square_meme) is None)
+    check("认不出尺寸的图片不拦",
+          lambda: ST.screen_shot_size(b"not-an-image") is None)
+
+    shot_pool = ROOT / ".tmp_test" / "fixrun" / "shot_pool"
+    shot_pool.mkdir(parents=True, exist_ok=True)
+    cap_cfg = Cfg({"stickers_enabled": True, "stickers_dir": str(shot_pool),
+                   "sticker_capture_enabled": True, "sticker_capture_min_interval": 0,
+                   "sticker_capture_max_per_day": 0})
+    cap_mgr = StickerManager(cap_cfg)
+    ok_shot = asyncio.run(auto_capture_image(cap_cfg, cap_mgr, "", "gaoxing",
+                                             image_data=phone_shot))
+    ok_meme = asyncio.run(auto_capture_image(cap_cfg, cap_mgr, "", "gaoxing",
+                                             image_data=square_meme))
+    saved_shots = list((shot_pool / "gaoxing").glob("auto_*"))
+    check("截图形态的图不落进表情库", lambda: ok_shot is False and len(saved_shots) == 1)
+    check("方形表情包照常收藏", lambda: ok_meme is True)
+
 
 def g2_sticker_no_category_fallback(monkeypatch_note=""):
     """分类拿不准时不得回退 pingjing，也不得把无关图片塞进表情库。"""
@@ -1299,7 +1339,7 @@ def g2_sticker_no_category_fallback(monkeypatch_note=""):
 
     seen = {}
 
-    async def fake_chat_once(ctx, messages, tools=None):
+    async def fake_chat_once(ctx, messages, tools=None, **kwargs):
         seen["messages"] = messages
         return {"content": "none", "tool_calls": [], "ms": 0, "backend": "ollama"}
 
@@ -1320,7 +1360,7 @@ def g2_sticker_no_category_fallback(monkeypatch_note=""):
               lambda: "不要代入任何角色" in str(seen["messages"])
               and "不要考虑对话里任何人的情绪" in str(seen["messages"]))
 
-        async def fake_chat_pingjing(ctx2, messages, tools=None):
+        async def fake_chat_pingjing(ctx2, messages, tools=None, **kwargs):
             return {"content": "pingjing", "tool_calls": [], "ms": 0, "backend": "ollama"}
         M.chat_once = fake_chat_pingjing
         RP.chat_once = fake_chat_pingjing
@@ -1329,7 +1369,7 @@ def g2_sticker_no_category_fallback(monkeypatch_note=""):
         check("模型给出合法分类时照常使用（pingjing 也是合法分类）",
               lambda: cat2["category"] == "pingjing")
 
-        async def fake_chat_named(ctx2, messages, tools=None):
+        async def fake_chat_named(ctx2, messages, tools=None, **kwargs):
             return {"content": '{"category": "sajiao", "name": "撒娇求抱抱"}',
                     "tool_calls": [], "ms": 0, "backend": "ollama"}
         M.chat_once = fake_chat_named
@@ -1340,7 +1380,7 @@ def g2_sticker_no_category_fallback(monkeypatch_note=""):
         check("中立判定同时给出分类与用途名",
               lambda: named["category"] == "sajiao" and named["name"] == "撒娇求抱抱")
 
-        async def fake_chat_garbage(ctx2, messages, tools=None):
+        async def fake_chat_garbage(ctx2, messages, tools=None, **kwargs):
             return {"content": "我不知道该怎么分类", "tool_calls": [], "ms": 0, "backend": "ollama"}
         M.chat_once = fake_chat_garbage
         RP.chat_once = fake_chat_garbage
@@ -1348,7 +1388,7 @@ def g2_sticker_no_category_fallback(monkeypatch_note=""):
             ctx, {"description": "风景照", "sentences": [{"zh": "嗯"}]}))
         check("模型输出无法识别 → 返回空分类（不再默认 pingjing）", lambda: cat3["category"] == "")
 
-        async def fake_chat_explain(ctx2, messages, tools=None):
+        async def fake_chat_explain(ctx2, messages, tools=None, **kwargs):
             return {"content": "这张图不是 gaoxing，更像是 wuyu 吧",
                     "tool_calls": [], "ms": 0, "backend": "ollama"}
         M.chat_once = fake_chat_explain
@@ -1358,7 +1398,7 @@ def g2_sticker_no_category_fallback(monkeypatch_note=""):
         check("输出里出现多个分类时不猜（避免归错目录）",
               lambda: ambiguous["category"] == "")
 
-        async def fake_chat_other(ctx2, messages, tools=None):
+        async def fake_chat_other(ctx2, messages, tools=None, **kwargs):
             return {"content": '{"category": "shangxin", "name": "难过想哭"}',
                     "tool_calls": [], "ms": 0, "backend": "ollama"}
         M.chat_once = fake_chat_other
@@ -1367,7 +1407,7 @@ def g2_sticker_no_category_fallback(monkeypatch_note=""):
             ctx, {"description": "一张哭泣的图", "sentences": [{"zh": "嗯"}]}))
         check("白名单之外的分类不落库", lambda: other["category"] == "")
 
-        async def fake_chat_boom(ctx2, messages, tools=None):
+        async def fake_chat_boom(ctx2, messages, tools=None, **kwargs):
             raise RuntimeError("model down")
         M.chat_once = fake_chat_boom
         RP.chat_once = fake_chat_boom
@@ -2094,7 +2134,7 @@ def l_proactive_history():
     # 生成函数确实把历史块交给模型
     captured = {}
 
-    async def fake_text_reply(ctx, system, user_prompt, max_tokens=512):
+    async def fake_text_reply(ctx, system, user_prompt, max_tokens=512, **kwargs):
         captured["system"] = system
         captured["user"] = user_prompt
         return "主人，刚才说的那件事，本座还记着呢。"
@@ -2291,7 +2331,7 @@ def n_todo_meaningless_transcribe():
     llm_tm = TodoManager(Cfg({"todo_keywords": "提醒"}), DB(), Sch())
     orig = llm_tm._parse_time_expr
     try:
-        async def fake_json(ctx, system, user_prompt, max_tokens=200):
+        async def fake_json(ctx, system, user_prompt, max_tokens=200, **kwargs):
             return {"has_todo": True, "content": "再提醒我", "delay_minutes": 5}
         import modules.todo_manager as TDM
         orig_json = TDM.generate_json_reply
@@ -2311,7 +2351,7 @@ def n_todo_meaningless_transcribe():
     llm_tm2 = TodoManager(Cfg({"todo_keywords": "提醒"}), DB(), Sch())
     import modules.todo_manager as TDM
 
-    async def fake_json2(ctx, system, user_prompt, max_tokens=200):
+    async def fake_json2(ctx, system, user_prompt, max_tokens=200, **kwargs):
         return {"has_todo": True, "content": "再提醒我", "delay_minutes": 5}
     orig_json = TDM.generate_json_reply
     TDM.generate_json_reply = fake_json2
@@ -2401,7 +2441,7 @@ def n2_todo_time_not_content():
                                "todo_extract_prompt": OLD_PROMPT}), DB(), Sch())
         captured = {}
 
-        async def fake_json(ctx, system, user_prompt, max_tokens=200):
+        async def fake_json(ctx, system, user_prompt, max_tokens=200, **kwargs):
             captured["system"] = system
             return model_reply
 

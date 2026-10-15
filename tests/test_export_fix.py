@@ -451,12 +451,12 @@ def e2_import_decrypts_password():
 def d_frontend_binding():
     section("D 前端导出链路静态校验")
     html = (ROOT / "webui" / "start.html").read_text(encoding="utf-8")
-    check("存在切换预设按钮元素 config-preset-btn",
-          lambda: 'id="config-preset-btn"' in html)
-    check("存在切换预设按钮点击绑定",
-          lambda: "getElementById('config-preset-btn').addEventListener('click'" in html)
-    check("导出当前配置走预设接口",
-          lambda: "apiPost('api/config/presets/save'" in html)
+    check("存在配置文件页入口按钮 profile-save-btn",
+          lambda: 'id="profile-save-btn"' in html)
+    check("存在保存配置文件按钮点击绑定",
+          lambda: "getElementById('profile-save-btn').addEventListener('click'" in html)
+    check("保存配置文件走配置文件接口",
+          lambda: "apiPost('api/config/profiles/save'" in html)
     check("downloadFile 对无 Content-Disposition 的响应有兜底",
           lambda: "return payload || {mode: 'saved'}" in html)
     check("导出请求带超时保护",

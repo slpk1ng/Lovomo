@@ -229,6 +229,9 @@ def f_delete_clears_state(tmp: Path):
     FakeServer.handle_delete = M.WebUIServer.handle_delete
     FakeServer._deleted_session_scopes = M.WebUIServer._deleted_session_scopes
     FakeServer._session_user_id = M.WebUIServer._session_user_id
+    # handle_delete 把状态清理交给了 _purge_session_state，桩也得把它绑上，
+    # 否则 self._purge_session_state 抛 AttributeError 被 handle_delete 吞掉，什么都没清
+    FakeServer._purge_session_state = M.WebUIServer._purge_session_state
     server = FakeServer()
 
     def prepare():

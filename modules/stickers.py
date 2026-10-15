@@ -25,6 +25,13 @@ MIME_BY_EXT[".jpeg"] = "image/jpeg"
 
 STRICT_ALLOWED = {"gaoxing", "shengqi", "haixiu", "wuyu", "jingya", "sajiao", "weixie", "pingjing"}
 
+# 「屏幕截图形态」的长宽比区间：手机截图约 0.45（9:20）、桌面截图约 1.78（16:9），
+# 而表情包都是接近方形的单一画面（用户库里那批的比值都在 0.99~1.21）。
+# 收藏前除画面内容外再按整张图的形状拦一道：截图里往往嵌着一张有趣的图，
+# 只看画面内容会被它骗过去。
+SCREEN_SHOT_ASPECT_MIN = 0.6
+SCREEN_SHOT_ASPECT_MAX = 1.7
+
 # 每个分类「适合什么互动场景」的说明，用于指导 LLM 归类。
 # 事故背景：纯风景/阴森图被判成 gaoxing，根因是分类说明太粗糙 +
 # 指令强调"必须给出分类"，模型于是随便挑了个正向情绪。
@@ -336,6 +343,27 @@ def _sticker_max_side(config) -> int:
         return 400
 
 
+def screen_shot_size(data: bytes):
+    """像屏幕截图/长图时返回它的 (宽, 高)，否则 None（认不出尺寸也返回 None）。
+
+    判据只有长宽比：真正的表情包是接近方形的单一画面，截图是一整屏界面
+    （手机 9:20、桌面 16:9）。
+    """
+    try:
+        from io import BytesIO
+        from PIL import Image
+        with Image.open(BytesIO(data)) as img:
+            width, height = img.size
+    except Exception:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    ratio = width / height
+    if ratio < SCREEN_SHOT_ASPECT_MIN or ratio > SCREEN_SHOT_ASPECT_MAX:
+        return (width, height)
+    return None
+
+
 def _reencode_for_sticker(data: bytes, ext: str, config) -> tuple:
     """静态图重编码：缩小体积并统一为 PNG/JPEG。失败时原样返回。"""
     try:
@@ -580,6 +608,12 @@ async def auto_capture_image(config, sticker_manager, source, category_hint="",
         print("[表情收藏] 跳过：没有取到图片数据（下载失败或文件为空）。")
         return False
 
+    shot = screen_shot_size(data)
+    if shot:
+        print(f"[表情收藏] 跳过：{shot[0]}x{shot[1]} 是屏幕截图/长图的长宽比，"
+              "不像表情包（表情包是接近方形的单一画面）。")
+        return False
+
     ext = _ext_for_bytes(data, src)
     if not ext:
         print("表情收藏跳过：无法识别的图片格式。") 
@@ -744,7 +778,8 @@ class StickerManager:
                    + (f"\n（当前情绪：{emotion}）" if emotion else ""))
         try:
             from .llm_helpers import chat_once
-            result = await chat_once(ctx, [{"role": "user", "content": payload}])
+            result = await chat_once(ctx, [{"role": "user", "content": payload}],
+                                     label="表情挑选")
         except Exception as e:
             print(f"按描述挑表情包失败，回退按情绪选择: {type(e).__name__}: {e}")
             return None
@@ -852,7 +887,8 @@ async def classify_sticker_image(ctx, source: str, data: bytes, mime: str) -> di
     from .llm_helpers import base64_b64, extract_json_objects, vision_chat_once
     prompt = _import_prompt(category_candidates_text(ctx))
     content, _ms = await vision_chat_once(
-        ctx, prompt, [(str(source), mime, base64_b64(data))], max_tokens=256)
+        ctx, prompt, [(str(source), mime, base64_b64(data))], max_tokens=256,
+        label="表情分类")
     for obj in extract_json_objects(content or ""):
         if isinstance(obj, dict) and ("category" in obj or "name" in obj):
             return obj

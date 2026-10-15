@@ -97,7 +97,7 @@ def b_promises():
     from modules import promises as promise_mod
 
     async def run_extract(content):
-        async def fake_chat(ctx, messages, tools=None):
+        async def fake_chat(ctx, messages, tools=None, **kwargs):
             return {"content": content, "tool_calls": [], "ms": 1.0, "backend": "fake"}
         old = promise_mod.chat_once
         promise_mod.chat_once = fake_chat
@@ -449,6 +449,31 @@ def e_mood_extra():
         check("同一天重写日记不产生重复条目",
               lambda: len(diary.diary["murasame"]) == 1
               and diary.get_diary()["murasame"][0]["text"] == "重写后的日记。")
+
+        diary.add_diary("murasame", "2026-09-29", "别处聊出来的日记。",
+                        session_id="private_other")
+        check("日记按会话取：取不到别处写的",
+              lambda: [e["text"] for e in
+                       diary.get_diary(session_id="private_other")["murasame"]]
+              == ["别处聊出来的日记。"]
+              and diary.get_diary(session_id="private_mine")["murasame"] == [])
+
+        from modules import app_context as AC
+        from modules.companion_tasks import mood_diary_note
+
+        class _Ctx:
+            character_key = "murasame"
+
+        saved_mgr, saved_cfg = AC.mood_mgr, AC.global_config
+        AC.mood_mgr = diary
+        AC.global_config = {"mood_diary_enabled": True}
+        try:
+            mine = mood_diary_note(_Ctx(), "private_other")
+            others = mood_diary_note(_Ctx(), "private_mine")
+        finally:
+            AC.mood_mgr, AC.global_config = saved_mgr, saved_cfg
+        check("注入提示词的日记只认本条会话写的",
+              lambda: "别处聊出来的日记。" in mine and others == "")
     finally:
         mood_mod.time.localtime = old_localtime
 
@@ -504,6 +529,9 @@ def g_companion_daily_check():
             self.client = object()
             self.sent = []
             self.not_recorded = []
+            # 最近一次发送是不是"超时、结果未知"（真发送器由发送层按异常类型判定）
+            self.last_send_uncertain = False
+            self.uncertain = False
 
         def session_client(self, session_id):
             # 没有真实连接：按「能力全支持」处理（reply_ctx_of 会据此取能力位）
@@ -517,12 +545,20 @@ def g_companion_daily_check():
             self.last_session = session_id
             yield
 
+        @contextlib.contextmanager
+        def send_once(self):
+            yield
+
         async def speak_and_send(self, session_type, target_id, text, emotions,
                                  ctx, use_voice=False, sticker=False,
                                  session_id="", record_history=True):
+            self.last_send_uncertain = False
             self.sent.append((session_type, target_id, text))
             if not record_history:
                 self.not_recorded.append((session_id, text))
+            if self.uncertain:
+                self.last_send_uncertain = True
+                return False
             return True
 
     work = fresh_dir("daily")
@@ -705,6 +741,26 @@ def g_companion_daily_check():
     check("过旧的日记不再补发，但仍留在日记列表里",
           lambda: not diary_sends("private_10001")
           and M.mood_mgr.has_diary("murasame", old_day, "private_10001"))
+
+    # 发送超时只是没等到发送回执：日记很可能已经到了，再补发一篇主人就会收到两遍
+    def pending_today():
+        return [e for _k, e in M.mood_mgr.unsent_diaries(50)
+                if str(e.get("session_id") or "") == "private_10001"
+                and e.get("date") == today]
+
+    M.mood_mgr.add_diary("murasame", today, "超时的日记", session_id="private_10001")
+    fake_sender.sent.clear()
+    fake_sender.not_recorded.clear()
+    fake_sender.uncertain = True
+    asyncio.run(M.deliver_mood_diaries())
+    check("发送超时的日记按已发出处理，不再排队补发",
+          lambda: len(diary_sends("private_10001")) == 1 and not pending_today())
+    fake_sender.sent.clear()
+    fake_sender.not_recorded.clear()
+    asyncio.run(M.deliver_mood_diaries())
+    fake_sender.uncertain = False
+    check("超时的日记下一轮不会再补发一遍",
+          lambda: not diary_sends("private_10001"))
 
     # 静默时段内跳过发言
     cfg.config["proactive_quiet_start"] = "00:00"

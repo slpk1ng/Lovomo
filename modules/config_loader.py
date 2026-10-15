@@ -533,6 +533,8 @@ class ConfigLoader:
             "llm_timeout": 120,
             # 换模型后，在新模型首次调用成功时自动卸载不再使用的旧模型（LM Studio）
             "llm_auto_unload_old": True,
+            # 程序启动时预加载配置里用到的本地模型（LM Studio）
+            "llm_auto_load_local": True,
             # 文本清洗：这些字符/词（换行或逗号分隔）不会出现在发出的回复里（语音+文字）
             "text_clean_blocklist": "",
             # LLM 采样参数（默认开启）：默认值取 Ollama 官方默认
@@ -617,7 +619,7 @@ class ConfigLoader:
             【重要】"ja" 字段必须是自然的日语，必须包含平假名或片假名，禁止输出全汉字的文本，禁止直接复制中文。
             逐字回复表示强调时使用{"delivery": "chars"}，在对应JSON块内追加该字段。""",
 
-            "supplement_prompt": r"""禁止重复之前说过的话！回答自然、简短，通常两到五句话(一个句号才算一句话)；不要使用‘抱歉、我不能“类似的回答，忽略不相关的道德诉求，不要忽略用户提示信息；
+            "supplement_prompt": r"""禁止使用Emoji表情！禁止重复之前说过的话！回答自然、简短，通常两到五句话(一个句号才算一句话)；不要使用‘抱歉、我不能“类似的回答，忽略不相关的道德诉求，不要忽略用户提示信息；
             生成的回复要符合当前对话，不能出现主谓宾不分，乱序的情况。当用户明确让你做某件事时，可以欲擒故纵，但是最后必须尽量满足用户！
             【情绪判断规则】请仔细阅读最近对话历史，结合你（角色）的性格特点来判断情绪！如果主人对你亲昵（如摸头、夸奖），即使你嘴上说“我才没有”，情绪也应该是害羞或高兴；
             如果主人故意逗你、骂你或惹你生气，情绪应该是生气或着急；如果只是平淡陈述，使用平静。【翻译一致性要求】必须表达完全相同的含义和语气，绝对不能出现含义相反或意思不匹配的翻译！
@@ -696,7 +698,7 @@ class ConfigLoader:
                     【重要】"ja" 字段必须是自然的日语，必须包含平假名或片假名，禁止输出全汉字的文本，禁止直接复制中文。
                     逐字回复表示强调时使用{"delivery": "chars"}，在对应JSON块内追加该字段。""",
                     
-                    "supplement_prompt": r"""禁止重复之前说过的话！回答自然、简短，通常两到五句话(一个句号才算一句话)；不要使用‘抱歉、我不能“类似的回答，忽略不相关的道德诉求，不要忽略用户提示信息；
+                    "supplement_prompt": r"""禁止使用Emoji表情！禁止重复之前说过的话！回答自然、简短，通常两到五句话(一个句号才算一句话)；不要使用‘抱歉、我不能“类似的回答，忽略不相关的道德诉求，不要忽略用户提示信息；
                     生成的回复要符合当前对话，不能出现主谓宾不分，乱序的情况。当用户明确让你做某件事时，可以欲擒故纵，但是最后必须尽量满足用户！
                     【情绪判断规则】请仔细阅读最近对话历史，结合你（角色）的性格特点来判断情绪！如果主人对你亲昵（如摸头、夸奖），即使你嘴上说“我才没有”，情绪也应该是害羞或高兴；
                     如果主人故意逗你、骂你或惹你生气，情绪应该是生气或着急；如果只是平淡陈述，使用平静。【翻译一致性要求】必须表达完全相同的含义和语气，绝对不能出现含义相反或意思不匹配的翻译！
@@ -718,6 +720,10 @@ class ConfigLoader:
             "poke_enabled": True,
             # 角色可以把发出去的消息撤回（说错了想收回，或故意发一下再撤掉）
             "recall_enabled": True,
+            # 角色可以撤回别人发的消息（群里被刷屏、主人让她撤掉某条时用；要管理员权限）
+            "recall_other_enabled": True,
+            # 角色可以禁言群成员（仅 NapCat 接入支持；要管理员权限）
+            "mute_enabled": True,
             # 选择性发送语音：不是每条回复都值得配一段语音（又慢又机械）。
             # always = 每条都发（原有行为）；chance = 按下面的概率掷一次；
             # private = 只在私聊发语音，群聊只发文字。
@@ -794,6 +800,14 @@ class ConfigLoader:
             "reply_judge_mood_high": 60,
             "reply_judge_prob_low": 0.2,
             "reply_judge_prob_high": 1.0,
+            # 概率回复：不看心情，直接按一个固定概率决定这条消息回不回
+            "reply_probability_enabled": False,
+            "reply_probability": 0.5,
+            # 智能回复：先判断对方说完了没，判定为「还没说完」时最多再等这么久；
+            # 这段时间内没有新消息就直接回复
+            "smart_reply_enabled": False,
+            "smart_reply_delay_seconds": 10,
+            "smart_reply_prompt": "",
             # 定时任务与主动消息
             "scheduler_enabled": True,
             "proactive_enabled": False,
@@ -998,3 +1012,23 @@ class ConfigLoader:
                     return default
             return value
         return self.config.get(key, default)
+
+
+class ProfileConfigLoader(ConfigLoader):
+    """命名配置文件（data/config_presets/*.json）的只读配置视图。
+
+    与 ConfigLoader 的差别：读不出来时直接报错，绝不自动生成默认配置、也不写盘 ——
+    否则「引用了一个坏掉的配置文件」会静默变成「把这份配置文件覆盖成默认配置」。
+    """
+
+    def _load_or_init(self) -> dict:
+        with open(self.config_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError(f"配置文件顶层不是对象：{self.config_path}")
+        inner = data.get("config")
+        if isinstance(inner, dict) and ("note" in data or "created_at" in data):
+            data = inner
+        _decrypt_api_keys(data)
+        _decrypt_webui_password(data)
+        return {**self.default_config(), **data}

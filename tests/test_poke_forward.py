@@ -118,6 +118,9 @@ class StubSender:
     def _active_client(self):
         return StubTextOnlyClient()
 
+    async def pace_text_only(self, session_type, target_id):
+        return None
+
     async def send_text(self, session_type, target_id, text, **kwargs):
         self.texts.append(str(text))
         return True
@@ -430,9 +433,53 @@ def t7_sentence_field():
         return (len(out) == 2 and out[0].get("poke") is True
                 and "poke" not in out[1])
 
+    def stage_direction_becomes_poke():
+        # 动作写成长句里的一个分句：动作不在括号开头、动词也可能是「弹」「敲」
+        s = LH.normalize_single({"zh": "(鼓起脸颊，伸手轻轻戳回去) 哼！"}, ctx, emotions, "在吗")
+        return s.get("poke") is True and s["zh"] == "(鼓起脸颊，伸手轻轻戳回去) 哼！"
+
+    def stage_direction_variants():
+        return (LH.strip_poke_action("(朝主人的额头弹了一下) 扯平了！")[1] is True
+                and LH.strip_poke_action("（轻轻敲了敲你的脑袋）")[1] is True
+                and LH.strip_poke_action("戳回去")[1] is True)
+
+    def self_or_object_poke_not_flagged():
+        return (LH.strip_poke_action("（戳了戳自己的脸颊）")[1] is False
+                and LH.strip_poke_action("（敲了敲桌子）")[1] is False
+                and LH.strip_poke_action("（想起主人说过的话，敲了敲自己的头）")[1] is False)
+
+    def plain_dialogue_not_flagged():
+        return (LH.strip_poke_action("你戳我干什么？")[1] is False
+                and LH.strip_poke_action("本座可不是好欺负的，再戳一次试试看？")[1] is False)
+
+    def stage_direction_other_actions():
+        return (LH.detect_stage_actions("（撤回这条）") == {"recall": True}
+                and LH.detect_stage_actions("（撤回主人的消息）") == {"recall_other": True}
+                and LH.detect_stage_actions("（禁言你）") == {"mute": True}
+                and LH.detect_stage_actions("（引用主人那条）") == {"reply_to": True}
+                and LH.detect_stage_actions("（一个字一个字地说）") == {"delivery": True})
+
+    def stage_direction_skips_hypothetical():
+        return (LH.detect_stage_actions("（要是能禁言你就好了）") == {}
+                and LH.detect_stage_actions("（真想撤回这条）") == {}
+                and LH.detect_stage_actions("撤回别人的消息要权限") == {})
+
+    def normalize_turns_stage_into_action():
+        s = LH.normalize_single({"zh": "（撤回这条）"}, ctx, emotions, "在吗")
+        s2 = LH.normalize_single({"zh": "（禁言你）"}, ctx, emotions, "在吗")
+        return (s.get("recall") is True and s["zh"] == "（撤回这条）"
+                and s2.get("mute") is True and s2["zh"] == "（禁言你）")
+
     check("normalize_single 保留 poke", normalize_keeps_poke)
     check("poke 只认 true", normalize_ignores_other_values)
     check("parse_sentences 把 poke 挂到第一句", sentences_attach_to_first)
+    check("舞台提示里的戳改成真动作、正文保留", stage_direction_becomes_poke)
+    check("弹/敲/戳回去这些写法也认", stage_direction_variants)
+    check("戳自己或戳东西不算戳人", self_or_object_poke_not_flagged)
+    check("普通对话里的「戳」不算戳人", plain_dialogue_not_flagged)
+    check("撤回/禁言/引用/逐字写成舞台提示也认", stage_direction_other_actions)
+    check("假设语气的舞台提示不算动作", stage_direction_skips_hypothetical)
+    check("舞台提示补成真动作、正文保留", normalize_turns_stage_into_action)
 
 
 def main():

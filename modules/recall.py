@@ -197,7 +197,8 @@ class HistoryRecallManager:
                   "请结合最近对话增删，输出更新后的完整清单。")
         try:
             result = await chat_once(ctx, [{"role": "system", "content": OPEN_TOPICS_SYSTEM},
-                                           {"role": "user", "content": prompt}])
+                                           {"role": "user", "content": prompt}],
+                                     label="未了话题")
         except Exception as e:
             print(f"未了话题更新失败（沿用旧清单）: {type(e).__name__}: {e}")
             return

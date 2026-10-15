@@ -1,3 +1,5 @@
+import contextvars
+
 from modules.scheduler import get_scheduler
 
 try:
@@ -71,3 +73,22 @@ _WEBUI_SERVER_HOLDER = {"server": None}
 _APP_HOOKS = {"install_update": None}
 
 MAIN_EVENT_LOOP = None
+
+# 当前处理链路该用哪份配置：接入方式绑了配置文件时，处理这条连接的消息期间
+# 指向那份配置；没绑（或不在消息链路里，如后台线程）时为空，一律回落到主配置。
+_ACTIVE_CONFIG = contextvars.ContextVar("lovomo_active_config", default=None)
+
+
+def active_config():
+    """当前处理链路该用的配置（可能是一份命名配置文件）。"""
+    return _ACTIVE_CONFIG.get() or global_config
+
+
+def set_active_config(config):
+    """把配置装进当前上下文，返回用于还原的 token。"""
+    return _ACTIVE_CONFIG.set(config)
+
+
+def reset_active_config(token) -> None:
+    if token is not None:
+        _ACTIVE_CONFIG.reset(token)

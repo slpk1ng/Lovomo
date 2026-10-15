@@ -691,7 +691,7 @@ def c2_neutral_context():
 
     seen = []
 
-    async def fake_chat_once(ctx, messages, tools=None):
+    async def fake_chat_once(ctx, messages, tools=None, **kwargs):
         seen.append(messages)
         return {"content": "用户1 与用户2 在讨论团子；用户1 自称主人。", "ms": 1.0}
 
@@ -779,7 +779,7 @@ def c3_context_recheck():
 
     replies = []
 
-    async def fake_chat_once(ctx_, messages, tools=None):
+    async def fake_chat_once(ctx_, messages, tools=None, **kwargs):
         replies.append(messages[-1]["content"])
         return {"content": '{"confirmed": true}', "ms": 1.0}
 
@@ -817,7 +817,7 @@ def c3_context_recheck():
     M.affection_mgr.records["murasame"]["10002"] = {
         "score": 100, "romance": True, "partner": False, "updated": 0}
 
-    async def deny(_ctx, _messages, tools=None):
+    async def deny(_ctx, _messages, tools=None, **kwargs):
         replies.append("deny")
         return {"content": '{"confirmed": false}', "ms": 1.0}
 
@@ -831,7 +831,7 @@ def c3_context_recheck():
     import modules.lexicon as lexicon_mod
     import modules.profiles as profiles_mod
 
-    async def profile_json(ctx_, system, user_prompt, max_tokens=512):
+    async def profile_json(ctx_, system, user_prompt, max_tokens=512, **kwargs):
         return {"nickname": "别人瞎起的", "birthday": "01-01",
                 "likes": ["猫", "狗", "甜食"], "notes": ["在准备考试"]}
 
@@ -848,7 +848,7 @@ def c3_context_recheck():
           and prof["notes"] == ["在准备考试"])
 
     # 词条复核：走词典自己的入库流程
-    async def term_json(ctx_, system, user_prompt, max_tokens=512):
+    async def term_json(ctx_, system, user_prompt, max_tokens=512, **kwargs):
         return {"learned": [{"term": "摸鱼", "meaning": "偷懒不干活", "confidence": 0.9}]}
 
     orig_lexicon_call = lexicon_mod.generate_json_reply
@@ -964,7 +964,7 @@ def d_search():
           lambda: not H._is_search_dissatisfied("这个图挺好看的"))
 
     def run_extract(model_output, user_text="那就搜索你是谁", fallback="你是谁"):
-        async def fake(ctx, messages, tools=None):
+        async def fake(ctx, messages, tools=None, **kwargs):
             return {"content": model_output, "ms": 1.0}
         orig = H.chat_once
         H.chat_once = fake
@@ -1373,7 +1373,7 @@ def i_end_to_end():
 
     state = {"extract": False}
 
-    async def fake_chat_once(ctx, messages, tools=None):
+    async def fake_chat_once(ctx, messages, tools=None, **kwargs):
         if state["extract"] and tools is None:
             return {"content": "千恋万花 丛雨 角色介绍", "tool_calls": [], "ms": 1.0,
                     "backend": "ollama"}
@@ -1764,7 +1764,7 @@ def l_speech_language():
           and not H.lang_text_broken("hello world", "en"))
 
     def fake_chat(reply):
-        async def _f(ctx, messages, tools=None):
+        async def _f(ctx, messages, tools=None, **kwargs):
             return {"content": reply, "tool_calls": [], "ms": 1.0, "backend": "ollama"}
         return _f
 
@@ -1912,7 +1912,8 @@ def n_tls_and_update_fallback():
     for name in ("main.py", "modules/tools.py", "modules/rag.py", "modules/tts.py",
                  "modules/tts_service.py", "modules/llm_helpers.py"):
         src = (ROOT / name).read_text(encoding="utf-8")
-        clients += src.count("httpx.AsyncClient(")
+        # 同步客户端（本地模型预加载用的 httpx.Client）也要带上证书上下文
+        clients += (src.count("httpx.AsyncClient(") + src.count("httpx.Client("))
         verified += (src.count("verify=verified_context()")
                      + src.count("verify=unverified_context()")
                      + src.count("verify=ctx"))
@@ -2589,6 +2590,9 @@ def v_voice_pacing():
             def new_message_group(self):
                 return 1
 
+            async def pace_text_only(self, st, tid):
+                return None
+
             async def send_text(self, st, tid, text, sticker=None, reply_id=None,
                                 at_ids=None, group=None):
                 return True
@@ -3244,6 +3248,94 @@ def _missing_html_i18n(html):
     return missing
 
 
+def aa_model_artifact_leak():
+    from modules import llm_helpers as H
+    from modules.llm_helpers import RoleContext, normalize_sentences, FALLBACK_REPLY
+
+    section("AA 模型抄上下文标记：说话人标签与表情包占位符不再当台词")
+
+    ctx = RoleContext({"text_lang": "ja", "display_lang": "zh",
+                       "default_voice": "pingjing", "llm_judge": True}, {})
+    emo = {"pingjing": {}}
+
+    check("说话人序号标签被剥掉", lambda:
+          H.strip_model_artifacts("[角色1] 喂——！ [角色1] 本座说了会生气的！")
+          == "喂——！ 本座说了会生气的！")
+    check("表情包占位符被剥掉", lambda:
+          H.strip_model_artifacts("哼 [表情包: 066]") == "哼")
+    check("换壳的表情包说明整段剥掉", lambda:
+          H.strip_model_artifacts("哼 [（表情包的日文翻译）:（震惊猫猫）]") == "哼")
+    check("调出表情包的变体写法也剥掉", lambda:
+          H.strip_model_artifacts("哼 [调用表情包：066]") == "哼")
+    check("不带表情包字样的括号不受影响", lambda:
+          H.strip_model_artifacts("[（生气）:哼] 你说什么") == "[（生气）:哼] 你说什么")
+    check("普通方括号内容不受影响", lambda:
+          H.strip_model_artifacts("[旁白] 你好") == "[旁白] 你好")
+
+    def labelled_reply_keeps_text():
+        out = normalize_sentences("[角色1] 喂——！ [角色1] 本座说了会生气的！",
+                                  ctx, emo, "hi")
+        joined = "".join(s.get("zh") or "" for s in out)
+        return "喂——！" in joined and "[角色1]" not in joined
+
+    def labelled_reply_not_fallback():
+        out = normalize_sentences("[角色1] 喂——！ [角色1] 本座说了会生气的！",
+                                  ctx, emo, "hi")
+        return all(s.get("zh") != FALLBACK_REPLY for s in out)
+
+    def sticker_placeholder_not_spoken():
+        out = normalize_sentences("[角色1] 哼 [表情包: 053]", ctx, emo, "hi")
+        joined = "".join(s.get("zh") or "" for s in out)
+        return "哼" in joined and "表情包" not in joined
+
+    def json_array_still_guarded():
+        return normalize_sentences("[1,2]", ctx, emo, "hi")[0]["zh"] == FALLBACK_REPLY
+
+    check("带说话人标签的回复照常作为台词", labelled_reply_keeps_text)
+    check("带说话人标签的回复不再走兜底台词", labelled_reply_not_fallback)
+    check("表情包占位符不再被念出来", sticker_placeholder_not_spoken)
+    check("真正的 JSON 数组仍然被拦下", json_array_still_guarded)
+
+    def capture_chat(reply, seen):
+        async def _f(_ctx, messages, tools=None, **kwargs):
+            seen.append(json.dumps(messages, ensure_ascii=False))
+            return {"content": reply, "tool_calls": [], "ms": 1.0, "backend": "ollama"}
+        return _f
+
+    def narration_dropped_before_translate():
+        ctx = H.RoleContext({"text_lang": "ja", "display_lang": "zh"}, {})
+        line = "（被戳得身子一歪，不满地鼓脸）你这人跟本座很熟吗？"
+        sents = [{"zh": line, "lang": line, "display": line, "emotion": "pingjing"}]
+        seen = []
+        orig = H.chat_once
+        H.chat_once = capture_chat("おいおい、本座と主はそんなに親しくないぞ", seen)
+        try:
+            asyncio.run(H.repair_sentence_lang(sents, ctx))
+        finally:
+            H.chat_once = orig
+        joined = " ".join(seen)
+        return "被戳得身子一歪" not in joined and "你这人跟本座很熟吗" in joined
+
+    check("重译前先剔掉旁白，只翻台词本身", narration_dropped_before_translate)
+
+    def stream_narration_dropped():
+        import main as _M
+        sink = _M.SentenceSink("private", 10001, {}, H.RoleContext(
+            {"text_lang": "ja", "display_lang": "zh", "default_voice": "pingjing"}, {}), "")
+        seen = []
+        orig = H.chat_once
+        H.chat_once = capture_chat("ひょいと横に避けた。お前、主人とそっくりだな", seen)
+        try:
+            asyncio.run(sink._speech_text(
+                {"zh": "（被戳得往后一缩）哼，本座可不是好欺负的！",
+                 "lang": "（被戳得往后一缩）哼，本座可不是好欺负的！"}))
+        finally:
+            H.chat_once = orig
+        return "被戳得往后一缩" not in " ".join(seen)
+
+    check("流式合成前同样先剔掉旁白", stream_narration_dropped)
+
+
 def main():
     print("Lovomo 第二轮修复回归测试")
     a_sentence_alignment()
@@ -3278,6 +3370,7 @@ def main():
     x_rename_to_lovomo()
     y_version_in_ui()
     z_role_napcat_connections()
+    aa_model_artifact_leak()
     print(f"\n{'=' * 70}")
     print(f"结果：通过 {len(PASS)} | 失败 {len(FAIL)}")
     for name, err in FAIL:

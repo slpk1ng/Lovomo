@@ -498,7 +498,7 @@ def s3_tools(tmp: Path):
         stub = _StubReg()
         calls = []
 
-        async def fake_chat_once(ctx, messages, tools=None):
+        async def fake_chat_once(ctx, messages, tools=None, **kwargs):
             calls.append(len(calls))
             if len(calls) == 1:
                 return {"content": answer_first, "tool_calls": [], "ms": 1.0, "backend": "ollama"}
@@ -535,7 +535,7 @@ def s3_tools(tmp: Path):
         stub = _StubReg()
         calls = []
 
-        async def fake_chat_once(ctx, messages, tools=None):
+        async def fake_chat_once(ctx, messages, tools=None, **kwargs):
             calls.append(len(calls))
             return {"content": "这是按搜索结果组织的回答。", "tool_calls": [], "ms": 1.0,
                     "backend": "ollama"}
@@ -803,7 +803,7 @@ def s6_todos(tmp: Path):
         # （旧逻辑 delay_minutes 优先，小模型算分钟差常错，"23点"被排到 40/80 分钟后）
         import modules.todo_manager as todo_mod
 
-        async def fake_extract_json(_ctx, _system, _user, max_tokens=200):
+        async def fake_extract_json(_ctx, _system, _user, max_tokens=200, **kwargs):
             return {"has_todo": True, "content": "喝水", "delay_minutes": 80, "time": "23:00"}
         orig_json = todo_mod.generate_json_reply
         todo_mod.generate_json_reply = fake_extract_json
@@ -1076,6 +1076,28 @@ def s9_10_11(tmp: Path):
     check("性能指标统计", lambda: perf["llm"]["count"] == 1 and perf["messages_total"] == 1)
     stats = st.get_stats()
     check("聚合统计查询", lambda: "totals" in stats and "today" in stats and stats["today"]["n"] >= 1)
+    # 同一临时目录被多段共用，先把可能残留的用量清掉，断言才对得上
+    db.execute("DELETE FROM llm_usage")
+    st.record_tokens("回复生成", 1200, 300)
+    st.record_tokens("心情判定", 800, 40)
+    st.record_tokens("台词翻译", 100, 50, model="qwen-turbo", local=False)
+    st.record_tokens("回复生成", 200, 100, model="qwen3.5:4b", local=True)
+    tokens = st.get_token_stats("all")
+    check("token 用量写入与汇总", lambda:
+          tokens["totals"]["total"] == 2790 and tokens["totals"]["calls"] == 4)
+    check("token 按用途拆分", lambda:
+          [r["label"] for r in tokens["by_label"]] == ["回复生成", "心情判定", "台词翻译"])
+    # 短窗口按天聚合只会得到一个点：「总共」这类区间自动改按小时
+    check("短窗口自动按小时分桶", lambda:
+          tokens["range"]["granularity"] == "hour" and len(tokens["per_bucket"]) >= 1)
+    check("token 云端/本地拆分", lambda:
+          tokens["totals"]["cloud"] == 2490 and tokens["totals"]["local"] == 300)
+    check("token 按模型拆分并标明位置", lambda:
+          [(r["model"], r["local"], r["total"]) for r in tokens["by_model"]]
+          == [("未知模型", 0, 2340), ("qwen3.5:4b", 1, 300), ("qwen-turbo", 0, 150)])
+    check("今天与昨天区间可用", lambda:
+          st.get_token_stats("today")["totals"]["total"] == 2790
+          and st.get_token_stats("yesterday")["totals"]["total"] == 0)
     db.close()
 
 
@@ -1487,6 +1509,8 @@ async def s16_flow(tmp: Path):
             check("GET /api/logs", lambda: r.status_code == 200 and "logs" in r.json())
             r = await hc.get(base + "/api/stats")
             check("GET /api/stats", lambda: r.status_code == 200 and "totals" in r.json())
+            r = await hc.get(base + "/api/token-stats")
+            check("GET /api/token-stats", lambda: r.status_code == 200 and "totals" in r.json())
             r = await hc.get(base + "/api/performance")
             perf = r.json()
             check("GET /api/performance 含连接状态", lambda: r.status_code == 200 and
@@ -1855,7 +1879,7 @@ def s22_stream_interrupt(tmp: Path):
     cfg.roles = cfg._parse_roles()
     old_stream = M.stream_chat
 
-    async def broken_stream(ctx, messages):
+    async def broken_stream(ctx, messages, **kwargs):
         yield {"delta": '{"sentences": [{"zh": "流式第一句", "ja": "s1", "emotion": "pingjing"}',
                "tool_calls": [], "first_token_ms": 1.0}
         yield {"delta": "]}后面的内容被截断", "tool_calls": []}
@@ -2370,6 +2394,10 @@ def s30_prompt_edges(tmp: Path):
           normalize_sentences('{":::}}', ctx4, emo4, "hi")[0]["zh"] == FALLBACK_REPLY)
     check("JSON数组根同样不进台词", lambda:
           normalize_sentences("[1,2]", ctx4, emo4, "hi")[0]["zh"] == FALLBACK_REPLY)
+    check("sentences 是字符串数组时按单句处理", lambda:
+          normalize_sentences('{"sentences": ["这是一句话"]}', ctx4, emo4, "hi")[0]["zh"] == "这是一句话")
+    check("sentences 里的非台词元素被丢掉而不是崩掉", lambda:
+          normalize_sentences('{"sentences": [[]]}', ctx4, emo4, "hi")[0]["zh"] == FALLBACK_REPLY)
 
     # ---- 宽容修复：模型 JSON 语法病不再让整段JSON被当台词念出 ----
     check("截断JSON自动补齐保住句子", lambda: _count4(
@@ -2621,7 +2649,7 @@ def s32_group_gate_quote_context(tmp: Path):
 
     captured = {"calls": []}
 
-    async def fake_chat_once(ctx, messages, tools=None):
+    async def fake_chat_once(ctx, messages, tools=None, **kwargs):
         captured["calls"].append([dict(m) for m in messages])
         return {"content": '{"sentences": [{"zh": "收到", "ja": "受信", "emotion": "pingjing"}]}',
                 "tool_calls": [], "ms": 1.0, "backend": ctx.get("llm_backend", "ollama")}
@@ -3122,7 +3150,7 @@ def s33_reply_judge(tmp: Path):
                     "backend": ctx.get("llm_backend", "ollama")}
         return _run()
 
-    async def fake_main_once(ctx, messages, tools=None):
+    async def fake_main_once(ctx, messages, tools=None, **kwargs):
         seen_prompts.append(messages)
         return {"content": '{"sentences": [{"zh": "回你啦", "ja": "返事", "emotion": "pingjing"}]}',
                 "tool_calls": [], "ms": 1.0, "backend": ctx.get("llm_backend", "ollama")}
@@ -3926,7 +3954,7 @@ def s41_group_at_text(tmp: Path):
 
     captured = {"prompt": ""}
 
-    async def fake_chat(ctx, messages, tools=None):
+    async def fake_chat(ctx, messages, tools=None, **kwargs):
         captured["prompt"] = str(messages[-1].get("content", ""))
         return {"content": '{"sentences": [{"zh": "收到", "ja": "受信", "emotion": "pingjing"}], '
                           '"reply_to": true, "mention_ids": ["777", "999"]}',
@@ -4600,9 +4628,11 @@ def s44_proactive_wait_reply(tmp: Path):
             return "主人好呀，主动消息测试。"
         # proactive_idle_check 已搬至 modules.companion_tasks，须打桩其模块内名字
         import modules.companion_tasks as ct_mod
-        saved_ct = (ct_mod.get_active_ctx, ct_mod.get_active_emotions,
+        saved_ct = (ct_mod.get_active_ctx, ct_mod.reply_ctx_of, ct_mod.get_active_emotions,
                     ct_mod._in_quiet_hours, ct_mod.generate_proactive_text)
         ct_mod.get_active_ctx = lambda: RoleContext({"character_name": "丛雨"})
+        ct_mod.reply_ctx_of = (lambda role, overrides=None, session_id="":
+                               RoleContext({"character_name": "丛雨"}))
         ct_mod.get_active_emotions = lambda: {}
         ct_mod._in_quiet_hours = lambda: False
         ct_mod.generate_proactive_text = fake_gen
@@ -4626,7 +4656,7 @@ def s44_proactive_wait_reply(tmp: Path):
             await M.proactive_idle_check()
             await M.proactive_idle_check()
         finally:
-            (ct_mod.get_active_ctx, ct_mod.get_active_emotions,
+            (ct_mod.get_active_ctx, ct_mod.reply_ctx_of, ct_mod.get_active_emotions,
              ct_mod._in_quiet_hours, ct_mod.generate_proactive_text) = saved_ct
         return first_sent, awaiting_after_first, len(M.sender.client.calls)
 
@@ -4842,7 +4872,7 @@ def s46_group_identity_and_mention(tmp: Path):
 
     captured = {"system": ""}
 
-    async def fake_chat(ctx, messages, tools=None):
+    async def fake_chat(ctx, messages, tools=None, **kwargs):
         captured["system"] = str(messages[0].get("content", ""))
         return {"content": '{"sentences": [{"zh": "听好了，'
                           + MENTION_PLACEHOLDER + ' 才是我说的那个人", "ja": "彼だ", '
@@ -4963,7 +4993,7 @@ def s47_voice_and_split_records(tmp: Path):
 
     heard = {"user": ""}
 
-    async def fake_chat(ctx, messages, tools=None):
+    async def fake_chat(ctx, messages, tools=None, **kwargs):
         for msg in reversed(messages):
             if msg.get("role") == "user" and "【" not in str(msg.get("content", ""))[:2]:
                 heard["user"] = str(msg.get("content", ""))

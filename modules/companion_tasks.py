@@ -8,8 +8,9 @@ import time
 
 from modules import app_context
 from modules.jobs import generate_proactive_text
-from modules.llm_helpers import (RoleContext, chat_once, strip_thinking,
-                                 extract_json, speaker_labeled_lines)
+from modules.llm_helpers import (RoleContext, POKE_MESSAGE_TEXT, chat_once,
+                                 strip_thinking, extract_json,
+                                 speaker_labeled_lines)
 from modules.memory_store import _is_memory_filename, _memory_session_id
 from modules.mood import MoodManager, affection_enabled
 from modules.promises import extract_promise
@@ -17,7 +18,7 @@ from modules.proactive_state import (save_proactive_state,
                                      session_memory_exists,
                                      forget_proactive_session)
 from modules.reply_pipeline import _norm_text, _repeat_ratio
-from modules.session_context import (get_active_ctx, reply_ctx_of,
+from modules.session_context import (get_active_ctx, get_active_role, reply_ctx_of,
                                      role_memory, get_active_emotions,
                                      get_role_emotions, parse_session_target,
                                      _in_quiet_hours, _parse_jitter_minutes,
@@ -58,14 +59,15 @@ def background_ready(text) -> str:
     return "" if in_character_background(kept) else kept
 
 
-async def generate_neutral_text(ctx: RoleContext, prompt: str, max_chars: int) -> str:
+async def generate_neutral_text(ctx: RoleContext, prompt: str, max_chars: int,
+                                label: str = "") -> str:
     """不带人设的一次性文本生成，用于摘要/话题这类客观整理。
 
     摘要与话题若用角色人设生成，回来的第一人称台词会被当成背景写进之后每一轮，
     角色的主观说法就这样变成了"事实"，身份与关系也跟着一起歪。
     """
     try:
-        result = await chat_once(ctx, [{"role": "user", "content": prompt}])
+        result = await chat_once(ctx, [{"role": "user", "content": prompt}], label=label)
     except Exception as e:
         print(f"中立整理失败: {type(e).__name__}: {e}")
         return ""
@@ -110,8 +112,11 @@ def session_user_id(session_id: str, history: list) -> str:
 # 只在主人催结果、或要求一个具体动作时才判：普通闲聊不该多插一条回复。
 TASK_URGE_RE = re.compile(r"开始|继续|接着|动手|去做|别说了|不要说这些|赶紧|快点|催"
                           r"|搞定|说好的|答应|还没|又忘|怎么还不")
-# 主人要求的具体动作（戳一戳 / @人 / 引用 / 撤回 / 一个字一条）与"帮我做某事"
-TASK_ACTION_RE = re.compile(r"戳|@|艾特|引用|撤回|一个字|一字|逐字|帮我|给我|帮忙|替我")
+# 主人要求的具体动作（戳一戳 / @人 / 引用 / 撤回 / 禁言 / 一个字一条）与"帮我做某事"
+TASK_ACTION_RE = re.compile(r"戳|@|艾特|引用|撤回|禁言|一个字|一字|逐字|帮我|给我|帮忙|替我")
+# 管线自己拼进消息里的标记（@ 某人、戳一戳事件）不是主人打的字：主人 @ 机器人说话、
+# 或只是戳一下，都不该被当成"要求角色做某个动作"
+TASK_SYSTEM_TAG_RE = re.compile(r"\[@[^\[\]\n]{0,60}\]|" + re.escape(POKE_MESSAGE_TEXT))
 # 角色明确拒绝做这件事、或说明自己做不到时都不再催她：这是她自己的决定或能力所限，
 # 硬推着她做既失真又白耗一轮
 TASK_REFUSE_RE = re.compile(
@@ -122,25 +127,38 @@ ACTION_NOW_HINT = (
     "【不要空转】主人已经明确要求的事，本轮要直接给出结果本身（内容、答案、东西），"
     "不要只说「这就开始」「马上做」这类答应的话；上一条回复只是在答应、并没有真做时，"
     "这一轮必须直接动手，不要再答应一次。"
+    "动作（戳一戳 / 引用 / @人 / 撤回 / 禁言）想做什么自己决定就行，不用等主人先开口；"
+    "只在台词里写「（戳回去）」「（撤回这条）」这种描述不算做了，必须填对应的动作字段；"
+    "也不要在台词里宣布结果（「已成功禁言…」「已经戳了你一下」），那同样不算做。"
 )
 TASK_PROGRESS_PROMPT = (
-    "你负责判断角色有没有真的把主人要的事做出来。输入是主人最近的要求、这个会话最近几轮对话、"
+    "你负责判断角色有没有真的把主人要的事做出来。输入是主人最近说的话、这个会话最近几轮对话、"
     "角色刚刚发出的回复、这条回复声明的动作字段、系统给出的动作执行回执，以及实际发出的消息条数。"
     "以下情况都算没做：只是答应、表示「这就开始 / 马上做」、反问主人要不要开始；"
-    "只顾撒娇打岔而没有任何实际内容；主人要的是某个动作（戳一戳 / @人 / 引用 / 撤回 / 一个字一条），"
+    "只顾撒娇打岔而没有任何实际内容；主人要的是某个动作"
+    "（戳一戳 / @人 / 引用 / 撤回 / 撤回别人的消息 / 禁言 / 一个字一条），"
     "却只在台词里嘴上说要这么做、动作字段是空的；或者声明了动作字段但实际没有做出来"
-    "（要@人却一条带@的消息都没发出、要逐字发却只发了一条）。"
+    "（要@人却一条带@的消息都没发出、要逐字发却只发了一条、要禁言却谁都没被禁言）。"
     "回执是动作的真实执行结果：显示成功就是真的做了；显示失败（这条接入方式不支持 / 发送失败）"
     "就是没做成——这时不要把「重做同一个动作」当成办法，action 里写「如实说明或换个方式」。"
+    "主人只要求了某个动作时，回执显示成功就算做成了：台词只是撒娇、打岔或随口一句，"
+    "也不必再让她重做一遍。"
     "已经把内容本身说出来（要讲的事、要写的段子、要给的答案、要办的事的进展）"
     "并且要求的动作确实做了，才算做了。"
-    "主人只是普通闲聊、并没有要角色做什么时，一律算做了。"
+    "主人只是在抱怨、感慨、描述一件事、自言自语，或者话里带过某个词时，都不算要求——"
+    "只有他明确要角色去做某事才算；角色并没有答应要做什么、只是照常回应时也算做了。"
     "角色明确拒绝做这件事、或者说自己做不了这件事（「才不」「不做」「不想」「偏不」「拒绝」"
     "「做不到」「没权限」这类话）时也算做了——那是她自己的决定或能力所限，不要逼她重做。"
     "客观判断，不要写成角色的台词。"
     "判定为没做时，必须写清「她该怎么做」——照下面这几条写，不要写「赶紧做」「别再答应了」这种空话："
-    "① 要动手做的，直接点名要填哪个动作字段（戳一戳 → poke；撤回 → recall；引用 → reply_to；"
-    "@人 → mention_ids；只发文字或一个字一条 → delivery），并写清参数（戳谁、撤哪一条、@哪几个人）；"
+    "① 要动手做的，直接点名要填哪个动作字段（戳一戳 → poke；撤回她自己刚发的那条 → recall；"
+    "撤回别人的消息 → recall_other；禁言 → mute，再配 mute_duration 写清禁言多少秒；"
+    "引用 → reply_to；@人 → mention_ids；只发文字或一个字一条 → delivery），"
+    "并写清参数（戳谁、撤哪一条、禁言谁、@哪几个人）；"
+    "禁言别人与撤回别人的消息都要求提出要求的人和机器人自己都是管理员或群主，"
+    "群主不能被禁言，"
+    "禁言他自己则只要机器人自己是管理员就够，"
+    "写步骤时按这个前提写，权限不够就让她如实说明做不到；"
     "② 要输出内容的，写清这一轮该直接说出什么（讲什么、答什么、写什么），可以只给要点；"
     "③ steps 里最多 3 条，按先后顺序写，让她照着做就行。"
     '只输出一个 JSON 对象：{"done": true 或 false,'
@@ -152,7 +170,7 @@ TASK_PROGRESS_PROMPT = (
 
 def wants_task_action(text) -> bool:
     """主人这条消息是不是在催角色动手、或要求一个具体动作。"""
-    body = str(text or "")
+    body = TASK_SYSTEM_TAG_RE.sub(" ", str(text or ""))
     return bool(TASK_URGE_RE.search(body) or TASK_ACTION_RE.search(body))
 
 
@@ -172,7 +190,7 @@ async def check_task_progress(ctx: RoleContext, user_text: str, reply_text: str,
 
     调用失败一律当"做了"，绝不因此凭空多插一条回复。
     """
-    prompt = (f"主人最近的要求：{str(user_text or '').strip()}\n"
+    prompt = (f"主人最近说的话：{str(user_text or '').strip()}\n"
               f"角色刚刚发出的回复：{str(reply_text or '').strip()[:400]}\n"
               f"这条回复声明的动作字段：{str(actions or '').strip() or '无'}\n"
               f"动作执行回执：{str(receipts or '').strip() or '无'}\n"
@@ -180,7 +198,7 @@ async def check_task_progress(ctx: RoleContext, user_text: str, reply_text: str,
               + (("最近的对话：\n" + "\n".join(context_lines)) if context_lines else ""))
     try:
         result = await chat_once(ctx, [{"role": "system", "content": TASK_PROGRESS_PROMPT},
-                                       {"role": "user", "content": prompt}])
+                                       {"role": "user", "content": prompt}], label="任务推进判定")
         obj = extract_json(strip_thinking(str((result or {}).get("content") or "")))
     except Exception as e:
         print(f"任务推进判定失败: {type(e).__name__}: {e}")
@@ -212,7 +230,7 @@ async def recheck_relationship(ctx: RoleContext, history: list, meta: dict, user
               + (f"\n背景摘要（只作资料）：{summary}\n" if summary else "")
               + "\n对话：\n" + "\n".join(lines))
     try:
-        result = await chat_once(ctx, [{"role": "user", "content": prompt}])
+        result = await chat_once(ctx, [{"role": "user", "content": prompt}], label="关系复核")
     except Exception as e:
         print(f"关系复核失败: {type(e).__name__}: {e}")
         return
@@ -323,7 +341,7 @@ async def post_reply_context_tasks(session_id: str, ctx: RoleContext):
                           "不要把不同用户合并为同一个人，也不要把角色台词当作用户事实。\n"
                           f"{'已有摘要（请合并并保留说话人归属）：' + existing if existing else ''}\n\n对话：\n"
                           + "\n".join(lines))
-                summary = await generate_neutral_text(ctx, prompt, 800)
+                summary = await generate_neutral_text(ctx, prompt, 800, label="会话摘要")
                 if summary:
                     meta["summary"] = summary
                     changed = True
@@ -347,7 +365,7 @@ async def post_reply_context_tasks(session_id: str, ctx: RoleContext):
                           "不做主观评价，不使用任何角色口吻、不写第一人称台词。"
                           "按行首用户序号区分群成员；若话题或立场只属于某位成员，保留其用户序号，不要推广为所有人的共同观点。\n"
                           + "\n".join(lines))
-                topic = await generate_neutral_text(ctx, prompt, 200)
+                topic = await generate_neutral_text(ctx, prompt, 200, label="当前话题")
                 if topic:
                     meta["topic"] = topic
                     changed = True
@@ -484,7 +502,7 @@ async def proactive_idle_check():
             print(f"主动消息：会话 {session_id} 已达当日上限（{max_per_day} 条），跳过。")
             continue
         session_type, target_id = parse_session_target(session_id)
-        ctx = get_active_ctx()
+        ctx = reply_ctx_of(get_active_role(), session_id=session_id)
         instruction = str(app_context.global_config.get("proactive_prompt", "主动找个话题和主人聊聊。"))
         try:
             hist_block = dialog_history_block(
@@ -755,7 +773,8 @@ async def write_silent_mood_diaries(roles: dict) -> int:
                         f"对方从 {last_day} 之后就没再跟你说过话，{day} 是断联的第 {step} 天，"
                         "这天也没有任何对话。"
                         "只写你这一天的状态和想法：想不想对方、自己做了什么、有没有在意的事，"
-                        "也可以只是发呆；不要编造你们之间发生过的对话。"
+                        "也可以只是发呆；不要编造你们之间发生过的对话，"
+                        "也不要提到任何约定、承诺或对方说过的话——那天你们根本没有说话。"
                         "用你自己的口吻写几句话，只输出日记正文。")
                     text = await generate_proactive_text(ctx, instruction)
                     if not str(text or "").strip():
@@ -862,8 +881,9 @@ async def deliver_mood_diaries() -> int:
     日记是角色自己写的私密东西，她并不知道会被谁看到：发给对方时既不写进
     会话历史，也不会在提示词里提到"已经发给你了"。
 
-    两个限制都为了"不要一次收到好几条"：同一个会话一次只发一篇（补写跨天时
-    几篇会一起就绪，群里有多个角色时也会各自写一篇），太旧的日记不再补发。
+    三个限制都为了"不要一次收到好几条"：同一个会话一次只发一篇（补写跨天时
+    几篇会一起就绪，群里有多个角色时也会各自写一篇），太旧的日记不再补发，
+    发出结果未知（发送超时）时也不再重发。
     """
     if app_context.mood_mgr is None or app_context.sender is None or app_context.sender.client is None:
         return 0
@@ -892,30 +912,44 @@ async def deliver_mood_diaries() -> int:
             diary_text = str(entry.get("text") or "").strip()
             if not diary_text:
                 continue
-            with app_context.sender.for_session(session_id):
+            # 只发一次、超时也不重试：超时只是没等到发送回执，消息很可能已经到了，
+            # 重发一次主人就会收到两篇同样的日记
+            with app_context.sender.for_session(session_id), app_context.sender.send_once():
                 ok = await app_context.sender.speak_and_send(
                     session_type, target_id, f"【日记】{diary_text}",
                     get_role_emotions(role), ctx, use_voice=False, sticker=False,
                     session_id=session_id, record_history=False)
+            uncertain = bool(app_context.sender.last_send_uncertain)
         except Exception as e:
             print(f"心情日记发送失败（{session_id}）: {type(e).__name__}: {e}")
             continue
-        if not ok:
+        if not ok and not uncertain:
             print(f"心情日记：会话 {session_id} 发送未成功，下次再发。")
             continue
+        # 走到这里要么确实发出去了，要么超时得不知道发没发：都按已发出处理、不再补发，
+        # 否则连着几轮重发，主人会收到好几篇同样的日记
         used_sessions.add(session_id)
         app_context.mood_mgr.mark_diary_sent(character_key, date, session_id)
         sent += 1
-        print(f"心情日记：{role.get('character_name') or character_key} "
-              f"{date} 的日记已发给 {session_id}。")
+        name = role.get("character_name") or character_key
+        if uncertain:
+            print(f"心情日记：{name} {date} 的日记发送超时、是否送达未知，"
+                  f"按已发送处理不再补发（{session_id}）。")
+        else:
+            print(f"心情日记：{name} {date} 的日记已发给 {session_id}。")
     return sent
 
 
-def mood_diary_note(ctx: RoleContext, limit: int = 1) -> str:
-    """把角色自己最近写的日记注进提示词：她知道那是自己写的，别人看不到。"""
+def mood_diary_note(ctx: RoleContext, session_id: str = "", limit: int = 1) -> str:
+    """把角色自己最近写的日记注进提示词：她知道那是自己写的，别人看不到。
+
+    日记按会话分别写，注入时也只认这个会话写的：别处聊过的事写进日记后
+    会飘到这条对话里，等于把另一个会话的内容泄漏过来。
+    """
     if app_context.mood_mgr is None or not bool(app_context.global_config.get("mood_diary_enabled", True)):
         return ""
-    entries = (app_context.mood_mgr.get_diary(limit=limit) or {}).get(ctx.character_key) or []
+    entries = (app_context.mood_mgr.get_diary(limit=limit, session_id=session_id)
+               or {}).get(ctx.character_key) or []
     rows = [f"{e.get('date')}：{e.get('text')}" for e in entries if e.get("text")]
     if not rows:
         return ""
@@ -972,11 +1006,12 @@ async def companion_daily_check() -> int:
 
     # 3) 奇遇安排：每个角色每天按概率由自己现场想一件
     if app_context.encounter_mgr is not None:
+        default_client = app_context.sender.client if app_context.sender is not None else None
         for key, role in roles.items():
             try:
                 if not app_context.encounter_mgr.should_roll(key, today):
                     continue
-                ctx = reply_ctx_of(role)
+                ctx = reply_ctx_of(role, client=default_client)
                 text = await generate_proactive_text(
                     ctx, "给自己想一件今天发生的小遭遇：日常、具体、一两句话，"
                          "符合你的人设与你现在的生活。只输出这件事本身，"

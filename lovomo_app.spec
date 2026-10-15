@@ -19,13 +19,16 @@ pystray_datas, pystray_bins, pystray_hidden = collect_all('pystray')
 pil_datas, pil_bins, pil_hidden = collect_all('PIL')
 # ----------------------------------------------
 
+# 微信/QQ 语音是 silk，解它要 pysilk 里的编译扩展，必须整包收进来
+silk_datas, silk_bins, silk_hidden = collect_all('pysilk')
+
 datas = []
 binaries = []
 hiddenimports = []
 
-datas += aiohttp_datas + pystray_datas + pil_datas
-binaries += aiohttp_bins + pystray_bins + pil_bins
-hiddenimports += aiohttp_hidden + pystray_hidden + pil_hidden
+datas += aiohttp_datas + pystray_datas + pil_datas + silk_datas
+binaries += aiohttp_bins + pystray_bins + pil_bins + silk_bins
+hiddenimports += aiohttp_hidden + pystray_hidden + pil_hidden + silk_hidden
 
 # 可选：收集 webview 依赖（如遇问题可启用）
 # webview_datas, webview_bins, webview_hidden = collect_all('webview')

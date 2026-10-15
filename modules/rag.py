@@ -17,6 +17,7 @@ from typing import List, Optional
 import numpy as np
 import httpx
 
+from .llm_helpers import record_token_usage
 from .tls import verified_context
 
 CHUNK_SIZE_DEFAULT = 500
@@ -98,7 +99,9 @@ class RAGManager:
                     resp = await client.post(f"{base_url}/api/embed",
                                              json={"model": model, "input": texts})
                     if resp.status_code == 200:
-                        embs = resp.json().get("embeddings")
+                        body = resp.json()
+                        record_token_usage("会话回忆检索", backend, body)
+                        embs = body.get("embeddings")
                         if embs:
                             return np.array(embs, dtype=np.float32)
                         errors.append("/api/embed[200]: 响应缺少 embeddings 字段")
@@ -131,7 +134,9 @@ class RAGManager:
                                              json={"model": model, "input": texts},
                                              headers=headers)
                     resp.raise_for_status()
-                    data = sorted(resp.json().get("data", []), key=lambda x: x.get("index", 0))
+                    body = resp.json()
+                    record_token_usage("会话回忆检索", backend, body)
+                    data = sorted(body.get("data", []), key=lambda x: x.get("index", 0))
                     vecs = [d.get("embedding") for d in data]
                     if not vecs or not vecs[0]:
                         return None

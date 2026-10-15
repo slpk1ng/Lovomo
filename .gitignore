@@ -226,8 +226,8 @@ data/
 plugins/packages/
 *.zip
 output/
-dist_n5/
-build_n5/
+dist_n*/
+build_n*/
 .tmp_test/
 .tmp_icon/
 .tmp_lexlogs.json
@@ -249,3 +249,12 @@ plugins/
 
 # 打包脚本是构建的一部分，不跟着 *.spec 一起忽略
 !lovomo_app.spec
+
+# --- 只留在本地、不进仓库的私有文件 ---
+# DSH 会话操作暂存（工具产物）
+.dsh-ops/
+# 本机安装脚本与个人笔记/知识库
+Lovomo_Setup.iss
+丛雨知识库.txt
+PYL编译.txt
+

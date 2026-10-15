@@ -316,7 +316,8 @@ class LexiconManager:
                   f"{json.dumps(self._prompt_terms(), ensure_ascii=False)}")
         user_prompt = "对话：\n" + "\n".join(lines)
         try:
-            data = await generate_json_reply(ctx, system, user_prompt, max_tokens=512)
+            data = await generate_json_reply(ctx, system, user_prompt, max_tokens=512,
+                                             label="词典整理")
         except Exception as e:
             print(f"黑话学习失败: {e}")
             return {}

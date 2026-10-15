@@ -11,7 +11,7 @@ import httpx
 
 from .tls import unverified_context, verified_context
 
-APP_VERSION = "1.2.4.0"
+APP_VERSION = "1.2.5.0"
 
 # 发布里可能直接挂 .exe，也可能打成压缩包；压缩包的扩展名（下载后自动解压取 exe）
 ARCHIVE_SUFFIXES = (".zip",)

@@ -20,6 +20,7 @@ from typing import Callable, Optional
 
 from .llm_helpers import RoleContext
 from .jobs import generate_proactive_text, render_template
+from .session_context import reply_ctx_of
 
 
 def _default_event(eid: str, name: str, date: str, prompt: str) -> dict:
@@ -188,19 +189,20 @@ class EventManager:
                 for target in targets:
                     session_key = (f"{target.get('session_type', 'private')}_"
                                    f"{target.get('session_id', '')}")
+                    target_ctx = reply_ctx_of(ctx.role, session_id=session_key)
                     block = ""
                     if history_provider is not None:
                         try:
-                            block = history_provider(session_key, ctx) or ""
+                            block = history_provider(session_key, target_ctx) or ""
                         except Exception as e:
                             print(f"[节日问候] 获取会话 {session_key} 的历史失败（忽略）: "
                                   f"{type(e).__name__}: {e}")
-                    text = await self._render_event_text(event, ctx, history_block=block)
+                    text = await self._render_event_text(event, target_ctx, history_block=block)
                     if not text:
                         print(f"[节日问候] {event.get('name', event.get('id'))} 对 {session_key} "
                               "的文案生成失败，下次检查时重试。")
                         continue
-                    if await self._send_to_targets(sender, [target], text, emotions, ctx, event):
+                    if await self._send_to_targets(sender, [target], text, emotions, target_ctx, event):
                         sent_any = True
             if sent_any:
                 sent_total += 1
@@ -223,20 +225,22 @@ class EventManager:
                 if self._sent(key):
                     continue
                 text = template.replace("{nickname}", profile.get("nickname") or "主人")
+                session_key = f"private_{user_id}"
+                user_ctx = reply_ctx_of(ctx.role, session_id=session_key)
                 if self.config.get("birthday_greet_mode", "template") == "llm":
                     block = ""
                     if history_provider is not None:
                         try:
-                            block = history_provider(f"private_{user_id}", ctx) or ""
+                            block = history_provider(session_key, user_ctx) or ""
                         except Exception as e:
                             print(f"[生日祝福] 获取会话历史失败（忽略）: {type(e).__name__}: {e}")
-                    text = await generate_proactive_text(ctx, text, history_block=block) or text
-                with sender.for_session(f"private_{user_id}"):
+                    text = await generate_proactive_text(user_ctx, text, history_block=block) or text
+                with sender.for_session(session_key):
                     ok = await sender.speak_and_send(
-                        "private", user_id, text, emotions, ctx,
+                        "private", user_id, text, emotions, user_ctx,
                         use_voice=bool(self.config.get("birthday_greet_voice", False)),
                         sticker=bool(self.config.get("proactive_sticker", False)),
-                        session_id=f"private_{user_id}")
+                        session_id=session_key)
                 if not ok:
                     print(f"[生日祝福] {user_id} 发送失败，不标记已发送，下次检查时重试。")
                     continue
@@ -257,10 +261,11 @@ class EventManager:
             if (stype, str(sid)) in seen:
                 continue
             seen.add((stype, str(sid)))
+            target_ctx = reply_ctx_of(ctx.role, session_id=f"{stype}_{sid}")
             try:
                 with sender.for_session(f"{stype}_{sid}"):
                     ok = await sender.speak_and_send(
-                        stype, sid, text, emotions, ctx,
+                        stype, sid, text, emotions, target_ctx,
                         use_voice=bool(event.get("use_voice", False)),
                         sticker=bool(self.config.get("proactive_sticker", False)),
                         session_id=f"{stype}_{sid}")
@@ -293,18 +298,25 @@ class EventManager:
         event = next((e for e in self.events if str(e.get("id")) == str(event_id)), None)
         if not event:
             return False
-        ctx = ctx_provider()
+        base_ctx = ctx_provider()
+        targets = event.get("targets", [])
+        first = targets[0] if targets else {}
+        first_key = (f"{first.get('session_type', 'private')}_"
+                     f"{first.get('session_id', '')}") if targets else ""
+        ctx = reply_ctx_of(base_ctx.role, session_id=first_key) if first_key else base_ctx
         text = await self._render_event_text(event, ctx)
         if not text:
             return False
         sent_any = False
-        for target in event.get("targets", []):
+        for target in targets:
             stype = target.get("session_type", "private")
             sid = target.get("session_id", "")
-            with sender.for_session(f"{stype}_{sid}"):
+            session_key = f"{stype}_{sid}"
+            target_ctx = reply_ctx_of(base_ctx.role, session_id=session_key)
+            with sender.for_session(session_key):
                 ok = await sender.speak_and_send(stype, sid, text,
-                                                 emotions_provider(), ctx,
+                                                 emotions_provider(), target_ctx,
                                                  use_voice=bool(event.get("use_voice", False)),
-                                                 session_id=f"{stype}_{sid}")
+                                                 session_id=session_key)
             sent_any = sent_any or bool(ok)
         return sent_any
