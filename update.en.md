@@ -5,7 +5,11 @@
 
 #### ✨ Added
 
-- Interface refresh: the settings page is now a card-based single-column list — every group is a rounded white card, each row inside puts the title and its description on the left and the control on the right, and only a hairline separates one row from the next; spacing is roomier overall, and narrow screens stack each row vertically.
+- Interface refresh: the settings page is now a card-based list — every group is a rounded white card, each row inside puts the title and its description on the left and the control on the right, and only a hairline separates one row from the next; spacing is roomier overall, wide screens fit two fields per row, and narrow screens stack each row vertically.
+
+- Sidebar and settings polish: while the sidebar is open only the collapse button at the right end of the brand row stays visible; once collapsed, an expand button waits in the content area's top-left corner (clicking slides the sidebar out to the left, clicking again slides it back, and so on). Every settings row now keeps just the switch itself pinned to its far right, descriptions and hints wrap instead of running off the screen, number-only fields grow to fit their content (about four digits by default, capped at 140px), and wide screens fit two fields per row.
+
+- Statistics and scheduled-task panels: an always-there refresh button in the bottom-right corner drops that panel's cache and reloads it on click.
 
 - Collapsible sidebar: a collapse button now sits at the right end of the sidebar's brand row; collapsing slides the sidebar out to the left and hands the horizontal space back to the content, while an always-there expand button in the content area's top-left corner brings it back. Ctrl / Cmd + B toggles it as well, the state is remembered, and on screens 760px and narrower (where the sidebar is already a top bar) neither button is shown.
 
@@ -20,6 +24,8 @@
 - Statistics panel: fixed line-chart legends with long names being drawn past the canvas so the values were invisible — the legend now wraps, individual names are truncated with an ellipsis, and the hover tooltip is placed against its own measured width instead of overflowing off the right edge of the screen.
 
 - Repeated requests: switching sidebar panels no longer re-downloads everything on every visit — a panel's result is reused while it is fresh (10 seconds to 5 minutes, depending on the panel), any write invalidates it immediately, and concurrent GETs to the same endpoint are merged into one request; the Advanced features page, which used to fire five requests at once when opened, no longer repeats them inside that window.
+
+- Deleting a session: there used to be just one way to delete; the dialog now offers two choices — "clear relations & profile" (wiping relationship progress and the user profile back to "stranger", per user for private chats and per member for group chats) or "keep them" (only the session records go, relationship progress and profiles stay exactly as they are).
 
 ### v1.2.4.0
 

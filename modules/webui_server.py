@@ -3168,6 +3168,9 @@ class WebUIServer:
         try:
             payload = await request.json()
             filenames = payload.get("files", [])
+            # 两种删法由界面选：True = 连关系进度与用户画像一起清（含私聊、含群聊成员），
+            # False = 只删会话记录，关系与画像原样保留；None = 旧调用方（私聊清、群聊不动）
+            clean_affection = payload.get("clean_affection")
             # 清理范围必须在删文件之前算出来：文件名里的会话名把 @ / . 等字符换成了下划线，
             # 照文件名回推的用户 ID 和运行时的对不上（微信 openid 尤其明显），
             # 真实 ID 只能从会话文件里取
@@ -3182,9 +3185,12 @@ class WebUIServer:
                     scope = scopes.get(filename)
                     if scope is None:
                         continue
-                    if self._purge_session_state(scope):
+                    if self._purge_session_state(scope, clean_affection):
                         private_users += 1
-                if private_users:
+                if clean_affection is False:
+                    print(f"已删除 {len(deleted)} 个会话记录：心情、日记、承诺与主动消息状态已清掉；"
+                          "关系进度与用户画像按选择保留。")
+                elif private_users:
                     print(f"已删除 {len(deleted)} 个会话记录：心情、日记、承诺与主动消息状态已清理，"
                           f"{private_users} 位用户的用户画像与关系进度一并清空。")
                 else:
@@ -3193,13 +3199,13 @@ class WebUIServer:
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
-    def _purge_session_state(self, scope) -> bool:
+    def _purge_session_state(self, scope, clean_affection=None) -> bool:
         """清掉一个会话依附的状态，返回它是不是私聊会话。
 
-        私聊就是「和这个人聊过」的全部记录，连用户画像一起清掉，当成从没聊过；
-        群聊只清这个群自己的记录（心情、日记、承诺、主动消息与回忆），
-        成员的关系进度与用户画像一律不动：同一个人可能同时在私聊里聊过，
-        那些关系与画像不该被一个群聊的删除牵连。
+        clean_affection 由界面给的两个选项决定：
+        True  = 连关系进度与用户画像一起清（私聊清这位用户；群聊清这个群里每位成员的关系）；
+        False = 只删会话自己的记录（心情、日记、承诺、主动消息与回忆），关系与画像原样保留；
+        None  = 老调用方（_purge_connection_sessions 等）：私聊清、群聊不动，保持原有行为。
         """
         character_key, sid, stype, target_id = scope
         if app_context.mood_mgr is not None:
@@ -3212,11 +3218,17 @@ class WebUIServer:
             app_context.recall_mgr.drop_session(sid)
         # 群聊不碰关系进度：成员的关系记录是这位成员自己处出来的，
         # 他可能同时在私聊里聊过，群记录被删不该把任何一条关系清掉。
-        if app_context.affection_mgr is not None and stype == "private":
-            app_context.affection_mgr.reset(character_key, str(target_id), sid)
+        if clean_affection is None:
+            clean_affection = stype == "private"
+        if clean_affection and app_context.affection_mgr is not None:
+            if stype == "private":
+                app_context.affection_mgr.reset(character_key, str(target_id), sid)
+            else:
+                # 群聊里每位成员的关系记录都挂在这个会话上，选了清理就一起清
+                app_context.affection_mgr.drop_session(character_key, sid)
         if stype != "private":
             return False
-        if app_context.profile_mgr is not None:
+        if clean_affection and app_context.profile_mgr is not None:
             app_context.profile_mgr.delete(str(target_id))
         return True
 

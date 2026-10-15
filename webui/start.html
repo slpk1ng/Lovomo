@@ -1980,17 +1980,21 @@
             /* 锚点导航占着左上角，表单必须给它留出位置，否则导航压住表单 */
             .config-form {
                 --nav-reserve: 204px;
-                max-width: calc(var(--nav-reserve) + 1040px);
+                max-width: calc(var(--nav-reserve) + 1240px);
                 padding-left: var(--nav-reserve);
             }
         }
-        /* 收掉 V3 的多列网格：一行一个字段，右侧控件对齐成一列 */
-        .config-group { display: block; }
+        /* 字段行：默认一行一个；宽屏两列，滚动条不至于拖太长 */
+        .config-group { display: grid; grid-template-columns: minmax(0, 1fr); }
+        @media (min-width: 1240px) {
+            .config-group { grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: var(--sp-8); }
+        }
         .config-group > .form-row {
             display: flex;
             flex-direction: row;
+            flex-wrap: nowrap;
             align-items: center;
-            gap: var(--sp-6);
+            gap: var(--sp-4);
             padding: var(--sp-4) 0;
             margin: 0;
             border-top: 1px solid var(--line);
@@ -2030,8 +2034,42 @@
             gap: var(--sp-1);
             align-items: stretch;
         }
-        /* 开关字段：控件是拨动卡，按内容宽度贴右即可 */
-        .config-group > .form-row:has(.enable-card) > .field-wrapper { flex: 0 0 auto; min-width: 0; }
+        /* 开关字段：卡片外壳收掉，只留开关本体，并且永远贴这一行的最右边 */
+        .config-group > .form-row:has(.enable-card) > .field-wrapper {
+            flex: 0 1 320px;
+            max-width: 320px;
+            min-width: 0;
+            margin-left: auto;
+            align-items: flex-end;
+        }
+        .config-group > .form-row .enable-card {
+            width: auto;
+            min-width: 0;
+            padding: 0;
+            border: none;
+            background: none;
+            gap: 0;
+        }
+        .config-group > .form-row .enable-card:hover { background: none; }
+        .config-group > .form-row .enable-card.checked { background: none; border: none; }
+        .config-group > .form-row .enable-card > span:not(.ic) { display: none; }
+        /* 只填数值的格子：按内容撑开（默认约 4 位数字），并卡一个上限 */
+        .config-group > .form-row input[type="number"] {
+            field-sizing: content;
+            width: auto;
+            min-width: calc(4ch + 26px);
+            max-width: 140px;
+        }
+        /* 说明与提示：再长的文案也要在格子里换行，不许顶出屏幕 */
+        .config-group > .form-row .field-wrapper,
+        .config-group > .form-row .field-desc,
+        .config-group > .form-row .field-hint,
+        .config-group > .form-row > .field-label > label {
+            max-width: 100%;
+            white-space: normal;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+        }
         /* 多行文本：标题在上、控件通栏，长文本才有地方写 */
         .config-group > .form-row:has(textarea) {
             flex-direction: column;
@@ -2093,6 +2131,34 @@
             transition: background 0.16s var(--ease), color 0.16s var(--ease),
                         border-color 0.16s var(--ease), transform 0.16s var(--ease);
         }
+        /* 通用按钮规则 button[data-icon] 是 (0,1,1)，特异性压过 .sidebar-expand-btn (0,1,0)，
+         * 所以展开态必须用 (0,2,0) 才藏得住；下面收起态的规则同权重但更靠后，仍能显示 */
+        /* ---------- 4.4 统计 / 定时任务面板：右下角常驻刷新按钮 ---------- */
+        .panel-refresh {
+            position: fixed;
+            right: 22px;
+            bottom: 22px;
+            z-index: 45;
+            width: 44px;
+            height: 44px;
+            padding: 0;
+            border-radius: 50%;
+            border: 1px solid var(--line, #e5e7eb);
+            background: var(--surface, #fff);
+            color: var(--brand, #4f7cff);
+            box-shadow: var(--shadow-card, 0 6px 18px rgba(15, 23, 42, .12));
+            cursor: pointer;
+            /* 不用单独写 display：面板是 display:none 时 fixed 子元素也不会渲染 */
+            align-items: center;
+            justify-content: center;
+        }
+        .panel-refresh:hover { border-color: var(--brand, #4f7cff); }
+        .panel-refresh.spinning .ic { animation: panel-refresh-spin .8s linear infinite; }
+        @keyframes panel-refresh-spin { to { transform: rotate(360deg); } }
+        @media (max-width: 760px) {
+            .panel-refresh { right: 14px; bottom: 14px; width: 40px; height: 40px; }
+        }
+        .sidebar-expand-btn[data-icon] { display: none; }
         body.sidebar-collapsed .sidebar-expand-btn { display: inline-flex; }
         .sidebar-expand-btn:hover {
             color: var(--brand-dark);
@@ -2626,6 +2692,7 @@
             </div>
         </div>
         <div class="panel" id="panel-tasks">
+            <button type="button" class="panel-refresh" id="tasks-refresh" data-icon="refresh" data-icon-only title="刷新定时任务" aria-label="刷新定时任务"></button>
             <div class="section-block">
                 <h3>定时任务（主动问候 / 例行消息）
                     <button class="btn btn-green" id="add-job-btn" data-icon="plus">新建任务</button>
@@ -2769,6 +2836,7 @@
             </div>
         </div>
         <div class="panel" id="panel-stats">
+            <button type="button" class="panel-refresh" id="stats-refresh" data-icon="refresh" data-icon-only title="刷新统计" aria-label="刷新统计"></button>
             <div class="section-block">
                 <h3>对话统计
                     <span style="float:right; font-weight:normal;">
@@ -3226,6 +3294,7 @@
             <input type="text" id="app-dialog-input" style="display:none;">
             <div class="app-dialog-actions">
                 <button class="btn btn-gray" id="app-dialog-cancel">取消</button>
+                <button class="btn btn-gray" id="app-dialog-alt" style="display:none;"></button>
                 <button class="btn btn-green" id="app-dialog-ok">确定</button>
             </div>
         </div>
@@ -3273,6 +3342,10 @@
 
         const I18N_EN = {
             "收起侧栏": "Collapse sidebar",
+        "清理关系与画像": "Clear relations & profile",
+        "不清理（保留关系与画像）": "Keep relations & profile",
+        "刷新定时任务": "Refresh scheduled tasks",
+        "刷新统计": "Refresh statistics",
             "展开侧栏": "Show sidebar",
             "· 难度调高以后她还是很难靠近": "· She is still hard to get close to at a higher difficulty",
             "：这是设计而不是故障 —— 难度越高，角色越是一个独立而自洽的人：有自己的目标、底线、执念与拒绝权，礼物、情话与长时间陪伴都换不走她的心，需要你理解她的过去、尊重她的底线、在关键节点做出符合她逻辑的选择；她也可能到最后也没有选择你。想让她好说话一些就调到「简单」，想保留好感节奏但别那么难就调「普通」。": ": that is by design, not a fault — the higher the level, the more self-consistent the character is, with her own goals, boundaries, obsessions and the right to refuse; gifts, sweet talk and long company do not buy her heart, and it takes understanding her past, respecting her limits and making choices that fit her logic at the decisive moments, and she may end up not choosing you at all. Switch to Easy to make her easier to approach, or keep Normal for the usual affection pace without the extra difficulty.",
@@ -6239,6 +6312,23 @@
         const panelLoadedAt = Object.create(null);
         function markPanelLoaded(panelId) { panelLoadedAt[panelId] = Date.now(); }
         function invalidatePanel(panelId) { if (panelId) delete panelLoadedAt[panelId]; }
+
+        /* 统计 / 定时任务面板右下角的常驻刷新按钮：点了就丢缓存重新拉一次 */
+        (function bindPanelRefresh() {
+            [['stats-refresh', 'stats'], ['tasks-refresh', 'tasks']].forEach(([id, panelId]) => {
+                const btn = document.getElementById(id);
+                if (!btn) return;
+                btn.addEventListener('click', async () => {
+                    btn.classList.add('spinning');
+                    try {
+                        invalidatePanel(panelId);
+                        await runPanelLoader(panelId);
+                    } finally {
+                        btn.classList.remove('spinning');
+                    }
+                });
+            });
+        })();
         /* 写操作之后谁都不敢保证列表与统计还准：直接把所有面板标记成待重拉 */
         function invalidatePanelCache() {
             for (const k of Object.keys(panelLoadedAt)) delete panelLoadedAt[k];
@@ -6873,6 +6963,7 @@
         // ---- 应用内弹窗：原生 alert / confirm / prompt 在 WebView2 里标题会带页面来源、
         // 样式也和界面不搭，这里换成自己的弹窗（confirm / prompt 相应改成 await） ----
         let appDialogResolve = null;
+        let appDialogAltValue = false;
 
         function appDialogEls() {
             return {
@@ -6882,6 +6973,7 @@
                 input: document.getElementById('app-dialog-input'),
                 cancel: document.getElementById('app-dialog-cancel'),
                 ok: document.getElementById('app-dialog-ok'),
+                alt: document.getElementById('app-dialog-alt'),
             };
         }
 
@@ -6916,6 +7008,12 @@
             el.cancel.style.display = opts.showCancel === false ? 'none' : '';
             el.ok.textContent = opts.okText || '确定';
             el.ok.className = 'btn ' + (opts.danger ? 'btn-red' : 'btn-green');
+            appDialogAltValue = opts.altValue === undefined ? false : opts.altValue;
+            if (el.alt) {
+                el.alt.textContent = opts.altText || '';
+                el.alt.className = 'btn ' + (opts.altClass || 'btn-gray');
+                el.alt.style.display = opts.altText ? '' : 'none';
+            }
             el.overlay.classList.add('active');
             if (opts.withInput) setTimeout(() => el.input.focus(), 50);
             return new Promise(resolve => { appDialogResolve = resolve; });
@@ -6927,6 +7025,14 @@
 
         function uiConfirm(message, title) {
             return appDialogOpen({title: title || '确认', message, okText: '确定'});
+        }
+
+        /* 三选一：确定 = 清理（关系 + 画像一起清），第二个按钮 = 不清理（保留），取消 = 什么都不做 */
+        function uiConfirmClean(message, title) {
+            return appDialogOpen({title: title || '删除会话', message,
+                                  okText: '清理关系与画像',
+                                  altText: '不清理（保留关系与画像）',
+                                  altValue: 'keep'});
         }
 
         function uiPrompt(message, defaultValue, title) {
@@ -6941,6 +7047,7 @@
                 appDialogSettle(el.input.style.display !== 'none' ? el.input.value : true);
             });
             el.cancel.addEventListener('click', appDialogCancel);
+            if (el.alt) el.alt.addEventListener('click', () => appDialogSettle(appDialogAltValue));
             el.overlay.addEventListener('click', ev => {
                 if (ev.target === el.overlay) appDialogCancel();
             });
@@ -9202,10 +9309,16 @@
         });
         document.getElementById('deleteBtn').addEventListener('click', async () => {
             if (selectedFiles.size === 0) return;
-            if (!await uiConfirm(`确定删除选中的 ${selectedFiles.size} 个文件？\n该会话的心情、心情日记、承诺与主动消息状态会一并清掉；私聊还会清空这位用户的用户画像与关系进度（回到「陌生」），删掉就无法恢复。`)) return;
+            const choice = await uiConfirmClean(
+                `确定删除选中的 ${selectedFiles.size} 个文件？\n` +
+                `两种删法都会清掉该会话的心情、心情日记、承诺与主动消息状态，删掉就无法恢复。\n` +
+                `「清理关系与画像」= 连这位用户（群聊里是每位成员）的关系进度与用户画像一起清空，回到「陌生」；\n` +
+                `「不清理」= 只删会话记录，关系进度与用户画像原样保留。`);
+            if (!choice) return;
+            const cleanAffection = choice === true;
             try {
                 const files = Array.from(selectedFiles);
-                const result = await apiPost('api/delete', { files });
+                const result = await apiPost('api/delete', { files, clean_affection: cleanAffection });
                 if (result.success) {
                     selectedFiles.clear();
                     loadChatList();
