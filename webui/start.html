@@ -6077,7 +6077,7 @@
             'device': { label: 'TTS 合成设备', description: 'TTS 合成设备', hint: '选择 CUDA 使用显卡（GPU），选择 CPU 使用处理器。', required: false, type: 'string', options: ['cuda', 'cpu'], condition: { auto_start_tts: true, tts_backend: 'local' }, default: 'cuda' },
             'llm_judge': { label: 'LLM 自动判别情绪', description: '是否使用 LLM 自动判别情绪', hint: '开启后，大模型会根据语境自动从文件夹中挑一个情绪；关闭则固定使用默认情绪。', required: false, type: 'boolean', default: true },
             'display_lang': { label: '显示文本语言', description: '显示文本语言', hint: '选择发送消息时文字的语言，可选：中文（zh）、日语（ja）、英语（en）、韩语（ko）或跟随语音（auto）。', required: false, type: 'string', options: ['zh', 'ja', 'en', 'ko', 'auto'], condition: { llm_judge: true }, default: 'zh' },
-            'default_voice': { label: '默认情绪', description: '默认情绪', hint: 'LLM 未开启或判别失败时使用，必须与文件夹名一致（例如 pingjing）。', required: false, type: 'string', condition: { llm_judge: false }, default: 'pingjing' },
+            'default_voice': { label: '默认情绪', description: '默认情绪', hint: 'LLM 未开启或判别失败时使用，填情绪文件夹名（如 pingjing）；留空则自动用情绪表里第一个可用情绪。', required: false, type: 'string', condition: { llm_judge: false }, default: '' },
             'tts_debug_log': { label: 'TTS 详细日志', description: '每次合成打印完整台词与合成参数', hint: '排查"语音少词"时打开：日志会打印 LLM 传来的完整内容、实际送去合成的文本、参考音频与切分方式。', required: false, type: 'boolean', default: false },
             'tts_strip_non_dialogue': { label: '移除非台词内容', description: '合成前剔除动作、表情、场景与颜文字，TTS 只念台词', hint: '默认开启。开启后括号里的动作、表情与场景说明（如 (笑)、[旁白]）以及颜文字（如 (*/ω＼*)）只在消息文本里保留，不进语音；「」引号里的台词不受影响。日志会写明剔除了哪些内容。', required: false, type: 'boolean', default: true },
             'tts_char_map': { label: 'TTS 字符替换表', description: '每行一条，格式：原字符=替换内容', hint: '默认已内置常见符号（—— → ～、♪ → 空 等）。想按自己的 TTS 服务调整时在这里覆盖，例如 ——=、 或 ♪=～。留空使用内置默认。', required: false, type: 'text' },
@@ -6183,7 +6183,7 @@
             'todo_enabled': { label: '待办提醒功能', description: '从聊天中提取提醒事项并到点发送提醒', hint: '提取方式见下一项。', required: false, type: 'boolean', default: false },
             'todo_extract_mode': { label: '待办提取方式', description: 'regex=正则匹配（快）；llm=大模型提取（准）；off=仅手动添加', hint: 'llm 模式仅在消息包含关键词时触发。', required: false, type: 'string', options: ['regex', 'llm', 'off'], default: 'regex' },
             'todo_voice': { label: '提醒附带语音', description: '提醒消息是否合成语音', hint: '需要 TTS 服务在线。', required: false, type: 'boolean', default: false },
-            'todo_voice_emotion': { label: '提醒语音使用的情绪', description: '提醒语音用哪套参考音色', hint: '填情绪文件夹名（如 开心 / gaoxing），留空或填错会回退角色默认情绪。', required: false, type: 'string', default: 'pingjing' },
+            'todo_voice_emotion': { label: '提醒语音使用的情绪', description: '提醒语音用哪套参考音色', hint: '填情绪文件夹名（如 开心 / gaoxing），留空或填错会回退角色默认情绪（默认情绪也留空时用第一个可用情绪）。', required: false, type: 'string', default: '' },
             'todo_remind_mode': { label: '提醒话术生成方式', description: 'llm=让角色用自己的人设现场说一句提醒；preset=固定模板', hint: 'llm 模式会多一次模型请求；若模型失败或生成内容没包含提醒事项，会自动回退到下面的预设模板，不会漏提醒。', required: false, type: 'string', options: ['llm', 'preset'], default: 'llm' },
             'todo_remind_prompt': { label: '提醒话术提示词（LLM 模式）', description: '自定义提醒话术的风格要求', hint: '留空使用内置规则（角色语气、一句话、必须说出事项内容）。', required: false, type: 'text' },
             'todo_remind_template': { label: '提醒话术模板（预设模式）', description: '到点发送的提醒内容模板，{content} 为事项', hint: '默认：⏰ 提醒时间到啦：{content}', required: false, type: 'string' },
@@ -8836,7 +8836,7 @@
                         </div>
                         <div class="form-row">
                             <label>默认情绪 (default_voice)</label>
-                            <div class="field-wrapper"><input type="text" data-role-key="default_voice" value="${esc(role.default_voice || 'pingjing')}"></div>
+                            <div class="field-wrapper"><input type="text" data-role-key="default_voice" value="${esc(role.default_voice || '')}"></div>
                         </div>
                         <div class="form-row">
                             <label>语气文件夹根目录 (ref_audio_root)</label>
@@ -8862,7 +8862,7 @@
             }
 
             container.querySelector('[data-add-role]').addEventListener('click', () => {
-                const newRole = { character_name: '', character_key: '', personality_prompt: '', json_prompt: '', supplement_prompt: '', default_voice: 'pingjing', ref_audio_root: '', emotion_mimic_root: '', text_lang: 'ja', connection_id: '' };
+                const newRole = { character_name: '', character_key: '', personality_prompt: '', json_prompt: '', supplement_prompt: '', default_voice: '', ref_audio_root: '', emotion_mimic_root: '', text_lang: 'ja', connection_id: '' };
                 const roleEl = renderRoleItem(rolesBox.querySelectorAll('.role-item').length, newRole);
                 rolesBox.appendChild(roleEl);
                 bindDeleteRole(roleEl);
@@ -8881,7 +8881,7 @@
                         personality_prompt: r.personality_prompt || '',
                         json_prompt: r.json_prompt || '',
                         supplement_prompt: r.supplement_prompt || '',
-                        default_voice: r.default_voice || 'pingjing',
+                        default_voice: r.default_voice || '',
                         ref_audio_root: r.ref_audio_root || '',
                         emotion_mimic_root: r.emotion_mimic_root || '',
                         text_lang: r.text_lang || 'ja',

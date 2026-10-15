@@ -343,7 +343,7 @@ class ConfigLoader:
                 "personality_prompt": self.config.get("personality_prompt", ""),
                 "json_prompt": self.config.get("json_prompt", ""),
                 "supplement_prompt": self.config.get("supplement_prompt", ""),
-                "default_voice": self.config.get("default_voice", "pingjing"),
+                "default_voice": self.config.get("default_voice", ""),
                 "ref_audio_root": self.config.get("ref_audio_root", ""),
                 "emotion_mimic_root": self.config.get("emotion_mimic_root", ""),
                 "text_lang": self.config.get("text_lang", "ja")
@@ -359,7 +359,7 @@ class ConfigLoader:
                 "personality_prompt": role_cfg.get("personality_prompt", self.config.get("personality_prompt", "")),
                 "json_prompt": role_cfg.get("json_prompt", self.config.get("json_prompt", "")),
                 "supplement_prompt": role_cfg.get("supplement_prompt", self.config.get("supplement_prompt", "")),
-                "default_voice": role_cfg.get("default_voice", "pingjing"),
+                "default_voice": role_cfg.get("default_voice", ""),
                 "ref_audio_root": role_cfg.get("ref_audio_root", ""),
                 "emotion_mimic_root": role_cfg.get("emotion_mimic_root", ""),
                 "text_lang": role_cfg.get("text_lang", "ja"),
@@ -485,7 +485,7 @@ class ConfigLoader:
                 "personality_prompt": base_config.get("personality_prompt", ""),
                 "json_prompt": base_config.get("json_prompt", ""),
                 "supplement_prompt": base_config.get("supplement_prompt", ""),
-                "default_voice": base_config.get("default_voice", "pingjing"),
+                "default_voice": base_config.get("default_voice", ""),
                 "ref_audio_root": base_config.get("ref_audio_root", ""),
                 "emotion_mimic_root": base_config.get("emotion_mimic_root", ""),
                 "text_lang": base_config.get("text_lang", "ja"),
@@ -647,7 +647,8 @@ class ConfigLoader:
             "device": "cuda",
             "llm_judge": True,
             "display_lang": "zh",
-            "default_voice": "pingjing",
+            # 留空 = 运行时自动用情绪表里第一个可用情绪
+            "default_voice": "",
             "voice_transition": True,
             "breathing_gap_ms": 100,
             "crossfade_ms": 300,
@@ -711,7 +712,7 @@ class ConfigLoader:
                     除非你明确使用了“但是”、“不过”等转折词，否则不要轻易切换成其他情绪。注意：禁止因为想切换情绪就一直使用转折词！
                     【情绪匹配规则】emotion 只能从【情绪可选列表】里原样照抄一个词：列表给的是中文就填中文、是拼音就填拼音、是英文就填英文，不许翻译、改写或自创；列表以外的词一律无效！""",
 
-                    "default_voice": "pingjing",
+                    "default_voice": "",
                     "ref_audio_root": "",
                     "text_lang": "ja",
                     "prompt_lang": ""
@@ -849,7 +850,7 @@ class ConfigLoader:
             "todo_enabled": False,
             "todo_extract_mode": "regex",
             "todo_voice": False,
-            "todo_voice_emotion": "pingjing",
+            "todo_voice_emotion": "",
             # 提醒话术：llm=用角色人设现场生成（失败自动回退预设），preset=固定模板
             "todo_remind_mode": "llm",
             "todo_remind_prompt": "",

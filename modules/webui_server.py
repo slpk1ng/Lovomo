@@ -50,7 +50,8 @@ from modules.config_loader import (CONNECTION_PLATFORMS, CONNECTION_PLATFORM_NAM
                                    ConfigLoader, connection_defaults,
                                    connection_identity)
 from modules.database import DatabaseManager
-from modules.memory_store import MemoryManager, _is_memory_filename, _memory_session_id
+from modules.memory_store import (MemoryManager, _is_memory_filename, _memory_session_id,
+                                    restore_session_id)
 from modules.emotion_voices import (EmotionManager, _AUDIO_EXTS, _is_emotion_folder,
                                     _read_sidecar_text)
 from modules.stats import StatsManager
@@ -4170,15 +4171,50 @@ class WebUIServer:
                               if aff_rec is not None else None)})
 
     # ---------------- 语音通话（打电话） ----------------
+    def _call_targets(self, role) -> list:
+        """通话能打给谁：只列已有私聊历史的会话。
+
+        通话记忆要落进真实私聊（聊天记录里看得见、心情/好感按那个联系人算），
+        所以只允许挑已经存在的私聊；没有聊过的会话没有历史可接，选中也是空的。
+        """
+        mem = role_memory(role)
+        if mem is None:
+            return []
+        prefix = str(mem.character_key or "") + "_"
+        out = []
+        for item in mem.list_memories():
+            filename = str(item.get("filename") or "")
+            # 记忆目录是所有角色共用一份，先按文件名前缀挑出本角色自己的档案
+            if not filename.startswith(prefix):
+                continue
+            session_id = _memory_session_id(filename)
+            if not session_id.startswith("private_"):
+                continue
+            out.append({"session_id": session_id,
+                        "display_name": str(item.get("display_name") or session_id),
+                        "last_sentence": str(item.get("last_sentence") or ""),
+                        "modified_time": float(item.get("modified_time") or 0)})
+        out.sort(key=lambda t: t["modified_time"], reverse=True)
+        return out
+
     async def handle_call_status(self, request):
-        """通话面板开场信息：可选角色、当前语音引擎、留痕档位。"""
+        """通话面板开场信息：可选角色、每个角色能打给谁、当前语音引擎、留痕档位。"""
         roles = getattr(self.config, "roles", None) or {}
+        characters = []
+        targets = {}
+        for key, role in roles.items():
+            characters.append({"key": key,
+                               "name": (role or {}).get("character_name") or key})
+            try:
+                targets[key] = self._call_targets(role)
+            except Exception as e:
+                print(f"语音通话：列出可拨打会话失败（{key}）: {type(e).__name__}: {e}")
+                targets[key] = []
         return web.json_response({
             "ok": True,
             "session_id": CALL_SESSION,
-            "characters": [{"key": key,
-                            "name": (role or {}).get("character_name") or key}
-                           for key, role in roles.items()],
+            "characters": characters,
+            "targets": targets,
             "asr_engine": self.config.get("asr_engine", "local"),
             "tts_backend": self.config.get("tts_backend", "") or "local",
             "retention_options": ["none", "text", "full"],
@@ -4205,6 +4241,7 @@ class WebUIServer:
             text = str(payload.get("text", "") or "").strip()
             audio_b64 = str(payload.get("audio", "") or "")
             lang = str(payload.get("lang", "auto") or "auto")
+            target_session = str(payload.get("target_session", "") or "").strip()
             retention = str(payload.get("retention", "text") or "text").strip().lower()
             if retention not in ("none", "text", "full"):
                 retention = "text"
@@ -4231,11 +4268,35 @@ class WebUIServer:
                 tmp_dir = tempfile.mkdtemp(prefix="lovomo_call_")
                 raw_audio_path = Path(tmp_dir) / "input.wav"
                 raw_audio_path.write_bytes(b64decode(audio_b64))
-                text = str(await transcribe_file(self.config.config, raw_audio_path, lang) or "").strip()
+                # 通话界面的「语言=自动」= 用配置页的「识别语言」（配置页也是自动时才是
+                # 真正逐句自判）。否则配置页老老实实写着中文，通话里却一句句乱判语种，
+                # 识别出来的文字会整句变成外语。
+                asr_lang = lang
+                if not asr_lang or asr_lang == "auto":
+                    asr_lang = str(self.config.get("asr_lang", "") or "").strip() or "auto"
+                text = str(await transcribe_file(self.config.config, raw_audio_path, asr_lang) or "").strip()
             if not text:
                 return web.json_response({"ok": False, "error": "没能听清这句话，再说一次试试"})
+            # 通话落到哪条会话：默认仍是旧的通话专用会话；选了某条私聊就打进那条私聊，
+            # 「我」就是该联系人，和真实私聊共用同一条记忆、同一份心情与好感。
             session_id = CALL_SESSION
             user_id = CALL_USER
+            mood_user = CALL_USER
+            if target_session:
+                try:
+                    allowed = {t["session_id"] for t in self._call_targets(role)}
+                except Exception as e:
+                    print(f"语音通话：校验目标会话失败（忽略）: {type(e).__name__}: {e}")
+                    allowed = set()
+                if target_session in allowed:
+                    session_id = target_session
+                    # 私聊的 uid 就是会话号去掉 private_ 前缀（与消息链路写法一致，
+                    # 带 @im.wechat 这类后缀的要还原，否则好感会开成第二条线）
+                    user_id = restore_session_id(session_id)[len("private_"):]
+                    mood_user = ""
+                else:
+                    print(f"语音通话：目标会话 {target_session} 不是可拨打的私聊，"
+                          f"本轮回退到 {CALL_SESSION}")
             # 写记忆看两处：勾了「记住这次通话」，或留痕档不是 none
             write_text = bool(remember) or retention != "none"
             lock = app_context._SESSION_LOCKS.setdefault(f"{session_id}::{character_key}",
@@ -4244,27 +4305,37 @@ class WebUIServer:
                 ctx = RoleContext(self.config.config, role)
                 emotions = get_role_emotions(role)
                 history = mem.load_history(session_id)
+                # 打进私聊时沿用这条会话里原来的称呼，聊天记录里不会凭空多出一个「我」
+                is_private_call = session_id.startswith("private_")
+                caller_name = "通话用户"
+                if is_private_call:
+                    for _m in reversed(history):
+                        if isinstance(_m, dict) and _m.get("role") == "user" \
+                                and _m.get("sender_name"):
+                            caller_name = str(_m["sender_name"])
+                            break
+                aff_label = "" if is_private_call else "通话用户"
                 extra_parts = []
                 verdict = None
                 if app_context.mood_mgr is not None and (judge_enabled(ctx) or mood_enabled(ctx)):
                     try:
                         verdict = await asyncio.wait_for(
                             judge_and_decide(ctx, app_context.mood_mgr, session_id, text, history,
-                                             user_id=user_id,
+                                             user_id=mood_user,
                                              reply_floor=(app_context.affection_mgr.stage_reply_floor(
                                                  character_key, user_id, session_id)
                                                  if app_context.affection_mgr is not None else 0.0)),
                             timeout=30)
                     except Exception as e:
                         print(f"语音通话：审判失败（忽略）: {type(e).__name__}: {e}")
-                mood_now = current_mood(ctx, app_context.mood_mgr, session_id, user_id) \
+                mood_now = current_mood(ctx, app_context.mood_mgr, session_id, mood_user) \
                     if app_context.mood_mgr is not None else None
                 if app_context.mood_mgr is not None:
                     _tier, mood_note = mood_style(ctx, mood_now)
                     if mood_note:
                         extra_parts.append(mood_note)
                 if app_context.affection_mgr is not None and affection_enabled(ctx):
-                    aff_note = app_context.affection_mgr.build_note(ctx, user_id, label="通话用户",
+                    aff_note = app_context.affection_mgr.build_note(ctx, user_id, label=aff_label,
                                                         session_id=session_id)
                     if aff_note:
                         extra_parts.append(aff_note)
@@ -4275,6 +4346,13 @@ class WebUIServer:
                 reply = reply or {}
                 raw_sentences = [s for s in (reply.get("sentences") or [])
                                  if isinstance(s, dict)]
+                # 与真实消息链路（message_pipeline 的发送前修复）保持一致：模型把中文
+                # 填进台词字段时先重译成角色语言，否则同一个音色会一会儿念日语、
+                # 一会儿把中文原文照念出来——听起来就是「一会中文一会外语」。
+                try:
+                    await repair_sentence_lang(raw_sentences, ctx)
+                except Exception as e:
+                    print(f"语音通话：台词语言修复失败（忽略）: {type(e).__name__}: {e}")
                 sentences = [{"zh": str(s.get("zh") or s.get("display") or ""),
                               "emotion": str(s.get("emotion") or ""),
                               "lang": str(s.get("lang") or "")}
@@ -4282,18 +4360,22 @@ class WebUIServer:
                 zh_text = "".join(s["zh"] for s in sentences)
                 if write_text:
                     history.append({"role": "user", "content": text, "sender_id": user_id,
-                                    "sender_name": "通话用户", "timestamp": time.time()})
+                                    "sender_name": caller_name, "timestamp": time.time()})
                     history.append({"role": "assistant", "content": zh_text, "timestamp": time.time(),
                                     "speaker": role.get("character_name", character_key),
                                     "emotion": sentences[0]["emotion"] if sentences else ""})
-                    mem.save_session_data(session_id, {"history": history})
+                    # 整份读回再写：打进私聊时要保住原文件的 meta 等字段，
+                    # 只写 {"history": ...} 会把那条会话的其他状态一起抹掉
+                    data = mem.load_session_data(session_id)
+                    data["history"] = history
+                    mem.save_session_data(session_id, data)
                     # 承诺追踪与真实消息同链路：台词命中承诺字样就提取入库
                     if app_context.promise_mgr is not None \
                             and bool(self.config.get("promise_enabled", True)) \
                             and PROMISE_HINT_RE.search(zh_text):
                         await _extract_and_store_promise(ctx, session_id, user_id, zh_text)
                 if app_context.mood_mgr is not None and verdict is not None:
-                    commit_mood(ctx, app_context.mood_mgr, session_id, verdict, user_id=user_id)
+                    commit_mood(ctx, app_context.mood_mgr, session_id, verdict, user_id=mood_user)
                 if app_context.affection_mgr is not None \
                         and verdict is not None and verdict.get("affection_enabled") \
                         and verdict.get("affection_delta") is not None:

@@ -757,7 +757,7 @@ class TodoManager:
                 sent = await self.sender.speak_and_send(
                     session_type, session_id, message, emotions, ctx,
                     use_voice=bool(use_voice),
-                    emotion=emotion or str(self.config.get("todo_voice_emotion", "") or "pingjing"),
+                    emotion=emotion or str(self.config.get("todo_voice_emotion", "") or ""),
                     session_id=full_session)
         except Exception as e:
             sent = False
