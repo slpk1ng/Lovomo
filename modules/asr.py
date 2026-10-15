@@ -48,6 +48,12 @@ DEFAULT_DASHSCOPE_MODEL = "qwen3-asr-flash"
 DEFAULT_WHISPER_API_MODEL = "whisper-1"
 # 服务根地址的版本段（…/v1、…/v1beta）：转写接口都在它下面
 _VERSION_SEG_RE = re.compile(r"/v\d+(?:\.\d+)*$")
+# 「识别接口风格」设成 auto 时，靠地址/模型名认出发音转写服务：
+# OpenAI / Groq / 硅基流动只提供 /v1/audio/transcriptions，本机的 whisper.cpp server、
+# Speaches 也只认这个接口；不认出来就会按「对话模型直接吃音频」发，必然失败。
+WHISPER_URL_HINTS = ("api.openai.com", "api.groq.com", "api.siliconflow.cn",
+                     "/audio/transcriptions", "speaches")
+WHISPER_MODEL_HINTS = ("whisper", "sensevoice", "transcribe")
 # 标准转写接口单次音频上限（OpenAI 25MB），留一点余量
 WHISPER_API_MAX_AUDIO_BYTES = 24 * 1024 * 1024
 # DashScope 兼容接口单次音频上限 10MB（base64 之后），留出编码膨胀的余量
@@ -102,9 +108,33 @@ def normalize_api_style(style) -> str:
     return value if value in ("auto", "openai", "dashscope", "ollama", "whisper") else "auto"
 
 
+def looks_like_transcription_service(config) -> bool:
+    """地址或模型名像「只会转写的语音识别服务」。
+
+    OpenAI / Groq / 硅基流动这类服务根本没有「对话模型吃音频」的接口，本机的
+    Speaches、whisper.cpp server 同样只认 /audio/transcriptions；这些地址配上
+    auto 风格时必须自动切到 whisper，否则报的错完全看不出原因。
+    """
+    base = (str(config.get("asr_base_url", "") or "").strip()
+            or str(config.get("llm_base_url", "") or "").strip()).lower()
+    model = (str(config.get("asr_model", "") or "").strip()
+             or str(config.get("asr_dashscope_model", "") or "").strip()).lower()
+    if any(hint in base for hint in WHISPER_URL_HINTS):
+        return True
+    return any(hint in model for hint in WHISPER_MODEL_HINTS)
+
+
 def is_whisper_style(config) -> bool:
-    """是否走标准的 <服务根>/audio/transcriptions 转写接口。"""
-    return normalize_api_style(config.get("asr_api_style", "auto")) == "whisper"
+    """是否走标准的 <服务根>/audio/transcriptions 转写接口。
+
+    explicitly 选了 whisper 就走；auto 时按地址/模型名推断。
+    """
+    style = normalize_api_style(config.get("asr_api_style", "auto"))
+    if style == "whisper":
+        return True
+    if style == "auto":
+        return looks_like_transcription_service(config)
+    return False
 
 
 def transcriptions_endpoint(base_url: str) -> str:

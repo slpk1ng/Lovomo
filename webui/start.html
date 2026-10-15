@@ -77,7 +77,6 @@
         .form-row { display: flex; flex-wrap: wrap; margin-bottom: 12px; align-items: flex-start; }
         .form-row label { width: 200px; font-size: 14px; color: #555; padding-top: 8px; font-weight: bold; }
         .form-row .required-mark { color: red; margin-left: 4px; }
-        .form-row .optional-mark { color: #888; margin-left: 4px; font-weight: normal; font-size: 12px; }
         .form-row .field-wrapper { flex: 1; display: flex; flex-direction: column; min-width: 240px; }
         .form-row input[type="text"], .form-row input[type="number"], .form-row input[type="password"], .form-row select, .form-row textarea { width: 100%; padding: 8px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 14px; }
         .form-row input[type="checkbox"] { width: auto; margin-top: 8px; }
@@ -1789,14 +1788,13 @@
             line-height: var(--lh-normal);
         }
 
-        /* ---------- 3.8 必填/可选标记：从文字方括号改为更轻的标记 ---------- */
-        .required-mark, .optional-mark {
+        /* ---------- 3.8 必填标记：只标必填，可选字段不带任何尾巴 ---------- */
+        .required-mark {
             font-weight: var(--fw-normal);
             font-size: var(--fs-xs);
             margin-left: var(--sp-1);
+            color: var(--danger);
         }
-        .required-mark { color: var(--danger); }
-        .optional-mark { color: var(--ink-3); }
 
         /* ---------- 3.9 响应式断点 ---------- */
         /* 主档 2 列（内容密度合适）；超宽屏给 3 列；中窄屏回 1 列 */
@@ -3400,9 +3398,9 @@
         "启用 HTTPS": "Enable HTTPS",
         "用加密连接提供 WebUI（手机上的麦克风需要它）": "Serve the WebUI over an encrypted connection (needed for the microphone on phones)",
         "HTTPS 证书文件": "HTTPS certificate file",
-        "【可选】自定义 PEM 证书": "Optional: your own PEM certificate",
+        "自定义 PEM 证书": "your own PEM certificate",
         "HTTPS 私钥文件": "HTTPS private key file",
-        "【可选】自定义 PEM 私钥": "Optional: your own PEM private key",
+        "自定义 PEM 私钥": "your own PEM private key",
         "非本机访问强制密码": "Require a password for non-local access",
         "监听地址不是本机时必须先设访问密码": "A password is required before listening on a non-local address",
         "识别通道": "Recognition channel",
@@ -3415,7 +3413,7 @@
         "本地识别引擎": "Local recognition engine",
         "本地通道用哪个识别引擎": "Engine used by the local channel",
         "识别根目录": "Recognition root folder",
-        "【可选】本地识别脚本所在目录": "Optional: folder holding the local recognition scripts",
+        "本地识别脚本所在目录": "folder holding the local recognition scripts",
         "识别服务地址": "Recognition service address",
         "线上识别的接口地址（可云可本地）": "Address of the recognition service (cloud or local)",
         "线上识别模型（备用）": "Online recognition model (fallback)",
@@ -3975,10 +3973,10 @@
             "OpenAI 兼容接口的密钥": "API key for the OpenAI-compatible endpoint",
             "仅 openai 接口类型需要；本地服务可留空。保存后只显示头尾各4位和长度，密钥本体加密存储在 config.json 中。": "Only needed for the openai API type; local services can leave it empty. After saving, only the first and last 4 characters and the length are shown; the key itself is stored encrypted in config.json.",
             "Embedding 端点": "Embedding endpoint",
-            "【可选】手动指定 Embedding API 完整路径": "[Optional] Set the full Embedding API path manually",
+            "手动指定 Embedding API 完整路径": "Set the full Embedding API path manually",
             "嵌入服务与对话模型不在同一个地址时必须填完整地址（如本地 LM Studio 的 http://127.0.0.1:1234/v1/embeddings）；留空则拼在 llm_base_url 后面。": "Fill in the full address when the embedding service is not at the same address as the chat model (for example a local LM Studio at http://127.0.0.1:1234/v1/embeddings); when empty it is appended to llm_base_url.",
             "Embedding 模型名": "Embedding model name",
-            "【可选】外部 API 的 Embedding 模型名": "[Optional] Embedding model name for an external API",
+            "外部 API 的 Embedding 模型名": "Embedding model name for an external API",
             "使用云端 API 时需填写，如 text-embedding-v3。本地 Ollama 留空则使用 rag_embedding_model。": "Required when using a cloud API, for example text-embedding-v3. With local Ollama, empty means rag_embedding_model is used.",
             "大语言模型 (LLM) 名称": "Large Language Model (LLM) name",
             "【必填】大语言模型 (LLM) 名称": "[Required] Large Language Model (LLM) name",
@@ -3996,16 +3994,16 @@
             "LLM 回复中出现这些字符/词时会被剔除后再发送（语音和文字都生效）": "These characters or words are removed from LLM replies before sending (applies to both voice and text)",
             "每行一个字符或词，也可用逗号分隔，例如剔除不想出现的口癖词、符号。留空不启用。": "One character or word per line, commas also work — useful for removing catchphrases or symbols you do not want. Empty disables it.",
             "识图模型名称": "Vision model name",
-            "【可选】识图模型名称": "[Optional] Vision model name",
+            "识图模型名称": "Vision model name",
             "用于处理图片，接收图片并输出JSON。可手动填写或点「选文件夹」/「服务列表」选择。留空则遇到图片时直接跳过。": "Used for images: it receives a picture and returns JSON. Type it manually or pick one with Choose Folder / Service List. Empty means images are skipped entirely.",
             "识图模型接口": "Vision model API type",
             "识图模型后端接口类型": "Backend API type for the vision model",
             "留空则跟随 LLM 接口类型。ollama：本地 Ollama；openai：云端 OpenAI 兼容接口。": "Empty follows the LLM API type. ollama: local Ollama; openai: a cloud OpenAI-compatible API.",
             "识图模型服务地址": "Vision model service URL",
             "识图模型 API Key": "Vision model API Key",
-            "【可选】识图模型独立的接口密钥": "[Optional] Separate API key for the vision model",
+            "识图模型独立的接口密钥": "Separate API key for the vision model",
             "留空则跟随「LLM API Key」。识图模型与语言模型不是同一家服务商（服务地址不同）时才需要单独填写。保存后只显示头尾各4位和长度，密钥本体加密存储在 config.json 中。": "Empty follows the LLM API Key. Fill it in only when the vision model comes from a different provider than the language model (a different service URL). After saving, only the first and last 4 characters plus the length are shown; the key itself is stored encrypted in config.json.",
-            "【可选】识图模型独立的接口地址": "[Optional] Separate endpoint for the vision model",
+            "识图模型独立的接口地址": "Separate endpoint for the vision model",
             "留空则跟随「LLM 服务地址」。服务根地址（如 http://127.0.0.1:8080/v1、https://xxx/compatible-mode/v1）和带对话端点的完整地址（如 https://xxx/compatible-mode/v1/chat/completions）都可以，程序会自动补全；不要填带业务路径的接口（…/services/xxx/xxx）。填错时点「服务列表」会明确报出实际请求的地址与上游返回的原因。": "Empty follows the LLM service URL. Both the service root (for example http://127.0.0.1:8080/v1 or https://xxx/compatible-mode/v1) and the full endpoint (for example https://xxx/compatible-mode/v1/chat/completions) work — the endpoint is completed automatically; do not use an interface with a business path (…/services/xxx/xxx). If it is wrong, Service List reports the URL actually requested and what the upstream returned.",
             "LLM 服务地址": "LLM service URL",
             "LLM服务地址": "LLM service URL",
@@ -4307,7 +4305,7 @@
             "合成前剔除动作、表情、场景与颜文字，TTS 只念台词": "Actions, expressions, scene notes and kaomoji are dropped before synthesis so the TTS only reads the lines",
             "默认开启。开启后括号里的动作、表情与场景说明（如 (笑)、[旁白]）以及颜文字（如 (*/ω＼*)）只在消息文本里保留，不进语音；「」引号里的台词不受影响。日志会写明剔除了哪些内容。": "On by default. With it on, actions, expressions and scene notes in brackets (such as (笑) or [旁白]) and kaomoji (such as (*/ω＼*)) stay in the message text but are never spoken; dialogue inside 「」 is untouched. The log lists what was removed.",
             "TTS 字符替换表": "TTS character replacement table",
-            "【可选】每行一条，格式：原字符=替换内容": "[Optional] One per line, format: character=replacement",
+            "每行一条，格式：原字符=替换内容": "One per line, format: character=replacement",
             "默认已内置常见符号（—— → ～、♪ → 空 等）。想按自己的 TTS 服务调整时在这里覆盖，例如 ——=、 或 ♪=～。留空使用内置默认。": "Common symbols are built in (—— → ～, ♪ → empty and so on). Override them here to match your TTS service, for example ——=、 or ♪=～. Empty uses the built-in defaults.",
             "图片身份规则": "Image identity rule",
             "告诉模型用户发的图/表情包不是角色自己": "Tell the model that images and stickers sent by the user are not the character itself",
@@ -4316,7 +4314,7 @@
             "在系统提示词里写明每个情绪的使用时机，避免模型一律填默认情绪": "Write when each emotion should be used into the system prompt so the model stops defaulting to one emotion",
             "强烈建议开启：关闭后模型会更容易把所有句子都判成默认情绪（例如 pingjing）。开启后，亲密语境会强制优先使用害羞（haixiu）。": "Strongly recommended: with it off the model tends to label every sentence with the default emotion (for example pingjing). When on, intimate contexts force the shy emotion (haixiu) to take priority.",
             "自定义情绪判定补充规则": "Custom emotion rules",
-            "【可选】追加到情绪判定规则后的自定义说明": "[Optional] Extra instructions appended to the emotion rules",
+            "追加到情绪判定规则后的自定义说明": "Extra instructions appended to the emotion rules",
             "例如：只要主人夸我可爱，就必须用 haixiu。留空则不追加。": "For example: whenever the user says I am cute, use haixiu. Empty appends nothing.",
             "语气渐变": "Tone crossfade",
             "开启后，不同情绪句子之间将平滑过渡。": "When on, sentences with different emotions transition smoothly.",
@@ -4619,7 +4617,7 @@
             "llm=让角色用自己的人设现场说一句提醒；preset=固定模板": "llm = the character improvises a reminder in its own persona; preset = a fixed template",
             "llm 模式会多一次模型请求；若模型失败或生成内容没包含提醒事项，会自动回退到下面的预设模板，不会漏提醒。": "The llm mode costs one extra model request; if the model fails or the text misses the reminder content, it falls back to the preset template below so the reminder is never lost.",
             "提醒话术提示词（LLM 模式）": "Reminder prompt (LLM mode)",
-            "【可选】自定义提醒话术的风格要求": "[Optional] Style requirements for the reminder text",
+            "自定义提醒话术的风格要求": "Style requirements for the reminder text",
             "留空使用内置规则（角色语气、一句话、必须说出事项内容）。": "Empty uses the built-in rules (in character, one sentence, must state the task).",
             "提醒话术模板（预设模式）": "Reminder template (preset mode)",
             "到点发送的提醒内容模板，{content} 为事项": "Template sent when the reminder is due; {content} is the task",
@@ -4963,7 +4961,6 @@
             "测速中…": "Testing speed…",
             "已按速度重排，保存后生效": "Reordered by speed; takes effect after saving",
             "【必填】": "[Required]",
-            "【可选】": "[Optional]",
             "🌐 服务列表": "🌐 Service list",
             "从 llm_base_url 指向的服务获取可用模型 ID 列表（最准确）": "Fetch the list of available model IDs from the service at llm_base_url (most accurate)",
             "测速并排序": "Speed Test and Sort",
@@ -5987,16 +5984,16 @@
             'hide_gsv_options': { label: '隐藏高级 GSV 参数', description: '【配好参数后可选】隐藏高级 GSV 参数', hint: '开启后，将隐藏大部分 GPT-SoVITS 推理细节参数，简化配置界面。', required: false, type: 'boolean', default: false },
             'llm_backend': { label: 'LLM 接口类型', description: '选择 LLM 后端接口类型', hint: 'ollama：Ollama 原生接口；openai：OpenAI 兼容接口——llama.cpp（llama-server）、LM Studio、vLLM 等都用这一档（llama.cpp 的工具调用需启动时加 --jinja）。', required: false, type: 'string', options: ['ollama', 'openai'], default: 'ollama' },
             'llm_api_key': { label: 'LLM API Key', description: 'OpenAI 兼容接口的密钥', hint: '仅 openai 接口类型需要；本地服务可留空。保存后只显示头尾各4位和长度，密钥本体加密存储在 config.json 中。', required: false, type: 'string' },
-            'llm_embedding_url': { label: 'Embedding 端点', description: '【可选】手动指定 Embedding API 完整路径', hint: '嵌入服务与对话模型不在同一个地址时必须填完整地址（如本地 LM Studio 的 http://127.0.0.1:1234/v1/embeddings）；留空则拼在 llm_base_url 后面。', required: false, type: 'string', default: '' },
-            'llm_embedding_model': { label: 'Embedding 模型名', description: '【可选】外部 API 的 Embedding 模型名', hint: '使用云端 API 时需填写，如 text-embedding-v3。本地 Ollama 留空则使用 rag_embedding_model。', required: false, type: 'string' },
+            'llm_embedding_url': { label: 'Embedding 端点', description: '手动指定 Embedding API 完整路径', hint: '嵌入服务与对话模型不在同一个地址时必须填完整地址（如本地 LM Studio 的 http://127.0.0.1:1234/v1/embeddings）；留空则拼在 llm_base_url 后面。', required: false, type: 'string', default: '' },
+            'llm_embedding_model': { label: 'Embedding 模型名', description: '外部 API 的 Embedding 模型名', hint: '使用云端 API 时需填写，如 text-embedding-v3。本地 Ollama 留空则使用 rag_embedding_model。', required: false, type: 'string' },
             'llm_model_name': { label: '大语言模型 (LLM) 名称', description: '【必填】大语言模型 (LLM) 名称', hint: '可手动填写模型 ID，或点「选文件夹」扫描本地模型 /「服务列表」从 LLM 服务获取。LM Studio 注意：填模型 ID（如 qwen/qwen3.5-9b），不是仓库名。', required: true, type: 'model_select' },
             'llm_auto_unload_old': { label: '换模型后自动卸载旧模型', description: '修改模型保存后，等新模型首次调用成功时自动卸载不再使用的旧模型（LM Studio）', hint: '默认开启。显存有限时旧模型常驻会挤爆显存或拖慢速度；需要 LM Studio 自带的 lms 命令行。', required: false, type: 'boolean', default: true },
             'llm_auto_load_local': { label: '启动时预加载本地模型', description: '程序打开时自动加载配置里用到的本机模型', hint: '默认开启。模型不必等到第一条消息才加载：对话、识图与嵌入模型都会预加载；LM Studio 走它自带的 lms 命令行，其余本机服务（Ollama、llama.cpp、vLLM 等）用一次极短的请求预热。服务地址在云端的模型不受影响。', required: false, type: 'boolean', default: true },
             'text_clean_blocklist': { label: '文本清洗屏蔽词', description: 'LLM 回复中出现这些字符/词时会被剔除后再发送（语音和文字都生效）', hint: '每行一个字符或词，也可用逗号分隔，例如剔除不想出现的口癖词、符号。留空不启用。', required: false, type: 'text' },
-            'image_caption_model_name': { label: '识图模型名称', description: '【可选】识图模型名称', hint: '用于处理图片，接收图片并输出JSON。可手动填写或点「选文件夹」/「服务列表」选择。留空则遇到图片时直接跳过。', required: false, type: 'model_select' },
+            'image_caption_model_name': { label: '识图模型名称', description: '识图模型名称', hint: '用于处理图片，接收图片并输出JSON。可手动填写或点「选文件夹」/「服务列表」选择。留空则遇到图片时直接跳过。', required: false, type: 'model_select' },
             'image_caption_backend': { label: '识图模型接口', description: '识图模型后端接口类型', hint: '留空则跟随 LLM 接口类型。ollama：本地 Ollama；openai：云端 OpenAI 兼容接口。', required: false, type: 'string', options: ['', 'ollama', 'openai'], default: '' },
-            'image_caption_base_url': { label: '识图模型服务地址', description: '【可选】识图模型独立的接口地址', hint: '留空则跟随「LLM 服务地址」。服务根地址（如 http://127.0.0.1:8080/v1、https://xxx/compatible-mode/v1）和带对话端点的完整地址（如 https://xxx/compatible-mode/v1/chat/completions）都可以，程序会自动补全；不要填带业务路径的接口（…/services/xxx/xxx）。填错时点「服务列表」会明确报出实际请求的地址与上游返回的原因。', required: false, type: 'string', presets: LLM_ENDPOINT_PRESETS, default: '' },
-            'image_caption_api_key': { label: '识图模型 API Key', description: '【可选】识图模型独立的接口密钥', hint: '留空则跟随「LLM API Key」。识图模型与语言模型不是同一家服务商（服务地址不同）时才需要单独填写。保存后只显示头尾各4位和长度，密钥本体加密存储在 config.json 中。', required: false, type: 'string', condition: { image_caption_base_url: { differsFrom: 'llm_base_url' } } },
+            'image_caption_base_url': { label: '识图模型服务地址', description: '识图模型独立的接口地址', hint: '留空则跟随「LLM 服务地址」。服务根地址（如 http://127.0.0.1:8080/v1、https://xxx/compatible-mode/v1）和带对话端点的完整地址（如 https://xxx/compatible-mode/v1/chat/completions）都可以，程序会自动补全；不要填带业务路径的接口（…/services/xxx/xxx）。填错时点「服务列表」会明确报出实际请求的地址与上游返回的原因。', required: false, type: 'string', presets: LLM_ENDPOINT_PRESETS, default: '' },
+            'image_caption_api_key': { label: '识图模型 API Key', description: '识图模型独立的接口密钥', hint: '留空则跟随「LLM API Key」。识图模型与语言模型不是同一家服务商（服务地址不同）时才需要单独填写。保存后只显示头尾各4位和长度，密钥本体加密存储在 config.json 中。', required: false, type: 'string', condition: { image_caption_base_url: { differsFrom: 'llm_base_url' } } },
             'llm_base_url': { label: 'LLM 服务地址', description: 'LLM服务地址', hint: 'Ollama 默认 http://127.0.0.1:11434；llama.cpp（llama-server）填 http://127.0.0.1:8080/v1（必须带 /v1，接口类型选 openai）；DeepSeek 等云 API 请填 https://api.deepseek.com（需将接口类型改为 openai）。', required: true, type: 'string', presets: LLM_ENDPOINT_PRESETS, default: 'http://127.0.0.1:11434' },
             'num_ctx': { label: '上下文长度 (num_ctx)', description: '大模型上下文长度', hint: '默认8192，决定模型能记住的对话历史长度（Token数）。', required: false, type: 'int', default: 8192 },
             'history_length': { label: '历史消息条数', description: '模型可读上下文条数', hint: '模型直接读取的最近对话条数，默认 8 条。开启自动摘要时，摘要后保留的原文也不会少于这个条数——想让角色记得更久就调大它（同时留意模型上下文长度是否够用）。', required: false, type: 'int', default: 8 },
@@ -6083,10 +6080,10 @@
             'default_voice': { label: '默认情绪', description: '默认情绪', hint: 'LLM 未开启或判别失败时使用，必须与文件夹名一致（例如 pingjing）。', required: false, type: 'string', condition: { llm_judge: false }, default: 'pingjing' },
             'tts_debug_log': { label: 'TTS 详细日志', description: '每次合成打印完整台词与合成参数', hint: '排查"语音少词"时打开：日志会打印 LLM 传来的完整内容、实际送去合成的文本、参考音频与切分方式。', required: false, type: 'boolean', default: false },
             'tts_strip_non_dialogue': { label: '移除非台词内容', description: '合成前剔除动作、表情、场景与颜文字，TTS 只念台词', hint: '默认开启。开启后括号里的动作、表情与场景说明（如 (笑)、[旁白]）以及颜文字（如 (*/ω＼*)）只在消息文本里保留，不进语音；「」引号里的台词不受影响。日志会写明剔除了哪些内容。', required: false, type: 'boolean', default: true },
-            'tts_char_map': { label: 'TTS 字符替换表', description: '【可选】每行一条，格式：原字符=替换内容', hint: '默认已内置常见符号（—— → ～、♪ → 空 等）。想按自己的 TTS 服务调整时在这里覆盖，例如 ——=、 或 ♪=～。留空使用内置默认。', required: false, type: 'text' },
+            'tts_char_map': { label: 'TTS 字符替换表', description: '每行一条，格式：原字符=替换内容', hint: '默认已内置常见符号（—— → ～、♪ → 空 等）。想按自己的 TTS 服务调整时在这里覆盖，例如 ——=、 或 ♪=～。留空使用内置默认。', required: false, type: 'text' },
             'image_identity_guard_enabled': { label: '图片身份规则', description: '告诉模型用户发的图/表情包不是角色自己', hint: '建议开启：避免模型把用户的表情包当成"这是我""我的照片"。', required: false, type: 'boolean', default: true },
             'emotion_guide_enabled': { label: '情绪判定规则引导', description: '在系统提示词里写明每个情绪的使用时机，避免模型一律填默认情绪', hint: '强烈建议开启：关闭后模型会更容易把所有句子都判成默认情绪（例如 pingjing）。开启后，亲密语境会强制优先使用害羞（haixiu）。', required: false, type: 'boolean', default: true },
-            'emotion_guide_extra': { label: '自定义情绪判定补充规则', description: '【可选】追加到情绪判定规则后的自定义说明', hint: '例如：只要主人夸我可爱，就必须用 haixiu。留空则不追加。', required: false, type: 'text' },
+            'emotion_guide_extra': { label: '自定义情绪判定补充规则', description: '追加到情绪判定规则后的自定义说明', hint: '例如：只要主人夸我可爱，就必须用 haixiu。留空则不追加。', required: false, type: 'text' },
             'voice_transition': { label: '语气渐变', description: '语气渐变', hint: '开启后，不同情绪句子之间将平滑过渡。', required: false, type: 'boolean', default: true },
             'breathing_gap_ms': { label: '呼吸间隙（毫秒）', description: '呼吸间隙（毫秒）', hint: '前一句说完后的停顿时间，默认 100。', required: false, type: 'int', condition: { voice_transition: true }, default: 100 },
             'crossfade_ms': { label: '交叉渐变长度（毫秒）', description: '交叉渐变长度（毫秒）', hint: '两句话重叠过渡的时长，默认 300。', required: false, type: 'int', condition: { voice_transition: true }, default: 300 },
@@ -6104,7 +6101,7 @@
             'asr_api_key': { label: '识别 API Key', description: '线上识别的密钥', hint: '留空则复用「LLM API Key」。本地服务可留空。保存后只显示头尾各4位和长度，密钥本体加密存储在 config.json 中。', required: false, type: 'string', condition: { asr_engine: 'dashscope' } },
             'asr_api_style': { label: '识别接口风格', description: '识别服务用哪种协议', hint: '默认 auto：按「识别服务地址」自动判断，本地地址按 Ollama、其它按 OpenAI 兼容（把音频直接喂给对话模型）。whisper 走标准的 /v1/audio/transcriptions 转写接口 —— OpenAI Whisper、Groq、硅基流动 SenseVoice、本机 Speaches / whisper.cpp server 这类都用它；ollama 是专门的本地 Ollama 服务，dashscope 固定按 OpenAI 兼容协议请求。', required: false, type: 'string', options: ['auto', 'openai', 'dashscope', 'ollama', 'whisper'], condition: { asr_engine: 'dashscope' }, default: 'auto' },
             'asr_local_engine': { label: '本地识别引擎', description: '本地通道用哪个识别引擎', hint: '默认 auto：中文走达摩 ASR（funasr），其它语种走 Faster Whisper。选 funasr / whisper 可以强制指定。', required: false, type: 'string', options: ['auto', 'funasr', 'whisper'], condition: { asr_engine: 'local' }, default: 'auto' },
-            'asr_local_root': { label: '识别根目录', description: '【可选】本地识别脚本所在目录', hint: '留空则沿用 GPT-SoVITS 目录（由「TTS 启动脚本」推出）。换成别的识别项目时填它的根目录，目录下要有 runtime/python.exe 和 tools/asr/funasr_asr.py（或 fasterwhisper_asr.py）。', required: false, type: 'path', condition: { asr_engine: 'local' }, default: '' },
+            'asr_local_root': { label: '识别根目录', description: '本地识别脚本所在目录', hint: '留空则沿用 GPT-SoVITS 目录（由「TTS 启动脚本」推出）。换成别的识别项目时填它的根目录，目录下要有 runtime/python.exe 和 tools/asr/funasr_asr.py（或 fasterwhisper_asr.py）。', required: false, type: 'path', condition: { asr_engine: 'local' }, default: '' },
             'asr_lang': { label: '音频语言', description: '识别时假定的音频语言', hint: '默认 auto。local 引擎下选中文用达摩 ASR，其余语种交给 Faster Whisper；页面上的选择会覆盖这里的默认值。', required: false, type: 'string', options: ['auto', 'zh', 'ja', 'en', 'ko'], default: 'auto' },
             'asr_base_url': { label: '识别服务地址', description: '线上识别的接口地址（可云可本地）', hint: '左边预设是能语音识别的服务地址（选服务商会自动定好「识别接口风格」）；留空则复用 LLM 大模型的地址与密钥。填服务根地址（如 https://dashscope.aliyuncs.com/compatible-mode/v1）或完整的对话端点都可以，程序会自动补全；填错时点「服务列表」会明确报出实际请求的地址与上游返回的原因。', required: false, type: 'string', presets: ASR_ENDPOINT_PRESETS, condition: { asr_engine: 'dashscope' }, default: '' },
             'asr_dashscope_model': { label: '线上识别模型（备用）', description: '「语音识别模型」留空时用这个名字', hint: '默认 qwen3-asr-flash。建议直接填上面的「语音识别模型」，那一项能扫描本地模型、也能从服务拉列表。', required: false, type: 'string', condition: { asr_engine: 'dashscope' }, default: 'qwen3-asr-flash' },
@@ -6188,7 +6185,7 @@
             'todo_voice': { label: '提醒附带语音', description: '提醒消息是否合成语音', hint: '需要 TTS 服务在线。', required: false, type: 'boolean', default: false },
             'todo_voice_emotion': { label: '提醒语音使用的情绪', description: '提醒语音用哪套参考音色', hint: '填情绪文件夹名（如 开心 / gaoxing），留空或填错会回退角色默认情绪。', required: false, type: 'string', default: 'pingjing' },
             'todo_remind_mode': { label: '提醒话术生成方式', description: 'llm=让角色用自己的人设现场说一句提醒；preset=固定模板', hint: 'llm 模式会多一次模型请求；若模型失败或生成内容没包含提醒事项，会自动回退到下面的预设模板，不会漏提醒。', required: false, type: 'string', options: ['llm', 'preset'], default: 'llm' },
-            'todo_remind_prompt': { label: '提醒话术提示词（LLM 模式）', description: '【可选】自定义提醒话术的风格要求', hint: '留空使用内置规则（角色语气、一句话、必须说出事项内容）。', required: false, type: 'text' },
+            'todo_remind_prompt': { label: '提醒话术提示词（LLM 模式）', description: '自定义提醒话术的风格要求', hint: '留空使用内置规则（角色语气、一句话、必须说出事项内容）。', required: false, type: 'text' },
             'todo_remind_template': { label: '提醒话术模板（预设模式）', description: '到点发送的提醒内容模板，{content} 为事项', hint: '默认：⏰ 提醒时间到啦：{content}', required: false, type: 'string' },
             'todo_keywords': { label: '触发关键词（每行一个）', description: '消息包含任一关键词才尝试提取待办', hint: '这是待办提取的第一道门槛：消息必须包含这里任意一个词才会进入提取流程。默认包含「提醒 / 待办 / 别忘了 / 记得 / 叫我」。如果你把「叫我」删掉，「8点半叫我起床」这类消息会被直接跳过（日志里会提示"看起来是提醒请求但未命中触发关键词"）。留空则对所有消息尝试提取（不推荐）。', required: false, type: 'text' },
             'todo_regex_patterns': { label: '待办正则（每行一个）', description: '每个正则需包含两个捕获组：第1组=时间表达式，第2组=事项内容', hint: '支持 “X分钟后 / X小时后 / HH:MM / 明天HH点MM分 / 8点半可以叫我起床” 等写法。留空使用内置默认正则（已覆盖"时间+可以+叫我+事项"这类语序）。', required: false, type: 'text' },
@@ -6280,8 +6277,8 @@
             'webui_port': { label: 'WebUI 端口', description: 'WebUI 端口号', hint: '默认 11500，请确保端口未被占用。', required: false, type: 'int', condition: { webui_enabled: true }, default: 11500 },
             'webui_access_info': { label: '访问地址', description: '当前 WebUI 的实际访问地址，手机或平板直接打开即可', required: false, type: 'access_info' },
             'webui_https': { label: '启用 HTTPS', description: '用加密连接提供 WebUI（手机上的麦克风需要它）', hint: '手机浏览器只在 https 或 localhost 下才把麦克风交给网页，所以「通话」类插件要在手机上用就必须开启这里。开启后自动生成一张 10 年自签证书，首次访问浏览器会提示不安全，选择继续访问即可；也可以自己填证书与私钥。改完保存后重启程序生效。', required: false, type: 'boolean', condition: { webui_enabled: true }, default: false },
-            'webui_cert_file': { label: 'HTTPS 证书文件', description: '【可选】自定义 PEM 证书', hint: '留空则用自动生成的自签证书（存在用户数据目录 webui_cert 下）。证书与私钥必须成对填写。', required: false, type: 'path', condition: { webui_https: true }, default: '' },
-            'webui_key_file': { label: 'HTTPS 私钥文件', description: '【可选】自定义 PEM 私钥', hint: '与证书成对；留空则用自签证书。', required: false, type: 'path', condition: { webui_https: true }, default: '' },
+            'webui_cert_file': { label: 'HTTPS 证书文件', description: '自定义 PEM 证书', hint: '留空则用自动生成的自签证书（存在用户数据目录 webui_cert 下）。证书与私钥必须成对填写。', required: false, type: 'path', condition: { webui_https: true }, default: '' },
+            'webui_key_file': { label: 'HTTPS 私钥文件', description: '自定义 PEM 私钥', hint: '与证书成对；留空则用自签证书。', required: false, type: 'path', condition: { webui_https: true }, default: '' },
             'webui_force_password': { label: '非本机访问强制密码', description: '监听地址不是本机时必须先设访问密码', hint: '默认开启。没设密码却监听在局域网地址时，程序会拒绝暴露、只监听 127.0.0.1，避免同网段的人直接看到聊天记录，甚至删除和发布。', required: false, type: 'boolean', condition: { webui_enabled: true }, default: true },
             'webui_password': { label: 'WebUI 访问密码', description: '设置后所有聊天记录等数据需输入密码才能查看', hint: '留空 = 不启用密码保护。设置后保存并刷新页面生效。', required: false, type: 'password' },
             'webui_auth_ttl_minutes': { label: '解锁默认有效时长（分钟）', description: '登录框的默认“不再弹出”时长', hint: '0 = 仅当前标签页会话内有效（关闭页面后重新输入）。解锁时也可临时修改。', required: false, type: 'int', condition: { webui_password: true }, default: 30 },
@@ -8486,11 +8483,6 @@
                 reqMark.className = 'required-mark';
                 reqMark.textContent = '【必填】';
                 label.appendChild(reqMark);
-            } else {
-                const optMark = document.createElement('span');
-                optMark.className = 'optional-mark';
-                optMark.textContent = '【可选】';
-                label.appendChild(optMark);
             }
             // 左列：标题 + 说明。说明跟在标题下面（而不是控件下面），
             // 这一行就成了「左标题说明 / 右控件」，和设置页的清单形态一致。
