@@ -247,10 +247,11 @@ _ui_server.py
 # 插件市场是独立仓库（slpk1ng/Lovomo_Plugin_Market），本目录是它的本地工作副本
 plugins/
 
-# 打包脚本是构建的一部分，不跟着 *.spec 一起忽略
-!lovomo_app.spec
-
 # --- 只留在本地、不进仓库的私有文件 ---
+# 测试套件是本机开发用的，仓库只保留成品文件（main.py / modules/ / webui/ 等）
+tests/
+# 打包脚本由上面的 *.spec 规则忽略，这里不再开例外
+lovomo_app.spec
 # DSH 会话操作暂存（工具产物）
 .dsh-ops/
 # 本机安装脚本与个人笔记/知识库

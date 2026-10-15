@@ -3197,8 +3197,9 @@ class WebUIServer:
         """清掉一个会话依附的状态，返回它是不是私聊会话。
 
         私聊就是「和这个人聊过」的全部记录，连用户画像一起清掉，当成从没聊过；
-        群聊只清这个群自己的记录：同一个人可能同时在私聊里聊过，
-        他在私聊里的关系与用户画像不该被牵连。
+        群聊只清这个群自己的记录（心情、日记、承诺、主动消息与回忆），
+        成员的关系进度与用户画像一律不动：同一个人可能同时在私聊里聊过，
+        那些关系与画像不该被一个群聊的删除牵连。
         """
         character_key, sid, stype, target_id = scope
         if app_context.mood_mgr is not None:
@@ -3209,11 +3210,10 @@ class WebUIServer:
             app_context.promise_mgr.drop_session(sid)
         if app_context.recall_mgr is not None:
             app_context.recall_mgr.drop_session(sid)
-        if app_context.affection_mgr is not None:
-            if stype == "private":
-                app_context.affection_mgr.reset(character_key, str(target_id), sid)
-            else:
-                app_context.affection_mgr.drop_session(character_key, sid)
+        # 群聊不碰关系进度：成员的关系记录是这位成员自己处出来的，
+        # 他可能同时在私聊里聊过，群记录被删不该把任何一条关系清掉。
+        if app_context.affection_mgr is not None and stype == "private":
+            app_context.affection_mgr.reset(character_key, str(target_id), sid)
         if stype != "private":
             return False
         if app_context.profile_mgr is not None:
