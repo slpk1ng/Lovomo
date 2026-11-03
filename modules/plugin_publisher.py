@@ -1,15 +1,3 @@
-"""把本地插件源包推到插件市场仓库的默认分支上。
-
-走 GitHub Git Data API：插件文件写到 `plugins/<分类>/<插件id>/` 下（分类来自
-清单的 `category`），以默认分支 HEAD 的 tree 作 base_tree，仓库里其它内容原样
-保留，同一提交里更新 `plugins/index.json` 里本插件那一条，再把默认分支指到这
-个新提交。发布完给这个版本打一个不可变标签（`<插件id>-v<版本>`），并把插件目录
-打成 zip 传成该版本的 Release 附件 —— 下载量与收藏量就是从 Release 上汇总来的。
-
-排查约定：所有出错的调用都会打一行 `[插件发布]` 日志（动作、URL、状态码、
-返回内容摘要），并把同一份上下文塞进 PublishError 的提示里 —— 调用方拿到的
-永远是可读错误，不会是 KeyError 之类的裸异常。
-"""
 import base64
 import io
 import json
@@ -29,19 +17,15 @@ from modules.tls import verified_context, is_cert_error
 
 API_ROOT = "https://api.github.com"
 
-# 插件清单：plugin.yaml 优先，plugin.json 兼容老包
 MANIFEST_NAMES = ("plugin.yaml", "plugin.yml", "plugin.json")
 
 SKIP_DIRS = {"data", "__pycache__", ".git"}
 TIMEOUT = 30.0
 
-# Git 引用名不接受空格、~ ^ : ? * [ \ 这类字符，版本号是用户自己写的，先收敛
 _TAG_BAD_RE = re.compile(r"[^0-9A-Za-z._-]+")
 
-CERT_HINT = ("证书校验失败：系统信任库里没有出网设备的根证书。"
-             "若确认网络可信，可把该根证书导入系统证书库后再试。")
+CERT_HINT = ("证书校验失败：系统信任库里没有出网设备的根证书。若确认网络可信，可把该根证书导入系统证书库后再试。")
 
-# 按状态码给出的排查提示，命中就给用户一句人话
 _STATUS_HINTS = {
     401: "Token 无效或已过期，请在「插件」→「发布到市场」里重新保存",
     403: "权限不足，或触发了 GitHub 限流（未认证调用每小时只有 60 次）",
@@ -52,10 +36,6 @@ _STATUS_HINTS = {
 
 
 def list_publish_files(src_dir: Path) -> List[Tuple[str, bytes]]:
-    """白名单扫描，返回 [(仓库内相对路径, 字节)]。
-
-    与 pack_plugin.py 同源同一份白名单，避免打进非代码文件。
-    """
     out = []
     for f in sorted(src_dir.rglob("*")):
         if not f.is_file():
@@ -70,7 +50,6 @@ def list_publish_files(src_dir: Path) -> List[Tuple[str, bytes]]:
 
 
 def find_manifest(src_dir: Path) -> Optional[Path]:
-    """在插件目录里找清单文件，plugin.yaml 优先。"""
     if src_dir is None or not src_dir.is_dir():
         return None
     for name in MANIFEST_NAMES:
@@ -94,7 +73,6 @@ class PublishError(Exception):
 
 
 def _body_brief(resp, limit: int = 200) -> str:
-    """返回内容摘要：压成单行并截断，避免把整页 HTML 灌进日志。"""
     try:
         text = resp.text
     except Exception:
@@ -103,7 +81,6 @@ def _body_brief(resp, limit: int = 200) -> str:
 
 
 def _dig(data, *keys):
-    """按路径安全取值，任何一层缺失或类型不符都返回 None。"""
     cur = data
     for key in keys:
         if not isinstance(cur, dict):
@@ -113,7 +90,6 @@ def _dig(data, *keys):
 
 
 def _json_dict(resp) -> dict:
-    """把响应体解析成字典；结构不是对象时给可读错误，不做裸下标。"""
     try:
         data = resp.json()
     except Exception as e:
@@ -128,7 +104,6 @@ def _json_dict(resp) -> dict:
 
 
 def _fail(action: str, url: str, resp, message: str) -> PublishError:
-    """统一的失败出口：日志留上下文，错误给人话。"""
     brief = _body_brief(resp)
     print(f"[插件发布] {action}失败：HTTP {resp.status_code} {url}"
           + (f" → {brief}" if brief else ""))
@@ -136,7 +111,6 @@ def _fail(action: str, url: str, resp, message: str) -> PublishError:
 
 
 def _api_error(action: str, url: str, resp) -> PublishError:
-    """把一次失败的调用转成可读错误，并按状态码补一句排查提示。"""
     hint = _STATUS_HINTS.get(resp.status_code, "")
     return _fail(action, url, resp,
                  f"{action}失败：HTTP {resp.status_code}"
@@ -144,7 +118,6 @@ def _api_error(action: str, url: str, resp) -> PublishError:
 
 
 def _missing_field(action: str, url: str, resp, field: str) -> PublishError:
-    """响应缺关键字段时统一出口：日志留上下文，错误给人话。"""
     print(f"[插件发布] {action}：响应缺少 {field}（HTTP {resp.status_code} {url}）"
           f" → {_body_brief(resp)}")
     return PublishError(f"{action}：GitHub 的响应里没有 {field}，无法继续")
@@ -161,7 +134,6 @@ async def _request(token: str, method: str, url: str, json_body=None, params=Non
             r = await client.request(method, url, headers=headers,
                                      json=json_body, params=params, content=content)
     except httpx.RequestError as e:
-        # PAT 就在这个请求头上，宁可报错也不降级成不校验
         hint = CERT_HINT if is_cert_error(e) else ""
         print(f"[插件发布] 网络错误：{method} {url} → {type(e).__name__}: {e}")
         raise PublishError(f"网络错误：{type(e).__name__}: {e}{hint}") from e
@@ -184,12 +156,6 @@ async def verify_token(token: str) -> dict:
 
 
 async def fetch_default(token: str, repo: str) -> Tuple[str, str]:
-    """返回 (默认分支名, 该分支 HEAD 的 commit SHA)。
-
-    GitHub 的仓库对象本身**没有** `sha` 字段 —— `GET /repos/{repo}` 只给
-    `default_branch` 这类元信息，HEAD 提交要另外查一次分支引用。所以这里
-    分两步走，任何一步拿不到关键字段都转成可读错误而不是 KeyError。
-    """
     url = f"{API_ROOT}/repos/{repo}"
     r = await _request(token, "GET", url)
     if r.status_code == 404:
@@ -227,11 +193,6 @@ async def commit_tree(token: str, repo: str, commit_sha: str) -> str:
 
 
 async def tree_blob_paths(token: str, repo: str, tree_sha: str) -> Tuple[list, bool]:
-    """递归列出一棵树里的全部文件路径，返回 (路径列表, 是否被截断)。
-
-    超大仓库的递归结果会被 GitHub 截断；截断时调用方不能拿它算
-    "哪些文件已经不存在"，否则会误删仓库里的文件。
-    """
     url = f"{API_ROOT}/repos/{repo}/git/trees/{tree_sha}"
     r = await _request(token, "GET", url, params={"recursive": "1"})
     if r.status_code != 200:
@@ -246,7 +207,6 @@ async def tree_blob_paths(token: str, repo: str, tree_sha: str) -> Tuple[list, b
 
 
 async def read_file_text(token: str, repo: str, ref: str, path: str) -> str:
-    """读仓库里一个文本文件的内容，文件不存在时返回空串。"""
     url = f"{API_ROOT}/repos/{repo}/contents/{path}"
     r = await _request(token, "GET", url, params={"ref": ref})
     if r.status_code == 404:
@@ -266,12 +226,6 @@ async def read_file_text(token: str, repo: str, ref: str, path: str) -> str:
 async def commit_files(token: str, repo: str, files: List[Tuple[str, bytes]],
                        message: str, parents: List[str],
                        base_tree: str = "", deleted: List[str] = None) -> Tuple[str, list]:
-    """把一组文件建成一个提交，返回 (提交 SHA, [(路径, blob SHA)])。
-
-    `base_tree` 给定时新树挂在它下面，仓库里其它内容原样保留；留空则
-    是不挂 base_tree 的空树（提交里只有这些文件）。`deleted` 里的路径
-    从新树里删掉（GitHub 用 sha 为 null 表示删除）。
-    """
     entries = []
     for path, content in files:
         url = f"{API_ROOT}/repos/{repo}/git/blobs"
@@ -314,7 +268,6 @@ async def commit_files(token: str, repo: str, files: List[Tuple[str, bytes]],
 
 
 async def update_branch(token: str, repo: str, branch: str, sha: str) -> None:
-    """把分支指到提交上（不加 force：默认分支只能快进，不能覆盖历史）。"""
     url = f"{API_ROOT}/repos/{repo}/git/refs/heads/{branch}"
     r = await _request(token, "PATCH", url, json_body={"sha": sha, "force": False})
     if r.status_code != 200:
@@ -322,7 +275,6 @@ async def update_branch(token: str, repo: str, branch: str, sha: str) -> None:
 
 
 def safe_version(version: str) -> str:
-    """版本号里 Git 与文件名不接受的字符换成 -，收敛不出东西时返回空串。"""
     raw = str(version or "").strip()
     if not raw:
         return ""
@@ -330,17 +282,11 @@ def safe_version(version: str) -> str:
 
 
 def version_tag(name: str, version: str) -> str:
-    """版本标签名 `<名字>-v<版本>`；空版本返回空串。"""
     safe = safe_version(version)
     return f"{name}-v{safe}" if safe else ""
 
 
 def parse_version_tag(tag: str, prefix: str = "") -> Tuple[str, str]:
-    """`version_tag()` 的反解：把标签名拆回 (插件 id, 版本)。
-
-    不是 `<前缀>_<id>-v<版本>` 这个形状（比如程序自己的版本标签）时返回
-    ("", "")。插件 id 与版本号里都可能有 `-`，所以从**最后一个** `-v` 切开。
-    """
     name = str(tag or "").strip()
     head = str(prefix or "").strip()
     if head and name.lower().startswith(head.lower()):
@@ -366,11 +312,6 @@ async def tag_exists(token: str, repo: str, tag: str) -> bool:
 
 
 async def ensure_version_tag(token: str, repo: str, tag: str, sha: str) -> bool:
-    """保证版本标签存在，返回本次是否新建。
-
-    已存在的标签不动：同一个版本号永远指向它第一次发布时的提交，
-    标签留档的仍是那一刻的内容。
-    """
     if not tag or await tag_exists(token, repo, tag):
         return False
     url = f"{API_ROOT}/repos/{repo}/git/refs"
@@ -406,7 +347,6 @@ async def create_release(token: str, repo: str, tag: str, name: str,
 async def upload_release_asset(token: str, upload_url: str, name: str,
                                data: bytes) -> dict:
     """把 zip 传成 Release 附件。"""
-    # 上传地址是模板形式（尾部带 {?name,label}），要先把模板尾巴切掉
     url = str(upload_url or "").split("{", 1)[0]
     if not url:
         raise PublishError("创建 Release：GitHub 的响应里没有 upload_url，无法上传安装包")
@@ -418,7 +358,6 @@ async def upload_release_asset(token: str, upload_url: str, name: str,
 
 
 def zip_bytes(files: List[Tuple[str, bytes]]) -> bytes:
-    """把待发布文件打成一个 zip（文件放在包根目录，与安装时的解压口径一致）。"""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for path, content in files:
@@ -428,10 +367,6 @@ def zip_bytes(files: List[Tuple[str, bytes]]) -> bytes:
 
 async def ensure_release(token: str, repo: str, tag: str, title: str,
                          body: str, zip_name: str, data: bytes) -> str:
-    """保证该版本有一个带 zip 附件的 Release，成功返回标签名。
-
-    已发过的版本原样留着 —— 同一个版本号对应的内容以第一次发布为准。
-    """
     if await find_release_by_tag(token, repo, tag) is not None:
         return tag
     try:
@@ -439,15 +374,12 @@ async def ensure_release(token: str, repo: str, tag: str, title: str,
         await upload_release_asset(token, str(rel.get("upload_url") or ""),
                                    zip_name, data)
     except PublishError as e:
-        # 文件夹与索引已经推上去了，Release 只是安装包与统计的来源，
-        # 没建上不该把整次发布判成失败，但必须留痕
         print(f"[插件发布] Release 没建上：{e}")
         return ""
     return tag
 
 
 async def list_version_tags(token: str, repo: str, plugin_id: str) -> list:
-    """列出某个插件的版本标签（`<插件id>-v<版本>`）。"""
     url = f"{API_ROOT}/repos/{repo}/git/matching-refs/tags/{plugin_id}-v"
     r = await _request(token, "GET", url)
     if r.status_code == 404:
@@ -465,7 +397,6 @@ async def list_version_tags(token: str, repo: str, plugin_id: str) -> list:
 
 
 async def delete_ref(token: str, repo: str, ref: str) -> None:
-    """删掉一个引用（标签）；已经不存在时当成功。"""
     url = f"{API_ROOT}/repos/{repo}/git/refs/{ref}"
     r = await _request(token, "DELETE", url)
     if r.status_code not in (200, 204, 404):
@@ -473,7 +404,6 @@ async def delete_ref(token: str, repo: str, ref: str) -> None:
 
 
 async def delete_release(token: str, repo: str, release_id) -> None:
-    """删掉一个 Release；已经不存在时当成功。"""
     url = f"{API_ROOT}/repos/{repo}/releases/{release_id}"
     r = await _request(token, "DELETE", url)
     if r.status_code not in (200, 204, 404):
@@ -482,11 +412,6 @@ async def delete_release(token: str, repo: str, release_id) -> None:
 
 async def unpublish_plugin(token: str, repo: str, plugin_id: str,
                            market_path: str = "plugins/index.json") -> dict:
-    """把插件从市场下架：删索引条目、仓库里的插件目录，以及版本标签与 Release。
-
-    标签与 Release 是「是否已上架」的另一半判据，留着会让插件一直显示
-    「当前版本已发布过」而发不出去，所以一并撤掉。
-    """
     index_path = str(market_path or "").strip().lstrip("/") or "plugins/index.json"
     default_branch, head = await fetch_default(token, repo)
     base_tree = await commit_tree(token, repo, head)
@@ -551,7 +476,6 @@ async def publish_plugin(token: str, repo: str, plugin_id: str,
                          sources_dir: Path,
                          message: Optional[str] = None,
                          market_path: str = "plugins/index.json") -> dict:
-    """主流程：把插件写进市场仓库的 `plugins/<分类>/<插件id>/`，并更新索引与 Release。"""
     src = sources_dir / plugin_id
     if not src.is_dir():
         raise PublishError(f"插件源码目录不存在：{src}")
@@ -562,7 +486,6 @@ async def publish_plugin(token: str, repo: str, plugin_id: str,
     files = list_publish_files(src)
     if not files:
         raise PublishError("插件没有任何白名单内的文件可发布")
-    # 清单已经在待发布文件里，直接就地解析，不再读一次盘
     manifest_data = parse_manifest_text(
         dict(files).get(manifest.name, b"").decode("utf-8", "replace"), manifest.name)
 
@@ -574,8 +497,7 @@ async def publish_plugin(token: str, repo: str, plugin_id: str,
     base_tree = await commit_tree(token, repo, head)
     existing, truncated = await tree_blob_paths(token, repo, base_tree)
     if truncated:
-        print(f"[插件发布] 仓库文件过多，GitHub 截断了目录树："
-              f"本次跳过清理 {folder}/ 下已不存在的文件")
+        print(f"[插件发布] 仓库文件过多，GitHub 截断了目录树：本次跳过清理 {folder}/ 下已不存在的文件")
 
     index_text = await read_file_text(token, repo, default_branch, index_path)
     index_data = {}
@@ -587,8 +509,6 @@ async def publish_plugin(token: str, repo: str, plugin_id: str,
                   f"本次按空索引重写")
             index_data = {}
 
-    # 改过分类（或老版本把插件直接放在 plugins/<插件id>/）时旧目录要一并删掉，
-    # 否则市场里会同时留下两份，用户分不清该装哪个
     old_folders = []
     for item in (index_data.get("plugins") or []):
         if not isinstance(item, dict) or str(item.get("id") or "").strip() != plugin_id:

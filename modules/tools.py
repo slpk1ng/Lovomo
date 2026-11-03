@@ -1,27 +1,3 @@
-"""工具调用（Function Calling）：内置工具 + 自定义 HTTP/命令工具，全部可在 WebUI 配置与授权。
-
-工具定义存于 data/tools.json（WebUI「高级功能-工具调用」页可视化编辑）：
-  {
-    "name": "get_weather",
-    "type": "builtin|http|command",
-    "description": "给 LLM 看的功能描述",
-    "parameters": {JSON Schema},
-    "enabled": true,
-    "allowed_users": [],           # 空 = 所有用户可用；填写 QQ 号则仅这些用户可触发
-    "max_calls_per_reply": 1,      # 单次回复内最多调用次数
-    # http 类型专用
-    "url": "https://.../?city={city}",
-    "method": "GET",
-    "timeout": 10,
-    # command 类型专用
-    "command": "python {script} --arg {value}",
-    # builtin 类型专用
-    "builtin": "time|calculate|random|weather|web_fetch"
-  }
-
-权限控制：全局开关 tools_enabled → 工具级 enabled → 用户白名单 allowed_users
-→ 单回复调用次数限制 → 命令类工具需额外打开 tools_allow_commands。
-"""
 import ast
 import asyncio
 import ipaddress
@@ -76,7 +52,7 @@ DEFAULT_TOOLS = [
     {
         "name": "web_search",
         "type": "builtin", "builtin": "web_search",
-        "description": "用关键词在互联网上搜索资料。【必须调用】只要用户消息表达出以下任一意图，都必须调用本工具搜索后再回答，绝不能凭记忆、凭常识直接作答，也不能以“我没有联网”之类的借口推托：① 明确的搜索请求（搜/搜索/搜一下/查一下/查找/查查/帮我搜/帮我查/找一下/找找/看看有没有）；② 询问新闻、时事、最新消息、最新进展、近期发生的事；③ 询问具体人物/作品/产品/事件/名词/名词解释（如“xx是什么”“xx是谁”“xx怎么样”“xx有没有出”“你知道xx吗”）；④ 询问价格、评价、推荐、攻略、教程；⑤ 询问任何你不确定或不知道答案的问题（此时必须先搜再答，不确定就承认不确定，绝不能编造）。query 必须严格取自【当前这一条用户消息】的核心搜索意图，用最简洁的关键词表述（例如用户说“帮我搜搜今天有什么新闻呗”就填“今天的新闻”；用户说“A游戏好玩吗”就填“A游戏 评价”），绝对不允许复制、沿用或参考历史对话中曾经出现过的旧搜索词。可选 engine 指定搜索引擎（bing/baidu/360/sogou 等，不填用默认引擎）；只有需要打开某个搜索结果看全文时，才接着用 web_fetch。",
+        "description": "用关键词在互联网上搜索资料。【必须调用】只要用户消息表达出以下任一意图，都必须调用本工具搜索后再回答，绝不能凭记忆、凭常识直接作答，也不能以“我没有联网”之类的借口推托：① 明确的搜索请求（搜/搜索/搜一下/查一下/查找/查查/帮我搜/帮我查/找一下/找找/看看有没有）；② 询问新闻、时事、最新消息、最新进展、近期发生的事；③ 询问具体人物/作品/产品/事件/名词/名词解释（如“xx是什么”“xx是谁”“xx怎么样”“xx有没有出”“你知道xx吗”）；④ 询问价格、评价、推荐、攻略、教程；⑤ 询问任何你不确定或不知道答案的问题（此时必须先搜再答，不确定就承认不确定，绝不能编造）；⑥ 用户只丢来一个话题或名词、没有完整问句（版本更新公告、活动兑换码、卡池、赛程比分这类时效性内容）时，同样要先搜索再回答。query 必须严格取自【当前这一条用户消息】的核心搜索意图，用最简洁的关键词表述（例如用户说“帮我搜搜今天有什么新闻呗”就填“今天的新闻”；用户说“A游戏好玩吗”就填“A游戏 评价”），绝对不允许复制、沿用或参考历史对话中曾经出现过的旧搜索词；结果里会带「检索时间」，拿不准新旧时以它为准，优先采用与检索时间接近、版本最新的那条，旧版本的攻略/兑换码不要当成本期答案；只把与用户所问直接相关、确实包含答案的链接写进回复，只匹配日期或年份的百科页、日历页、导航页不要发；结果或正文里混着多个主体（不同游戏/产品）时，只取与用户所问主体一致的部分，用户没说清是哪一个就先问一句，不要拿别的主体的兑换码当答案。结果末尾可能附有【网页正文】，那是系统替你打开页面抓回来的正文，回答时以正文里的内容为准（摘要可能只是标题党，正文里没有的码或数据不要编）。可选 engine 指定搜索引擎（bing/baidu/360/sogou 等，不填用默认引擎）；只有需要打开某个搜索结果看全文时，才接着用 web_fetch。",
         "parameters": {"type": "object", "properties": {
             "query": {"type": "string", "description": "当前这条用户消息对应的搜索关键词，必须只用这条消息里的信息，禁止使用历史对话中的旧搜索词"},
             "queries": {"type": "array", "items": {"type": "string"}, "description": "需要同时了解几件事时用的多个搜索词（最多 4 个）；一次把主题都列全，不要只搜第一个"},
@@ -100,12 +76,9 @@ _CALC_FUNCS = {
 }
 
 
-# 时间工具短 TTL 缓存：模型常在一条回复里反复调用当前时间工具，一分钟内
 # 重复查询没有意义，直接复用结果
 _TIME_TOOL_CACHE = {"ts": 0.0, "value": ""}
 
-# 合法算式：至少含一个数字和一个运算符（含中文运算词）。没有运算符说明模型
-# 只是在无关内容里幻觉出"我算了一下"，照常执行只会助长它胡说
 _CALC_OPERATOR_RE = re.compile(r"[+\-*/×÷^%(）)]|加|减|乘|除|平方|根号|开方|次方|百分比")
 
 
@@ -205,7 +178,6 @@ def _pick_arg(args: dict, *keys) -> str:
 
 
 def extract_urls(text: str, limit: int = 3) -> List[str]:
-    """从文本中提取 http(s) 链接（去重、保序、剥离尾部标点）。"""
     out: List[str] = []
     for raw in re.findall(r"https?://[^\s<>\"'）)】\]]+", str(text or ""), re.I):
         url = raw.rstrip(".,;:!?。，、；：！？")
@@ -217,7 +189,6 @@ def extract_urls(text: str, limit: int = 3) -> List[str]:
 
 
 def _looks_like_url_arg(text: str) -> bool:
-    """判断一段裸文本是不是网址（含 www. 开头与裸域名）。"""
     text = str(text or "").strip()
     if not text or re.search(r"\s", text):
         return False
@@ -229,15 +200,10 @@ def _looks_like_url_arg(text: str) -> bool:
 
 # ------------------------- 搜索引擎注册表 -------------------------
 # 每个引擎一个 spec：
-#   url_template  HTML 检索地址模板，{query} 查询词 / {page} 页码
-#   build_params  JSON 接口参数构造（返回 None 表示不支持 JSON 接口）
 #   parse_json    JSON 响应 -> [{title, url, snippet}]
 #   parse_html    HTML 响应 -> [{title, url, snippet}]
-#   api_key_env   官方 API key 环境变量（有 key 优先走接口，无 key 回退 HTML）
 #   api_url       官方 API 地址
 #   api_headers   官方 API 认证头
-#   resolve_redirect  结果里的跳转链接是否需要在返回时解析成真实地址
-# 新增引擎只需在这里加一项即可，WebUI 下拉框、文案、测试都会自动带上。
 
 _ENTITIES = {
     "amp": "&", "lt": "<", "gt": ">", "quot": '"', "apos": "'", "nbsp": " ",
@@ -286,7 +252,6 @@ def _abs_url(href: str, base: str) -> str:
 
 
 def _search_terms(query: str) -> List[str]:
-    """把搜索词拆成用于相关性判断的词元（中文按 2 字滑窗，避免整句比对）。"""
     text = re.sub(r"[\s\u3000]+", " ", str(query or "")).strip().lower()
     terms = []
     for token in re.split(r"[\s,，、;；/|]+", text):
@@ -310,11 +275,6 @@ def _result_matches(item: dict, terms: List[str]) -> bool:
 
 
 def _core_lookup(query: str) -> str:
-    """从"李祖祥是谁"这类问句里取出真正要找的对象（"李祖祥"），用于提示与相关性判断。
-
-    直接拿整句去判"有没有命中"会把正常结果判成不相关（结果里写的是名字，不会写"是谁"），
-    提示里也不必把整个问题重复三遍。
-    """
     text = re.sub(r"[\s\u3000]+", " ", str(query or "")).strip()
     text = re.sub(r"^(帮我|请|麻烦|给我)?\s*(搜索|搜一下|搜搜|搜|查一下|查查|查|找一下|找找|找)\s*(一下|下|一哈)?\s*", "", text)
     text = re.sub(r"(是谁|是什么人|是什么|怎么样|如何|的资料|的介绍|的信息|的意思|在哪里|是哪里|吗|呢|？|\?)+$", "", text)
@@ -323,22 +283,168 @@ def _core_lookup(query: str) -> str:
 
 
 def _is_short_lookup(query: str) -> bool:
-    """短查询（人名/专有名词，如"李祖祥"）需要整体命中，才允许说"搜到了"。"""
     text = re.sub(r"[\s\u3000]+", "", str(query or ""))
     return 0 < len(text) <= 8
 
 
+_RECENCY_QUERY_RE = re.compile(
+    r"兑换码|激活码|礼包码|前瞻|预告|爆料|情报|卡池|祈愿|复刻|返场|"
+    r"开服|停服|维护|停机|补偿|公告|版本|更新|赛季|赛程|比分|战报|"
+    r"汇率|股价|票价|开售|预售|定档|上映|排期|开奖|榜单|"
+    r"最新|新闻|时事|进展|近况|价格|多少钱|今天|本周|本月|今年")
+
+
+_CODE_QUERY_RE = re.compile(r"兑换码|激活码|礼包码")
+_LOOKUP_QUERY_RE = re.compile(r"兑换码|激活码|礼包码|公告|赛程|比分|汇率|股价|价格|多少钱|前瞻|预告")
+_NO_FETCH_HOSTS = ("bilibili.com", "douyin.com", "iesdouyin.com", "youtube.com",
+                   "youtu.be", "kuaishou.com", "weibo.com", "xiaohongshu.com")
+
+
+def _with_freshness_hint(query: str) -> str:
+    q = str(query or "").strip()
+    if not q or not _RECENCY_QUERY_RE.search(q):
+        return q
+    if re.search(r"最新|今日|今天|刚刚|近期|本周|本月|今年", q):
+        return q
+    if re.search(r"(?:19|20)\d{2}|\d{1,2}\s*月", q):
+        return q
+    return f"{q} 最新"
+
+
+_VERSION_CTX_RE = re.compile(r"版本|前瞻|卡池|兑换码|更新|上线|复刻|祈愿")
+_VERSION_RE = re.compile(r"(?<![\d.])(\d{1,2})\.(\d{1,2})(?![\d.])")
+_VERSION_TOPIC_RE = re.compile(
+    r"最新|兑换码|激活码|礼包码|前瞻|卡池|祈愿|复刻|返场|版本|更新|公告|攻略|"
+    r"大全|汇总|整理|一览|什么时候|上线|开服|停机|维护|补偿|活动|礼包|福利|码")
+_VERSION_CACHE = {}
+_VERSION_CACHE_TTL = 3600.0
+
+
+def _extract_version(text: str) -> str:
+    lines = [ln for ln in str(text or "").splitlines() if ln.strip()]
+
+    def best_from(needles) -> str:
+        best = None
+        for line in lines:
+            if needles and not any(n in line for n in needles):
+                continue
+            for m in _VERSION_RE.finditer(line):
+                before = line[m.start() - 1:m.start()]
+                after = line[m.end():m.end() + 1]
+                if before in "-~—－" or after in "-~—－." or after.isdigit():
+                    continue
+                major, minor = int(m.group(1)), int(m.group(2))
+                if not (0 < major <= 20 and minor <= 30):
+                    continue
+                if best is None or (major, minor) > best:
+                    best = (major, minor)
+        return f"{best[0]}.{best[1]}" if best else ""
+
+    return best_from(("前瞻",)) or best_from(("版本",))
+
+
+_VERSION_SUBJECT_STOP_RE = re.compile(
+    r"^(?:剩余|剩下|其他|其它|还有|这个|那个|这些|那些|刚才|上面|下面|之前|之后|"
+    r"前面|后面|全部|所有|更多|新的|旧的|几个|一个|两个|三个|多少|哪个|什么|怎么|为什么|"
+    r"我们|你们|他们|我的|你的|他的|她的|我们的|你们的|我|你|他|她|它)+$")
+
+
+def _version_subject(query: str) -> str:
+    s = re.sub(r"site:\S+", " ", str(query or ""), flags=re.I)
+    parts = [p for p in re.split(r"[\s\u3000]+", s) if p]
+    candidates = ([parts[0]] if parts else []) + [s]
+    for cand in candidates:
+        t = _VERSION_TOPIC_RE.sub(" ", cand)
+        t = re.sub(r"(?<![\d.])\d{1,2}\.\d{1,2}(?![\d.])", " ", t)
+        t = re.sub(r"[\s\u3000]+", " ", t).strip(" 　，,。.、:：;；呢吗啊呀吧")
+        if not 2 <= len(t) <= 20:
+            continue
+        if _VERSION_SUBJECT_STOP_RE.match(t):
+            continue
+        if re.fullmatch(r"[\d一二三四五六七八九十百两几多余个只件种批套]+", t):
+            continue
+        return t
+    return ""
+
+
+def _version_filter(results: list, target: str) -> list:
+    if not target:
+        return results
+    kept = []
+    for item in results:
+        text = f"{item.get('title', '')} {item.get('content', '')}"
+        if target in text:
+            kept.append(item)
+    return kept
+
+_DATE_IN_TEXT_RE = re.compile(r"(20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日"
+                              r"|(20\d{2})-(\d{1,2})-(\d{1,2})")
+_QUERY_DATE_RE = re.compile(
+    r"(?:19|20)\d{2}\s*年(?:\s*\d{1,2}\s*月(?:\s*\d{1,2}\s*日)?)?"
+    r"|(?:19|20)\d{2}[-/.]\d{1,2}(?:[-/.]\d{1,2})?"
+    r"|\d{1,2}\s*月\s*\d{1,2}\s*日"
+    r"|今天|今日|最新")
+
+
+def _result_matches_query(item: dict, query: str) -> bool:
+    topic = _QUERY_DATE_RE.sub(" ", str(query or "")).strip() or str(query or "")
+    core = re.sub(r"[\s\u3000]+", "", _core_lookup(topic)).lower()
+    if not core:
+        return True
+    haystack = f"{item.get('title', '')}{item.get('content', '')}".lower().replace(" ", "")
+    if _is_short_lookup(core):
+        grams = {core[i:i + 2] for i in range(len(core) - 1)} if len(core) > 2 else {core}
+        return core in haystack or sum(1 for gram in grams if gram in haystack) >= 2
+    terms = _search_terms(topic)
+    return not terms or _result_matches(item, terms)
+
+
+_REL_DATE_RE = re.compile(r"(?<!\d)(\d{1,2})\s*(天|小时|分钟)\s*之前")
+_MD_RE = re.compile(r"(?<!\d)(\d{1,2})\s*[月/]\s*(\d{1,2})(?!\d)")
+
+
+def _text_date_ts(text: str):
+    s = str(text or "")
+    m = _DATE_IN_TEXT_RE.search(s)
+    if m:
+        parts = [p for p in m.groups() if p]
+        try:
+            return time.mktime((int(parts[0]), int(parts[1]), int(parts[2]),
+                                0, 0, 0, 0, 0, -1))
+        except (ValueError, OverflowError):
+            return None
+    m = _REL_DATE_RE.search(s)
+    if m:
+        seconds = {"天": 86400, "小时": 3600, "分钟": 60}.get(m.group(2), 0)
+        return time.time() - int(m.group(1)) * seconds
+    m = _MD_RE.search(s)
+    if m:
+        month, day = int(m.group(1)), int(m.group(2))
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            now = time.localtime()
+            try:
+                ts = time.mktime((now.tm_year, month, day, 0, 0, 0, 0, 0, -1))
+                if ts > time.time() + 86400:      # 写的是"明年"的日期，按去年算
+                    ts = time.mktime((now.tm_year - 1, month, day, 0, 0, 0, 0, 0, -1))
+                return ts
+            except (ValueError, OverflowError):
+                return None
+    return None
+
+
+def _sort_by_recency(results: list) -> list:
+    dated, undated = [], []
+    for idx, item in enumerate(results):
+        ts = _text_date_ts(f"{item.get('title', '')} {item.get('content', '')}")
+        if ts is None:
+            undated.append((idx, item))
+        else:
+            dated.append((ts, idx, item))
+    dated.sort(key=lambda x: (-x[0], x[1]))
+    return [item for _, _, item in dated] + [item for _, item in undated]
+
+
 def _looks_relevant(query: str, results: list, minimum: int = 1) -> bool:
-    """判断这批结果是否真的对上了搜索词。
-
-    事故背景：中文姓名会被引擎悄悄放宽成单字命中——搜"李祖祥"，Bing 返回的全是
-    "李（汉语汉字）""李姓"这类词条，一条都不含"李祖祥"（实测确认：请求没问题，
-    是 Bing 对这个名字没有索引，于是退化成姓氏词条）。引擎返回了结果 ≠ 这些结果
-    回答了问题；若这里判为"没命中"，上层会换引擎重试，并在结果里写明"没有真正包含
-    搜索词的条目"，模型才不会把"李姓的百科"当成"李祖祥"的资料编出一段介绍。
-
-    短查询按**整体**判断（人名必须整个出现）；长问句按词元判断，避免误杀正常结果。
-    """
     if not results:
         return False
     core = re.sub(r"[\s\u3000]+", "", _core_lookup(query)).lower()
@@ -346,11 +452,6 @@ def _looks_relevant(query: str, results: list, minimum: int = 1) -> bool:
         return True
     minimum = max(1, int(minimum))
     if _is_short_lookup(core):
-        # 短查询（人名、专有名词）：整体出现最理想；否则看它拆出的相邻二字片段
-        # 有几个真的出现——"李祖祥"在"李（汉语汉字）"里 0 个，判为没命中；
-        # "量子纠缠"遇到只写"量子"的资料时仍有 1 个命中，不会被误杀。
-        # 命中门槛是 1 条：只要有一条真的对上了就算搜索成功（要求 2 条会把
-        # "只有一条结果真的相关"的正常情况误判成失败，进而白白多跑一遍引擎）。
         grams = {core[i:i + 2] for i in range(len(core) - 1)} if len(core) > 2 else {core}
         hits = 0
         for item in results:
@@ -361,25 +462,15 @@ def _looks_relevant(query: str, results: list, minimum: int = 1) -> bool:
     terms = _search_terms(query)
     if not terms:
         return True
-    # 长问句用更高的命中门槛（2 条）：避免"只要有一条沾边"就给结果加上
-    # "资料不可靠"的提示，反而让模型不敢回答。
     hits = sum(1 for item in results if _result_matches(item, terms))
     return hits >= max(2, int(minimum))
 
 
 def _query_variants(query: str, limit: int = 2) -> List[str]:
-    """给短查询（人名/专有名词）准备"更像在找这个实体"的改写版本。
-
-    事故背景：搜"李祖祥"，引擎会把三个字拆开、退化成"李（汉语汉字）""李姓"这类词条，
-    一条都不含名字本身。同一个引擎换个问法（"李祖祥 个人资料"）往往就能命中，
-    所以不相关时先用改写版本重试一次，再考虑换引擎。
-    """
     raw = str(query or "").strip()
     core = re.sub(r"[\s\u3000]+", "", str(_core_lookup(raw) or ""))
     if not (2 <= len(core) <= 8):
         return []
-    # 注意：Python 的 \w 也匹配中文，所以"像网址"的判断必须限定 ASCII，
-    # 否则"李祖祥"会被当成域名而被跳过（这个坑实际踩到过）。
     if _looks_like_url_arg(core) or re.match(r"^[A-Za-z0-9.\-:/]+$", core):
         return []
     out: List[str] = []
@@ -391,12 +482,6 @@ def _query_variants(query: str, limit: int = 2) -> List[str]:
 
 
 def _looks_like_verify_page(html_text: str) -> bool:
-    """识别"HTTP 200 但其实是人机校验页"的响应。
-
-    事故背景：搜狗等引擎触发风控时返回 200 + 一个校验页（含 verify.css / anti.min.js），
-    解析器自然一条结果都拿不到，工具于是回"没有找到结果"——用户会以为真的没有资料，
-    而不是"被拦了、换个引擎就好"。这里按页面特征认出来并明确报错。
-    """
     sample = str(html_text or "")[:6000]
     if not sample:
         return False
@@ -416,11 +501,10 @@ def _is_verify_url(url: str) -> bool:
 
 
 class SearchVerifyRequired(Exception):
-    """搜索引擎把我们跳到了安全验证页（人机校验），不是地址错误。"""
+    pass
 
 
 def _real_url(url: str) -> str:
-    """把搜索引擎跳转链接里的真实地址掏出来。"""
     parsed = urlparse(str(url or ""))
     if parsed.hostname and parsed.hostname.endswith("baidu.com") and parsed.path.startswith("/link"):
         target = (parse_qs(parsed.query).get("url") or [""])[0]
@@ -430,12 +514,6 @@ def _real_url(url: str) -> str:
 
 
 def _unwrap_meta_redirect(html_text: str) -> str:
-    """从跳转页里读出真实地址：JS replace / meta refresh / 直链。
-
-    搜狗等引擎返回的是 200 + 一段跳转脚本（`window.location.replace("真实地址")`），
-    HTTP 层看不到 30x，需要在返回文本里再挖一次，否则模型只能拿到 /link?url=…
-    这种自己打不开的地址。
-    """
     text = str(html_text or "")[:4000]
     patterns = (
         r'window\.location(?:\.href)?\s*(?:=|\.replace\()\s*[\'"](https?://[^\'"]+)[\'"]',
@@ -476,14 +554,12 @@ def _clean_results(items: list, limit: int) -> list:
     return out
 
 
-# 常见站点后缀：用于把"以_百度百科"这类标题还原成正文主体"以"
 _SITE_SUFFIX_RE = re.compile(
     r"[\s_\-–—·|]*(?:百度百科|维基百科|wikipedia|百度知道|百度文库|百度经验|抖音百科|快懂百科|搜狗百科|360百科|知乎|豆瓣|萌娘百科|哔哩哔哩|bilibili|github|游侠网|游民星空|3dm)\s*$",
     re.I)
 
 
 def _title_core(title: str) -> str:
-    """去掉标题尾部的站点名，得到页面的主体词（"以_百度百科"→"以"）。"""
     text = str(title or "").strip()
     while True:
         stripped = _SITE_SUFFIX_RE.sub("", text).strip()
@@ -493,17 +569,6 @@ def _title_core(title: str) -> str:
 
 
 def _demote_degenerate_results(results: list, query: str) -> list:
-    """把"引擎拆字退化"出来的单字/双字词条沉到结果列表末尾（不删除）。
-
-    事故背景：搜"以恋结缘 歌词"，引擎把首字"以"单独的百科词条排在第 1 位——
-    模型最先读到的就是垃圾结果，还占掉搜索字符预算。判定标准：标题去掉站点
-    后缀后，只剩搜索核心词的 1~2 字**真前缀**（查询"以恋结缘…"，标题主体只剩
-    "以"），即是拆字词条。
-
-    只在列表里存在正常结果时沉底；整批全是拆字词条（如搜生僻人名只返回
-    "李（汉语汉字）""李姓"）则保持原样——那时"没查到"的相关性提示需要这些
-    词条在场才能如实说明引擎到底返回了什么。
-    """
     if not results:
         return results
     core = re.sub(r"[\s\u3000]+", "", str(_core_lookup(query) or "")).lower()
@@ -521,6 +586,71 @@ def _demote_degenerate_results(results: list, query: str) -> list:
     print(f"[搜索] 拆字退化结果沉底 {len(junk)} 条："
           f"{[str(item.get('title', ''))[:24] for item in junk]}")
     return normal + junk
+
+
+def _body_on_topic(body: str, query: str) -> bool:
+    topic = _QUERY_DATE_RE.sub(" ", str(query or "")).strip() or str(query or "")
+    core = re.sub(r"[\s\u3000]+", "", _core_lookup(topic)).lower()
+    text = re.sub(r"[\s\u3000]+", "", str(body or "")).lower()
+    if not core or not text:
+        return True
+    if _is_short_lookup(core):
+        grams = {core[i:i + 2] for i in range(len(core) - 1)} if len(core) > 2 else {core}
+        return core in text or sum(1 for gram in grams if gram in text) >= 2
+    terms = _search_terms(topic)
+    if not terms:
+        return True
+    return sum(1 for term in terms if term in text) >= 2
+
+
+def _demote_failed_results(results: list, failed_urls: set) -> list:
+    if not results or not failed_urls:
+        return results
+    good = [item for item in results if item.get("url") not in failed_urls]
+    bad = [item for item in results if item.get("url") in failed_urls]
+    if not good or not bad:
+        return results
+    print(f"[搜索] 正文核对不通过的结果沉底 {len(bad)} 条："
+          f"{[str(item.get('title', ''))[:24] for item in bad]}")
+    return good + bad
+
+
+async def _verify_bodies(items: list, query: str, must_contain=(),
+                         limit: int = 3, chars: int = 1200) -> Tuple[List[Tuple[dict, str]], set]:
+    picked = []
+    for item in items:
+        url = str(item.get("url") or "")
+        host = (urlparse(url).hostname or "").lower()
+        if not url.startswith("http"):
+            continue
+        if any(host == h or host.endswith("." + h) for h in _NO_FETCH_HOSTS):
+            continue
+        picked.append((item, url))
+        if len(picked) >= limit:
+            break
+    if not picked:
+        return [], set()
+
+    async def _one(pair):
+        item, url = pair
+        try:
+            ok, body = await _fetch_page({"max_chars": chars, "timeout": 10}, url)
+        except Exception:
+            return item, url, ""
+        return item, url, str(body or "").strip() if ok else ""
+
+    verified, failed = [], set()
+    for item, url, body in await asyncio.gather(*[_one(pair) for pair in picked]):
+        if not body or len(body) < 200:
+            continue
+        if must_contain and not all(m in body for m in must_contain):
+            failed.add(url)
+            continue
+        if not _body_on_topic(body, query):
+            failed.add(url)
+            continue
+        verified.append((item, body))
+    return verified, failed
 
 
 def _baidu_parse_html(text: str, limit: int) -> list:
@@ -595,7 +725,6 @@ def _rss_parse_xml(text: str, limit: int) -> list:
 
 
 def _generic_parse_html(text: str, limit: int) -> list:
-    """自定义引擎的兜底解析：抓正文里的标题链接。"""
     items = []
     for block in re.findall(r"<li[\s\S]*?</li>", str(text or ""), re.I):
         heading = _first(r"<h[1-4][^>]*>([\s\S]*?)</h[1-4]>", block)
@@ -622,13 +751,6 @@ def _searxng_parse_json(data, limit: int) -> list:
 
 
 def _searxng_parse_html_text(text, limit: int) -> list:
-    """供"网页解析"分支使用：SearXNG 返回的其实是 JSON 文本，这里解码后再解析。
-
-    SearXNG 没有官方 API key，tools.py 里两条分支（API 分支 / 网页解析分支）
-    它永远只能走后者，而后者的解析器取的是 spec["parse_html"]。之前只注册了
-    parse_json，于是解析器为 None、结果被静默丢弃 —— HTTP 200、拿到 17KB JSON、
-    却报"没有找到与…相关的搜索结果"。这个包装函数把 JSON 文本接上同一个解析器。
-    """
     if isinstance(text, (dict, list)):
         return _searxng_parse_json(text, limit)
     try:
@@ -685,15 +807,8 @@ SEARCH_ENGINES: Dict[str, dict] = {
         "url": "https://searx.be/search",
         "params": _searxng_params,
         "parse_json": _searxng_parse_json,
-        # 【必须有】SearXNG 没有 api_url/api_key，所以它永远走"网页解析"那条分支；
-        # 而那个分支只认 spec["parse_html"]，解析器为 None 时结果会被**静默丢掉**，
-        # 表现为 HTTP 200、拿到 17KB JSON、却报"没有找到相关结果"。
-        # 把 parse_html 指向同一个 JSON 解析器，"网页解析"分支就能正确解析 JSON。
         "parse_html": _searxng_parse_html_text,
         "url_env": ("web_search_url",),
-        # 自建 SearXNG 最常见就是跑在本机 127.0.0.1，这正是 SSRF 防护会拦下的地址。
-        # 把它标记为"允许本机/内网"，否则填 http://127.0.0.1:8888/search 会直接抛
-        # ValueError: 禁止访问本机、内网或保留地址。
         "allow_private": True,
     },
     "bing": {
@@ -778,11 +893,6 @@ SEARCH_ENGINES: Dict[str, dict] = {
 
 
 def invalid_custom_engines(raw) -> List[str]:
-    """返回地址模板缺少 {query} 的自定义引擎别名。
-
-    这类模板拿不到搜索词，请求会带着空查询去检索、返回一堆无关结果，
-    而且不会有任何提示；必须在保存时就拦下来。
-    """
     bad = []
     for line in str(raw or "").splitlines():
         line = line.strip()
@@ -798,7 +908,6 @@ def invalid_custom_engines(raw) -> List[str]:
 
 
 def _parse_custom_engines(raw) -> Dict[str, dict]:
-    """自定义引擎：`别名=地址模板`，每行一个（模板用 {query} / {page}）。"""
     engines: Dict[str, dict] = {}
     for line in str(raw or "").splitlines():
         line = line.strip()
@@ -823,7 +932,6 @@ def _parse_custom_engines(raw) -> Dict[str, dict]:
 
 
 def available_engines(config) -> Dict[str, dict]:
-    """内置引擎 + 配置文件里的自定义引擎（每项都带上自己的 key，供安全搜索等按引擎定制）。"""
     engines = {k: {**v, "key": k} for k, v in SEARCH_ENGINES.items()}
     engines.update(_parse_custom_engines((config or {}).get("web_search_custom_engines", "")))
     return engines
@@ -834,10 +942,6 @@ def engine_labels(config) -> List[tuple]:
 
 
 def default_engine_key(config) -> str:
-    """当前默认引擎：显式配置优先，否则取注册表顺序里的第一个。
-
-    不做"必须叫 bing"这类硬编码——新增/删除引擎后默认值自动跟着注册表走。
-    """
     engines = available_engines(config)
     if not engines:
         return ""
@@ -846,7 +950,6 @@ def default_engine_key(config) -> str:
 
 
 def parse_api_keys(raw) -> dict:
-    """解析 API key 配置：每行 `ENV_NAME=值`（也兼容 JSON 对象）。"""
     if isinstance(raw, dict):
         return {str(k): str(v) for k, v in raw.items() if str(v).strip()}
     keys = {}
@@ -862,7 +965,6 @@ def parse_api_keys(raw) -> dict:
 
 
 def engine_api_key(config, env_name: str) -> str:
-    """引擎的 API key：配置文件里的 web_search_api_keys 优先，其次环境变量。"""
     if not env_name:
         return ""
     configured = parse_api_keys((config or {}).get("web_search_api_keys", {}))
@@ -871,7 +973,7 @@ def engine_api_key(config, env_name: str) -> str:
 
 def _engine_request_url(spec: dict, query: str, page: int, language: str, config) -> str:
     template = str(spec.get("url", "") or "")
-    for key in spec.get("url_env", ()):  # 旧的 web_search_url 仍可覆盖默认地址
+    for key in spec.get("url_env", ()):
         configured = str((config or {}).get(key, "") or "").strip()
         if configured:
             template = configured
@@ -888,7 +990,6 @@ def _engine_request_url(spec: dict, query: str, page: int, language: str, config
     merged = parse_qs(parsed.query)
     for k, v in query_pairs:
         merged[k] = [v]
-    # 安全搜索参数：同一个 key 可能带多个值（如 tbs=explicitOff 与 tbs=qdr:w 并存）
     for key, value in _safe_search_params(spec, config).items():
         merged.setdefault(key, [])
         if value not in merged[key]:
@@ -901,12 +1002,9 @@ def _engine_request_url(spec: dict, query: str, page: int, language: str, config
 # 安全搜索（三档）
 # ---------------------------------------------------------------------------
 #   off    —— 不限制任何搜索
-#   normal —— 允许搜到 R16+ 的站点，但不允许 R18 内容（默认）
-#   strict —— 连低俗、性暗示的站点与内容一并过滤
 SAFE_SEARCH_LEVELS = ("off", "normal", "strict")
 _SAFE_SEARCH_LABELS = {"off": "无", "normal": "一般", "strict": "严格"}
 
-# 引擎级安全搜索参数：level -> {参数名: 值}
 _ENGINE_SAFE_PARAMS = {
     "searxng": {"off": {"safesearch": "0"}, "normal": {"safesearch": "1"},
                 "strict": {"safesearch": "2"}},
@@ -917,9 +1015,6 @@ _ENGINE_SAFE_PARAMS = {
     "google-news": {"off": {}, "normal": {"safe": "active"}, "strict": {"safe": "active"}},
 }
 
-# 成人向（一般档就拦）：成人站点、成人品牌、明确的成人内容描述。
-# 刻意不收「成人」「色」「黄」「性」「av」「sm」这类单字/短词——「成人高考」「裸眼视力」
-# 「Java」「smart」「性教育」都会被它们误伤。
 _ADULT_TERMS = (
     "r18", "r-18", "18禁", "十八禁", "18+", "限制级",
     "成人内容", "成人向", "成人视频", "成人影片", "成人电影", "成人动画",
@@ -944,7 +1039,6 @@ _ADULT_TERMS = (
     "性服务", "性交易", "性奴", "性虐", "约炮", "约啪", "炮友", "一夜情",
     "援交", "sex video", "sex toy", "sex chat", "sex cam",
 )
-# 成人聚合站 / 黑料站 / 里番站站名（一般档就拦）
 _ADULT_SITES = (
     "91爆料", "91porn", "91av", "91视频", "91国产", "91制片厂", "51吃瓜",
     "吃瓜网", "黑料网", "黑料不打烊", "爆料网", "草榴", "1024社区", "t66y",
@@ -952,8 +1046,6 @@ _ADULT_SITES = (
     "蜜桃传媒", "星空传媒", "果冻传媒", "糖心vlog", "糖心传媒", "国产精品",
     "精品国产", "自拍偷拍", "偷拍自拍", "里番库", "91传媒"
 )
-# 低俗 / 性暗示 + 露骨但属客观词的词（只有严格档才拦）。
-# 客观词（性交/性爱/自慰/性行为…）放严格档：查医学、性教育资料时一般档还能用。
 _SUGGESTIVE_TERMS = (
     "性暗示", "大尺度", "露点", "走光", "艳照", "裸照", "裸聊", "裸舞", "裸体",
     "性感写真", "性感主播", "擦边", "擦边球", "软色情", "情色小说", "情欲",
@@ -967,7 +1059,6 @@ _SUGGESTIVE_TERMS = (
     "野外露出", "野战", "群p", "多人性行为", "多人性交", "多人性爱", "车震", "激情床戏",
     "摸奶", "摸胸", "操逼", "淫穴"
 )
-# 成人站域名：一般档起拦（只在网址里匹配）
 _ADULT_DOMAINS = (
     "91porn", "91av", "91zuida", "51chigua", "chigua", "heiliao", "madou",
     "sehuatang", "t66y", "xvideo", "pornhub", "missav", "javbus", "javdb",
@@ -977,7 +1068,6 @@ _ADULT_DOMAINS = (
 
 
 def safe_search_level(config) -> str:
-    """当前安全搜索档位；非法/缺失一律按「一般」处理。"""
     raw = str((config or {}).get("web_search_safe", "normal") or "normal").strip().lower()
     aliases = {"0": "off", "off": "off", "none": "off", "无": "off", "关闭": "off",
                "1": "normal", "normal": "normal", "moderate": "normal", "一般": "normal",
@@ -994,16 +1084,14 @@ def _safe_search_params(spec: dict, config) -> dict:
     if level == "off":
         return {}
     if spec.get("custom") or spec.get("api_url"):
-        return {}          # 自定义地址 / 官方 API：参数由对方约定，用关键词过滤兜底
+        return {}
     mapping = _ENGINE_SAFE_PARAMS.get(str(spec.get("key", "") or "").lower())
     if not mapping:
-        # 未登记参数的引擎（百度/360/搜狗…）走它们通用的站点级过滤参数
         return {"safe": "1"} if level == "strict" else {}
     return dict(mapping.get(level, {}))
 
 
 def _safe_search_terms(level: str) -> tuple:
-    """该档位的内置词表；严格档一定包含一般档的全部内容。"""
     if level == "off":
         return ()
     if level == "strict":
@@ -1015,7 +1103,6 @@ _WORD_SPLIT_RE = re.compile(r"[\n\r,，、;；]+")
 
 
 def _split_words(raw) -> tuple:
-    """把词表文本切成小写去重的词元（换行 / 逗号 / 顿号 / 分号分隔）。"""
     out = []
     for chunk in _WORD_SPLIT_RE.split(str(raw or "")):
         word = chunk.strip().lower()
@@ -1025,12 +1112,10 @@ def _split_words(raw) -> tuple:
 
 
 def extra_block_terms(config) -> tuple:
-    """配置里用户自己加的过滤词，一般档与严格档都拦。"""
     return _split_words((config or {}).get("web_search_block_words", ""))
 
 
 def extra_allow_terms(config) -> tuple:
-    """配置里用户自己加的白名单词：命中就放行，优先于黑名单与域名判断。"""
     return _split_words((config or {}).get("web_search_allow_words", ""))
 
 
@@ -1040,7 +1125,6 @@ def _adult_domain(url: str) -> str:
 
 
 def filter_unsafe_results(results: list, config, query: str = "") -> list:
-    """按安全搜索档位过滤搜索结果；off 档不做任何过滤。"""
     level = safe_search_level(config)
     if level == "off" or not results:
         return list(results or [])
@@ -1052,7 +1136,6 @@ def filter_unsafe_results(results: list, config, query: str = "") -> list:
             continue
         haystack = " ".join(str(item.get(k, "") or "")
                             for k in ("title", "url", "content", "snippet")).lower()
-        # 白名单优先：命中就放行，不再看黑名单与域名
         if allow and any(t in haystack for t in allow):
             kept.append(item)
             continue
@@ -1073,7 +1156,6 @@ def filter_unsafe_results(results: list, config, query: str = "") -> list:
 
 
 def safe_search_hint(config) -> str:
-    """给模型看的安全搜索说明（只在非 off 档追加）。"""
     level = safe_search_level(config)
     if level == "off":
         return ""
@@ -1084,7 +1166,6 @@ def safe_search_hint(config) -> str:
             "如结果偏少可换用更中性的关键词。）")
 
 
-# 官方 API 的安全搜索参数（字段名各不相同）
 _API_SAFE_PARAMS = {
     "bing": {"off": {"adultPreference": "Off"}, "normal": {"adultPreference": "Moderate"},
              "strict": {"adultPreference": "Strict"}},
@@ -1104,7 +1185,6 @@ def _safe_api_params(spec: dict, config) -> dict:
 
 
 def _with_api_safe_search(payload, spec: dict, config):
-    """把安全搜索参数并进 JSON 请求体（字段名按各家接口约定）。"""
     extra = _safe_api_params(spec, config)
     if not extra or not isinstance(payload, dict):
         return payload
@@ -1163,22 +1243,15 @@ TOOL_TEST_SAMPLES = {
 
 
 # ---------------------------------------------------------------------------
-# 天气地点校验：用户没说城市时不许模型自己猜一个
 # ---------------------------------------------------------------------------
-# 事故背景：用户只问"今天天气怎么样"，本地模型随手把 city 填成"上海"，
-# 于是回出"上海的天气…很适合…！"——凭空替主人搬到了另一个城市。
-# 现在：city 必须能在【用户本条消息】里找到，或用配置里明确写下的默认城市，
-# 否则不查天气，直接把"问主人在哪"的结论交给模型。
 _WEATHER_INTENT_RE = re.compile(
     r"天气|气温|温度|下雨|降雨|带伞|雨伞|下雪|降雪|台风|冷不冷|热不热|穿什么|要穿|"
     r"多少度|几度|(?<![A-Za-z])weather(?![A-Za-z])|(?<![A-Za-z])forecast(?![A-Za-z])|"
     r"(?<![A-Za-z])temperature(?![A-Za-z])|(?<![A-Za-z])rain(?![A-Za-z])", re.I)
 
-# 地点后缀：带这些字且不是泛指时，认为用户在指某个地方
 _CITY_SUFFIXES = ("市", "县", "区", "州", "盟", "旗", "镇")
 _VAGUE_PLACES = ("这里", "这边", "那里", "那边", "本地", "当地", "我这", "你那",
                  "家里", "外面", "附近", "外面", "国内", "国外")
-# 常见城市名（判"用户没提地点却在聊天气"时的兜底依据；不追求全，够用即可）
 _KNOWN_CITIES = (
     "北京", "上海", "广州", "深圳", "天津", "重庆", "成都", "杭州", "南京", "武汉",
     "西安", "苏州", "长沙", "郑州", "青岛", "沈阳", "大连", "厦门", "福州", "济南",
@@ -1193,9 +1266,7 @@ _WEATHER_NOISE_WORDS = ("天气", "气温", "温度", "下雨", "降雨", "雨�
                         "现在", "怎么样", "如何", "怎样", "冷不冷", "热不热", "需不需",
                         "要不要", "记得", "帮我", "查一下", "查查", "看看", "一下",
                         "主人", "会不会", "适合", "穿什么", "要穿", "出门", "外面")
-# 这些字只可能是语气/助词/疑问词，收尾就说明这串不是地名
 _NON_CITY_CHARS = set("了的地得吗呢吧啊呀哦喔嘛么啥谁哪怎")
-# 拉丁词元里不可能是地名的常见疑问/功能词
 _EN_NON_CITY = {"what", "how", "when", "where", "which", "who", "why", "is", "are",
                 "the", "in", "at", "of", "today", "tomorrow", "please", "tell", "me",
                 "weather", "forecast", "temperature", "rain"}
@@ -1206,7 +1277,6 @@ def _is_weather_question(text: str) -> bool:
 
 
 def _clean_city_token(token: str) -> str:
-    """把"北京的""北京今天要"这类粘连词元修剪成"北京"。"""
     t = str(token or "").strip().strip("的了地得吗呢吧啊呀哦喔嘛么")
     for _ in range(6):
         before = t
@@ -1214,7 +1284,6 @@ def _clean_city_token(token: str) -> str:
             break
         if t in _VAGUE_PLACES:
             return ""
-        # 剥掉粘连在首/尾的常见词（"今天""要""我在""主人"…），但必须留下 >=2 个字
         for word in ("今天", "明天", "后天", "昨天", "现在", "帮我", "主人", "查一下",
                      "查查", "看看", "我在", "我在", "你在", "他在", "我在"):
             if t.startswith(word) and len(t) - len(word) >= 2:
@@ -1230,7 +1299,6 @@ def _clean_city_token(token: str) -> str:
 
 
 def _looks_like_city(token: str) -> bool:
-    """一个词元看起来是不是具体地名（而不是泛指或天气词汇）。"""
     t = _clean_city_token(token)
     if len(t) < 2 or t in _VAGUE_PLACES:
         return False
@@ -1244,18 +1312,13 @@ def _looks_like_city(token: str) -> bool:
         return True
     cjk = re.sub(r"[^\u4e00-\u9fff]", "", t)
     if cjk != t:
-        # 含非汉字：按纯拉丁地名处理，但排除功能词（Tokyo / New York）
         return bool(re.fullmatch(r"[A-Za-z][A-Za-z\s\-]{1,20}", t))
-    # 「XX市/XX县/XX区/XX州」这类带后缀的写法直接算地名
     if t.endswith(_CITY_SUFFIXES):
         return len(cjk) >= 2
-    # 其余（含"XX今天"这种粘连）：没命中已知城市就一律不算，
-    # 宁可让角色回问一句"主人在哪个城市"，也不能猜错城市报错天气
     return False
 
 
 def _extract_city_from_text(text: str) -> str:
-    """从用户消息里找出用户说出的城市名；找不到返回空串（= 不许猜）。"""
     from .llm_helpers import strip_quote_note   # 延迟导入，避免模块级循环依赖
     body = strip_quote_note(str(text or ""))
     body = _WEATHER_INTENT_RE.sub(" ", body)
@@ -1267,16 +1330,11 @@ def _extract_city_from_text(text: str) -> str:
 
 
 def _resolve_weather_city(args: dict, tool: dict, user_text: str) -> Tuple[str, str]:
-    """确定本次天气查询的城市；**以用户本条消息为准**，绝不允许模型自己猜。
-
-    返回 (city, hint)：city 为空表示"不知道地点"，hint 是给模型的说明。
-    """
     city = _pick_arg(args, "city", "location", "name", "place", "城市", "地点")
     default = str((tool or {}).get("default_location", "") or "").strip()
     text = str(user_text or "")
     said = _extract_city_from_text(text)
     if not text:
-        # 拿不到用户消息（工具测试等场景）：只能信任模型给的参数
         return city or default, ""
     if said:
         return said, ""          # 用户明确说了地点：以用户说的为准
@@ -1291,7 +1349,6 @@ def _resolve_weather_city(args: dict, tool: dict, user_text: str) -> Tuple[str, 
         else:
             print(f"[工具] 天气：用户没给地点（消息={text[:60]!r}），已拦下查询并让角色反问地点")
         return "", msg
-    # 不是天气问题：允许用配置的默认城市，否则仍不猜
     if default:
         return default, ""
     if city:
@@ -1306,13 +1363,11 @@ def test_sample_for(tool: dict) -> dict:
     return dict(TOOL_TEST_SAMPLES.get(str((tool or {}).get("builtin", "")).lower(), {}) or {})
 
 
-# 最终回答里表示"正在问用户地点"的收尾句（用于校验模型是否照做了）
 _ASK_LOCATION_RE = re.compile(r"哪个城市|哪座城市|在哪儿|在哪里|什么城市|哪里的|所在城市|"
                               r"どこの|どの都市|どこに住|where do you live|which city", re.I)
 
 
 def last_user_message(messages) -> str:
-    """从消息列表里取出【最后一条真实用户消息】（跳过系统注入的【…】提示）。"""
     for message in reversed(list(messages or [])):
         if not isinstance(message, dict) or message.get("role") != "user":
             continue
@@ -1324,7 +1379,6 @@ def last_user_message(messages) -> str:
 
 
 def reply_asks_for_location(text) -> bool:
-    """回复是否只是在问主人所在的城市（用于天气"不许猜地点"的收尾校验）。"""
     return bool(_ASK_LOCATION_RE.search(str(text or "")))
 
 
@@ -1372,12 +1426,6 @@ def _best_geo(results: list) -> Optional[dict]:
 
 
 async def _fetch_direct(query: str, tool_registry) -> Tuple[bool, str]:
-    """web_fetch 收到的是搜索词而不是网址时，自动改走搜索引擎。
-
-    事故背景：用户说"帮我搜索 xx"，模型有时会把 web_search 和 web_fetch 记混，
-    用 web_fetch 传 {"query": "xx"}，于是回一句"缺少 url 参数"、什么也没搜到。
-    参数里没有任何网址、只有关键词时，用户要的就是搜索，直接搜比报错有用。
-    """
     search_tool = _search_tool(tool_registry)
     if search_tool is None:
         return False, (f"「{query}」不是网址：web_fetch 只能读取具体网页，"
@@ -1441,7 +1489,6 @@ async def _fetch_page(tool: dict, url: str) -> Tuple[bool, str]:
 
 
 def _search_tool(tool_registry) -> Optional[dict]:
-    """同一个注册表里启用着的 web_search 工具（没有就返回 None）。"""
     for item in getattr(tool_registry, "tools", []) or []:
         if str(item.get("builtin", "")).lower() == "web_search" and item.get("enabled"):
             return item
@@ -1449,12 +1496,6 @@ def _search_tool(tool_registry) -> Optional[dict]:
 
 
 def _pick_queries(args: dict, limit: int = 4) -> List[str]:
-    """收集本次调用要搜的关键词：兼容 query 单值、queries 数组以及中英文参数名。
-
-    事故背景：web_search 的 schema 原先只有 query 一个字段，而模型（照别的工具的
-    习惯）经常一次传 queries 数组来表达"同时查几件事"，于是整条调用直接以
-    "缺少 query 参数"失败——用户看到的就是"搜不全/只搜到第一项"。这里两种形态都接受。
-    """
     out: List[str] = []
 
     def _add(value):
@@ -1474,16 +1515,8 @@ def _pick_queries(args: dict, limit: int = 4) -> List[str]:
 
 async def _run_queries(tool_registry, queries: List[str], tool: dict, engine: str = "",
                        total_chars: int = 0) -> Tuple[bool, str]:
-    """一次调用里搜索多个关键词，把各自的结果拼成一份完整结果返回。
-
-    整体字符预算按子查询数量平分（下限 600 字符），避免"查 4 件事、每件都返回一屏"
-    把上下文塞爆；每个子查询仍保留完整多条结果。
-    """
     per_query = 0
     if total_chars and len(queries) > 1:
-        # 每个子查询给"略高于均分"的额度（下限 500、上限 1100 字符）：
-        # 额度太小会把结果砍到只剩一两条（"搜不全"换个形式回来），太大则几个子查询
-        # 加起来把上下文塞爆，所以上限取均分的 1.1 倍左右。
         share = int(total_chars) // len(queries)
         per_query = min(1000, max(500, int(share * 0.95)))
     blocks, failures = [], []
@@ -1508,12 +1541,6 @@ async def _run_queries(tool_registry, queries: List[str], tool: dict, engine: st
 
 
 def _decode_console_output(raw) -> str:
-    """解码子进程输出。
-
-    中文 Windows 的控制台工具默认按本机代码页（cp936）输出，而多数跨平台
-    命令按 UTF-8 输出；固定按 UTF-8 解码会把前者整段变成替换字符且不报错。
-    依次尝试候选编码，取第一个能完整解码的结果。
-    """
     if not raw:
         return ""
     if isinstance(raw, str):
@@ -1553,9 +1580,6 @@ class ToolRegistry:
             missing = [json.loads(json.dumps(t)) for t in DEFAULT_TOOLS
                        if t.get("name") not in known]
             refreshed = 0
-            # 内置工具的说明/参数属于随版本更新的代码资产（写死在 tools.json 里会让
-            # 升级后的新说明永远不生效，导致模型分不清 web_search 与 web_fetch）；
-            # 这里以随程序发布的定义为准刷新，用户自己的 enabled/授权/次数限制保留。
             for tool in self.tools:
                 if not isinstance(tool, dict):
                     continue
@@ -1568,7 +1592,6 @@ class ToolRegistry:
                 if tool.get("description") != shipped.get("description"):
                     tool["description"] = shipped.get("description")
                     refreshed += 1
-                # 参数也要按发布定义刷新，并计入 refreshed，否则磁盘上的参数永远停留在旧版
                 if tool.get("parameters") != shipped.get("parameters"):
                     tool["parameters"] = json.loads(json.dumps(shipped.get("parameters")))
                     refreshed += 1
@@ -1662,7 +1685,6 @@ class ToolRegistry:
             return False, f"工具执行异常: {type(e).__name__}: {e}"
 
     def begin_reply(self):
-        """每次回复开始时重置调用计数。"""
         self._call_counts.clear()
 
     async def _run_builtin(self, builtin: str, args: dict, tool: dict,
@@ -1685,7 +1707,6 @@ class ToolRegistry:
             if not expr:
                 return False, "缺少 expression 参数，示例：{\"expression\": \"23*7+sqrt(144)\"}"
             if not (re.search(r"\d", str(expr)) and _CALC_OPERATOR_RE.search(str(expr))):
-                # 消息里没有数字与运算式时模型的"我算了一下"是幻觉：拒绝执行并
                 # 明确告知，避免它顺着编造计算过程
                 return True, (f"无需计算：「{expr}」不是包含数字与运算符的算式。"
                               "请直接以角色身份回应，不要再调用计算工具。")
@@ -1710,8 +1731,6 @@ class ToolRegistry:
                 lon = float(lon) if lon not in (None, "") else None
             except Exception:
                 lon = None
-            # 地点校验：用户没说城市时绝不替主人猜一个（历史 bug：凭空报"上海的天气"）。
-            # 只有用户本条消息里真的说出了地点，或配置里明确写了默认城市，才允许查。
             resolved, hint = _resolve_weather_city(args, tool, user_text)
             city = resolved
             if not city and (lat is None or lon is None):
@@ -1739,7 +1758,6 @@ class ToolRegistry:
             url = _pick_arg(args, "url", "link", "website", "网址", "链接")
             if url:
                 return await _fetch_page(tool, url)
-            # 模型把搜索词塞给了 web_fetch：用户要的是搜索，直接搜
             fallback_query = _pick_arg(args, "query", "q", "keyword", "keywords", "search",
                                        "关键词", "搜索词", "内容", "text", "name", "value")
             if fallback_query:
@@ -1751,69 +1769,88 @@ class ToolRegistry:
                            "如果是想按关键词搜索，请改用 web_search（或用 {\"query\": \"关键词\"}）")
         return False, f"未知内置工具: {builtin}"
 
+    async def _current_version(self, query: str, engines: dict, tool: dict) -> str:
+        subject = _version_subject(query)
+        if not subject:
+            return ""
+        hit = _VERSION_CACHE.get(subject)
+        if hit and time.time() - hit[1] < _VERSION_CACHE_TTL:
+            return hit[0]
+        key = default_engine_key(self.config)
+        if key not in engines:
+            return ""
+        ok, text = await self._search_one_engine(f"{subject} 最新版本", engines[key], key,
+                                                 tool, max_chars=1500)
+        if not ok or subject not in str(text):
+            return ""
+        version = _extract_version(text)
+        if version:
+            _VERSION_CACHE[subject] = (version, time.time())
+            print(f"[搜索] 探测到「{subject}」当前版本 {version}，按这个版本检索")
+        return version
+
     async def _web_search(self, query: str, tool: dict, engine: str = "",
                           max_chars: Optional[int] = None) -> Tuple[bool, str]:
-        """搜索入口：按需在多个引擎间兜底，挑出"真的对得上搜索词"的那一份结果。
-
-        事故背景：引擎返回了结果 ≠ 结果回答了问题。中文姓名常被引擎放宽成单字命中
-        （搜"李祖祥"全是"李（汉语汉字）""李姓"），模型只好回答"没查到这个人"。
-        所以：默认引擎的结果若一条都不含搜索词，就自动换下一个已启用引擎重试，
-        并把"哪些引擎搜过、哪个命中了"写进结果，模型才能据此如实作答。
-        """
         engines = available_engines(self.config)
         if not engines:
             return False, "没有可用的搜索引擎"
+        if _CODE_QUERY_RE.search(str(query or "")) and not _version_subject(query):
+            print(f"[搜索] 查询缺少主体，跳过检索：{query!r}")
+            return False, ("这条消息只说了要兑换码，没说是哪个游戏或产品："
+                           "如果你能从上面的对话确定是哪一个，就用「名字 + 兑换码」再搜一次；"
+                           "确定不了就问一句是哪一个，不要拿搜索结果里其他游戏/产品的内容作答。")
         requested = str(engine or tool.get("engine", "") or "").strip()
         explicit = requested in engines
         first = requested if explicit else default_engine_key(self.config)
-        # 兜底顺序：选中的引擎 → 用户自定义引擎 → 其余内置引擎。
-        # 自定义引擎放前面，是因为那通常是用户特意配的可用渠道。
         custom = [k for k in engines if engines[k].get("custom")]
         rest = [k for k in engines if k != first and k not in custom]
         order = [first] + [k for k in custom if k != first] + rest
-        # 模型/工具配置显式点名了引擎就只用它（尊重明确选择，也避免一次调用打爆多个引擎）；
-        # 用默认引擎时允许在引擎之间兜底——中文姓名常被某个引擎放宽成单字命中。
         if explicit or not self.config.get("web_search_auto_fallback", True):
             order = [first]
         best: Optional[Tuple[bool, str]] = None
         attempts: List[str] = []
-        # 第一轮：按当前引擎顺序，先用原始搜索词
+        ask = _with_freshness_hint(query)
+        if _VERSION_CTX_RE.search(query) and not _VERSION_RE.search(query):
+            version = await self._current_version(query, engines, tool)
+            if version:
+                ask = f"{version} {query}"
         for key in order:
-            ok, text = await self._search_one_engine(query, engines[key], key, tool, max_chars)
-            # 失败时区分"被验证页拦住"和"结果不相关"：前者值得换引擎，后者值得换搜索词
-            tag = "[验证]" if _looks_like_verify_page(text) else "" if ok else "[失败]"
+            ok, text = await self._search_one_engine(query, engines[key], key, tool, max_chars,
+                                                     ask_query=ask)
+            tag = "" if ok else "[失败]"
             attempts.append(f"{engines[key].get('label', key)}：{'命中' if ok else '未命中'}{tag}")
             if best is None or (ok and not best[0]):
                 best = (ok, text)
             if ok:
                 break
-        # 第二轮：一个引擎都没给出相关结果时，用"更像在找这个实体"的问法重试
-        # （中文人名/专有名词被引擎拆字退化是常见现象，换个问法比换引擎更有效）
         if best is not None and not best[0] and self.config.get("web_search_query_rewrite", True):
             for alternative in _query_variants(query):
                 ok, text = await self._search_one_engine(alternative, engines[order[0]],
-                                                         order[0], tool, max_chars)
+                                                         order[0], tool, max_chars,
+                                                         ask_query=_with_freshness_hint(alternative))
                 attempts.append(f"改写「{alternative}」：{'命中' if ok else '未命中'}")
                 if ok:
                     best = (True, text)
                     break
         assert best is not None
         ok, text = best
-        print(f"[搜索] query={query!r} 命中={ok} 尝试过程：{'；'.join(attempts)}")
-        if not ok and order:  # 一份结果都没取到时，把失败原因放在最前面（模型要看到真实原因）
+        print(f"[搜索] query={query!r}"
+              f"{'' if ask == query else f'（实际检索 {ask!r}）'}"
+              f" 命中={ok} 尝试过程：{'；'.join(attempts)}")
+        if not ok and order:
             text = f"本次搜索未取到可用结果。最后一个引擎的返回：{text}"
         if len(order) > 1:
             text += "\n\n（引擎尝试情况：" + "；".join(attempts) + "）"
         elif len(attempts) > 1:
-            # 只指定了一个引擎、又做过改写重试：说明改写过，但不冒充"换过引擎"
             text += "\n\n（已尝试换问法重搜：" + "；".join(attempts[1:]) + "）"
         elif not ok:
             text += "\n\n（该引擎没有给出与搜索词真正相关的结果，可换个引擎再试）"
         return ok, text
 
     async def _search_one_engine(self, query: str, spec: dict, key: str, tool: dict,
-                                 max_chars: Optional[int] = None) -> Tuple[bool, str]:
-        """用指定引擎搜一次；返回 (结果是否真的对得上搜索词, 结果文本或失败原因)。"""
+                                 max_chars: Optional[int] = None,
+                                 ask_query: str = "") -> Tuple[bool, str]:
+        ask = str(ask_query or query)
         timeout = float(self.config.get("web_search_timeout", tool.get("timeout", 15)) or 15)
         max_results = max(1, int(self.config.get("web_search_max_results", 8) or 8))
         budget = int(max_chars or 0) or max(200, int(self.config.get("web_search_max_chars", 3000) or 3000))
@@ -1827,7 +1864,6 @@ class ToolRegistry:
         }
         results, channel_hint = [], ""
         safe_dropped = 0
-        # 多取一些候选再截断：引擎返回的结果里有导航页/聚合页，去重后常常不够 max_results 条
         pool = max(max_results * 3, 12)
         per_result_chars = max(60, int(self.config.get("web_search_result_chars", 240) or 240))
 
@@ -1843,16 +1879,16 @@ class ToolRegistry:
                 if str(spec.get("api_method", "GET")).upper() == "POST":
                     body_builder = spec.get("api_json")
                     if callable(body_builder):
-                        payload = body_builder(query, 1, language)
+                        payload = body_builder(ask, 1, language)
                     else:
-                        payload = {"query": query}
+                        payload = {"query": ask}
                     payload = _with_api_safe_search(payload, spec, self.config)
                     api_headers["Content-Type"] = "application/json"
                     raw = await self._fetch_text(api_url, api_headers, timeout, params=None,
                                                  method="POST", json_body=payload)
                 else:
                     param_builder = spec.get("api_params")
-                    params = param_builder(query, 1, language) if callable(param_builder) else {"q": query}
+                    params = param_builder(ask, 1, language) if callable(param_builder) else {"q": ask}
                     if isinstance(params, dict):
                         params = {**params, **_safe_api_params(spec, self.config)}
                     raw = await self._fetch_text(api_url, api_headers, timeout, params=params)
@@ -1867,11 +1903,9 @@ class ToolRegistry:
                 print(f"搜索引擎 {key} 接口调用失败，改用网页解析: {type(e).__name__}: {e}")
 
         if not results:
-            request_url = _engine_request_url(spec, query, 1, language, self.config)
+            request_url = _engine_request_url(spec, ask, 1, language, self.config)
             if not request_url:
                 return False, f"搜索引擎「{spec.get('label', key)}」未配置检索地址"
-            # 自定义引擎和 SearXNG 都是"用户自己指定地址"的检索服务，允许指向本机/内网；
-            # 其余内置引擎仍是公网站点，保持 SSRF 防护（不许被改成本机地址）。
             request_url = await asyncio.to_thread(
                 _validate_url,
                 request_url,
@@ -1896,24 +1930,82 @@ class ToolRegistry:
                 return False, (f"搜索引擎「{spec.get('label', key)}」要求安全验证（人机校验），"
                                f"本次没有取到结果")
 
-        # 安全搜索：按档位过滤成人向（及更严格档下的低俗/性暗示）结果
         before_safe = len(results)
         results = filter_unsafe_results(results, self.config, query)
         safe_dropped = before_safe - len(results)
 
-        # 引擎拆字退化的单字词条（"以_百度百科"）沉底，别让垃圾占据第 1 条
         results = _demote_degenerate_results(results, query)
+        engine_total = len(results) + safe_dropped
+
+        matched = [item for item in results if _result_matches_query(item, query)]
+        if matched and len(matched) < len(results):
+            print(f"[搜索] 过滤掉 {len(results) - len(matched)} 条与搜索词无关的结果")
+            results = matched
+        target = ""
+        ver_head = re.match(r"^(\d{1,2}\.\d{1,2})\s", ask)
+        if ver_head:
+            target = ver_head.group(1)
+        elif _VERSION_CTX_RE.search(query):
+            found = _VERSION_RE.search(query)
+            if found:
+                target = f"{int(found.group(1))}.{int(found.group(2))}"
+        if target:
+            same_version = _version_filter(results, target)
+            if results and not same_version:
+                return False, (f"引擎只返回了其他版本的页面，没有与“{query}”对应版本的内容。")
+            if same_version and len(same_version) < len(results):
+                print(f"[搜索] 过滤掉 {len(results) - len(same_version)} 条其他版本的结果")
+                results = same_version
+        subject = _version_subject(query) if _VERSION_CTX_RE.search(query) else ""
+        if subject:
+            keys = [k for k in re.split(r"[\s\u3000]+", subject) if k]
+            same_subject = [it for it in results
+                            if all(k in f"{it.get('title', '')}{it.get('content', '')}"
+                                   for k in keys)]
+            if len(same_subject) < len(results):
+                print(f"[搜索] 过滤掉 {len(results) - len(same_subject)} 条与「{subject}」无关的结果")
+                if not same_subject:
+                    return False, (f"引擎返回的结果都和“{subject}”无关，没有可用内容。")
+                results = same_subject
+        if _LOOKUP_QUERY_RE.search(query):
+            this_year = time.localtime().tm_year
+            cutoff = time.time() - 180 * 86400
+            fresh = []
+            for it in results:
+                title = str(it.get("title", ""))
+                if any(int(y) < this_year for y in re.findall(r"20\d{2}", title)):
+                    continue
+                ts = _text_date_ts(f"{title}{it.get('content', '')}")
+                if ts is None or ts >= cutoff:
+                    fresh.append(it)
+            if len(fresh) < len(results):
+                print(f"[搜索] 丢弃 {len(results) - len(fresh)} 条过期结果")
+                if not fresh:
+                    return False, "引擎返回的结果都太旧了，没有可用的最新内容。"
+                results = fresh
+        if _RECENCY_QUERY_RE.search(query) and not re.search(r"(?:19|20)\d{2}", query):
+            results = _sort_by_recency(results)
 
         lines = []
         redirect_hosts = tuple(spec.get("redirect_hosts") or ())
         if redirect_hosts:
             await self._resolve_result_urls(results, redirect_hosts, headers, timeout)
-        head = f"搜索关键词：{query}\n搜索引擎：{spec.get('label', key)}"
+        head = (f"搜索关键词：{ask}\n搜索引擎：{spec.get('label', key)}"
+                f"\n检索时间：{time.strftime('%Y-%m-%d %H:%M')}")
+        if subject:
+            head += f"\n主体：{subject}（回答里只能用这个主体名，不要换成别的游戏或产品）"
         if channel_hint:
             head += f"（{channel_hint}）"
-        # 按整条结果累加预算：宁可少给几条完整结果，也不要把某条摘要截成半句——
-        # 半截摘要会让模型以为"资料就这么多"，答出来的东西自然不全面。
+        must = [x for x in (subject, target) if x]
+        relevant = _looks_relevant(query, results)
         selected = results[:max_results]
+        verified: List[Tuple[dict, str]] = []
+        failed_urls: set = set()
+        if relevant:
+            verified, failed_urls = await _verify_bodies(selected, query, must_contain=must)
+            if failed_urls:
+                results = _demote_failed_results(results, failed_urls)
+                selected = results[:max_results]
         used = len(head)
         kept = 0
         for item in selected:
@@ -1936,7 +2028,7 @@ class ToolRegistry:
         text = head + "\n" + "\n\n".join(lines)
         omitted = len(results) - kept
         if omitted > 0:
-            text += (f"\n\n（引擎共返回 {len(results) + safe_dropped} 条"
+            text += (f"\n\n（引擎共返回 {engine_total} 条"
                      f"（其中 {safe_dropped} 条被安全搜索过滤），"
                      f"本次给出 {kept} 条完整结果；"
                      f"其余 {omitted} 条因长度限制省略，摘要未被截断。"
@@ -1945,7 +2037,6 @@ class ToolRegistry:
             text += (f"\n\n（安全搜索：{safe_search_label(self.config)} —— "
                      f"已按安全搜索设置过滤 {safe_dropped} 条成人向/低俗结果。）")
         text += safe_search_hint(self.config)
-        relevant = _looks_relevant(query, results)
         print(f"[搜索] 引擎={spec.get('label', key)} query={query!r} "
               f"返回 {len(results)} 条（给出 {kept} 条），相关性判定={relevant}，渠道={channel_hint or '网页'}")
         if not relevant:
@@ -1959,15 +2050,39 @@ class ToolRegistry:
                 text += (f"\n\n【重要】以上结果几乎没有真正包含“{query}”的内容，"
                          f"属于引擎放宽后的近似结果。回答时要说明这是近似资料，"
                          f"不要当作该主题的确切事实。")
+        shown_urls = {item.get("url") for item in selected[:kept]}
+        bodies = [(item, body) for item, body in verified if item.get("url") in shown_urls][:3]
+        bad_shown = [i + 1 for i, item in enumerate(selected[:kept])
+                     if item.get("url") in failed_urls]
+        if bad_shown:
+            text += ("\n\n【注意】第 " + "、".join(str(n) for n in bad_shown)
+                     + " 条结果抓回的正文与所问主题对不上，属于摘要与正文不符的标题党页面："
+                       "不要把它们标题或摘要里的内容当事实复述；"
+                       "下面如有【网页正文】，以核对过的正文为准，没有佐证就说没查到。")
+        if bodies:
+            parts = []
+            for item, body in bodies:
+                host = (urlparse(str(item.get("url", ""))).hostname or "").lower()
+                note = (f"（正文里可能同时列出多个主体，只采用与「{must[0]}」相关的内容）\n"
+                        if must else "")
+                parts.append(f"【网页正文】{item.get('title', '')}\n（来源：{host}）\n{note}{body}")
+            text += "\n\n" + "\n\n".join(parts)
+            if _LOOKUP_QUERY_RE.search(query):
+                hosts = {urlparse(str(item.get("url", ""))).hostname or "" for item, _ in bodies}
+                if len(hosts) >= 2:
+                    text += ("\n\n【多源核对】以上正文来自不同网站：兑换码、价格、比分这类关键数据，"
+                             "只有两个及以上不同网站都写到的才算可靠；只在一个网站出现的，"
+                             "很可能是引流页编造的假数据，不要直接当答案，"
+                             "确实只有单一来源时要说明来源单一、真实性待确认。")
+                else:
+                    text += ("\n\n【多源核对】上面正文只有单一来源，无法交叉核对："
+                             "其中的兑换码/价格等关键数据可能是引流页编造的假信息，"
+                             "给出时要说明只有一处来源、真实性待确认。")
+            print(f"[搜索] 已回源核对 {len(parts)} 条结果的正文")
         return relevant, text
 
     async def _resolve_result_urls(self, results: list, redirect_hosts: tuple,
                                    headers: dict, timeout: float) -> None:
-        """把引擎的跳转链接（如搜狗 /link?url=…）解析成真实地址，失败就保留原链接。
-
-        只对 spec 里声明 `redirect_hosts` 的引擎做这一步：每个结果一次 HEAD/GET，
-        并发执行但整体限时，避免拖慢搜索。
-        """
 
         async def _one(item: dict) -> None:
             url = item.get("url", "")
@@ -1992,11 +2107,6 @@ class ToolRegistry:
 
     async def _fetch_text(self, url: str, headers: dict, timeout: float, params=None,
                           method: str = "GET", json_body=None, follow_hosts=None) -> str:
-        """带主机校验的一次性 HTTP 取文：默认只跟随同主机跳转，跨主机拒绝。
-
-        `follow_hosts` 用于已知的地区跳转（如 www.bing.com → cn.bing.com），
-        只有显式列出的主机才允许跟随，避免把 SSRF 边界放宽成任意跳转。
-        """
         template_host = urlparse(url).hostname
         allowed = {template_host} | {h for h in (follow_hosts or ()) if h}
         current = url
@@ -2088,7 +2198,7 @@ class ToolRegistry:
         url_tpl = tool.get("url", "")
         if not url_tpl:
             return False, "未配置 url"
-        template_url = _validate_url(url_tpl, allow_private=True)
+        template_url = await asyncio.to_thread(_validate_url, url_tpl, True)
         template_host = urlparse(template_url).hostname
         url = template_url
         for k, v in args.items():
@@ -2100,7 +2210,7 @@ class ToolRegistry:
         parsed_url = urlparse(url)
         if parsed_url.hostname != template_host:
             return False, "HTTP 工具不允许通过参数修改目标主机"
-        url = _validate_url(url, allow_private=True)
+        url = await asyncio.to_thread(_validate_url, url, True)
         async with httpx.AsyncClient(timeout=timeout, trust_env=False, follow_redirects=False,
                                      verify=verified_context()) as client:
             if method == "POST":

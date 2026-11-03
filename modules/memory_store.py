@@ -1,9 +1,4 @@
 # -*- coding: utf-8 -*-
-"""会话记忆存取与会话 ID 净化/还原辅助（MemoryManager）。
-
-自 main.py 原样搬迁（refactor_plan 第 9 节）：会话记忆文件的读写/删除/清理
-（MemoryManager）与会话 ID 净化写法的还原辅助函数。
-"""
 import json
 import os
 import re
@@ -19,8 +14,6 @@ class MemoryManager:
         self.config = config
         self.data_path = _resolve_data_dir(config)
         self.data_path.mkdir(parents=True, exist_ok=True)
-        # 会话按当前激活的角色建档：用全局 character_key 的话，
-        # 换了角色之后新对话仍会被算成默认角色的会话
         roles = getattr(config, "roles", None) or {}
         active = str(getattr(config, "active_character", "")
                      or config.get("active_character", "") or "")
@@ -42,9 +35,6 @@ class MemoryManager:
             try:
                 data = json.loads(file_path.read_text(encoding='utf-8'))
                 if isinstance(data, dict):
-                    # 只兜底"缺失"不够：history 是 dict、meta 是字符串、或 history 里
-                    # 混进非 dict 条目时，后续 append / 下标赋值会每轮都抛异常，
-                    # 表现为该会话的消息永远不落盘、机器人也不回复
                     if not isinstance(data.get("history"), list):
                         data["history"] = []
                     else:
@@ -64,9 +54,6 @@ class MemoryManager:
         file_path = self.get_memory_file(session_id)
         data["character_name"] = data.get("character_name", self.character_name)
         data.setdefault("meta", {})
-        # 会话文件保存完整聊天记录，不在这里截断：送给模型的上下文另由
-        # history_length / summary_max_history 等限制，截断只会让 WebUI 看不到旧记录
-        # 走统一原子写：临时名唯一 + fsync，避免与 WebUI 线程的写盘互相覆盖
         from modules.jsonio import save_json
         save_json(file_path, data)
 
@@ -126,18 +113,52 @@ class MemoryManager:
         except Exception as e:
             print(f"迁移旧记忆文件失败: {e}")
 
+    def _role_display_names(self) -> dict:
+        names = {}
+        try:
+            from .model_library import load_library_cached
+            for role in (load_library_cached(self.data_path).get("roles") or []):
+                if not isinstance(role, dict):
+                    continue
+                key = str(role.get("character_key") or "").strip()
+                name = str(role.get("name") or "").strip()
+                if key and name:
+                    names[key] = name
+        except Exception as e:
+            print(f"读取角色库失败: {type(e).__name__}: {e}")
+        roles = getattr(self.config, "roles", None) or {}
+        if isinstance(roles, dict):
+            for key, role in roles.items():
+                if not isinstance(role, dict):
+                    continue
+                display = str(role.get("character_name") or "").strip()
+                role_key = str(role.get("character_key") or key).strip()
+                if role_key and display:
+                    names.setdefault(role_key, display)
+        if self.character_key and self.character_name:
+            names.setdefault(self.character_key, self.character_name)
+        return names
+
+    def _display_name_of(self, role_key: str, stored_name, role_display: dict) -> str:
+        name = str(stored_name or "").strip()
+        display = role_display.get(role_key)
+        if display and (not name or name.lower() == str(role_key).lower()):
+            return display
+        return name or role_key
+
     def list_memories(self):
         memories = []
+        role_display = self._role_display_names()
         if self.data_path.exists():
             for f in self.data_path.glob("*.json"):
-                # 仅匹配角色会话记忆文件，排除 tools.json / scheduled_jobs.json 等功能数据
                 if not _is_memory_filename(f.name):
                     continue
                 try:
                     role_name = f.name.split("_")[0] if "_" in f.name else "未知"
                     with open(f, 'r', encoding='utf-8') as fh:
                         data = json.load(fh)
-                    character_name = data.get("character_name", role_name)
+                    character_name = self._display_name_of(
+                        role_name, data.get("character_name"), role_display)
                     history = data.get("history", [])
                     last_sentence = ""
                     for msg in reversed(history):
@@ -153,7 +174,6 @@ class MemoryManager:
                                 break
                         if not sender_name:
                             sender_name = sender_id
-                        # 微信/QQ 的 sender_id 是长串 openid，直接当名字很难看
                         display_name = (f"{character_name}和"
                                         f"{friendly_user_label('', str(sender_name))}的聊天")
                     else:
@@ -165,7 +185,9 @@ class MemoryManager:
                         "display_name": display_name,
                         "last_sentence": last_sentence,
                         "modified_time": f.stat().st_mtime,
-                        "role_name": role_name
+                        "role_name": role_name,
+                        "character_name": character_name,
+                        "message_count": len(history)
                     })
                 except Exception as e:
                     print(f"读取记忆文件 {f.name} 失败: {e}")
@@ -182,7 +204,10 @@ class MemoryManager:
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            return {"success": True, "character_name": data.get("character_name", "未知"), "history": data.get("history", [])}
+            role_key = filename.split("_")[0] if "_" in filename else ""
+            character_name = self._display_name_of(
+                role_key, data.get("character_name"), self._role_display_names()) or "未知"
+            return {"success": True, "character_name": character_name, "history": data.get("history", [])}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -226,9 +251,6 @@ class MemoryManager:
             return {"success": False, "error": str(e)}
 
 
-# 会话记忆文件名：<角色>_<private|group>_<会话号>.json。
-# data 目录下同时存放 webui_auth.json / user_profiles.json 等功能数据文件，
-# 凡是"按目录批量读写"的地方都必须用它过滤，不能把功能数据一起卷进来。
 _MEMORY_FILE_RE = re.compile(r'^[^\\/:*?"<>|]+?_(private|group)_[A-Za-z0-9_\-]+\.json$')
 
 
@@ -236,19 +258,12 @@ def _is_memory_filename(name) -> bool:
     return bool(_MEMORY_FILE_RE.match(str(name or "")))
 
 
-# 记忆文件名里的会话ID被净化过（非 [A-Za-z0-9_-] 一律变成 _），openid 的 @ 与 . 都丢了。
-# 同一个会话因此有两种写法：收到消息时是 …@im.wechat，从文件名反推出来的是 …_im_wechat。
 _SANITIZED_ID_SUFFIXES = (("_im_wechat", "@im.wechat"),
                           ("_chatroom", "@chatroom"),
                           ("_im_bot", "@im.bot"))
 
 
 def restore_session_id(session_id: str) -> str:
-    """把净化过的会话ID还原成运行时那一种写法（本来就正常的原样返回）。
-
-    两种写法混用会把同一个会话当成两个：按会话选连接时查不到（主动消息落到默认的
-    NapCat 上，报「无法获取用户信息」），解析发送目标时还会把 openid 从 _ 处截断。
-    """
     text = str(session_id or "")
     for safe, real in _SANITIZED_ID_SUFFIXES:
         if text.endswith(safe):
@@ -257,7 +272,6 @@ def restore_session_id(session_id: str) -> str:
 
 
 def merge_restored_keys(raw, combine=max):
-    """把状态字典里净化过的会话ID并回运行时写法；同一个会话只留一条，按 combine 合并。"""
     out = {}
     for key, value in (raw or {}).items():
         fixed = restore_session_id(str(key))

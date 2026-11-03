@@ -1,10 +1,4 @@
 # -*- coding: utf-8 -*-
-"""WebUI 通用件：响应工具、文件名净化、错误/认证中间件、插件指令与消息分发桥、GGUF 头解析。
-
-自 main.py 原样搬迁（refactor_plan 第 12 节）：函数体、装饰器、注释、docstring 一字未改；
-仅按方案授权把函数体内的 global_config / _WEBUI_SERVER_HOLDER 裸名引用改为
-app_context.<名字>（_WEBUI_SERVER_HOLDER 是 dict 容器，原地读取，对象共享语义不变）。
-"""
 import asyncio
 import json
 import re
@@ -30,12 +24,6 @@ def _json_file_response(data, filename: str):
 
 
 async def _local_file_response(path: Path, content_type: str):
-    """读取本地文件并返回响应，读不到时返回 404。
-
-    不用 web.FileResponse：它会无条件把文件的修改时间写进 Last-Modified，
-    时间戳越界（负值等）时 time.gmtime 抛 OSError，响应在准备阶段就断开、
-    浏览器拿到的是空连接。这里服务的是用户自己放的文件，元数据不可信。
-    """
     try:
         body = await asyncio.to_thread(path.read_bytes)
     except OSError:
@@ -46,7 +34,6 @@ async def _local_file_response(path: Path, content_type: str):
 
 
 def _brief_response(resp, limit: int = 200) -> str:
-    """把服务端响应体压成一行短文本，用于把上游报错原因带回给用户。"""
     try:
         text = resp.text
     except Exception:
@@ -59,7 +46,6 @@ _NAME_ILLEGAL_CHARS = set('/\\:*?"<>|')
 
 
 def _safe_name(name: str) -> str:
-    """校验用户给出的目录名/文件名：只挡路径分隔符与穿越写法，其余一律放行。"""
     s = str(name or "")
     if not s or s in (".", "..") or s != Path(s).name or (_NAME_ILLEGAL_CHARS & set(s)):
         return ""
@@ -67,7 +53,6 @@ def _safe_name(name: str) -> str:
 
 
 def _safe_subdir(root: Path, name: str) -> Optional[Path]:
-    """校验 name 为 root 的直接子目录名（防路径穿越）。"""
     safe = _safe_name(name)
     if not safe:
         return None
@@ -78,7 +63,6 @@ def _safe_subdir(root: Path, name: str) -> Optional[Path]:
 
 
 def _emotion_audio_file(folder: Path, file_name):
-    """校验 file_name 是 folder 下的音频；返回 (路径, 错误文案)。"""
     name = _safe_name(file_name)
     if not name:
         return None, f"文件名非法：{file_name}"
@@ -91,7 +75,6 @@ def _emotion_audio_file(folder: Path, file_name):
 
 
 def _write_text_file(path: Path, text) -> None:
-    """写入参考文字文件；文字为空就把它删掉。"""
     text = str(text or "").strip()
     if text:
         path.write_text(text, encoding="utf-8")
@@ -124,13 +107,6 @@ _CSRF_SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
 
 
 def _same_origin(request) -> bool:
-    """跨站表单/请求能否带着浏览器 Cookie 打过来。
-
-    WebUI 默认不设密码，且写接口多为 multipart 表单，跨站 <form> 可以在
-    没有预检的情况下直接提交到 127.0.0.1。浏览器对跨源请求必定带 Origin，
-    因此「Origin/Referer 的主机与 Host 不一致」即可判定为跨站并拒绝。
-    非浏览器客户端（命令行、测试）不带 Origin，按放行处理。
-    """
     if request.method in _CSRF_SAFE_METHODS:
         return True
     origin = request.headers.get("Origin") or request.headers.get("Referer") or ""
@@ -165,7 +141,6 @@ def _make_auth_middleware(server: "WebUIServer"):
             if token:
                 if request.cookies.get("lovomo_auth") != token:
                     return web.json_response({"success": False, "error": "需要密码"}, status=401)
-            # 二级密码：设了才拦，解锁一次在有效期内不再拦
             if _needs_second_password(path) and server._second_password \
                     and not server._second_unlocked():
                 return web.json_response({"success": False, "error": "需要二级密码",
@@ -175,24 +150,16 @@ def _make_auth_middleware(server: "WebUIServer"):
 
 
 def _plugin_runtime():
-    """取当前运行的插件运行时；插件系统未启用或尚未就绪时返回 None。"""
     server = app_context._WEBUI_SERVER_HOLDER.get("server")
     if server is None:
         return None
     return getattr(server, "_plugin_runtime", None)
 
 
-# 指令前缀：#名字 或 /名字，后面跟参数。用 \S+ 取指令名，其余整体当参数，
-# 这样"#喵开关 开"和"#喵开关"两种写法都能命中同一个处理器。
 _COMMAND_RE = re.compile(r"^\s*[#/]\s*(\S+)\s*(.*)$", re.S)
 
 
 def _parse_plugin_command(text: str):
-    """从消息文本里解析插件指令，返回 (名字, 参数) 或 None。
-
-    只认行首的 # / 前缀，正文里出现的 # 不算 —— 否则一句普通聊天里带了
-    井号就会把消息吞掉。名字长度也做个上限，避免把长文本当指令名去查表。
-    """
     m = _COMMAND_RE.match(str(text or ""))
     if not m:
         return None
@@ -204,11 +171,6 @@ def _parse_plugin_command(text: str):
 
 def _dispatch_plugin_command(user_text, session_type, target_id,
                              session_id, sender_id, sender_name, event):
-    """把一条可能的插件指令交给插件运行时。
-
-    返回 (是否已被插件处理, 要回复的文本)。没装插件系统、消息不是指令、
-    或没有插件认领这个指令时都返回 (False, None)，调用方继续走正常回复流程。
-    """
     if not app_context.global_config.get("plugins_enabled", True):
         return False, None
     parsed = _parse_plugin_command(user_text)
@@ -239,11 +201,6 @@ def _dispatch_plugin_command(user_text, session_type, target_id,
 
 
 def _dispatch_plugin_message(event_info: dict) -> list:
-    """把消息事件广播给插件的 on_message，返回插件想追加的回复文本列表。
-
-    只在插件启用、且这一轮本来就要回复时才有意义；异常一律由运行时隔离，
-    这里只负责把结果带回去，不让插件的问题影响主链路。
-    """
     if not app_context.global_config.get("plugins_enabled", True):
         return []
     rt = _plugin_runtime()
@@ -257,11 +214,6 @@ def _dispatch_plugin_message(event_info: dict) -> list:
 
 
 def _plugin_log(text: str) -> None:
-    """插件日志入口：统一并进主日志流，带「插件」前缀便于在日志页里筛。
-
-    只走 print —— 它会经 StdoutRedirector 落进 global_log_buffer，
-    所以「日志输出」页天然就能看到插件的输出，不需要单独一套缓冲。
-    """
     try:
         print(f"[插件] {text}")
     except Exception:
@@ -269,11 +221,6 @@ def _plugin_log(text: str) -> None:
 
 
 def _gguf_general_name(path) -> str:
-    """读取 GGUF 头部的 general.name 元数据（LM Studio 模型 ID 的主要来源）。
-
-    general.* 键位于 GGUF 元数据最前面，扫描到即返回，不会碰到后面的
-    tokenizer 大数组；文件损坏/超限时返回空串。
-    """
     import struct
     try:
         with open(path, "rb") as f:

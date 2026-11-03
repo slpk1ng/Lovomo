@@ -1,53 +1,3 @@
-"""插件系统：本地插件包的安装、安全审查、启用/禁用与热加载。
-
-设计要点
---------
-- **存储**：插件全部落在 `%LOCALAPPDATA%\\Lovomo\\plugins\\<插件id>\\`，
-  跟程序目录解耦，重装/更新程序不会丢插件。
-- **市场**：不依赖自建服务器。市场的主数据源是仓库里的一批分支
-  （名字以配置的「插件分支前缀」开头，一条分支 = 一个插件），
-  WebUI 点「插件市场」时从 GitHub 拉取；分支一个都没扫到时才回退读
-  仓库里的 JSON 索引（`plugins/index.json`）。以后想换托管，只改配置即可。
-- **安全**：完整 Python 插件等同于本机任意代码执行，所以安装前一律静态
-  扫描并给出风险分级清单，高危项必须用户显式确认。
-
-插件包结构（.zip，或直接一个目录）
-----------------------------------
-    plugin.yaml        必需，清单文件（plugin.yml / plugin.json 兼容老包，见下）
-    main.py            可选，完整 Python 插件入口（高危）
-    theme.css          可选，皮肤样式
-    webui.html         可选，插件自己的网页界面（「打开webui」按钮，见下）
-    logo.png           可选，图标（只认 logo.<主流图片格式>）
-    README.md          可选
-    update.md          可选，历史更新说明
-
-清单格式：plugin.yaml 优先
---------------------------
-按 `plugin.yaml` → `plugin.yml` → `plugin.json` 的顺序取**第一个存在**的文件。
-YAML 用 `modules/yaml_lite.py` 解析（零依赖），写法就是普通 YAML。
-展示用的元信息（介绍 / 版本 / 作者 / 仓库 / 图标）全部写在这里。
-
-清单字段
---------
-    id          str   必需，唯一标识（字母数字下划线连字符，须字母数字开头，≤64 位）
-    name        str   必需，显示名
-    version     str   必需，版本号
-    author      str   可选，显示用作者名
-    github      str   可选，作者 GitHub 用户名（发布归属校验用）
-    repo        str   可选，"用户名/仓库名"，插件所在仓库
-    homepage    str   可选，插件主页链接
-    source_repo str   可选，由市场安装时自动记入，标明插件来自哪个仓库
-    logo        str   可选，图标文件名（不带路径），留空则自动找 logo.* / icon.*
-    description str   可选
-    tags        list  可选，市场与列表里显示的标签（≤8 个，每个 ≤24 字）
-    type        str   "theme" | "python" | "mixed"，默认 "python"
-    entry       str   可选，Python 入口文件，默认 main.py
-    panel       dict  可选，声明插件自带的功能页（label / title / html）
-    skin        dict  可选，声明皮肤可调项（background / layout / accent / vars）
-    features    list  可选，声明插件自己的可调项，前端按声明自动渲染控件
-                       （select 可以写 `options_file: data/xxx.json`，
-                       由插件在运行时把选项写进这个文件，主程序读它渲染下拉）
-"""
 import hashlib
 import io
 import json
@@ -78,28 +28,20 @@ ALLOWED_EXTS = {
     # 音视频
     ".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac", ".opus", ".webm", ".mp4",
 }
-# 清单文件名，按优先级排列（第一个是新建清单时用的名字）
 MANIFEST_NAMES = ("plugin.yaml", "plugin.yml", "plugin.json")
 MANIFEST_NAME = MANIFEST_NAMES[0]
-# 插件自带网页界面的固定文件名（放在插件根目录）
 WEBUI_NAME = "webui.html"
-# 插件私有设置文件名（放在插件 data 目录里）
 SETTINGS_NAME = "settings.json"
-# 卸载时选择保留配置/数据后，在插件目录里留这个标记：目录还在，但不再算已安装
 UNINSTALLED_MARKER = ".uninstalled"
-# 解压后总大小与文件数上限（防 zip 炸弹，同时容得下插件自带的纯 Python 库）
 MAX_UNPACK_BYTES = 128 * 1024 * 1024
 MAX_FILES = 2000
 
-# GitHub 用户名/仓库名出现的位置：URL 或 "owner/repo" 简写
 _GITHUB_URL_RE = re.compile(r"github\.com[/:]+([A-Za-z0-9_.\-]+)", re.I)
 _REPO_PATH_RE = re.compile(
     r"github\.com[/:]+([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)", re.I)
-# GitHub 用户名：字母数字开头，可含内部连字符，最长 39 位
 _LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 
 
-# 插件自带的静态资源只允许这些类型经由 WebUI 直接读取
 ASSET_EXTS = {
     ".png", ".jpg", ".jpeg", ".jfif", ".gif", ".svg", ".webp", ".avif",
     ".apng", ".bmp", ".ico",
@@ -110,11 +52,9 @@ ASSET_EXTS = {
 }
 MAX_ASSET_BYTES = 32 * 1024 * 1024
 
-# 插件图标的文件名（按优先级）与允许的图片格式
 ICON_STEMS = ("logo", "icon")
 ICON_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".ico", ".bmp")
 
-# 插件自带说明文档的文件名（大小写不敏感）
 MAX_DOC_BYTES = 256 * 1024
 _DOC_NAMES = {
     "readme": ("readme.md", "readme.txt", "readme.markdown"),
@@ -122,7 +62,6 @@ _DOC_NAMES = {
                "changelog.md", "changelog.txt", "history.md", "history.txt"),
 }
 
-# Windows 文件名不允许出现的字符
 _ILLEGAL_NAME_CHARS = '<>:"/\\|?*'
 _RESERVED_NAMES = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)),
                    *(f"lpt{i}" for i in range(1, 10))}
@@ -145,9 +84,6 @@ _MIME_TYPES = {
 }
 
 # ---------------------------------------------------------------- 安全扫描
-# 按危险程度分级：high 必须用户显式确认才允许启用；medium 提示但不阻断。
-# high 只留「装上就可能是冲着用户来的」那几类；子进程、动态执行、网络套接字、
-# 删单个文件这些插件开发里的常见写法降为 medium，避免正常插件被拦在确认框后面。
 _RISK_RULES = [
     ("high", "读取进程环境与凭据",
      re.compile(r"(?:config\.json|\.env\b|api_key|password|token)\s*[\"']?\s*\)?"
@@ -200,10 +136,6 @@ _OBFUSCATION_RULES = [
 
 
 def scan_python_source(code: str) -> list:
-    """静态扫描一段 Python 代码，返回风险条目列表。
-
-    每条形如 {"level": "high"|"medium"|"low", "title": str, "hits": [行号...]}
-    """
     findings = []
     lines = code.splitlines()
     for level, title, pattern in _RISK_RULES:
@@ -226,7 +158,6 @@ def scan_python_source(code: str) -> list:
 
 
 def summarize_risks(findings: list) -> dict:
-    """把风险清单汇总成计数与是否放行建议。"""
     high = [f for f in findings if f.get("level") == "high"]
     medium = [f for f in findings if f.get("level") == "medium"]
     low = [f for f in findings if f.get("level") == "low"]
@@ -239,11 +170,6 @@ def summarize_risks(findings: list) -> dict:
 
 
 def _safe_extract_root(name: str):
-    """把 zip 内的路径压平到单层目录名，挡住 ../ 穿越。
-
-    返回 (top_dir_or_None, relative_parts)。遇到绝对路径或 .. 时返回
-    (None, None) 表示该条目非法。
-    """
     norm = name.replace("\\", "/").strip("/")
     if not norm:
         return None, None
@@ -258,7 +184,6 @@ def _safe_extract_root(name: str):
 
 
 def find_manifest(root: Path):
-    """在目录里按优先级找清单文件，找不到返回 None。"""
     if root is None:
         return None
     for name in MANIFEST_NAMES:
@@ -269,11 +194,6 @@ def find_manifest(root: Path):
 
 
 def parse_manifest_text(text: str, filename: str = "") -> dict:
-    """把清单文本解析成字典；解析不了返回空字典（不抛异常）。
-
-    `.json` 走 JSON，其余按 YAML 解析。解析失败只当"没有清单"处理，
-    由调用方决定是提示还是兜底，绝不让一个写坏的清单把安装流程打挂。
-    """
     raw = str(text or "").lstrip("\ufeff")
     if not raw.strip():
         return {}
@@ -299,7 +219,6 @@ def _read_manifest_from_dir(root: Path) -> dict:
 
 
 def repo_owner(value) -> str:
-    """从 `用户名/仓库名` 或各种 GitHub 链接里取用户名，取不到返回空串。"""
     raw = str(value or "").strip()
     if not raw:
         return ""
@@ -313,7 +232,6 @@ def repo_owner(value) -> str:
 
 
 def repo_slug(value) -> str:
-    """从链接或简写里取 `用户名/仓库名`，取不到返回空串。"""
     raw = str(value or "").strip()
     if not raw:
         return ""
@@ -327,13 +245,6 @@ def repo_slug(value) -> str:
 
 
 def manifest_logins(manifest: dict) -> list:
-    """清单里所有能标识"这个插件属于谁"的 GitHub 用户名（去重、保序）。
-
-    认这些来源：`github` / `owner` 直接写的用户名、`repo` / `source_repo` /
-    `homepage` 里的仓库归属、以及本身就是一个 GitHub 用户名的 `author`。
-    不像用户名的值（中文作者名、带空格、带斜杠）一律跳过 —— 否则
-    `author: 爱丽丝` 会被误当成一个账号，把归属判断带偏。
-    """
     raw = manifest if isinstance(manifest, dict) else {}
     found = []
     for key in ("github", "owner"):
@@ -354,7 +265,6 @@ def manifest_logins(manifest: dict) -> list:
 
 
 def ownership_matches(manifest: dict, login: str) -> bool:
-    """清单声明的归属里有没有这个 GitHub 账号（没有就视为"不是你的插件"）。"""
     who = str(login or "").strip().lower()
     if not who:
         return False
@@ -384,6 +294,7 @@ def _normalize_manifest(raw: dict, fallback_id: str = "") -> dict:
         "description": str(raw.get("description") or "").strip()[:400],
         "tags": tags,
         "type": ptype,
+        "category": str(raw.get("category") or "").strip()[:24],
         "entry": str(raw.get("entry") or "main.py").strip()[:120],
         "skin": _normalize_skin(raw.get("skin")),
         "features": _normalize_features(raw.get("features")),
@@ -401,18 +312,6 @@ CSS_LENGTH_UNITS = ("px", "rem", "em", "%", "vw", "vh", "vmin", "vmax",
 
 
 def _normalize_panel(raw) -> dict:
-    """规范化插件清单里的 panel 段：声明插件自带的功能页。
-
-    两种玩法，插件自己挑：
-
-    - **只声明** —— `{"label": "喵喵设置", "title": "喵喵皮肤"}`。
-      功能页由前端按 skin / features 自动渲染，插件一行 HTML 都不用写。
-    - **自带界面** —— 额外写 `"html": "ui/panel.html"`（zip 内相对路径）。
-      功能页会直接加载这个 HTML，插件想画成什么样就什么样，主程序只
-      通过 `window.lovomo` 桥接提供设置读写、资源 URL、日志等能力。
-
-    指向的文件缺失时自动退回自动渲染，插件不会因此变成一个打不开的死页面。
-    """
     if not isinstance(raw, dict):
         return {}
     label = str(raw.get("label") or "").strip()[:40]
@@ -426,11 +325,6 @@ def _normalize_panel(raw) -> dict:
 
 
 def _clean_var_name(raw) -> str:
-    """把一个变量名收敛成合法的 CSS 变量片段。
-
-    只留小写字母、数字和连字符；`--skin-` 前缀由主程序补，插件写名字时
-    带不带前缀都行。
-    """
     name = re.sub(r"[^a-z0-9\-]", "-", str(raw or "").strip().lower())
     name = re.sub(r"-+", "-", name).strip("-")
     if name.startswith("skin-"):
@@ -439,11 +333,6 @@ def _clean_var_name(raw) -> str:
 
 
 def _normalize_field(item: dict, index: int) -> dict:
-    """规范化单条字段声明，支持 10 种控件类型。
-
-    `type` 省略时按 old-school 布尔开关处理（等价 type="bool"，保留
-    `default` 是布尔的旧写法），所以老插件清单不需要任何改动。
-    """
     key = re.sub(r"[^A-Za-z0-9_\-]", "", str(item.get("key") or ""))[:64]
     if not key:
         return {}
@@ -458,7 +347,6 @@ def _normalize_field(item: dict, index: int) -> dict:
     if raw_type in FIELD_TYPES:
         out["type"] = raw_type
     elif raw_type:
-        # 写了个主程序不认识的类型：退回布尔，别让整条字段消失
         out["type"] = "bool"
     elif isinstance(default, bool):
         out["type"] = "bool"
@@ -501,15 +389,12 @@ def _normalize_field(item: dict, index: int) -> dict:
         out["options"] = _normalize_options(item.get("options"))
         options_file = _safe_rel_path(item.get("options_file"))
         if options_file:
-            # 选项由插件运行时写进这个文件，主程序渲染前读它填进 options
             out["options_file"] = options_file
         if not out["options"] and not options_file:
             return {}
         if t == "select":
             vals = [o["value"] for o in out["options"]]
             if not vals and options_file:
-                # 选项要等运行时读 options_file 才知道，此时不能按"空选项"把
-                # 清单里声明的默认值改掉（_features_with_options 之后会补上选项）
                 out["default"] = str(default if default is not None else "")
             else:
                 fallback = vals[0] if vals else ""
@@ -529,7 +414,6 @@ def _normalize_field(item: dict, index: int) -> dict:
 
 
 def _safe_rel_path(value) -> str:
-    """把清单里写的相对路径规整成安全的相对路径（越界或为空返回空串）。"""
     rel = str(value or "").replace("\\", "/").strip().lstrip("/")
     parts = [p for p in rel.split("/") if p not in ("", ".")]
     if not parts or ".." in parts:
@@ -538,7 +422,6 @@ def _safe_rel_path(value) -> str:
 
 
 def _normalize_options(raw) -> list:
-    """下拉选项：接受 ["a","b"] 或 [{"value":..,"label":..}] 两种写法。"""
     if not isinstance(raw, list):
         return []
     out = []
@@ -572,10 +455,6 @@ def _clamp(value: float, lo: float, hi: float) -> float:
 
 
 def _as_bool(value, fallback: bool = False) -> bool:
-    """布尔值容错：兼容清单/请求里写成字符串的 "false" / "0" / "否"。
-
-    直接 bool("false") 会得到 True，把声明的默认值或用户的选择反向。
-    """
     if isinstance(value, bool):
         return value
     if value is None or value == "":
@@ -586,24 +465,6 @@ def _as_bool(value, fallback: bool = False) -> bool:
 
 
 def _normalize_features(raw) -> list:
-    """规范化插件清单里的 features 段：声明插件对外暴露的可调项。
-
-    每项至少给 `key`，其余可选。`type` 决定前端自动渲染成什么控件：
-
-        bool / range / number / text / textarea / select / multiselect /
-        color / password / file
-
-    示例：
-        {"key": "meow_reply_enabled", "label": "喵喵追加", "type": "bool"}
-        {"key": "block_opacity", "label": "区块透明度", "type": "range",
-         "min": 0.2, "max": 1, "step": 0.01, "default": 0.92}
-        {"key": "mode", "label": "模式", "type": "select",
-         "options": ["安静", "活泼"], "default": "安静"}
-
-    前端据此自动渲染，值存进插件私有 settings.json，插件运行时自己读。
-    写清单就能加设置项，不必改主程序或前端；真想要完全自定义的界面，
-    再用 panel.html 自己画（见 `_normalize_panel`）。
-    """
     if not isinstance(raw, list):
         return []
     out = []
@@ -619,25 +480,6 @@ def _normalize_features(raw) -> list:
 
 
 def _normalize_skin(raw) -> dict:
-    """规范化插件清单里的 skin 段：皮肤提供哪些可调项。
-
-    固定项里 `background` / `accent` 会渲染出控件（背景图选择器、主色
-    取色器），`layout` 只是保留的标记位、当前界面不为它渲染控件。
-    真正想要"任意可调项"的插件应该用 `vars`：
-
-        "skin": {
-          "vars": [
-            {"name": "block-opacity", "label": "区块透明度", "type": "range",
-             "min": 0.2, "max": 1, "step": 0.01, "default": 0.92},
-            {"name": "radius", "label": "圆角", "type": "range",
-             "min": 0, "max": 30, "default": 14}
-          ]
-        }
-
-    每个变量会在 CSS 里以 `--skin-<name>` 的形式出现（名字带不带
-    `skin-` 前缀都行），插件在 theme.css 里用 var() 取用即可。
-    主程序不再规定"皮肤只能调哪几样"。
-    """
     if not isinstance(raw, dict):
         return {}
     out = {}
@@ -671,7 +513,6 @@ def _normalize_skin(raw) -> dict:
 
 
 def safe_asset_name(raw_name: str, fallback_ext: str = "") -> str:
-    """把用户选中的文件名转成磁盘上可用的名字（保留中文，只替换非法字符）。"""
     raw = str(raw_name or "")
     stem = Path(raw.replace("\\", "/")).name.strip()
     ext = (Path(stem).suffix or "").lower() or fallback_ext.lower()
@@ -692,7 +533,6 @@ def safe_asset_name(raw_name: str, fallback_ext: str = "") -> str:
 
 
 def unique_asset_name(directory, name: str) -> str:
-    """同名不要互相覆盖：第二个开始加 -2、-3 …（保留扩展名）。"""
     target = Path(directory) / name
     if not target.exists():
         return name
@@ -705,7 +545,6 @@ def unique_asset_name(directory, name: str) -> str:
 
 
 def _sanitize_background_url(value: str) -> str:
-    """把背景图设置转成安全的站内 URL（文件名做百分号编码）。"""
     raw = str(value or "").strip()
     if not raw:
         return ""
@@ -736,12 +575,6 @@ def _sanitize_color(value: str) -> str:
 
 
 def _css_string(text: str, limit: int = 200) -> str:
-    """把任意文本压成一个安全的 CSS 字符串字面量。
-
-    保留 CJK 与常见标点（下拉选项、自定义文案用得上），只滤掉引号、
-    反斜杠、换行和尖括号 —— 这些是唯一能突破字符串边界、改写样式表
-    结构的字符。
-    """
     clean = (str(text or "")
              .replace("\\", "").replace("\n", " ").replace("\r", " ")
              .replace('"', "").replace("'", ""))
@@ -750,24 +583,11 @@ def _css_string(text: str, limit: int = 200) -> str:
 
 
 def _css_unit_of(decl: dict) -> str:
-    """清单里声明的 unit，只有白名单内的 CSS 长度单位才会被写进样式表。
-
-    只允许长度单位：像 "次"、"个" 这种是给界面当后缀看的，写进 CSS 会让
-    整条声明失效（浏览器认不出 3次 这种长度）。
-    """
     unit = str(decl.get("unit") or "").strip()
     return unit if unit in CSS_LENGTH_UNITS else ""
 
 
 def _css_value_for(decl: dict, raw) -> str:
-    """把一个插件设置值渲染成可以安全写进 CSS 的变量值。
-
-    插件作者能用任意变量名和任意取值范围，所以这里是唯一的收口：
-    每个类型都只有一种确定形态的输出，插件没法借"值"往样式表里塞
-    额外声明（比如 `1; } body { display: none } /*`）。
-
-    返回 None 表示这条变量不该输出，前端会退回 theme.css 里的兜底值。
-    """
     t = decl.get("type") or "bool"
     if raw is None:
         raw = decl.get("default")
@@ -806,7 +626,6 @@ def _css_value_for(decl: dict, raw) -> str:
         return _css_string(joined, 200) if joined else None
 
     if t == "file":
-        # 只允许指向插件资源接口的站内相对路径（复用背景图那套收敛）。
         url = _sanitize_background_url(str(raw))
         return "url(\"" + url + "\")" if url else None
 
@@ -814,18 +633,12 @@ def _css_value_for(decl: dict, raw) -> str:
 
 
 def _fmt_num(num: float) -> str:
-    """把浮点压成短字符串：整数不带小数点，小数最多留 4 位。"""
     if abs(num - round(num)) < 1e-9:
         return str(int(round(num)))
     return f"{num:.4f}".rstrip("0").rstrip(".")
 
 
 def _validate_setting(field: dict, value):
-    """按字段声明校验并收敛一个设置值。
-
-    返回 `(ok, value)`；ok 为 False 时调用方应丢弃该键，避免插件把
-    任意结构写进自己的 settings.json 之后又读出来当配置用。
-    """
     t = field.get("type") or "bool"
     if t == "bool":
         return True, _as_bool(value)
@@ -858,13 +671,6 @@ def _validate_setting(field: dict, value):
 
 
 def _rmtree_retry(path, attempts: int = 3, delay: float = 0.25) -> bool:
-    """删目录，失败就重试几次。
-
-    Windows 上文件被别的进程短暂占着时会直接拒绝删除（PermissionError），
-    而这种情况往往几十毫秒后就自己好了。默认的 rmtree(ignore_errors=True)
-    一失败就放弃，于是临时目录永远留在那里 —— 插件装了几次，根目录里
-    就多出几个 .backup-xxx，看起来像"一个插件好几个文件夹"。
-    """
     for i in range(max(1, attempts)):
         try:
             shutil.rmtree(path)
@@ -879,18 +685,14 @@ def _rmtree_retry(path, attempts: int = 3, delay: float = 0.25) -> bool:
 
 
 class PluginManager:
-    """插件目录的唯一管理者。所有路径都限制在 plugins_root 之内。"""
 
     def __init__(self, plugins_root: Path, state_file: Path = None,
                  loader=None, on_change=None):
         self.root = Path(plugins_root)
         self.state_file = Path(state_file) if state_file else self.root / "state.json"
-        self._loader = loader            # 由一个上层注入：真正 import 插件
+        self._loader = loader
         self._on_change = on_change      # 启用状态变化后的回调（热重载）
         self._state_cache = None
-        # 生效快照：pid -> settings。plugin_settings() 读这里而不是磁盘，
-        # 目的是让"保存"与"生效"分开 —— 用户写完设置点「保存并重载」
-        # 才把磁盘上的草稿提交进来，否则改了立刻生效、滑条一拖一动。
         self._applied: dict = {}
         self._settings_seeded: set = set()
         self.purge_temp_dirs()
@@ -900,19 +702,9 @@ class PluginManager:
         self.root.mkdir(parents=True, exist_ok=True)
         return self.root
 
-    # 安装过程用的临时目录前缀。它们只在一次 install_zip 期间存在，
-    # 正常情况下会在 finally 里被删掉；一旦安装中途崩溃/被强杀，
-    # 或者删除时插件目录里的文件还被别的进程占着（Windows 常见），
-    # 就会永久留在插件根目录里，看起来像"一个插件好几个文件夹"。
     _TEMP_PREFIXES = (".staging-", ".backup-", ".keep-")
 
     def purge_temp_dirs(self) -> int:
-        """清掉残留的安装临时目录，返回清理数量。
-
-        在插件管理器初始化时调用一次即可：这些目录只是搬运途中的中转站，
-        里面的内容要么已经搬进正式目录、要么是待回滚的旧副本，
-        没有任何一份是"只有它才有"的数据，删掉是安全的。
-        """
         self.ensure_root()
         removed = 0
         try:
@@ -947,7 +739,6 @@ class PluginManager:
         data.setdefault("source", {})
         if not isinstance(data.get("source"), dict):
             data["source"] = {}
-        # 置顶顺序：列表里靠前的排在「插件」页最前面
         data.setdefault("pinned", [])
         if not isinstance(data.get("pinned"), list):
             data["pinned"] = []
@@ -958,8 +749,6 @@ class PluginManager:
     def _save_state(self) -> None:
         try:
             self.ensure_root()
-            # 临时名必须唯一：并发写入共用同一个 .tmp 时，
-            # os.replace 可能把另一次写入的半截内容提交成正式文件
             tmp = Path(f"{self.state_file}.{os.getpid()}.{time.time_ns()}.tmp")
             tmp.write_text(json.dumps(self._state(), ensure_ascii=False, indent=2),
                            encoding="utf-8")
@@ -983,11 +772,9 @@ class PluginManager:
         return True
 
     def pinned_ids(self) -> list:
-        """置顶的插件 id，靠前的排最前。"""
         return list(self._state()["pinned"])
 
     def set_pinned(self, pid: str, pinned: bool) -> bool:
-        """置顶 / 取消置顶。新置顶的排在最前面。"""
         if not self.get(pid):
             return False
         ids = [p for p in self._state()["pinned"] if p != pid]
@@ -1008,7 +795,6 @@ class PluginManager:
         return d
 
     def set_source(self, pid: str, repo: str, branch: str = "", kind: str = "") -> None:
-        """记下插件是从哪个仓库装来的（市场安装时写，便于追溯来源）。"""
         repo = str(repo or "").strip()
         if not repo or self.get(pid) is None:
             return
@@ -1021,7 +807,6 @@ class PluginManager:
         self._save_state()
 
     def source_of(self, pid: str) -> dict:
-        """取插件记录的来源（没有记录时返回空字典）。"""
         src = self._state()["source"].get(pid)
         return dict(src) if isinstance(src, dict) else {}
 
@@ -1049,8 +834,6 @@ class PluginManager:
 
     def _describe(self, d: Path):
         if (d / UNINSTALLED_MARKER).exists():
-            # 卸载时选了保留配置/数据留下的目录：里面的东西留着给重装用，
-            # 但它已经不是插件了，不该再出现在列表里。
             return None
         raw = _read_manifest_from_dir(d)
         manifest = _normalize_manifest(raw, fallback_id=d.name)
@@ -1077,24 +860,18 @@ class PluginManager:
             info["installed_at"] = int(d.stat().st_mtime)
         except Exception:
             info["installed_at"] = 0
-        # 清单缺失时不报错，但要让用户看出来是个"裸目录"
         info["manifest_ok"] = bool(raw)
-        # 归属：清单里声明了哪些 GitHub 账号，发布门禁按它判断"是不是你的插件"
         info["owners"] = manifest_logins(manifest)
-        # 来源：市场装来的插件会记一笔，手工上传/本地目录则为空
         src = self.source_of(manifest["id"])
         if src.get("repo"):
             info["source_repo"] = src["repo"]
             info["source_branch"] = str(src.get("branch") or "")
-        # 插件自带功能页界面（panel.html）：文件真的存在才算数，
-        # 没写或写错了就退回前端自动渲染，不至于变成一个打不开的死页面。
         panel = info.get("panel") or {}
         if panel.get("html"):
             info["panel"] = {**panel, "html_ok": self.panel_html_path(d, panel) is not None}
         return info
 
     def panel_html_path(self, d: Path, panel: dict):
-        """解析插件自带界面的 HTML 文件，越界或不存在都返回 None。"""
         rel = str((panel or {}).get("html") or "").replace("\\", "/").strip()
         if not rel or rel.startswith("/") or ".." in rel.split("/"):
             return None
@@ -1110,13 +887,6 @@ class PluginManager:
         return target if target.is_file() else None
 
     def _features_with_options(self, d: Path, features):
-        """给声明了 options_file 的下拉补上选项。
-
-        插件清单是静态的，写不了"运行时才知道的选项"（比如本机有哪些录音
-        设备）。所以留一个口子：清单里写 `options_file: data/xxx.json`，
-        主程序在把插件信息交给前端之前读一次，把选项填进 `options`。
-        文件不在或格式不对就退回清单里写死的 options。
-        """
         out = []
         for field in features or []:
             field = dict(field)
@@ -1128,7 +898,6 @@ class PluginManager:
         return out
 
     def _read_options_file(self, d: Path, rel: str):
-        """读插件目录里的选项文件：["值", ...] 或 [{"value":..,"label":..}, ...]。"""
         safe = _safe_rel_path(rel)
         if not safe:
             return []
@@ -1154,7 +923,6 @@ class PluginManager:
 
     # ------------------------------------------------------------ 扫描（安装前预览）
     def inspect_zip(self, data: bytes) -> dict:
-        """只读地审查一个插件 zip，不落盘。用于"安装前提示风险"。"""
         result = {"ok": False, "error": "", "manifest": {}, "manifest_name": "",
                   "risks": {}, "files": [], "warnings": []}
         try:
@@ -1196,7 +964,6 @@ class PluginManager:
                 keep.append(n)
                 low = parts[-1].lower()
                 if low in MANIFEST_NAMES:
-                    # 同名的取第一个；优先级（yaml > json）留到最后再挑
                     manifest_files.setdefault(low, zf.read(n).decode("utf-8", "replace"))
                 elif low == "theme.css":
                     try:
@@ -1218,7 +985,6 @@ class PluginManager:
                     if not manifest_raw:
                         result["warnings"].append(f"{name} 解析失败，已忽略")
                     break
-            # 顶层目录唯一时允许"包了一层文件夹"的 zip
             tops = {_safe_extract_root(n)[0] for n in keep}
             result["wrapped"] = len(tops) == 1 and not any(
                 Path(n).name.lower() in MANIFEST_NAMES
@@ -1253,11 +1019,6 @@ class PluginManager:
     # ------------------------------------------------------------ 安装
     def install_zip(self, data: bytes, *, force: bool = False,
                     enable: bool = False) -> dict:
-        """安装一个 zip 插件包。force=True 表示用户已确认高危风险。
-
-        enable 只管新装的插件：默认装完是停用状态，由用户自己去「插件」里
-        启用；覆盖安装一律沿用原有状态，升级不该把用户的开关改掉。
-        """
         report = self.inspect_zip(data)
         if not report.get("ok"):
             return {"success": False, "error": report.get("error") or "包不可用",
@@ -1276,12 +1037,9 @@ class PluginManager:
         target = self.plugin_dir(pid)
         if target is None:
             return {"success": False, "error": "插件 id 非法", "report": report}
-        # 覆盖安装：先解到临时目录，成功了再替换，避免解压中途失败留下半成品
         staging = self.root / f".staging-{pid}-{int(time.time() * 1000)}"
         backup = self.root / f".backup-{pid}-{int(time.time() * 1000)}"
         had_old = target.exists()
-        # 覆盖安装时把插件自己的 data 目录先挪出来：那里存的是用户设置
-        # （背景图、开关状态等），升级插件不该把它们清掉。
         kept_data = None
         if had_old:
             old_data = target / "data"
@@ -1297,7 +1055,6 @@ class PluginManager:
             staging.mkdir(parents=True, exist_ok=True)
             self._extract_into(data, staging, report.get("wrapped", False))
             if find_manifest(staging) is None:
-                # 没清单也允许装，补一份生成的清单，便于后续统一管理
                 (staging / MANIFEST_NAME).write_text(
                     yaml_lite.dumps(report["manifest"]), encoding="utf-8")
             if kept_data is not None:
@@ -1308,12 +1065,8 @@ class PluginManager:
             os.replace(str(staging), str(target))
             if had_old:
                 _rmtree_retry(backup)
-            # 新装的插件默认停用，装完由用户自己去「插件」里启用；
-            # 覆盖安装沿用原有状态（setdefault 只在没有记录时生效）
             self._state()["enabled"].setdefault(pid, bool(enable))
             self._save_state()
-            # 覆盖安装保留了旧的 data/，但设置要重新补种一次：
-            # 新版本的清单可能声明了新的键，旧的生效快照不一定对得上。
             self._applied.pop(pid, None)
             self._settings_seeded.discard(pid)
             if callable(self._on_change):
@@ -1326,7 +1079,6 @@ class PluginManager:
                     "replaced": had_old, "report": report}
         except Exception as e:
             _rmtree_retry(staging)
-            # 回滚：备份还在就还原回去，用户数据也要放回原位
             try:
                 if backup.exists() and not target.exists():
                     os.replace(str(backup), str(target))
@@ -1343,7 +1095,6 @@ class PluginManager:
                 _rmtree_retry(kept_data)
 
     def _extract_into(self, data: bytes, dest: Path, wrapped: bool) -> None:
-        """把 zip 内容安全解压到 dest。已在外层校验过路径，这里再挡一遍。"""
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             for info in zf.infolist():
                 if info.is_dir():
@@ -1369,17 +1120,6 @@ class PluginManager:
     # ------------------------------------------------------------ 卸载
     def uninstall(self, pid: str, keep_settings: bool = False,
                   keep_data: bool = False) -> bool:
-        """卸载插件：先让运行时释放模块，再删目录。
-
-        顺序很重要：Windows 上插件模块还在 sys.modules / 文件句柄未释放时
-        rmtree 会失败，表现为"点了卸载但插件还在"。所以先通知上层卸掉运行时
-        （_on_change 会触发 reload_all，把 sys.modules 里的模块摘掉），
-        再删除目录；万一仍被占用（编辑器/杀软扫描），短暂重试几次。
-
-        keep_data 保留整个 `data/` 目录；只 keep_settings 时保留其中的
-        settings.json。要留的东西先挪到临时目录，删完再放回来 ——
-        Windows 上没法"只删目录里的一部分"。
-        """
         d = self.plugin_dir(pid)
         if d is None or not d.is_dir():
             return False
@@ -1388,8 +1128,6 @@ class PluginManager:
         saved_pinned = pid in self._state()["pinned"]
         self._state()["pinned"] = [p for p in self._state()["pinned"] if p != pid]
         self._save_state()
-        # 卸掉生效快照：重装同一个 id 时应该重新从磁盘补种，
-        # 而不是留着上一份（可能是旧版本的）设置。
         self._applied.pop(pid, None)
         self._settings_seeded.discard(pid)
         if callable(self._on_change):
@@ -1401,8 +1139,6 @@ class PluginManager:
         last_err = None
         ok = _rmtree_retry(d, attempts=3, delay=0.15)
         if not ok:
-            # 目录没删掉，插件其实还在：把挪走的配置/数据放回原位、状态也恢复回去，
-            # 否则会变成「插件还在、却显示未启用且来源未知」，用户选的保留配置也一起丢了。
             self._restore_stash(d, stash)
             if saved_enabled is not None:
                 self._state()["enabled"][pid] = saved_enabled
@@ -1418,7 +1154,6 @@ class PluginManager:
         return True
 
     def _restore_stash(self, d: Path, stash) -> None:
-        """卸载失败时把挪走的 data/ 放回插件目录（不打卸载标记，插件仍是插件）。"""
         if stash is None:
             return
         kept = stash / "data"
@@ -1434,7 +1169,6 @@ class PluginManager:
         shutil.rmtree(stash, ignore_errors=True)
 
     def _stash_kept_data(self, d: Path, keep_settings: bool, keep_data: bool):
-        """把要保留的配置/数据挪到临时目录，返回该目录（没有要留的返回 None）。"""
         data_dir = d / "data"
         if not data_dir.is_dir() or not (keep_settings or keep_data):
             return None
@@ -1462,7 +1196,6 @@ class PluginManager:
             if kept.is_dir() and any(kept.iterdir()):
                 d.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(kept), str(d / "data"))
-                # 目录留着但不算已安装：标记一下，重装时会被新目录整个替换掉
                 (d / UNINSTALLED_MARKER).write_text("", encoding="utf-8")
         except Exception as e:
             print(f"[插件] 卸载后恢复配置/数据失败: {e}")
@@ -1470,12 +1203,6 @@ class PluginManager:
 
     # ------------------------------------------------------------ 皮肤聚合
     def theme_css(self) -> str:
-        """把所有启用的皮肤插件拼成一段 CSS，供 WebUI 注入。
-
-        每个插件的样式被包在 :root 作用域下的注释块里，方便排查。
-        声明了 skin 段的插件，其私有设置会被翻译成 `--skin-*` 变量前置，
-        这样插件 CSS 用 var() 引用即可，无需自己生成样式文本。
-        """
         chunks = []
         for info in self.list_plugins():
             if not info.get("enabled"):
@@ -1496,12 +1223,6 @@ class PluginManager:
         return "\n\n".join(chunks)
 
     def _skin_vars_css(self, info: dict) -> str:
-        """把插件私有设置翻译成 `--skin-*` CSS 变量。
-
-        两条来源合并：主程序认识的固定项（background / accent），以及
-        插件在 `skin.vars` 里自己声明的任意变量。后者是主力 —— 主程序
-        不再规定"皮肤只能调哪几样"，变量名和取值范围都由插件定。
-        """
         meta = info.get("skin")
         if not meta:
             return ""
@@ -1539,11 +1260,6 @@ class PluginManager:
 
     @staticmethod
     def _custom_var_lines(info: dict, settings: dict, decls: list) -> list:
-        """按声明把插件自定义变量渲染成 CSS 行。
-
-        值取插件私有设置，缺失或类型不符时退回声明的默认值。所有值都经
-        `_css_value_for` 收敛，插件没法借变量名或值往样式表里注入别的规则。
-        """
         lines = []
         for decl in decls:
             if not isinstance(decl, dict):
@@ -1559,15 +1275,6 @@ class PluginManager:
         return lines
 
     def active_skin_ids(self) -> list:
-        """哪些皮肤插件的「应用外观」是开着的。
-
-        前端据此给 html 加 skin-on 类；theme.css 里改底色的规则都挂在
-        html.skin-on 下，所以没主动开的插件只贡献配色与排版，
-        程序原本的背景保持不变。
-
-        用 `plugin_settings()`（生效值）而不是磁盘草稿：用户刚在功能页里
-        勾上开关但还没点「保存并重载」时，界面不该先变了。
-        """
         out = []
         for info in self.list_plugins():
             if not info.get("enabled") or not info.get("skin"):
@@ -1579,11 +1286,6 @@ class PluginManager:
     # ------------------------------------------------------------ 图标
     @staticmethod
     def _declared_icon(d: Path, name):
-        """清单里 `logo:` 声明的图标（只认文件名，不允许带路径）。
-
-        声明的文件不存在或格式不在白名单里时返回 None，让调用方退回
-        `logo.*` / `icon.*` 的自动查找，不至于因为写错一个字段就没有图标。
-        """
         rel = str(name or "").replace("\\", "/").strip()
         if not rel or "/" in rel or rel.startswith("."):
             return None
@@ -1594,7 +1296,6 @@ class PluginManager:
 
     @staticmethod
     def _find_icon(d: Path):
-        """找插件根目录里的图标文件（logo.* 优先，其次 icon.*）。"""
         if d is None or not d.is_dir():
             return None
         try:
@@ -1610,7 +1311,6 @@ class PluginManager:
 
     @staticmethod
     def _find_doc(d: Path, kind: str):
-        """在插件根目录里按文件名找说明文档（大小写不敏感）。"""
         wanted = _DOC_NAMES.get(kind) or ()
         if d is None or not d.is_dir():
             return None
@@ -1625,7 +1325,6 @@ class PluginManager:
         return None
 
     def read_doc_text(self, pid: str, kind: str, limit: int = MAX_DOC_BYTES) -> dict:
-        """读插件自带的说明文档（readme / update），超长时截断。"""
         d = self.plugin_dir(pid)
         f = self._find_doc(d, kind) if d else None
         if f is None:
@@ -1648,7 +1347,6 @@ class PluginManager:
 
     # ------------------------------------------------------------ 插件私有设置
     def data_dir(self, pid: str) -> Path:
-        """插件自己的可写目录。插件只应在这里落盘，卸载时随之删除。"""
         d = self.plugin_dir(pid)
         if d is None:
             return None
@@ -1661,7 +1359,6 @@ class PluginManager:
         return None if d is None else d / SETTINGS_NAME
 
     def _settings_of(self, pid: str) -> dict:
-        """读取插件私有设置（磁盘上的草稿），损坏或缺失时返回空字典。"""
         f = self.plugin_settings_file(pid)
         if f is None or not f.is_file():
             return {}
@@ -1672,11 +1369,6 @@ class PluginManager:
         return raw if isinstance(raw, dict) else {}
 
     def commit_settings(self, pid: str = None) -> dict:
-        """把磁盘上的设置草稿提交为"已生效"，返回被提交的 {pid: settings}。
-
-        这是「保存并重载」的后半程：`plugin_settings()` / `theme_css()` 读的都是
-        生效快照，只有走这里才会看到磁盘上的新值。
-        """
         if pid:
             self._applied[pid] = self._settings_of(pid)
             self._settings_seeded.add(pid)
@@ -1689,31 +1381,17 @@ class PluginManager:
         return out
 
     def _applied_for(self, pid: str) -> dict:
-        """取某个插件的生效设置，必要时用磁盘内容补种一次。
-
-        补种只发生在"从来没有过这个插件的快照"时：程序启动后第一次读就靠它
-        拿到用户上次保存的设置。一旦写过草稿，快照里必然已经有旧值（见
-        `save_plugin_settings`），不会在这里被草稿偷偷覆盖。
-        """
         if pid not in self._applied:
             self._seed_applied(pid)
         return self._applied.get(pid) or {}
 
     def _seed_applied(self, pid: str) -> None:
-        """用磁盘上的内容初始化某个插件的生效快照（只做一次）。"""
         if pid in self._settings_seeded:
             return
         self._settings_seeded.add(pid)
         self._applied[pid] = self._settings_of(pid)
 
     def save_plugin_settings(self, pid: str, data) -> bool:
-        """整份替换插件私有设置（原子写，失败不破坏原文件）。
-
-        写的是"草稿"：不会影响 `plugin_settings()` 读到的生效值，
-        要等 `commit_settings()` 才生效。
-        """
-        # 先把快照补种成"写之前"的样子，否则第一次读会因为快照为空、
-        # 直接从磁盘补种，把刚写的草稿当成生效值（等于没有暂存）。
         self._seed_applied(pid)
         f = self.plugin_settings_file(pid)
         if f is None or not isinstance(data, dict):
@@ -1729,17 +1407,11 @@ class PluginManager:
             return False
 
     def plugin_settings(self, pid: str) -> dict:
-        """插件私有设置（已生效的那份）。插件未安装时返回空字典。"""
         if self.get(pid) is None:
             return {}
         return dict(self._applied_for(pid))
 
     def field_specs(self, pid: str) -> dict:
-        """插件声明的所有可调项：{key: 字段声明}。
-
-        features 与 skin.vars 合并到一起交给前端，于是"功能开关"和
-        "皮肤变量"能用同一套渲染逻辑，插件也只需要学一种写法。
-        """
         info = self.get(pid)
         if not info:
             return {}
@@ -1751,13 +1423,6 @@ class PluginManager:
         return specs
 
     def filter_settings(self, pid: str, data) -> dict:
-        """按插件声明的字段筛一遍要落盘的设置。
-
-        只保留声明过的键，并按声明类型收敛值；插件的 `data/` 目录里
-        已经有别的东西（背景图、用户传的文件）时也不受影响，因为写的是
-        独立的 settings.json。未声明的键一律丢弃 —— settings.json 是
-        给插件读的配置，不该变成任意 JSON 的暂存区。
-        """
         if not isinstance(data, dict):
             return {}
         specs = self.field_specs(pid)
@@ -1765,14 +1430,11 @@ class PluginManager:
         for key, value in data.items():
             field = specs.get(key)
             if field is None:
-                # 插件无权声明的键：只放行几个主程序认识的内建键
                 if key == "appearance_enabled":
                     out[key] = _as_bool(value)
                 elif key == "background" and isinstance(value, dict):
                     out[key] = value
                 elif key == "accent":
-                    # 主色由「外观」区块的取色器写入，_skin_vars_css 会翻成
-                    # --skin-accent。漏掉它就会「改完保存又变回清单里的默认色」。
                     color = _sanitize_color(str(value or ""))
                     if color:
                         out[key] = color
@@ -1783,13 +1445,6 @@ class PluginManager:
         return out
 
     def asset_file(self, pid: str, name: str, root_scope: bool = False):
-        """解析插件目录下的静态资源，返回 (Path, mime) 或 (None, "")。
-
-        默认只在插件私有 data 子目录里取（用户上传的图片等）；
-        `root_scope=True` 时改为在插件根目录取，供自带界面（panel.html）
-        及其 css/js 使用。两种作用域都要求解析后的真实路径仍落在插件
-        目录内，且后缀在 ASSET_EXTS 白名单里。
-        """
         d = self.plugin_dir(pid) if root_scope else self.data_dir(pid)
         if d is None or not name:
             return None, ""

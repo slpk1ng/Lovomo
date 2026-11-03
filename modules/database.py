@@ -1,7 +1,3 @@
-"""SQLite 数据库管理：交互统计、待办事项。
-
-零第三方依赖（标准库 sqlite3），写入轻量，不会明显阻塞事件循环。
-"""
 import sqlite3
 import threading
 import time
@@ -10,8 +6,6 @@ from pathlib import Path
 DB_FILENAME = "lovomo.db"
 LEGACY_DB_FILENAMES = ("ltvm.db",)
 
-# 表一旦建成就不再变更结构，后续新增的列只能靠 ALTER 补；
-# 老用户手里的库可能停留在任意旧版本，缺哪些列要到运行时才知道。
 _ADDED_COLUMNS = {
     "interactions": {
         "llm_ms": "REAL DEFAULT 0",
@@ -30,13 +24,10 @@ _ADDED_COLUMNS = {
         "remind_time": "REAL",
         "status": "TEXT DEFAULT 'pending'",
         "source": "TEXT DEFAULT 'auto'",
-        # 该条待办是否合成语音；NULL = 跟随配置项 todo_voice
         "use_voice": "INTEGER",
     },
     "llm_usage": {
-        # 消耗这些 token 的模型名；老记录没有就留空
         "model": "TEXT DEFAULT ''",
-        # 这次调用打向的是本地推理（1）还是云端服务（0）
         "local": "INTEGER DEFAULT 0",
     },
 }
@@ -49,7 +40,6 @@ _INDEXES = (
 
 
 class _ExecResult:
-    """写语句的结果快照（在持锁期间取出，避免锁外读游标拿到别的线程的值）。"""
 
     __slots__ = ("lastrowid", "rowcount")
 
@@ -69,7 +59,6 @@ class DatabaseManager:
         self._init_db()
 
     def _migrate_legacy_db(self):
-        """旧版本用的库文件名直接改名沿用，避免老用户统计/待办凭空清空。"""
         if self.db_path.exists():
             return
         for legacy in LEGACY_DB_FILENAMES:
@@ -88,8 +77,6 @@ class DatabaseManager:
             self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA journal_mode=WAL")
-            # 单连接被 bot 协程与 WebUI 线程共用：没有等待窗口时，
-            # 另一侧持写锁会立刻抛 "database is locked"
             self._conn.execute("PRAGMA busy_timeout=5000")
         return self._conn
 
@@ -100,12 +87,6 @@ class DatabaseManager:
             return set()
 
     def _ensure_columns_and_indexes(self, conn):
-        """按当前实际表结构补列、补索引。
-
-        不能把 ALTER / CREATE INDEX 塞进 executescript：那里任一条失败都会中断整段脚本，
-        而旧库（例如缺 status 列的 todos 表）会让创建索引直接抛错，程序就起不来了。
-        这里逐条执行并各自兜底，最坏情况是少一个索引，服务照常可用。
-        """
         for table, columns in _ADDED_COLUMNS.items():
             existing = self._columns(conn, table)
             if not existing:
@@ -172,11 +153,6 @@ class DatabaseManager:
             conn.commit()
 
     def execute(self, sql, params=()):
-        """执行写语句，返回 (lastrowid, rowcount)。
-
-        旧实现把游标返回给调用方，lastrowid 是在锁外读取的：另一个线程
-        在此期间再执行一条 INSERT，取到的就是别人的自增 ID。
-        """
         with self._lock:
             conn = self._connect()
             cur = conn.execute(sql, params)

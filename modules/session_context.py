@@ -1,12 +1,4 @@
 # -*- coding: utf-8 -*-
-"""会话/角色运行时上下文辅助与多角色连接路由。
-
-自 main.py 原样搬迁（refactor_plan 第 11 节）：活跃角色/回复上下文、白名单/
-防刷、角色情绪缓存、群成员昵称、会话目标解析与连接路由函数。管理器与容器
-槽位（memory_manager、global_config、sender、global_emotion_manager、
-_spam_log、_role_emotions_cache、_role_mimics_cache、_member_cache）在
-modules.app_context，本模块经 app_context 读写。
-"""
 import re
 import time
 from typing import List, Optional
@@ -17,14 +9,10 @@ from modules.llm_helpers import RoleContext
 from modules.emotion_voices import EmotionManager
 from modules.config_loader import CONNECTION_PLATFORMS, CONNECTION_PLATFORM_NAMES
 from modules.config_presets import DEFAULT_PROFILE, profile_loader
+from modules.model_library import PROVIDER_KINDS
 
 
 def list_known_sessions() -> list:
-    """列出所有留下过聊天记录的会话（定时任务/事件/待办选发送目标用）。
-
-    会话记忆文件名是 <角色>_<private|group>_<号码>.json，一个会话可能有多个
-    角色的记忆文件，所以按号码去重。返回的 session_id 是纯数字号码。
-    """
     sessions = []
     if app_context.memory_manager is None:
         return sessions
@@ -36,8 +24,6 @@ def list_known_sessions() -> list:
         rest = f.name.rsplit(".json", 1)[0].split(f"{stype}_", 1)[-1]
         if stype == "group":
             rest = rest.split("_")[0]
-        # 记忆文件名把 @ 与 . 净化成了下划线，这里要还原成运行时写法，
-        # 否则同一个微信会话会被当成两个（选目标时查不到、openid 还会被截断）
         rest = restore_session_id(rest)
         if not rest:
             continue
@@ -115,18 +101,6 @@ def get_active_ctx() -> RoleContext:
 
 def reply_ctx_of(role: dict, overrides: Optional[dict] = None,
                  session_id: str = "", client=None) -> RoleContext:
-    """回复用的上下文：带上当前通道的能力位，提示词据此只讲这条通道做得到的动作。
-
-    给了 session_id 就按这条会话该走的连接取能力位与配置（主动消息不在 for_session 里）；
-    给了 client 就按这条连接取（按角色生成、没有具体会话的主动内容）；
-    都没有就用当前正在发送的连接，配置同样跟随当前处理链路（消息链路里它已经是那条
-    连接绑定的配置）——否则接入方式绑了配置文件，回复却仍按主配置生成。
-    角色内容一律以这份配置里的同标识角色为准，
-    免得接入方式绑了配置文件、人设却还是主配置那份。
-
-    能力位必须查**类**属性：NapCat 客户端的 __getattr__ 会给任意属性返回函数，
-    hasattr / getattr 探不出真假。没声明的能力位一律按支持处理。
-    """
     sender = app_context.sender
     if session_id:
         config = config_for_session(session_id)
@@ -150,7 +124,6 @@ def reply_ctx_of(role: dict, overrides: Optional[dict] = None,
 
 
 def role_memory(role: dict) -> Optional[MemoryManager]:
-    """按角色拿一份记忆访问器（会话文件按角色建档，档案导入导出用）。"""
     if app_context.global_config is None or app_context.memory_manager is None:
         return None
     key = str((role or {}).get("character_key") or "").strip()
@@ -162,6 +135,34 @@ def role_memory(role: dict) -> Optional[MemoryManager]:
     return mem
 
 
+def memory_for_session(session_id: str = "", client=None) -> Optional[MemoryManager]:
+    """会话所在接入方式绑定了专属角色时，返回该角色的记忆管理器；否则回退全局管理器。"""
+    fallback = app_context.memory_manager
+    if fallback is None:
+        return None
+    sender = app_context.sender
+    channel_key = ""
+    if client is not None and sender is not None:
+        lookup = getattr(sender, "channel_key_of", None)
+        if callable(lookup):
+            channel_key = str(lookup(client) or "")
+    if not channel_key and session_id and sender is not None:
+        lookup = getattr(sender, "session_channel_key", None)
+        if callable(lookup):
+            channel_key = str(lookup(session_id) or "")
+    if not channel_key:
+        return fallback
+    role_key = connection_role_key(app_context.global_config, channel_key)
+    if not role_key:
+        return fallback
+    config = config_for_connection(channel_key) or app_context.global_config
+    role = (getattr(config, "roles", None) or {}).get(role_key)
+    if not role:
+        return fallback
+    mem = role_memory(role)
+    return mem or fallback
+
+
 def get_active_emotions() -> dict:
     return app_context.global_emotion_manager.emotions if app_context.global_emotion_manager else {}
 
@@ -171,7 +172,6 @@ def get_active_mimics() -> dict:
 
 
 def _load_role_voices(role: dict) -> None:
-    """按角色扫描参考音频目录，一次缓存语气与情绪模仿两套配置。"""
     key = (role or {}).get("character_key", "")
     if not key or app_context.global_emotion_manager is None or key in app_context._role_emotions_cache:
         return
@@ -186,30 +186,22 @@ def _load_role_voices(role: dict) -> None:
 
 
 def get_role_emotions(role: dict) -> dict:
-    """按角色获取情绪配置（各角色可有独立 ref_audio_root），带缓存。"""
     _load_role_voices(role)
     return app_context._role_emotions_cache.get((role or {}).get("character_key", "")) \
         or get_active_emotions()
 
 
 def get_role_mimics(role: dict) -> dict:
-    """按角色获取情绪模仿配置（各角色可有独立 emotion_mimic_root），带缓存。"""
     _load_role_voices(role)
     return app_context._role_mimics_cache.get((role or {}).get("character_key", "")) \
         or get_active_mimics()
 
 
 def parse_session_target(session_id: str):
-    """从会话ID解析发送目标：private_123 → (private,123)；group_456[_789] → (group,456)
-
-    会话ID可能来自记忆文件名（非 [A-Za-z0-9_-] 都被净化成 _）：先还原成运行时写法，
-    否则微信 openid 会被从 _ 处截断成半截，发给一个不存在的用户。
-    """
     text = restore_session_id(str(session_id))
     if text.startswith("private_"):
         return "private", text[len("private_"):]
     if text.startswith("group_"):
-        # 群号本身不含 _；group_456_789 是开了隔离会话，只取群号
         return "group", text[len("group_"):].split("_", 1)[0]
     return "private", text
 
@@ -254,7 +246,6 @@ def _in_quiet_hours() -> bool:
 
 
 def _parse_jitter_minutes(value) -> tuple:
-    """解析主动消息时间抖动区间（分钟）。支持单个数字或区间，分隔符：~ ～ 空格 , ， 、"""
     text = str(value or "").strip()
     if not text:
         return 0.0, 0.0
@@ -275,54 +266,146 @@ def _parse_jitter_minutes(value) -> tuple:
 
 
 def connections_of(config) -> List[dict]:
-    """接入方式清单（按 id 稳定排序，方便界面与日志对照）。"""
     raw = config.get("connections", []) or []
     out = [c for c in raw if isinstance(c, dict) and c.get("id")]
     return sorted(out, key=lambda c: str(c.get("id")))
 
 
 def connection_role_key(config, connection_id: str) -> str:
-    """绑定到这条接入方式上的角色（没有绑定返回空串）。
-
-    老配置里「每个角色一条独占连接」就是这么表达的，迁移后变成角色引用连接 id。
-    """
     target = str(connection_id or "")
     if not target:
         return ""
+    for conn in connections_of(config):
+        if str(conn.get("id")) != target:
+            continue
+        entry = _connection_role_entry(conn)
+        if entry:
+            return str(entry.get("character_key") or "")
+        break
     for key, role in (getattr(config, "roles", None) or {}).items():
         if str((role or {}).get("connection_id") or "") == target:
             return str(key)
     return ""
 
 
-def connection_config_profile(config, connection_id: str) -> str:
-    """这条接入方式绑定的配置文件名（没绑定返回空串，表示跟随主配置）。"""
+def _connection_of(config, connection_id: str):
     target = str(connection_id or "")
     if not target:
-        return ""
+        return None
     for conn in connections_of(config):
         if str(conn.get("id")) == target:
-            return str(conn.get("config_profile") or "").strip()
-    return ""
+            return conn
+    return None
+
+
+def connection_config_profile(config, connection_id: str) -> str:
+    conn = _connection_of(config, connection_id)
+    return str((conn or {}).get("config_profile") or "").strip()
+
+
+def _library():
+    manager = app_context.memory_manager
+    data_path = getattr(manager, "data_path", None) if manager is not None else None
+    if not data_path:
+        return None
+    try:
+        from .model_library import load_library_cached
+        return load_library_cached(data_path)
+    except Exception:
+        return None
+
+
+def _connection_role_entry(conn) -> dict:
+    lib = _library()
+    if not lib:
+        return {}
+    try:
+        from .model_library import connection_role_entry
+        return connection_role_entry(conn or {}, lib)
+    except Exception:
+        return {}
+
+
+class ConnectionConfigView:
+
+    def __init__(self, base, overrides: dict):
+        object.__setattr__(self, "_base", base)
+        object.__setattr__(self, "_overrides", dict(overrides or {}))
+        object.__setattr__(self, "_data", None)
+        object.__setattr__(self, "_parsed", None)
+
+    def _merged(self) -> dict:
+        data = object.__getattribute__(self, "_data")
+        if data is None:
+            base = object.__getattribute__(self, "_base")
+            data = dict(getattr(base, "config", {}) or {})
+            data.update(object.__getattribute__(self, "_overrides"))
+            object.__setattr__(self, "_data", data)
+        return data
+
+    def _roles(self):
+        cached = object.__getattribute__(self, "_parsed")
+        if cached is None:
+            from .config_loader import parse_roles_of
+            cached = parse_roles_of(self._merged())
+            object.__setattr__(self, "_parsed", cached)
+        return cached
+
+    @property
+    def config(self) -> dict:
+        return self._merged()
+
+    def get(self, key: str, default=None):
+        data = self._merged()
+        if "." in key:
+            value = data
+            for part in key.split("."):
+                if isinstance(value, dict) and part in value:
+                    value = value[part]
+                else:
+                    return default
+            return value
+        return data.get(key, default)
+
+    @property
+    def roles(self):
+        return self._roles()[1]
+
+    @property
+    def active_character(self):
+        return self._roles()[0]
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_base"), name)
 
 
 def config_for_connection(connection_id: str):
-    """这条接入方式该用的配置访问器；没绑配置文件或读不出来时用主配置。"""
     base = app_context.global_config
     if base is None:
         return None
-    name = connection_config_profile(base, connection_id)
-    if not name or name == DEFAULT_PROFILE or app_context.memory_manager is None:
-        return base
-    try:
-        return profile_loader(app_context.memory_manager.data_path, name) or base
-    except Exception as e:
-        print(f"[配置文件] {name} 读不出来，这条接入方式改用主配置：{e}")
-        return base
+    conn = _connection_of(base, connection_id)
+    name = str((conn or {}).get("config_profile") or "").strip()
+    target = base
+    if name and name != DEFAULT_PROFILE and app_context.memory_manager is not None:
+        try:
+            target = profile_loader(app_context.memory_manager.data_path, name) or base
+        except Exception as e:
+            print(f"[配置文件] {name} 读不出来，这条接入方式改用主配置：{e}")
+            target = base
+    overrides = {}
+    lib = _library()
+    if conn and lib:
+        try:
+            from .model_library import connection_overrides
+            overrides = connection_overrides(conn, lib)
+        except Exception:
+            overrides = {}
+    if not overrides:
+        return target
+    return ConnectionConfigView(target, overrides)
 
 
 def config_for_client(client):
-    """这条客户端对应的接入方式该用的配置。"""
     sender = app_context.sender
     lookup = getattr(sender, "channel_key_of", None) if sender is not None else None
     if client is None or not callable(lookup):
@@ -331,7 +414,6 @@ def config_for_client(client):
 
 
 def config_for_session(session_id: str):
-    """这条会话走的接入方式该用的配置（主动消息也按它选配置）。"""
     sender = app_context.sender
     lookup = getattr(sender, "session_channel_key", None) if sender is not None else None
     key = lookup(session_id) if (callable(lookup) and session_id) else ""
@@ -339,7 +421,6 @@ def config_for_session(session_id: str):
 
 
 def role_connection_snapshot(config) -> tuple:
-    """接入方式快照，用来判断配置保存后是否需要重连。"""
     out = []
     for conn in connections_of(config):
         out.append((str(conn.get("id")), str(conn.get("platform") or "napcat"),
@@ -348,14 +429,14 @@ def role_connection_snapshot(config) -> tuple:
                     str(conn.get("app_id") or ""), str(conn.get("app_secret") or ""),
                     str(conn.get("bot_id") or ""),
                     str(conn.get("config_profile") or ""),
-                    connection_role_key(config, conn.get("id"))))
+                    connection_role_key(config, conn.get("id")),
+                    str(conn.get("role_id") or ""),
+                    tuple(str(conn.get(f"{k}_provider") or "") for k in PROVIDER_KINDS)))
     return tuple(sorted(out))
 
 
 def build_connection_profiles(config) -> List[dict]:
-    """要建立的连接清单：只取启用的接入方式，按平台交给对应的适配器。"""
     out = []
-    default_taken = False
     for conn in connections_of(config):
         if not conn.get("enabled", True):
             continue
@@ -363,26 +444,24 @@ def build_connection_profiles(config) -> List[dict]:
         if platform not in CONNECTION_PLATFORMS:
             continue
         role_key = connection_role_key(config, conn.get("id"))
-        # 没绑角色的第一条作为默认发送连接（其余只在收到消息时用）
-        is_default = not role_key and not default_taken
-        if is_default:
-            default_taken = True
         profile = {"key": str(conn.get("id")),
                    "label": str(conn.get("name")
                                 or CONNECTION_PLATFORM_NAMES.get(platform, platform)),
                    "platform": platform,
-                   "role_key": role_key, "default": is_default,
+                   "role_key": role_key, "default": False,
                    "connection": dict(conn)}
         if platform == "napcat":
             profile["ws_url"] = str(conn.get("ws_url") or "ws://127.0.0.1:3001")
             profile["token"] = str(conn.get("token") or "")
         out.append(profile)
+    pick = next((p for p in out if not p["role_key"]), out[0] if out else None)
+    if pick is not None:
+        pick["default"] = True
     return out
 
 
 def resolve_target_roles(user_text: str, is_private: bool,
                          source_role_key: str = "") -> List[dict]:
-    """多角色路由：账号绑了角色就用它；否则群聊按消息中出现的角色名路由。"""
     config = app_context.active_config()
     if config is None:
         return []

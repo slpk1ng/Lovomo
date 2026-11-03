@@ -1,11 +1,4 @@
 # -*- coding: utf-8 -*-
-"""主动消息状态簇的落盘/加载/播种/遗忘。
-
-自 main.py 原样搬迁（refactor_plan 第 10 节）：只含函数；7 个主动消息状态
-全局本体（last_interaction、last_user_activity、proactive_counts、
-proactive_pending、proactive_awaiting、last_proactive_sent、
-_proactive_state_date）在 modules.app_context，本模块经 app_context 读写。
-"""
 import json
 import time
 from pathlib import Path
@@ -21,11 +14,6 @@ def _proactive_state_path() -> Path:
 
 
 def load_proactive_state():
-    """载入主动消息状态（当日计数 + 各会话用户最后发言时间）。
-
-    历史 bug：last_interaction 只在"收到消息"时写入内存，程序重启后为空，
-    导致重启后闲置会话永远不会被主动消息检查命中 —— 表现就是"从来不主动发消息"。
-    """
     app_context._proactive_state_date = time.strftime("%Y-%m-%d")
     path = _proactive_state_path()
     if not path.exists():
@@ -35,10 +23,8 @@ def load_proactive_state():
     except Exception as e:
         print(f"读取主动消息状态失败（忽略，重新统计）: {e}")
         return
-    # "等待用户回复"标记跨天仍然有效（用户没回复就一直没有主动资格），先于当日计数恢复
     for key in (data.get("awaiting") or []):
         app_context.proactive_awaiting.add(restore_session_id(str(key)))
-    # 已排定的主动消息发送时刻一并恢复（过期的丢弃，由闲置检查重新排期）
     for key, target in merge_restored_keys(data.get("pending") or {}).items():
         try:
             target_ts = float(target)
@@ -46,8 +32,6 @@ def load_proactive_state():
             continue
         if str(data.get("date", "")) == app_context._proactive_state_date and target_ts > time.time():
             app_context.proactive_pending[str(key)] = target_ts
-    # 用户最后发言时间与上次主动发送时间存的都是绝对时间戳，不是"当日"数据：
-    # 跨天也要恢复，否则重启后闲置计时归零，会立刻重复主动搭话
     def _restore_ts(raw, target: dict):
         if not isinstance(raw, dict):
             return
@@ -64,7 +48,6 @@ def load_proactive_state():
         return
     counts = data.get("counts", {})
     if isinstance(counts, dict):
-        # 键是「日期|会话ID」，还原后缀不影响前面的日期
         for k, v in merge_restored_keys(counts).items():
             if str(k).startswith(app_context._proactive_state_date):
                 try:
@@ -78,11 +61,9 @@ def load_proactive_state():
 
 
 def save_proactive_state():
-    """原子写盘，避免程序重启后当日上限失效、闲置时间丢失。"""
     if app_context.memory_manager is None:
         return
     try:
-        # 实际生效的日期必须先取出来：日期为空时 startswith("") 恒真，
         # 会把往日的计数一并算到当天头上
         today = app_context._proactive_state_date or time.strftime("%Y-%m-%d")
         payload = {
@@ -101,7 +82,6 @@ def save_proactive_state():
 
 
 def _session_last_user_ts(session_id: str) -> float:
-    """从会话历史里取用户最后一次发言时间（重启后恢复闲置计时的依据）。"""
     try:
         data = app_context.memory_manager.load_session_data(session_id) if app_context.memory_manager else {}
     except Exception:
@@ -119,7 +99,6 @@ def _session_last_user_ts(session_id: str) -> float:
 
 
 def seed_proactive_sessions():
-    """启动时把所有历史会话纳入主动消息候选，避免"重启后再也不主动说话"。"""
     if app_context.memory_manager is None:
         return
     seeded = 0
@@ -142,12 +121,6 @@ def seed_proactive_sessions():
 
 
 def session_memory_exists(session_id: str) -> bool:
-    """该会话的记忆文件是否还在。
-
-    会话被删除后，闲置计时与主动消息计数仍留在内存里，到点就会继续往
-    已删除的对话发主动消息；发送前必须确认会话本身还存在。
-    记忆实现没有 get_memory_file 接口时无法判定，按存在处理。
-    """
     if app_context.memory_manager is None:
         return False
     getter = getattr(app_context.memory_manager, "get_memory_file", None)
@@ -161,7 +134,6 @@ def session_memory_exists(session_id: str) -> bool:
 
 
 def forget_proactive_session(session_id: str):
-    """会话被删除时一并清掉它的主动消息状态，避免删完还继续被搭话。"""
     forgotten = (session_id in app_context.last_user_activity or session_id in app_context.last_proactive_sent
                  or session_id in app_context.proactive_pending or session_id in app_context.proactive_awaiting)
     app_context.last_user_activity.pop(session_id, None)

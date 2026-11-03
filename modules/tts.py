@@ -1,4 +1,3 @@
-"""TTS 合成与音频处理工具（自 main.py 迁出，供主流程与主动消息共用）。"""
 import asyncio
 import random
 import re
@@ -26,7 +25,6 @@ def _level_setting(config, key: str, fallback: float) -> float:
 
 
 def _tts_reference(path, config, data_path: Path) -> str:
-    """送进 TTS 的参考音频先统一电平（单声道 + 裁静音 + 响度归一），结果缓存复用。"""
     if not bool(config.get("tts_ref_normalize", True)):
         return str(path)
     try:
@@ -44,7 +42,6 @@ def _tts_reference(path, config, data_path: Path) -> str:
 
 
 def _normalize_tts_output(path, config) -> None:
-    """把这一段语音的响度对齐到统一目标，避免段与段之间忽大忽小。"""
     if not bool(config.get("tts_loudness_normalize", True)):
         return
     try:
@@ -95,11 +92,6 @@ def resolve_tts_path(input_path: str) -> str:
     return target_dir
 
 
-# 送进 TTS 的字符白名单。CJK / 假名 / 谚文 / 全角标点 / 半角可打印字符。
-# 注意：这里的白名单**不再决定"哪些字可以念"**，只用于兜底剔除
-# 真正无法合成的字符（表情符号、控制字符等）。
-# 历史事故：旧白名单缺少 …—―♪♡ 等符号，导致它们被静默删除，
-# 表现为"语音比 LLM 实际发送的文本少了某个词/某句话"。
 _TTS_ALLOWED_RE = re.compile(
     r'[\u3040-\u30FF\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF'
     r'\uAC00-\uD7AF\u3000-\u303F\uFF01-\uFF5E'
@@ -112,11 +104,9 @@ _TTS_ALLOWED_RE = re.compile(
     r'a-zA-Z0-9 \n\r\t.,!?;:()\[\]{}<>@#$%^&*+=|\\/~`\'"\-_]+'
 )
 
-# 1) 送 TTS 前的字符归一化：把"能表达语气但朗读器不认"的符号换成等效写法，
-#    而不是直接删掉。凡是有语义/语气意义的标点都保留其停顿含义。
 _TTS_CHAR_MAP = {
     "\u301c": "\uff5e",   # 〜 → ～
-    "\u2015": "\uff5e",   # ― 水平线 → ～（长音，比顿号更自然）
+    "\u2015": "\uff5e",
     "\u2014": "\uff5e",   # — 破折号 → ～
     "\u2013": "\uff5e",   # – 连接号 → ～
     "\u2012": "\uff5e",
@@ -125,7 +115,7 @@ _TTS_CHAR_MAP = {
     "\u00b7": "\u3001",   # · → 、
     "\u2027": "\u3001",
     "\u2022": "\u3001",   # • → 、
-    "\u266a": "",         # ♪ 哼唱记号：无对应的朗读音，去掉不影响内容
+    "\u266a": "",
     "\u266b": "",
     "\u2665": "",         # ♥ 纯装饰，删掉不影响内容
     "\u2661": "",
@@ -133,28 +123,22 @@ _TTS_CHAR_MAP = {
     "\uff5e": "\uff5e",
 }
 
-# 2) TTS 参考音频尾部会拼接，行首标点容易被误读；只剥离行首的纯标点，
 #    保留「『（ 等开引号/开括号。
 _LEADING_JUNK_RE = re.compile(r'^(?:[\s\u3000。，、,.!?！？…～~；;：:\-—―_*#]+)')
 _TRAILING_WS_RE = re.compile(r'[\s\u3000]+$')
 
-# 2.1) 非台词内容：括号里的动作、表情、场景、演出（如 (笑)、[旁白]）与颜文字
-#      都不该被念出来。只影响语音，消息文本原样保留。
 _NONDIALOGUE_BRACKETS = (("(", ")"), ("（", "）"), ("[", "]"), ("［", "］"),
                          ("【", "】"), ("{", "}"), ("｛", "｝"),
                          ("〈", "〉"), ("〔", "〕"), ("〖", "〗"))
 _BRACKET_SEG_RE = re.compile("|".join(
     re.escape(open_ch) + "[^" + re.escape(open_ch + close_ch) + "]*" + re.escape(close_ch)
     for open_ch, close_ch in _NONDIALOGUE_BRACKETS))
-# 颜文字：整段由"表情符号"组成才判为颜文字；只有含强特征符号（ω ∀ ▽ □ ☆ 之类）才真的剔除，
-# 免得把「——」「～～」这类正常停顿标点也吃掉。
 _FACE_STRONG = "＾^´｀`ω・∀≧≦∇▽△▲°□Дд〇☆★♪♥♡⌒゜〃ゝゞ‿◕◡◠︶︵╯╰┻┳︻︼"
 _FACE_WEAK = "><;:：；'\"_\\|/／＼~～-—＝=＋+＊*"
 _KAOMOJI_SEG_RE = re.compile("[%s%s]{2,}" % (re.escape(_FACE_STRONG), re.escape(_FACE_WEAK)))
 
 
 def strip_non_dialogue_enabled(config) -> bool:
-    """是否把动作/表情/场景/颜文字这类非台词内容剔除后再合成（默认开启）。"""
     if config is None:
         return True
     raw = config.get("tts_strip_non_dialogue", True)
@@ -164,7 +148,6 @@ def strip_non_dialogue_enabled(config) -> bool:
 
 
 def strip_non_dialogue_text(text: str, log: bool = True) -> str:
-    """剔除非台词内容（动作、表情、场景、演出、颜文字），只留要念的台词。"""
     original = str(text or "")
     if not original:
         return original
@@ -189,16 +172,11 @@ def strip_non_dialogue_text(text: str, log: bool = True) -> str:
         _safe_print(f"TTS 移除非台词内容（动作/表情/场景/颜文字，仅语音）: {removed}")
     return out
 
-# 3) 语气拖音标记：全角波浪线（含归一化后的 — ― – 〜）与片假名长音符「ー」。
-#    连续 3 个以上一律压到 2 个。模型写「————————」时上面那条映射会把它变成
-#    十几个 ～ 送进合成，引擎会把这一串当成一个超长元音，直接进入
-#    "同一个音节无限重复"的失控状态（表现为一句台词末尾拖着几十秒的「に」「呜」）。
 _TONE_MARK_KEEP = 2
 _TONE_MARK_RUN_RE = re.compile(r'([\uff5e\u301c\u30fc])\1{2,}')
 
 
 def _collapse_tone_marks(text: str, log: bool = True) -> str:
-    """把连续的拖音标记压到 _TONE_MARK_KEEP 个（只缩短，不删内容）。"""
     collapsed = _TONE_MARK_RUN_RE.sub(
         lambda m: m.group(1) * _TONE_MARK_KEEP, text)
     if collapsed != text and log:
@@ -209,7 +187,6 @@ def _collapse_tone_marks(text: str, log: bool = True) -> str:
 
 
 def _normalize_tts_chars(text: str, extra_map: dict = None) -> str:
-    """按映射表归一化字符；extra_map 来自配置，可覆盖/扩展默认映射。"""
     mapping = _TTS_CHAR_MAP if not extra_map else {**_TTS_CHAR_MAP, **extra_map}
     out = []
     for ch in str(text or ""):
@@ -218,11 +195,6 @@ def _normalize_tts_chars(text: str, extra_map: dict = None) -> str:
 
 
 def _configured_char_map(config) -> dict:
-    """从配置读取自定义字符映射（格式：字符=替换；每行一条）。
-
-    默认映射只是"常见符号"的兜底，用户可以在 WebUI 里按自己的 TTS 服务
-    调整（例如把某个符号改成空格），不必改代码。
-    """
     raw = config.get("tts_char_map", None) if config is not None else None
     if raw is None:
         return {}
@@ -244,8 +216,6 @@ def _configured_char_map(config) -> dict:
 
 
 def _safe_print(message: str):
-    """控制台可能是 GBK（Windows 中文默认）：打印特殊符号可能抛 UnicodeEncodeError。
-    日志绝不能因为编码问题打断 TTS 流程。"""
     try:
         print(message)
     except UnicodeEncodeError:
@@ -259,22 +229,12 @@ def _safe_print(message: str):
         pass
 
 
-# 送进 TTS 的台词里的 URL 一律剔除：合成引擎会把 "https://xxx" 逐字符念出来
-# （ASCII 全在字符白名单里，常规清洗拦不住）。链接只保留在聊天展示文本里。
-# 采用标准 URL 字符集：?id=xx、%E4 这类查询串/转义都是链接的一部分；
-# 中文字符不在集合里，所以"链接在这里https://x.com/a。下一句"会在句号/汉字处自然截断，
-# 绝不会吞掉链接后面的中文。
 _TTS_URL_RE = re.compile(
     r'(?:https?://|www\.)[A-Za-z0-9\-._~:/?#@!$&*+,;=%]+',
     re.I)
 
 
 def strip_urls_for_tts(text: str) -> str:
-    """剔除台词里的 URL，返回供合成的纯文本；纯链接的台词会变成空串（调用方跳过合成）。
-
-    事故背景：LLM 回复里带链接时，整段文本被送进 TTS，合成出
-    "h t t p s 冒号 斜杠…"式的乱码语音。链接本身只该出现在聊天展示文本里。
-    """
     raw = str(text or "")
     if "://" not in raw and "www." not in raw.lower():
         return raw
@@ -286,7 +246,6 @@ def strip_urls_for_tts(text: str) -> str:
 
 
 def _mapping_changes(original: str, extra_map: dict = None) -> list:
-    """列出会被替换/删除的字符及替换结果（仅用于日志）。"""
     mapping = _TTS_CHAR_MAP if not extra_map else {**_TTS_CHAR_MAP, **extra_map}
     changes = []
     for ch in str(original or ""):
@@ -299,23 +258,11 @@ def _mapping_changes(original: str, extra_map: dict = None) -> list:
 
 
 def _content_chars(text: str) -> str:
-    """只保留"能念出来的内容字"，用于判断清洗前后是否丢了内容。"""
     return re.sub(r'[\W_]+', '', str(text or ""), flags=re.UNICODE)
 
 
 def _log_tts_payload(config, original: str, clean_text: str, emotion: str, ref_path: str,
                      cloud: bool = False, spoken_source: str = None):
-    """打印"LLM 交过来的完整内容 → 实际送去合成的文本"，便于排查少词问题。
-
-    只要合成文本长度与原文不同（含只剩装饰符号被去掉的情况），就打印两边完整内容，
-    这样"语音少词"的排查可以只看日志定位；内容与长度都没变时不刷屏。
-
-    spoken_source 是"按规则主动剔掉的动作/表情/场景之后的文本"：有它时，
-    内容字比对以它为基准，否则正常的非台词剔除会被误报成"清洗丢了内容"。
-
-    cloud=True 时不打印参考音频、文本语言、切分、语速这几项：它们是 GPT-SoVITS 的
-    请求参数，云端请求里没有，打出来会让人误以为它们被送进了云端接口。
-    """
     debug = str((config.get("tts_debug_log", "") if config is not None else "") or "").lower() \
         in ("true", "1", "yes", "on")
     changed = clean_text != original
@@ -346,12 +293,6 @@ def _log_tts_payload(config, original: str, clean_text: str, emotion: str, ref_p
 
 def _sanitize_tts_text(text: str, emotion: str = "", log: bool = True,
                        extra_map: dict = None) -> str:
-    """清洗待合成文本：只做等价替换与无害剔除，绝不静默丢内容。
-
-    凡是"能表达语气但朗读器不认"的符号都做等价替换（…—―♪ 等），
-    而不是直接删除；只有真正无法合成的字符（emoji 等）才会被剔除，
-    且一定打印日志，便于排查"语音比模型输出少了内容"这类问题。
-    """
     original = str(text or "")
     mapped = _normalize_tts_chars(original, extra_map)
     if mapped != original and log:
@@ -371,19 +312,11 @@ def _sanitize_tts_text(text: str, emotion: str = "", log: bool = True,
     return _TRAILING_WS_RE.sub("", cleaned)
 
 
-# 句子终止标点（句号/问号/叹号/分号/半角对应符号）。
-# 注意不把「…」「——」当句末：它们只是句中停顿，按它们切会切出"…"这种碎片片段。
 _TTS_SENT_END_RE = re.compile(r'[。？！；?!;]')
 _TTS_FRAGMENT_RE = re.compile(r'^[\s\u3000。，、,.!?！？…～~；;：:\-—―_*#]*$')
 
 
 def split_tts_chunks(text: str, max_chars: int = 120, config=None) -> list:
-    """把一段文本切成适合逐句 TTS 的片段。
-
-    - 只在真正的句末标点（。？！；等）处切分，保证每句话完整；
-    - 超长无标点的连续文本按 max_chars 硬切，避免 TTS 自己截断；
-    - 纯标点碎片（如省略号被切开剩下的 "…"）会被丢弃，不单独合成。
-    """
     extra_map = _configured_char_map(config)
     text = strip_urls_for_tts(text)
     if strip_non_dialogue_enabled(config):
@@ -411,10 +344,8 @@ def split_tts_chunks(text: str, max_chars: int = 120, config=None) -> list:
             out.append(head)
         if part:
             out.append(part)
-    # 逐片再清洗一次：切句后新出现的行首标点（如「。～～でも」）需要剥离
     kept = [_sanitize_tts_text(p, log=False, extra_map=extra_map) for p in out]
     kept = [p for p in kept if p and not _TTS_FRAGMENT_RE.match(p)]
-    # 全是标点碎片时退回原文本，至少保证"发出声音"而不是静默丢弃
     return kept or [text]
 
 
@@ -427,7 +358,6 @@ _LANG_PATTERNS = (
 
 
 def detect_text_lang(text: str, default: str = "ja") -> str:
-    """按文本实际使用的文字判断合成语言（假名优先、其次谚文、汉字、拉丁）。"""
     t = str(text or "")
     counts = {code: len(pattern.findall(t)) for code, pattern in _LANG_PATTERNS}
     total = sum(counts.values())
@@ -447,9 +377,6 @@ def _readable_chars(text: str) -> int:
     return len(re.sub(r"[\W_]+", "", str(text or ""), flags=re.UNICODE))
 
 
-# 时长下限的绝对下限：判断依据是"有效人声"而不是文件总时长，所以这里要放得很小 ——
-# 「はあ？！」这种两三个字的短句本来就只说得出一瞬间的人声（实测约 0.26 秒），
-# 门槛压到 0.3 秒会把正常短句误判成过短，白白丢掉语音。
 _MIN_VOICED_FLOOR = 0.12
 
 
@@ -463,17 +390,12 @@ def _min_expected_seconds(text: str, config) -> float:
     return max(_MIN_VOICED_FLOOR, _readable_chars(text) * per_char)
 
 
-# 时长上限的绝对下限：短句（大量停顿标点、结巴式重复）本身字数少，
-# 只按字数算上限会把正常音频误判成失控。
 _MAX_SECONDS_FLOOR = 6.0
 
-# 整句合成超长后最多再换一次切分方式：十来字的单句换 cut0/cut2 几乎没有区别，
-# 再拿整句反复试只会继续合成出拖腔，之后一律改走小节合成
 _TOO_LONG_FULL_ATTEMPTS = 2
 
 
 def _max_expected_seconds(text: str, config) -> float:
-    """这条台词的合成时长上限；0 表示不做上限判断。"""
     try:
         per_char = float(config.get("tts_max_seconds_per_char", 0.6) or 0)
     except (TypeError, ValueError, AttributeError):
@@ -499,7 +421,6 @@ _AUDIO_CONTAINER_MAGIC = (b"RIFF", b"OggS", b"fLaC", b"ID3", b"FORM", b"ADIF")
 
 
 def _looks_like_audio(path) -> bool:
-    """文件头是已知音频容器时才认，避免把服务端报错页当语音发给发送层。"""
     try:
         with open(path, "rb") as fh:
             head = fh.read(12)
@@ -513,13 +434,6 @@ def _looks_like_audio(path) -> bool:
 
 
 def _audio_too_long(path, text: str, config) -> bool:
-    """合成时长远超台词本身的合理上限。
-
-    事故背景：自回归 TTS 偶发进入"同一个音节无限重复"的失控状态，
-    一句 30 多字的台词能合成出 27 秒的拖腔（末尾全是「に」「呜」）。
-    音频本身是合法 wav，只能靠时长与台词的量级关系认出来 —— 这种结果
-    必须丢弃并换切分方式重试，绝不能当成功语音发出去。
-    """
     limit = _max_expected_seconds(text, config)
     if limit <= 0:
         return False
@@ -532,12 +446,6 @@ def _audio_too_long(path, text: str, config) -> bool:
 
 
 def _voiced_seconds(path) -> float:
-    """这段音频里真正有人声的秒数（掐掉数字静音）。
-
-    只看文件总时长会把「只念了开头、后面全是静音」当成合格：TTS 偶发提前结束
-    推理时就是这样，听感上只念了两三个音，时长却有整句那么长。
-    取不到（非 16bit / 读失败 / 整段静音）时返回 0，调用方退回按总时长判断。
-    """
     try:
         with wave.open(str(path), "rb") as wf:
             rate = wf.getframerate()
@@ -580,19 +488,6 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
                               data_path: Path, stats=None,
                               mimic: str = "", mimics: dict = None,
                               _piece_mode: bool = False) -> Optional[Path]:
-    """合成一句话语音，返回 wav 路径；纯标点/空句子返回 None。
-
-    参数顺序：config, text(要念的台词), emotion(情绪名), emotions(情绪表)。
-    语言按台词实际使用的文字判定（tts_auto_lang），避免拿中文台词配日文语言
-    模型合成出无法辨认的语音；合成结果过短时按备用切分方式重试，仍然拿不到
-    合格音频就改成逐小节合成再合并（_piece_mode 的内部递归），
-    全都拿不到就返回 None（调用方只发文本），绝不把半截语音发出去。
-
-    tts_backend=cloud 时整句交给 modules.tts_cloud（云端不看参考音频与情绪表）。
-
-    mimic 命中 mimics 时启用情绪模仿：情绪音频当主参考决定说话情绪，
-    语气音频当辅助参考（按 emotion_mimic_voice_weight 重复加权）决定音色。
-    """
     if isinstance(text, (dict, list)) or isinstance(emotion, (dict, list)):
         _safe_print("TTS arg order looks swapped (text/emotion); auto-corrected.")
         text, emotion = emotion, text
@@ -608,7 +503,6 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
         text, emotion = emotion, text
     from .tts_cloud import is_cloud_tts, synthesize_cloud
     if is_cloud_tts(config):
-        # 云端不需要参考音频，情绪只用来查音色映射，因此不校验它是否在情绪表里
         return await synthesize_cloud(config, text, emotion, data_path, stats=stats)
     default_voice = str(config.get("default_voice", "") or "").strip()
     if default_voice not in emotions:
@@ -633,8 +527,6 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
     aux_paths = []
     mimic_data = (mimics or {}).get(str(mimic or "")) if mimic else None
     if mimic_data:
-        # 情绪音频当主参考（决定说话情绪），语气音频当辅助参考并重复加权：
-        # GPT-SoVITS 对多参考音频的音色取平均，重复次数决定语气音色的占比
         try:
             weight = max(1, int(config.get("emotion_mimic_voice_weight", 4) or 1))
         except (TypeError, ValueError):
@@ -642,11 +534,9 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
         aux_paths = [ref_path] * weight
         mimic_key = str(mimic)
         candidates = [p for p in (mimic_data.get("candidates") or []) if p]
-        # 一个情绪文件夹里可能放了多段情绪音频，每次随机挑一段
         ref_path = random.choice(candidates) if len(candidates) > 1 else (
             candidates[0] if candidates else mimic_data["ref_path"])
         prompt_text = mimic_data["prompt_text"]
-        # 每段音频可以有自己的识别文字，用它才能对上所选音频的语调
         sidecar = (mimic_data.get("candidate_texts") or {}).get(
             str(ref_path).replace("\\", "/"))
         if sidecar:
@@ -681,21 +571,16 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
     timeout = config.get("timeout_seconds", 120)
     split_default = str(config.get("text_split_method", "cut1") or "cut1")
     if _piece_mode:
-        # 小节本身只有十来个字，切分方式几乎没有区别：只用默认那种，
-        # 免得一段失败的小节又反复重试，把整句的耗时放大好几倍
         variants = [split_default]
     else:
         variants = ([split_default] + [v for v in ("cut5", "cut0", "cut2", "cut3")
                                        if v != split_default])[:3]
     attempts = [(variant, True) for variant in variants]
     if mimic_key:
-        # 模仿用的参考音频不合规（如时长不在 3~10 秒）时退回纯语气，别让整句丢掉语音
         attempts.append((split_default, False))
     best_path = None
     best_duration = 0.0
     raw_path = None
-    # 整句合成超长的次数：换一次切分方式仍超长就说明整句这条路走不通了，
-    # 后面统一改按小节合成，不再拿整句反复试
     too_long_attempts = 0
     retry_delay = 1.0
     start = time.time()
@@ -774,8 +659,6 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
                         temp_path.unlink(missing_ok=True)
                     print("TTS 返回的内容不是可解析的音频，换一种切分方式重试。")
                 elif too_long:
-                    # 偏长的一律不进 best_path：宁可这句不发语音，
-                    # 也不能把几十秒的拖腔当成"最长的一段"挑出来发出去
                     temp_path.unlink(missing_ok=True)
                     too_long_attempts += 1
                     print("本次合成时长超限已作废，换一种切分方式重试。")
@@ -799,7 +682,6 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
             print(f"TTS 合成失败: {resp.status_code} - {str(resp.text)[:120]} | 文本={clean_text[:60]}")
             break
     if too_long_attempts and best_path is None and not _piece_mode:
-        # 整句合成超长：不再拿整句反复试，改切小节合成 —— 小节短，念完就停，
         # 最可能拿到正常时长的语音
         piece_path = await _synthesize_by_pieces(
             config, clean_text, emotion, emotions, data_path,
@@ -811,10 +693,6 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
                 stats.record_tts((time.time() - start) * 1000)
             return piece_path
     if best_path is not None:
-        # 每种切分方式都短于台词该有的长度：服务端这次多半只念了个开头
-        # （听感上就是"只说了两三个音"）。改成一小节一小节地合成再拼起来，
-        # 每节都要达标；拼不齐就整句不发语音 —— 宁可只发文本，也不能让主人
-        # 听到半句话。内部递归用 _piece_mode 标记，避免来回切分。
         if not _piece_mode:
             piece_path = await _synthesize_by_pieces(
                 config, clean_text, emotion, emotions, data_path,
@@ -842,22 +720,13 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
     return None
 
 
-# 整句合不出来时按小节重试：每节字数。自回归 TTS 偶发"只念开头就结束"，
-# 整句重试往往一直失败，切成十来字的小节更可能一次念完。
 _PIECE_MAX_CHARS = 12
-# 小节数量上限：太长的一句切太多节会连着发很多次请求，得不偿失
 _PIECE_MAX_PIECES = 6
 
 
 async def _synthesize_by_pieces(config, text: str, emotion: str, emotions: dict,
                                 data_path: Path, mimic: str = "",
                                 mimics: dict = None) -> Optional[Path]:
-    """把整句切成小节逐段合成再合并，返回合并后的 wav（任何一节不合格就返回 None）。
-
-    每一节都走一次完整的 synthesize_sentence（含它自己的时长校验），所以
-    "拼出来的整句"不会夹着半截小节；拿不到合格小节时整体放弃，
-    由调用方降级为只发文本。
-    """
     pieces = split_tts_chunks(text, max_chars=max(
         _PIECE_MAX_CHARS,
         (len(text) + _PIECE_MAX_PIECES - 1) // _PIECE_MAX_PIECES), config=config)
@@ -888,13 +757,6 @@ _STAMP_LOCK = threading.Lock()
 
 
 def _unique_stamp() -> int:
-    """毫秒时间戳 + 自增序号，保证同一毫秒内多次合并也不会覆盖同名文件。
-
-    事故背景：合并与合成都用 `int(time.time()*1000)` 命名，同一毫秒内连续两次
-    调用会拿到同样的文件名，后一次直接覆盖前一次 —— 表现为"刚合成的语音内容
-    对不上/被截断"。加一个进程内自增序号即可根治；序号是读-改-写，
-    多线程（合成线程与缓存清理线程）并发时会读到同一个值，因此必须持锁。
-    """
     global _STAMP_SEQ
     with _STAMP_LOCK:
         now = int(time.time() * 1000)
@@ -905,7 +767,6 @@ def _unique_stamp() -> int:
 
 
 def simple_concat_wavs(wav_paths: list, data_path: Path) -> Optional[Path]:
-    """无损直接拼接（不做任何渐变/裁剪）：兜底用，保证一句都不会少。"""
     wav_paths = [w for w in (wav_paths or []) if w]
     if not wav_paths:
         return None
@@ -925,21 +786,11 @@ def simple_concat_wavs(wav_paths: list, data_path: Path) -> Optional[Path]:
         return None
 
 
-# 段间裁剪静音的判定阈值（int16 幅度）。TTS 每段首尾都会带一段数字静音，
-# 先裁掉它再交叉渐变，渐变就不会啃掉真实语音。
 _SILENCE_LEVEL = 240
 
 
 def _trim_silence(audio, channels: int, lead: bool = False, trail: bool = False,
                   keep_ms: int = 60, sample_rate: int = 16000):
-    """裁掉音频开头/结尾的**纯数字静音**（保留 keep_ms 的呼吸感）。
-
-    只裁无声区，任何有声内容（哪怕只是气声）都不会被裁掉；整段静音时原样返回。
-
-    注意：判定数组必须压成一维。numpy 的 argmax 在多维数组上返回的是**扁平索引**，
-    直接拿它当帧号会在多声道（(N,2)）音频上算出偏大的位置，把该裁的静音留下来
-    （表现为"合并后多出一段空白"）。
-    """
     if audio is None or len(audio) == 0:
         return audio
     mono = np.abs(audio.astype(np.int64)).max(axis=1) if channels > 1 \
@@ -962,16 +813,6 @@ def _trim_silence(audio, channels: int, lead: bool = False, trail: bool = False,
 
 def merge_wavs(wav_paths: list, config, data_path: Path,
                crossfade_ms=None) -> Optional[Path]:
-    """把多段语音合并成一条。
-
-    语气渐变（voice_transition）下的历史 bug ——「每个句子之间少了很多字眼」：
-    旧实现把「上一段的结尾」和「下一段的开头」**真实重叠** crossfade_ms 后拼接，
-    等于每拼一句就凭空丢掉 crossfade_ms 的音频；而 TTS 每段首尾本就带静音，
-    重叠区里常常还有真实语音，默认 300ms 正好是半个词到一个词的长度。
-
-    现在：先裁掉各段首尾的纯数字静音，再做**等长交叉淡化**，重叠长度同时受
-    上一段可用长度与下一段总长度约束，任何情况下都不丢音频内容。
-    """
     wav_paths = [w for w in (wav_paths or []) if w]
     if not wav_paths:
         return None
@@ -1019,8 +860,6 @@ def merge_wavs(wav_paths: list, config, data_path: Path,
                     (all_audio,
                      np.zeros((breathing_gap_samples, n_channels), dtype=np.int16)),
                     axis=0)
-            # 等长交叉淡化：重叠区取「上一段尾部 ov」与「下一段头部 ov」等长混合，
-            # 输出长度 = 上段 + 下段 - ov，任何一帧都不会被丢下
             ov = min(crossfade_samples, len(all_audio), len(audio))
             if getattr(config, "_debug_merge", False):
                 print(f"[merge] i={i} acc={len(all_audio)} audio={len(audio)} "

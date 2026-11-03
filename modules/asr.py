@@ -1,14 +1,7 @@
 # -*- coding: utf-8 -*-
-"""参考音频的语音识别：本地 GPT-SoVITS 自带 ASR 与线上接口两条通道。
-
-本地走 GPT-SoVITS 的 tools/asr 脚本（中文用达摩 ASR，其余语种与自动交给 Faster Whisper），
-线上有两种协议（看「识别接口风格」）：whisper 走标准的 <服务根>/audio/transcriptions
-转写接口（OpenAI Whisper、Groq、硅基流动 SenseVoice、本机 Speaches / whisper.cpp server
-这类都用它）；其余把音频直接喂给对话模型（DashScope 的 qwen3-asr-flash、Gemini、
-Qwen2-Audio 等）。识别在后台线程里跑，前端轮询进度；识别结果写回与音频同名的 <音频名>.txt。
-"""
 import asyncio
 import base64
+import os
 import re
 import shutil
 import subprocess
@@ -27,36 +20,37 @@ from .tls import verified_context
 from .tts_service import no_window_kwargs
 
 ASR_LANGS = ("auto", "zh", "ja", "en", "ko")
-# 达摩 ASR 只认中文，其余语种（含自动）交给 Faster Whisper
 FUNASR_LANGS = {"zh"}
 LOCAL_SCRIPTS = {"funasr": "tools/asr/funasr_asr.py",
                  "whisper": "tools/asr/fasterwhisper_asr.py"}
 WHISPER_MODEL_SIZES = ("medium", "medium.en", "large-v2", "large-v3", "large-v3-turbo")
 DEFAULT_WHISPER_SIZE = "medium"
-# GPT-SoVITS 的 runtime 是 embeddable Python：目录里的 python39._pth 会让解释器忽略
-# PYTHONPATH，也不会把脚本所在目录放进 sys.path。Faster Whisper 脚本要 import
-# tools.*，直接运行必然 ModuleNotFoundError（达摩脚本只 import 第三方库，所以
-# 中文那条路看不出问题）。用一段引导代码把根目录塞进 sys.path 再跑脚本。
 SCRIPT_BOOTSTRAP = (
-    "import runpy, sys;"
-    "sys.path.insert(0, sys.argv.pop(1));"
-    "script = sys.argv.pop(1);"
-    "sys.argv[0] = script;"
-    "runpy.run_path(script, run_name='__main__')"
+    "import runpy, sys, os\n"
+    "sys.path.insert(0, sys.argv.pop(1))\n"
+    "if os.environ.get('LOVOMO_ASR_OFFLINE'):\n"
+    "    try:\n"
+    "        import modelscope as _ms\n"
+    "        _sd = _ms.snapshot_download\n"
+    "        def _local_snapshot(*a, **k):\n"
+    "            d = k.get('local_dir') or (a[1] if len(a) > 1 else '')\n"
+    "            if d and os.path.isfile(os.path.join(d, 'model.pt')):\n"
+    "                return d\n"
+    "            return _sd(*a, **k)\n"
+    "        _ms.snapshot_download = _local_snapshot\n"
+    "    except Exception:\n"
+    "        pass\n"
+    "script = sys.argv.pop(1)\n"
+    "sys.argv[0] = script\n"
+    "runpy.run_path(script, run_name='__main__')\n"
 )
 DEFAULT_DASHSCOPE_MODEL = "qwen3-asr-flash"
 DEFAULT_WHISPER_API_MODEL = "whisper-1"
-# 服务根地址的版本段（…/v1、…/v1beta）：转写接口都在它下面
 _VERSION_SEG_RE = re.compile(r"/v\d+(?:\.\d+)*$")
-# 「识别接口风格」设成 auto 时，靠地址/模型名认出发音转写服务：
-# OpenAI / Groq / 硅基流动只提供 /v1/audio/transcriptions，本机的 whisper.cpp server、
-# Speaches 也只认这个接口；不认出来就会按「对话模型直接吃音频」发，必然失败。
 WHISPER_URL_HINTS = ("api.openai.com", "api.groq.com", "api.siliconflow.cn",
                      "/audio/transcriptions", "speaches")
 WHISPER_MODEL_HINTS = ("whisper", "sensevoice", "transcribe")
-# 标准转写接口单次音频上限（OpenAI 25MB），留一点余量
 WHISPER_API_MAX_AUDIO_BYTES = 24 * 1024 * 1024
-# DashScope 兼容接口单次音频上限 10MB（base64 之后），留出编码膨胀的余量
 DASHSCOPE_MAX_AUDIO_BYTES = 7 * 1024 * 1024
 DASHSCOPE_TIMEOUT_SECONDS = 180.0
 # 本地首次使用要下载模型，给足时间
@@ -82,16 +76,11 @@ def whisper_model_size(config) -> str:
 
 
 def asr_api_key(config) -> str:
-    """线上识别用的密钥：优先「识别 API Key」，留空则跟随 LLM。"""
     return (str(config.get("asr_api_key", "") or "").strip()
             or str(config.get("llm_api_key", "") or "").strip())
 
 
 def asr_model_name(config, style=None) -> str:
-    """线上识别模型名：新键 asr_model 优先，回落旧的 asr_dashscope_model。
-
-    都没填时按接口风格给默认值：whisper 风格用 whisper-1，其余用 qwen3-asr-flash。
-    """
     value = (str(config.get("asr_model", "") or "").strip()
              or str(config.get("asr_dashscope_model", "") or "").strip())
     if value:
@@ -109,12 +98,6 @@ def normalize_api_style(style) -> str:
 
 
 def looks_like_transcription_service(config) -> bool:
-    """地址或模型名像「只会转写的语音识别服务」。
-
-    OpenAI / Groq / 硅基流动这类服务根本没有「对话模型吃音频」的接口，本机的
-    Speaches、whisper.cpp server 同样只认 /audio/transcriptions；这些地址配上
-    auto 风格时必须自动切到 whisper，否则报的错完全看不出原因。
-    """
     base = (str(config.get("asr_base_url", "") or "").strip()
             or str(config.get("llm_base_url", "") or "").strip()).lower()
     model = (str(config.get("asr_model", "") or "").strip()
@@ -125,10 +108,6 @@ def looks_like_transcription_service(config) -> bool:
 
 
 def is_whisper_style(config) -> bool:
-    """是否走标准的 <服务根>/audio/transcriptions 转写接口。
-
-    explicitly 选了 whisper 就走；auto 时按地址/模型名推断。
-    """
     style = normalize_api_style(config.get("asr_api_style", "auto"))
     if style == "whisper":
         return True
@@ -138,7 +117,6 @@ def is_whisper_style(config) -> bool:
 
 
 def transcriptions_endpoint(base_url: str) -> str:
-    """标准转写端点：<服务根>/audio/transcriptions（地址已带端点时原样返回）。"""
     base = str(base_url or "").strip().rstrip("/")
     if not base:
         return ""
@@ -149,7 +127,6 @@ def transcriptions_endpoint(base_url: str) -> str:
         if normalized.endswith(suffix):
             normalized = normalized[: -len(suffix)]
             break
-    # OpenAI 兼容服务的转写接口都在版本段下面（本机 whisper.cpp / Speaches 也认 /v1），
     # 服务根地址没带版本段就补一个
     if not _VERSION_SEG_RE.search(normalized):
         normalized = f"{normalized}/v1"
@@ -157,12 +134,10 @@ def transcriptions_endpoint(base_url: str) -> str:
 
 
 def api_style_backend(style) -> str:
-    """把界面上的接口风格映射成 llm_helpers 认识的后端名。"""
     return "ollama" if normalize_api_style(style) == "ollama" else "openai"
 
 
 def local_whisper_size(config) -> str:
-    """本地 Whisper 规格：「识别模型」填了合法规格就用它，否则用「本地识别模型规格」。"""
     name = str(config.get("asr_model", "") or "").strip()
     if name in WHISPER_MODEL_SIZES:
         return name
@@ -170,7 +145,6 @@ def local_whisper_size(config) -> str:
 
 
 def local_asr_root(config) -> Optional[Path]:
-    """本地识别根目录：优先「识别根目录」，留空则沿用 GPT-SoVITS 目录。"""
     raw = str(config.get("asr_local_root", "") or "").strip()
     if raw:
         path = Path(raw)
@@ -182,7 +156,6 @@ def local_asr_root(config) -> Optional[Path]:
 
 
 def resolve_sovits_root(config) -> Optional[Path]:
-    """从 tts_start_script 推出 GPT-SoVITS 根目录（该键可填目录，也可填 api_v2.py 路径）。"""
     raw = str(config.get("tts_start_script", "") or "").strip()
     if not raw:
         return None
@@ -202,9 +175,29 @@ def _runtime_python(root: Path) -> Optional[Path]:
     return None
 
 
+LOCAL_DEVICE_MODES = ("cpu", "auto", "gpu")
+
+
+def local_device_mode(config) -> str:
+    mode = str(config.get("asr_local_device", "") or "").strip().lower()
+    return mode if mode in LOCAL_DEVICE_MODES else "cpu"
+
+
+def _asr_env(force_cpu: bool, offline: bool) -> dict:
+    env = dict(os.environ)
+    if force_cpu:
+        env["CUDA_VISIBLE_DEVICES"] = ""
+    else:
+        env.pop("CUDA_VISIBLE_DEVICES", None)
+    if offline:
+        env["LOVOMO_ASR_OFFLINE"] = "1"
+    else:
+        env.pop("LOVOMO_ASR_OFFLINE", None)
+    return env
+
+
 def transcribe_local(config, targets: List[Tuple[str, Path]], lang: str,
                      log=None) -> Dict[str, str]:
-    """本地批量识别，返回 {key: 文字}；key 由调用方给定，未识别出的不在结果里。"""
     root = local_asr_root(config)
     if root is None:
         raise RuntimeError("未配置「识别根目录」/tts_start_script，无法定位本地 ASR 目录")
@@ -213,20 +206,17 @@ def transcribe_local(config, targets: List[Tuple[str, Path]], lang: str,
         raise RuntimeError(f"找不到 {root / 'runtime'} 下的 python，无法调用本地 ASR")
     local_engine = str(config.get("asr_local_engine", "") or "").strip().lower()
     if local_engine == "funasr":
-        # 达摩 ASR 只认中英；其它语种退中文，脚本内部还会自己判一次
         script, script_lang = LOCAL_SCRIPTS["funasr"], (lang if lang in FUNASR_LANGS else "zh")
     elif local_engine == "whisper":
         script, script_lang = LOCAL_SCRIPTS["whisper"], lang
     elif lang in FUNASR_LANGS:
         script, script_lang = LOCAL_SCRIPTS["funasr"], lang
     else:
-        # Whisper 传 auto 让模型自己判语种；判成中文时脚本内部会转达摩 ASR
         script, script_lang = LOCAL_SCRIPTS["whisper"], lang
     script_path = root / script
     if not script_path.exists():
         raise RuntimeError(f"找不到 ASR 脚本：{script_path}")
 
-    # 脚本会把输入目录里的每个文件都识别一遍，所以只把选中的音频复制进临时目录
     tmp_dir = Path(tempfile.mkdtemp(prefix="lovomo_asr_"))
     mapping = {}
     try:
@@ -238,56 +228,66 @@ def transcribe_local(config, targets: List[Tuple[str, Path]], lang: str,
                "-i", str(tmp_dir), "-o", str(tmp_dir), "-l", script_lang]
         if script == LOCAL_SCRIPTS["whisper"]:
             cmd += ["-s", local_whisper_size(config)]
-        proc = subprocess.Popen(cmd, cwd=str(root), stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True,
-                                encoding="utf-8", errors="replace", **no_window_kwargs())
-        # 超时必须在读流的同时生效：子进程卡住不退出时读 stdout 会一直阻塞，
-        # 写在后面的 proc.wait(timeout=) 永远轮不到，任务会一直停在 running
-        watchdog = threading.Timer(LOCAL_TIMEOUT_SECONDS, proc.kill)
-        watchdog.daemon = True
-        watchdog.start()
-        tail = deque(maxlen=8)
-        try:
-            for line in proc.stdout:
-                tail.append(line.rstrip())
+
+        def run_once(env):
+            proc = subprocess.Popen(cmd, cwd=str(root), stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True,
+                                    encoding="utf-8", errors="replace", env=env,
+                                    **no_window_kwargs())
+            watchdog = threading.Timer(LOCAL_TIMEOUT_SECONDS, proc.kill)
+            watchdog.daemon = True
+            watchdog.start()
+            tail = deque(maxlen=8)
+            try:
+                for line in proc.stdout:
+                    tail.append(line.rstrip())
+                    if log:
+                        log(line)
+                proc.wait(timeout=LOCAL_TIMEOUT_SECONDS)
+            finally:
+                watchdog.cancel()
+                if proc.poll() is None:
+                    proc.kill()
+            return proc.returncode, tail
+
+        mode = local_device_mode(config)
+        plans = [(True, True)] if mode == "cpu" \
+            else ([(False, True), (True, True)] if mode == "auto" else [(False, True)])
+        plans.append((plans[-1][0], False))
+        for index, (force_cpu, offline) in enumerate(plans):
+            if index:
+                for stale in tmp_dir.glob("*.list"):
+                    try:
+                        stale.unlink()
+                    except OSError:
+                        pass
                 if log:
-                    log(line)
-            proc.wait(timeout=LOCAL_TIMEOUT_SECONDS)
-        finally:
-            watchdog.cancel()
-            if proc.poll() is None:
-                proc.kill()
-        results, rows, empty_rows, found = _collect_asr_results(tmp_dir, mapping)
-        if not results:
+                    log("本地识别上一遍没出结果，换一套参数重跑"
+                        + ("（放开模型仓库核对）" if not offline else "（改用 CPU）"))
+            returncode, tail = run_once(_asr_env(force_cpu, offline))
+            results, rows, empty_rows, found = _collect_asr_results(tmp_dir, mapping)
+            if results:
+                return results
             detail = " / ".join(x for x in tail if x.strip())[:400]
             if found and (not rows or empty_rows == rows):
-                # 脚本正常收尾（退出码 0）却没留下任何文字：短语音、静音、纯噪声，
-                # 或音频解不开。识别不出文字属于语音识别的正常结果，不能当成
-                # 脚本故障报错——调用方按「没转出文字」处理即可
                 if log:
-                    log(f"识别脚本没有给出文字（退出码 {proc.returncode}）："
+                    log(f"识别脚本没有给出文字（退出码 {returncode}）："
                         + (detail or "结果文件为空"))
                 return {}
             if rows:
-                # 识别出了文字却一行都没对上输入文件：脚本的输出命名与读取端不一致
                 raise RuntimeError(
                     f"ASR 脚本识别出了 {rows} 行结果但都没对上输入文件（退出码 "
-                    f"{proc.returncode}）")
-            # 压根没写出结果文件：模型没下好、参数被拒、缺依赖…
-            raise RuntimeError(f"ASR 脚本没有产出结果（退出码 {proc.returncode}）"
-                               + (f"：{detail}" if detail else ""))
+                    f"{returncode}）")
+            failure = RuntimeError(f"ASR 脚本没有产出结果（退出码 {returncode}）"
+                                   + (f"：{detail}" if detail else ""))
+            if index == len(plans) - 1:
+                raise failure
         return results
     finally:
         _cleanup_tmp_dir(tmp_dir)
 
 
 def _collect_asr_results(tmp_dir: Path, mapping: Dict[str, str]) -> Tuple[dict, int, int, bool]:
-    """从脚本的输出目录收识别结果，返回 (结果, 结果行数, 空文本行数, 是否找到结果文件)。
-
-    标准位置是 <输出目录>/<输入目录名>.list；不同版本的 GPT-SoVITS 脚本
-    命名略有出入，找不到时按 *.list 兜底再扫一遍。脚本跑完却没识别出文字时
-    会写出一个空结果文件，那种情况要能和「压根没写出文件」区分开。
-    """
     list_text = _read_list_file(tmp_dir)
     found = bool(list_text)
     if not list_text.strip():
@@ -320,11 +320,6 @@ def _collect_asr_results(tmp_dir: Path, mapping: Dict[str, str]) -> Tuple[dict, 
 
 
 def _cleanup_tmp_dir(tmp_dir: Path) -> None:
-    """删掉识别用的临时目录。
-
-    文件被杀软/索引器占着时 rmtree 会静默失败（ignore_errors=True），
-    目录就此留在临时区；这里再试一次，仍然删不掉就把位置打出来。
-    """
     shutil.rmtree(tmp_dir, ignore_errors=True)
     if not tmp_dir.exists():
         return
@@ -335,7 +330,6 @@ def _cleanup_tmp_dir(tmp_dir: Path) -> None:
 
 
 def _read_list_file(tmp_dir: Path) -> str:
-    """脚本把结果写成 <输出目录>/<输入目录名>.list，每行 path|目录|语种|文字。"""
     target = tmp_dir / f"{tmp_dir.name}.list"
     try:
         return target.read_text(encoding="utf-8", errors="ignore")
@@ -380,11 +374,6 @@ async def transcribe_dashscope(config, audio: Path, lang: str) -> str:
 
 
 async def transcribe_whisper_api(config, audio: Path, lang: str) -> str:
-    """标准 <服务根>/audio/transcriptions 接口（OpenAI Whisper / Groq / SenseVoice 等）。
-
-    本地识别服务（Speaches、whisper.cpp server）通常不校验密钥，所以密钥留空也照发；
-    云端被 401/403 拒了会在报错里点明要填「识别 API Key」。
-    """
     base_url = (str(config.get("asr_base_url", "") or "").strip()
                 or str(config.get("llm_base_url", "") or "").strip())
     endpoint = transcriptions_endpoint(base_url)
@@ -404,8 +393,7 @@ async def transcribe_whisper_api(config, audio: Path, lang: str) -> str:
                                  verify=verified_context()) as client:
         resp = await client.post(endpoint, data=data, files=files, headers=headers)
     if resp.status_code in (401, 403) and not api_key:
-        raise RuntimeError("识别服务拒绝了请求：本机识别服务可以留空密钥，"
-                           "云端要在「识别 API Key」里填密钥")
+        raise RuntimeError("识别服务拒绝了请求：本机识别服务可以留空密钥，云端要在「识别 API Key」里填密钥")
     if resp.status_code != 200:
         raise RuntimeError(f"HTTP {resp.status_code}: {str(resp.text)[:200]}")
     payload = resp.json()
@@ -421,18 +409,12 @@ async def transcribe_whisper_api(config, audio: Path, lang: str) -> str:
 
 
 async def transcribe_online(config, audio: Path, lang: str) -> str:
-    """线上识别的统一入口：whisper 风格走转写接口，其余把音频喂给对话模型。"""
     if is_whisper_style(config):
         return await transcribe_whisper_api(config, audio, lang)
     return await transcribe_dashscope(config, audio, lang)
 
 
 async def transcribe_file(config, audio, lang=None) -> str:
-    """识别单个音频文件，返回文字（识别不出来返回空串）。
-
-    语种与引擎都取「语音识别」那几项配置；调用方（用户发来的语音）不留文件，
-    所以本地通道也走临时目录那套批量脚本，只是只放一个文件进去。
-    """
     path = Path(audio)
     use_lang = normalize_lang(lang if lang is not None
                               else config.get("asr_lang", "auto"))
@@ -444,7 +426,6 @@ async def transcribe_file(config, audio, lang=None) -> str:
 
 
 class AsrJob:
-    """一次批量识别任务：后台线程跑识别，逐条写回 <音频名>.txt。"""
 
     def __init__(self, config, targets: List[dict], lang: str, engine: str):
         self.id = uuid.uuid4().hex

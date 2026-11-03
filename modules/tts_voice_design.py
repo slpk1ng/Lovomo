@@ -1,9 +1,3 @@
-"""云端声音设计：调百炼 /services/audio/tts/customization 管理自定义音色。
-
-用一段文字描述设计音色，拿到的 voice 值填进云 TTS 的音色字段即可（声音设计类模型
-只认这样创建出来的音色，配系统音色会被上游拒绝）。创建时的 target_model 必须与
-合成时用的模型一致，所以这里默认取「云 TTS 模型」。
-"""
 import base64
 import re
 from typing import List
@@ -15,17 +9,15 @@ from .tls import verified_context
 CUSTOMIZATION_PATH = "/services/audio/tts/customization"
 DESIGN_MODEL = "qwen-voice-design"
 
-# 声音描述与预览文本支持的语言，顺序即界面下拉的顺序
 LANGUAGES = ("zh", "en", "de", "it", "pt", "es", "ja", "ko", "fr", "ru")
 DEFAULT_LANGUAGE = "zh"
 
 _NAME_RE = re.compile(r"[0-9A-Za-z_]{1,16}\Z")
-# 预览音频是 Base64 字符串：正常只有几十 KB，给足余量后仍然设个上限
 MAX_PREVIEW_BASE64_CHARS = 2_000_000
 
 
 class VoiceDesignError(Exception):
-    """接口返回的失败原因，文案可直接展示给用户。"""
+    pass
 
 
 async def _call(config, body: dict) -> dict:
@@ -54,7 +46,6 @@ def _preview_bytes(out: dict) -> bytes:
     if not data:
         return b""
     if len(data) > MAX_PREVIEW_BASE64_CHARS:
-        # 预览只是给用户试听，异常大的响应直接丢掉，别把内存吃光
         print(f"云 TTS 预览音频过大（{len(data)} 字符），已忽略。")
         return b""
     try:
@@ -65,7 +56,6 @@ def _preview_bytes(out: dict) -> bytes:
 
 async def create_voice(config, *, voice_prompt: str, preview_text: str, name: str,
                        language: str = "", target_model: str = "") -> dict:
-    """按描述设计一个音色，返回 voice / target_model / preview_audio(wav 字节)。"""
     model = str(target_model or config.get("cloud_tts_model", "") or "").strip()
     if not model:
         raise VoiceDesignError("先在「云 TTS 模型」里填要驱动的模型")
@@ -89,7 +79,6 @@ async def create_voice(config, *, voice_prompt: str, preview_text: str, name: st
 
 
 async def list_voices(config, *, page_index: int = 0, page_size: int = 50) -> List[dict]:
-    """列出已创建的音色，返回 voice_list 原样条目。"""
     out = await _call(config, {"model": DESIGN_MODEL,
                                "input": {"action": "list", "page_index": page_index,
                                          "page_size": page_size}})

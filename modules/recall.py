@@ -1,13 +1,3 @@
-"""会话回忆：把「未了话题」置顶，并按需检索更早的相关往事注入。
-
-- 未了话题：定期让模型维护一份「提起过、但还没结清」的清单，每轮带进提示词，
-  解决「说好要去海边、聊到别处就忘了」这类问题；
-- 相关往事：历史按话题段建索引，每轮用当前消息检索最相关的几段注入，
-  解决「用户提起旧事、角色想不起来细节」。
-
-检索有两条路：embedding 走语义（换说法也能命中，需要配嵌入模型）；
-lexical 走字符重合（零依赖、离线可用，但换了说法就抓不住）。
-"""
 import hashlib
 import json
 import re
@@ -20,21 +10,13 @@ import numpy as np
 from .jsonio import load_json_ex, save_json
 from .llm_helpers import RoleContext, chat_once, extract_json, speaker_labeled_lines
 
-# 话题分段：相邻消息间隔超过这个时长就切一段，单段条数也封顶
 SEGMENT_GAP_SECONDS = 30 * 60
 SEGMENT_MAX_MESSAGES = 8
 # 注入块的默认字数上限
 DEFAULT_MAX_CHARS = 600
-# 相似度下限：低于它宁可不注入，也不要塞一堆无关内容把话题带偏。
-# 字符重合的分数受查询长度稀释（一个关键词命中也只有 1/查询长度），所以它的下限
-# 只是「至少要有实打实的二元组重合」，真正的取舍交给 top-k 排序。
 MIN_SIMILARITY_EMBEDDING = 0.35
 MIN_SIMILARITY_LEXICAL = 0.05
-# 检索结果的时间跨度：相隔小于这个时长的段算「同一个话题时段」，只取其中一段。
-# 相似度检索容易把同一段讨论里的几条近义段全捞上来（都在「聊这件事」，
-# 却没有一段是「这件事本身」），按时间拉开才覆盖得到更早的往事。
 RECALL_TIME_SPREAD_SECONDS = SEGMENT_GAP_SECONDS
-# 未了话题：每隔几轮维护一次、最多留几条、每条多长
 OPEN_TOPICS_EVERY_N = 3
 OPEN_TOPICS_MAX = 5
 OPEN_TOPICS_MAX_CHARS = 40
@@ -63,7 +45,6 @@ RECALL_HEADER = (
 
 def split_segments(history: list, gap_seconds: float = SEGMENT_GAP_SECONDS,
                    max_messages: int = SEGMENT_MAX_MESSAGES) -> List[list]:
-    """把历史切成话题段：间隔过久或条数够多就切一刀。"""
     segments: List[list] = []
     current: list = []
     for msg in history or []:
@@ -86,7 +67,6 @@ def split_segments(history: list, gap_seconds: float = SEGMENT_GAP_SECONDS,
 
 
 def render_segment(messages: list) -> str:
-    """一段话题渲染成给模型看的转录（时间只标在段首）。"""
     lines = []
     for i, msg in enumerate(messages):
         who = msg["speaker"] if msg["role"] == "assistant" \
@@ -106,11 +86,6 @@ def _bigrams(text: str) -> set:
 
 
 def lexical_score(query: str, text: str) -> float:
-    """查询的字符二元组在往事段里的覆盖率（0~1）。
-
-    用覆盖率而不是 Jaccard：往事段通常比当前消息长得多，Jaccard 会被段长稀释，
-    同一个查询在长段和短段上得到的分完全不可比。
-    """
     q = _bigrams(query)
     if not q:
         return 0.0
@@ -124,11 +99,6 @@ def _normalize(vec) -> np.ndarray:
 
 
 class HistoryRecallManager:
-    """会话回忆：话题段索引 + 检索注入 + 未了话题清单。
-
-    索引按会话分文件存放，且**只索引已经结束的话题段**（最后一段还在进行中，
-    既在最近窗口里、每轮又会变长，索引它只会反复重算）。
-    """
 
     def __init__(self, config, data_path, embedder=None):
         self.config = config
@@ -178,7 +148,6 @@ class HistoryRecallManager:
         return OPEN_TOPICS_HEADER + "\n".join(lines) if lines else ""
 
     async def update_open_topics(self, ctx: RoleContext, session_id: str, history: list):
-        """定期让模型把未了话题清单更新一遍；失败就沿用旧清单。"""
         sid = str(session_id or "")
         if not self._enabled() or not sid:
             return
@@ -271,7 +240,6 @@ class HistoryRecallManager:
             print(f"保存回忆索引失败: {e}")
 
     async def refresh(self, session_id: str, history: list):
-        """把已经结束的话题段增量索引一遍（正在进行的最后一段不索引）。"""
         if not self._enabled():
             return
         sid = str(session_id or "")
@@ -294,7 +262,6 @@ class HistoryRecallManager:
                 print(f"回忆索引向量化失败（下次再试）: {type(e).__name__}: {e}")
             if fresh is not None and len(fresh) == len(todo):
                 for text, vec in zip(todo, fresh):
-                    # 嵌入服务回的是 numpy 数组，元素是 float32，直接落盘会 JSON 序列化失败
                     known[text] = [float(x) for x in vec]
         index["segments"] = [{"text": t, "ts": float(g[0]["ts"] or 0)}
                              for t, g in zip(texts, done)]
@@ -334,8 +301,6 @@ class HistoryRecallManager:
                     scored.append((float(_normalize(vec) @ q), entry))
                 floor = MIN_SIMILARITY_EMBEDDING
         if not scored:
-            # 嵌入不可用（没配模型、维度不符、还没建过向量）就退回字符重合，
-            # 别让整个回忆功能因为嵌入这条路的依赖而失效
             scored = [(lexical_score(query, str(e.get("text") or "")), e)
                       for e in segments]
         hits = []
@@ -356,7 +321,6 @@ class HistoryRecallManager:
             picked.append(hit)
             if len(picked) >= top_k:
                 break
-        # 按时间从早到晚注入：往事是按时间发生的，「第几个 / 最开始」这类问题要靠先后推
         picked.sort(key=lambda h: h["ts"])
         return picked
 
@@ -372,7 +336,6 @@ class HistoryRecallManager:
 
     async def recall_context(self, session_id: str, query: str,
                              exclude_after_ts: float = 0.0) -> str:
-        """检索并拼成可直接注入的段落；出错一律返回空串。"""
         try:
             hits = await self.recall(session_id, query, exclude_after_ts=exclude_after_ts)
         except Exception as e:

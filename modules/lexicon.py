@@ -1,9 +1,3 @@
-"""自主学习：从历史对话里学习黑话、俚语与专有表达，供角色理解与复用。
-
-存于 data/learned_terms.json：
-  {"terms": {"<表达>": {term, meaning, category, confidence, evidence, count, updated_at}},
-   "pending": [{id, term, meaning, category, confidence, evidence, reason, created_at}]}
-"""
 import json
 import re
 import time
@@ -12,8 +6,6 @@ from pathlib import Path
 
 from .llm_helpers import generate_json_reply, role_names, speaker_labeled_lines
 
-# 各条规则单独定义：默认提示词与「补回旧默认提示词」的迁移共用同一份文本。
-# 两处各写一遍时字面稍有出入，迁移就会匹配不上或重复插入。
 _RULE_SELF_LITERAL = (
     "6. 先看字面：该表达在普通话里本来的具体含义优先——它本身就有明确的具体所指"
     "（某种动作、物品或现象）时，就按这个本义写，不要按网络流行义、调侃义改写成别的意思；"
@@ -94,9 +86,6 @@ DEFAULT_INJECT_TEMPLATE = (
     "按这些含义理解，不要向对方解释你在查词典：\n{terms}"
 )
 
-# 旧版默认提示词缺了后加的规则（先按字面理解、含义必须通用、排除角色名）：
-# 不补的话模型会把角色名或只对某次互动成立的说法写进含义，换个角色就完全用不了。
-# 规则文案只有上面这一份：这里的旧片段要与它逐字对应，否则补不进去或重复插入。
 _LEGACY_GENERIC_MEANING = (
     "8. 含义必须通用：这本词典是所有角色、所有会话共用的，"
     "meaning 要写成脱离本次对话、换一个角色、换一群人也成立的说法。"
@@ -106,7 +95,6 @@ _LEGACY_GENERIC_MEANING = (
     "不要写成「某人对某角色的专属称呼」「被角色唯一承认的伴侣」这种绑定某段关系的说法。\n"
 )
 LEGACY_LEARN_TAIL_PHRASES = (
-    # 这一条要排在最前：先按整段替换掉上一版规则文本，再判断是否需要补插
     (_LEGACY_GENERIC_MEANING, _RULE_GENERIC_MEANING),
     (_PROMPT_BEFORE_DICT, _PROMPT_BEFORE_DICT + _RULE_SELF_LITERAL),
     ("4. 只出现过一次、且上下文完全看不出含义的临时玩笑，除非它在对话里被明确解释过。\n",
@@ -118,11 +106,6 @@ LEGACY_LEARN_TAIL_PHRASES = (
 
 
 def migrate_learn_prompt(config) -> bool:
-    """把旧版默认学习提示词补上后加的规则。
-
-    逐条判断目标文本是否已经存在：这些片段补进去之后原文案仍在，
-    不看这一层的话每次启动都会把同一段规则重复插一遍。
-    """
     raw = str(config.get("learning_prompt", "") or "")
     if not raw:
         return False
@@ -138,15 +121,11 @@ def migrate_learn_prompt(config) -> bool:
 
 CATEGORIES = ("网络黑话", "俚语", "专有表达", "指代称呼")
 
-# 只对某一次对话成立的说法：词典是跨角色共用的，这类含义换个角色就读不通。
-# 「此处」「这次」这类描述一般使用场景的措辞不算——它只是说明了这个说法怎么用，
-# 换个角色照样成立（如「指代被轻视的对象，此处用于在暧昧时骂人」）。
 _SESSION_BOUND_RE = re.compile(r"本次对话|这次对话里|本对话|这轮对话|用户\d+|角色\d+")
 QUARANTINE_REASON = "含义绑定了具体角色或某次对话，换个角色不适用，请改成通用含义"
 
 
 def _bound_to_character(term: str, meaning: str, names) -> bool:
-    """词条本身或含义里出现了角色名/会话编号：换个角色就没法用。"""
     text = f"{term} {meaning}".lower()
     if _SESSION_BOUND_RE.search(text):
         return True
@@ -215,11 +194,6 @@ class LexiconManager:
             self.save()
 
     def _restore_no_longer_bound(self) -> bool:
-        """把之前因「绑定角色」被隔离、按当前规则其实通用的条目放回词典。
-
-        判定规则收紧过一次又放宽过一次（如「此处用于…」这种说明使用场景的写法
-        不再算绑定），早先被隔离的条目会一直挂在待确认里，理由也已经不成立。
-        """
         names = role_names(self.config)
         keep, restored = [], []
         for item in self.pending:
@@ -250,15 +224,6 @@ class LexiconManager:
         return True
 
     def _quarantine_character_bound(self) -> bool:
-        """把含义绑定了具体角色的旧词条移入「待确认」。
-
-        词典是所有角色共用的：含义里写了角色名、昵称或某次互动才成立的说法，
-        换个角色就读不通。移入待确认后它不再参与回复，用户可在页面上改成通用含义再采纳；
-        重新学到通用含义时也会自动把这条待确认顶掉。
-
-        用户自己采纳或手写的词条（confirmed）一律不再动：上一次点过「通过」，
-        重启后又被打回待确认，等于白确认一遍。
-        """
         names = role_names(self.config)
         bad = [key for key, item in self.terms.items()
                if isinstance(item, dict) and not item.get("confirmed")
@@ -292,7 +257,6 @@ class LexiconManager:
 
     # ---------------- 触发 ----------------
     def should_learn(self, user_msg_count: int) -> bool:
-        """按会话累计的用户消息数触发，避免每条消息都调用一次 LLM。"""
         if not self.enabled:
             return False
         every = _as_int(self.config.get("learning_trigger_messages"), 20)
@@ -304,7 +268,6 @@ class LexiconManager:
 
     # ---------------- 学习 ----------------
     async def learn_from_history(self, ctx, history: list, session_id: str = "") -> dict:
-        """扫描近期历史并更新词典，失败静默。"""
         if not self.enabled or not history:
             return {}
         limit = _as_int(self.config.get("learning_history_lines"), 30, minimum=4)
@@ -331,14 +294,10 @@ class LexiconManager:
         return result
 
     def apply_items(self, items: list) -> dict:
-        """按置信度分流模型输出：达标入库，不达标进待确认。"""
         threshold = _as_float(self.config.get("learning_min_confidence"), 0.6)
         names = role_names(self.config)
         result = {"added": 0, "updated": 0, "removed": 0, "held": 0, "skipped": 0}
         now = time.time()
-        # 落盘依据是"内存有没有被改动"，不能拿 result 计数代替：
-        # 刷新已有待确认项、或删除只存在于待确认里的词条时计数为 0，
-        # 但内存已经变了，不落盘就会在重启后回退。
         changed = False
         for item in items:
             if not isinstance(item, dict):
@@ -356,7 +315,6 @@ class LexiconManager:
             meaning = _clean(item.get("meaning"), MAX_MEANING_CHARS)
             if not meaning:
                 continue
-            # 含义里带角色名/编号的条目一律不要：词典跨角色共用，这种含义换个角色就读不通
             if _bound_to_character(term, meaning, names):
                 result["skipped"] += 1
                 continue
@@ -392,7 +350,6 @@ class LexiconManager:
         return sorted(self.pending, key=lambda p: p.get("created_at", 0), reverse=True)
 
     def confirm(self, pending_id: str, term=None, meaning=None, category=None) -> bool:
-        """采纳待确认词条；允许用户在页面上改完再采纳。"""
         item = next((p for p in self.pending if p.get("id") == pending_id), None)
         if item is None:
             return False
@@ -409,7 +366,6 @@ class LexiconManager:
             "evidence": _clean(item.get("evidence"), MAX_EVIDENCE_CHARS),
             "count": _as_int((existing or {}).get("count"), 0, minimum=0) + 1,
             "updated_at": time.time(),
-            # 用户亲自采纳过：之后不再被自动清理，否则重启就打回待确认
             "confirmed": True,
         }
         self.pending = [p for p in self.pending if p.get("id") != pending_id]
@@ -426,7 +382,6 @@ class LexiconManager:
         return True
 
     def _hold(self, term, meaning, category, confidence, evidence, reason, now) -> bool:
-        """不确定的候选入队；同词同义只刷新证据，不重复堆叠。"""
         reason = _clean(reason, MAX_REASON_CHARS) or "对话里没有足够依据判断含义"
         for item in self.pending:
             if item.get("term") == term and item.get("meaning") == meaning:
@@ -458,7 +413,6 @@ class LexiconManager:
         return sorted(self.terms.values(), key=lambda t: t.get("updated_at", 0), reverse=True)
 
     def upsert_term(self, term, meaning, category="") -> bool:
-        """页面手动新增或改写词条。"""
         final_term = _clean(term, MAX_TERM_CHARS)
         final_meaning = _clean(meaning, MAX_MEANING_CHARS)
         if not final_term or not final_meaning:
@@ -488,7 +442,6 @@ class LexiconManager:
         return True
 
     def _trim(self):
-        """超出上限时先淘汰出现次数最少、最久未更新的词条。"""
         limit = _as_int(self.config.get("learning_max_terms"), 200, minimum=10)
         if len(self.terms) <= limit:
             return
@@ -516,7 +469,6 @@ class LexiconManager:
         return template.replace("{terms}", "\n".join(lines))
 
     def _prompt_terms(self) -> dict:
-        """喂给模型的已有词典摘要，按最近更新截断，避免提示词无限膨胀。"""
         brief, used = {}, 0
         for item in self.list_terms()[:MAX_PROMPT_TERMS]:
             term = str(item.get("term", ""))

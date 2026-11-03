@@ -1,12 +1,4 @@
 # -*- coding: utf-8 -*-
-"""WebUI 服务（自 main.py 原样搬迁）：WebUIServer 整类 + WebUI 域常量 +
-TTS 服务可用性检查。
-
-本模块是方案第 19 节（第 5 批）的落点：main.py 的 WebUIServer 类体逐字搬运，
-跨域可变全局（global_config / memory_manager / 各管理器槽位）一律经
-modules.app_context 读写；在线更新状态机取自 modules.updater_tools，
-WebView2 运行时辅助取自 modules.webview_runtime，依赖方向单向。
-"""
 
 import asyncio
 import hashlib
@@ -31,6 +23,7 @@ import httpx
 from napcat import Text
 
 from modules import app_context
+from modules import model_library
 from modules.app_context import _APP_HOOKS
 from modules.app_paths import get_resource_path, runtime_path, user_data_dir
 from modules.log_console import (
@@ -167,17 +160,12 @@ from modules.app_context import HAS_AIOHTTP
 if HAS_AIOHTTP:
     from aiohttp import web
 
-# 每次刷新最多查几个 Release 的点赞数（GitHub 匿名接口有次数限制）
 MAX_REACTION_LOOKUPS = 12
 
-# 市场扫分支最多翻几页（每页 100 条），只是防止仓库异常时无限翻页
 MAX_BRANCH_PAGES = 10
 
-# 官方市场的第三方来源清单最多认几个仓库（清单靠别人提 PR 维护，防它跑飞）
 MARKET_SOURCE_REPOS_MAX = 20
 
-# 插件自带页面（功能页 / webui.html）注入的桥接脚本：同源 iframe 直接调父窗口上的
-# lovomoHost。必须插在插件自己的脚本之前，否则插件在解析阶段拿不到 window.lovomo。
 PLUGIN_BRIDGE_TEMPLATE = """<script>
 (function () {
   var info = /*__LOVOMO_INFO__*/ null;
@@ -218,42 +206,51 @@ PLUGIN_BRIDGE_TEMPLATE = """<script>
 """
 
 
-# 扫码登录的临时状态：接入方式 id -> {"qrcode": ...}
 _CONNECTION_LOGIN_STATE: dict = {}
-# 投递自检发出去的那句话：既当测试，也直接告诉对方"看到它就说明能正常送达"
 SELFTEST_TEXT = "（自检消息）如果你在微信里看到这一条，说明这台机器人现在能正常把消息发出来。"
 
 
-# 本机「已推送 / 已下架」记录的有效期：够撑过市场镜像与索引的缓存，
-# 又不会在很久以后还压着市场里的真实状态
 PUBLISH_STATE_TTL = 24 * 3600
 
 
 
 
-# 聊天测试台专用会话：与真实 QQ 会话隔离，方便随时清掉重测
 TEST_CHAT_SESSION = "webui_test"
 TEST_CHAT_USER = "webui_test"
 
-# 语音通话专用会话：与真实 QQ 会话、聊天测试台都隔离，留痕由通话面板自己控制
 CALL_SESSION = "webui_call"
 CALL_USER = "webui_call"
-# 角色档案导出/导入时随档案带走的角色字段
+_CALL_TURNS: dict = {}
+CALL_TURN_KEEP_SECONDS = 120
 _ROLE_EXPORT_KEYS = ("character_name", "character_key", "personality_prompt", "json_prompt",
                      "supplement_prompt", "default_voice", "ref_audio_root", "text_lang",
                      "prompt_lang")
 
 
-# 待办状态取值（与 TodoManager 使用的一致，供 WebUI 更新接口做白名单校验）
 TODO_STATUSES = ("pending", "done", "cancelled", "missed")
 
 
+def _call_turn_note(turn_id: str, **fields) -> None:
+    if not turn_id:
+        return
+    now = time.time()
+    for key in [k for k, v in _CALL_TURNS.items()
+                if now - float(v.get("updated") or 0) > CALL_TURN_KEEP_SECONDS]:
+        _CALL_TURNS.pop(key, None)
+    item = _CALL_TURNS.get(turn_id)
+    if item is None:
+        item = {"text": "", "reply": "", "sentences": [], "done": False,
+                "error": "", "session_id": "", "retained": {}}
+        _CALL_TURNS[turn_id] = item
+    if "sentence" in fields:
+        item["sentences"].append(fields.pop("sentence"))
+    item.update(fields)
+    item["updated"] = now
+
+
 # --- WebUI 的 HTTPS 与访问地址 -------------------------------------------
-# 手机浏览器只在 https 或 localhost 下把麦克风交给网页（通话插件要用），
-# 所以这里支持自签证书的 HTTPS；没有现成证书时现场生成一张长期自签证书。
 
 def _is_loopback_host(host) -> bool:
-    """只有本机能访问的监听地址算 loopback。0.0.0.0 / :: 是全网卡，不算。"""
     text = str(host or "").strip().lower()
     if text in ("", "localhost", "127.0.0.1", "::1", "[::1]"):
         return True
@@ -264,13 +261,11 @@ def _is_loopback_host(host) -> bool:
 
 
 def _lan_ipv4_addresses() -> List[str]:
-    """本机的局域网 IPv4 地址（给手机访问用），取不到返回空列表。"""
     import socket
     found: List[str] = []
 
     def add(ip: str) -> None:
         ip = str(ip or "").strip()
-        # 127.* 是本机回环，169.254.* 是链路本地地址（连不上），都不当作可用的局域网地址
         if ip and not ip.startswith("127.") and not ip.startswith("169.254.") and ip not in found:
             found.append(ip)
 
@@ -280,7 +275,6 @@ def _lan_ipv4_addresses() -> List[str]:
     except Exception:
         pass
     if not found:
-        # 某些系统解析不到主机名：连一个不存在的地址也能拿到出口网卡地址
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             try:
@@ -298,7 +292,6 @@ def _cert_dir() -> Path:
 
 
 def _ensure_self_signed_cert(hosts: List[str]) -> Optional[tuple]:
-    """生成自签证书，返回 (证书路径, 私钥路径)；缺 cryptography 或出错返回 None。"""
     folder = _cert_dir()
     cert_path = folder / "webui_cert.pem"
     key_path = folder / "webui_key.pem"
@@ -354,7 +347,6 @@ def _ensure_self_signed_cert(hosts: List[str]) -> Optional[tuple]:
 
 
 def _build_ssl_context(config) -> Optional["ssl.SSLContext"]:
-    """按配置准备 HTTPS 上下文；没开 HTTPS 或证书不可用时返回 None（退回 http）。"""
     if not bool(config.get("webui_https")):
         return None
     cert_text = str(config.get("webui_cert_file", "") or "").strip()
@@ -383,7 +375,6 @@ def _build_ssl_context(config) -> Optional["ssl.SSLContext"]:
 
 
 def _webui_access_urls(scheme: str, host: str, port: int) -> List[str]:
-    """当前监听地址对应的可访问 URL（绑定非本机时把局域网地址排在前，方便手机直接打开）。"""
     urls: List[str] = []
 
     def add(ip: str) -> None:
@@ -396,7 +387,6 @@ def _webui_access_urls(scheme: str, host: str, port: int) -> List[str]:
             urls.append(url)
 
     if _is_loopback_host(host):
-        # 只监听本机：局域网地址根本连不上，列出来只会误导
         add("127.0.0.1")
         return urls
     if str(host).strip() not in ("0.0.0.0", "::", "[::]"):
@@ -407,14 +397,32 @@ def _webui_access_urls(scheme: str, host: str, port: int) -> List[str]:
     return urls
 
 
+def _job_manager(server) -> ScheduledJobManager:
+    if app_context.job_mgr is None:
+        from modules.companion_tasks import session_history_block
+        from modules.session_context import (get_active_ctx, get_active_emotions,
+                                             list_known_sessions)
+        app_context.job_mgr = ScheduledJobManager(
+            server.config, server.memory_manager.data_path, app_context.scheduler,
+            app_context.sender, get_active_ctx, get_active_emotions,
+            list_known_sessions, session_history_block)
+    return app_context.job_mgr
+
+
 class WebUIServer:
     def __init__(self, config: ConfigLoader, memory_manager: MemoryManager):
         self.config = config
-        # 必须先用当前配置初始化：为 None 时"首次保存"的 diff 恒为空，
-        # 用户第一次改 TTS 参数保存不会触发重启，第二次才补上
+        self.ready = threading.Event()
         self._last_saved_config = dict(config.config or {})
         self.memory_manager = memory_manager
         self.html_path = get_resource_path("webui") / "start.html"
+        try:
+            model_library.ensure_migrated(memory_manager.data_path, config)
+            model_library.apply_library(
+                config.config, model_library.load_library(memory_manager.data_path))
+            config.roles = config._parse_roles()
+        except Exception as e:
+            print(f"[模型库] 初始化失败（沿用配置自带值）：{type(e).__name__}: {e}")
         self.app = web.Application(client_max_size=200 * 1080 * 1080)
         self._update_state_file = memory_manager.data_path / "update_check.json"
         self._update_checked_this_run = False
@@ -422,21 +430,16 @@ class WebUIServer:
         self._auth_file = memory_manager.data_path / "webui_auth.json"
         self._password = ""
         self._auth_token = None
-        # 二级密码：设了才生效，解锁一次在有效期内不再拦敏感操作
         self._second_password = ""
         self._second_unlocked_until = 0.0
         self._second_once = 0
-        # 插件系统：插件目录跟着用户数据目录走（%LOCALAPPDATA%\Lovomo\plugins），
-        # 这样重装/覆盖更新程序不会把用户的插件一起删掉。
         self._plugins_root = user_data_dir() / "plugins"
         self.plugin_manager = PluginManager(
             self._plugins_root,
             self._plugins_root / "state.json",
             on_change=self._on_plugins_changed)
-        self._plugin_runtime = None      # 由 run_backend 注入（能发消息时才建）
+        self._plugin_runtime = None
         self._plugin_market_cache = {}   # {缓存键: {entries, fetched_at, ...}}
-        # 本机推送/下架过哪些插件：市场索引与镜像都有缓存，刚推上去或刚删掉的
-        # 未必立刻读得到。落盘保存，重启后仍然算数，避免同一版本被重复推送。
         self._publish_state_file = user_data_dir() / "publish_state.json"
         self._publish_state = {"published": {}, "unpublished": {}}
         self._publish_state_readable = True
@@ -456,15 +459,11 @@ class WebUIServer:
         self.app.router.add_post("/api/update/install", self.handle_update_install)
 
     def _refresh_auth_state(self):
-        """按当前 webui_password 重建会话令牌。「记住我」的令牌与密码哈希一起
-        持久化：重启后密码未变则沿用令牌（浏览器旧 Cookie 继续有效），
-        密码改变即作废。"""
         import secrets
         password = str(self.config.get("webui_password", "") or "")
         self._password = password
         second = str(self.config.get("webui_second_password", "") or "")
         if second != self._second_password:
-            # 二级密码变了（或刚被清空），之前的解锁一律作废
             self._second_unlocked_until = 0.0
             self._second_once = 0
         self._second_password = second
@@ -486,8 +485,6 @@ class WebUIServer:
         self._auth_token = remembered or secrets.token_hex(16)
 
     def _second_unlocked(self) -> bool:
-        """二级密码是否已解锁。有效时长填 0 时只放行紧接着的那一次请求
-        （前端解锁后会自动重放被拦的那次），之后每次敏感操作都要重输。"""
         if self._second_unlocked_until and time.time() < self._second_unlocked_until:
             return True
         if self._second_once:
@@ -518,8 +515,6 @@ class WebUIServer:
             pass
 
     async def handle_auth_status(self, request):
-        # 这个接口在页面加载时必被调用一次，版本号搭车返回，
-        # 省得为了左上角那行小字再开一个请求（关掉更新检查时也要能显示）
         from modules.updater import APP_VERSION
         version = APP_VERSION
         second = {"second_enabled": bool(self._second_password)}
@@ -546,7 +541,6 @@ class WebUIServer:
                 raw = payload.get("remember_minutes")
                 if raw is None or raw == "":
                     raw = self.config.get("webui_auth_ttl_minutes", 30)
-                # 0 是合法值（关掉页面即失效），不能当"没填"退回默认
                 minutes = max(0, min(int(raw or 0), 60 * 24 * 30))
             except (TypeError, ValueError):
                 minutes = max(0, int(self.config.get("webui_auth_ttl_minutes", 30) or 30))
@@ -559,7 +553,6 @@ class WebUIServer:
         return web.json_response({"success": False, "error": "密码错误"}, status=401)
 
     async def handle_auth_second(self, request):
-        """校验二级密码并解锁敏感操作。没设二级密码时直接放行。"""
         if not self._second_password:
             return web.json_response({"success": True, "unlocked": False,
                                       "second_enabled": False})
@@ -573,7 +566,6 @@ class WebUIServer:
             raw = payload.get("minutes")
             if raw is None or raw == "":
                 raw = self.config.get("webui_second_unlock_minutes", 30)
-            # 0 是合法值（每次都要重输），不能当"没填"退回默认
             minutes = max(0, min(int(raw or 0), 60 * 24 * 30))
         except (TypeError, ValueError):
             minutes = max(0, int(self.config.get("webui_second_unlock_minutes", 30) or 0))
@@ -640,9 +632,7 @@ class WebUIServer:
         return web.json_response(
             self._with_update_download(await self._update_check_payload()))
 
-    # ---------------- 在线更新（下载 / 进度 / 安装） ----------------
     def _update_download_payload(self) -> dict:
-        """下载状态：内存里的进度优先；没有就把磁盘上已下好的安装包报上来。"""
         with _UPDATE_LOCK:
             state = dict(_UPDATE_STATE)
         ready = find_ready_installer()
@@ -654,7 +644,6 @@ class WebUIServer:
         return state
 
     def _with_update_download(self, payload: dict) -> dict:
-        """把「有没有下好的安装包」并进检查结果：前端据此直接跳到安装提示。"""
         result = dict(payload or {})
         result["download"] = self._update_download_payload()
         return result
@@ -663,7 +652,6 @@ class WebUIServer:
         return web.json_response({"ok": True, **self._update_download_payload()})
 
     async def handle_update_download(self, request):
-        """开始下载安装包（后台跑，前端轮询进度、日志里看同一行）。"""
         if not self.config.get("update_check_enabled", True):
             return web.json_response({"ok": False, "error": "更新检查已在配置里关闭"},
                                      status=400)
@@ -683,7 +671,6 @@ class WebUIServer:
         return web.json_response({"ok": True, "started": True})
 
     async def _race_mirrors(self, url: str):
-        """镜像测速：直连与各镜像并发试，谁先响应就用谁；证书问题降级再试一遍。"""
         from modules import updater as U
         from modules.ghmirror import candidates
         from modules.tls import is_cert_error
@@ -694,13 +681,11 @@ class WebUIServer:
         except Exception as e:
             if not is_cert_error(e):
                 raise
-            print("[更新] 证书校验失败，改用不校验证书的方式测速（本机可能装了"
-                  "自签根证书的安全软件/加速器）")
+            print("[更新] 证书校验失败，改用不校验证书的方式测速（本机可能装了自签根证书的安全软件/加速器）")
             winner, elapsed = await U.race_candidates(urls, verify=False)
             return winner, elapsed, True
 
     async def _update_download_task(self):
-        """后台任务：查发布 → 测速挑最快镜像 → 流式下载 → 落盘。"""
         from modules import updater as U
         from modules.ghmirror import mirror_label, note_success
         try:
@@ -711,8 +696,7 @@ class WebUIServer:
             if not (payload or {}).get("has_update"):
                 raise RuntimeError("当前已是最新版本，不需要下载")
             if not url:
-                raise RuntimeError("这个版本没有上传安装包（.exe）资源，"
-                                   "请点「前往 GitHub 更新」手动下载")
+                raise RuntimeError("这个版本没有上传安装包（.exe）资源，请点「前往 GitHub 更新」手动下载")
             if not is_own_release_asset(url):
                 raise RuntimeError("安装包地址不在本仓库的 Releases 里")
             try:
@@ -754,13 +738,11 @@ class WebUIServer:
             size = await U.download_asset(winner, dest, expected_size=expected,
                                           verify=not insecure, on_progress=on_progress)
             used = max(0.001, time.time() - started)
-            # 类型校验按资源类型来：exe 看 MZ、压缩包看 PK（镜像可能回 HTML 错误页）
             await asyncio.to_thread(U.check_downloaded_head, dest, kind)
             print(f"[更新] 下载完成：{dest.name}（{size / 1048576:.1f} MB，"
                   f"用时 {used:.0f} 秒，平均 {size / used / 1048576:.1f} MB/s，"
                   f"来源 {label}）")
             if kind == "archive":
-                # 发布的是压缩包：自动解出里面的 exe 再用；解完把压缩包删掉，
                 # 留着只会让用户目录里躺双份
                 with _UPDATE_LOCK:
                     _UPDATE_STATE.update({"phase": "解压中"})
@@ -786,7 +768,6 @@ class WebUIServer:
             print(f"[更新] 下载失败：{type(e).__name__}: {e}")
 
     async def handle_update_install(self, request):
-        """立即安装：把安装包交给主程序那边的入口（起助手 → 退出本进程）。"""
         try:
             payload = await request.json()
         except Exception:
@@ -814,12 +795,6 @@ class WebUIServer:
 
     async def _github_fetch(self, url: str, kind: str = "json", *,
                             timeout: float = 10.0, headers=None):
-        """取一个 GitHub 地址，直连不通时按配置里的镜像重试。
-
-        返回 `(数据, 是否跳过了证书校验)`；kind 决定怎么解析响应
-        （json / text / bytes），解析不了的响应（镜像返回错误页之类）也算失败，
-        换下一个候选。只服务**匿名读**请求 —— 带 token 的写操作一律直连官方。
-        """
         from modules.ghmirror import candidates, mirror_label, note_success
         from modules.tls import verified_context, unverified_context, is_cert_error
         hdrs = headers or {}
@@ -843,8 +818,6 @@ class WebUIServer:
                             data = resp.content
                 except Exception as e:
                     last_err = e
-                    # 证书问题（本机自签根证书/加速器/公司代理）换个不校验的方式再试；
-                    # 其它错误直接换下一个候选地址。
                     if not unverified and is_cert_error(e):
                         continue
                     break
@@ -865,7 +838,6 @@ class WebUIServer:
         return data, insecure
 
     async def _update_check_payload(self) -> dict:
-        """向 GitHub 查一次最新版本并返回结果（含失败原因），成功时写入缓存。"""
         from modules.updater import APP_VERSION, is_newer, pick_latest_release
         include_pre = bool(self.config.get("update_include_prerelease", False))
         try:
@@ -884,8 +856,7 @@ class WebUIServer:
                 return {"enabled": True, "current": APP_VERSION, "has_update": False,
                         "checked_at": checked_at, "include_prerelease": include_pre,
                         "releases_seen": seen, "insecure": insecure,
-                        "error": "GitHub 上没有可用的发布版本"
-                                 "（草稿状态的发布对检查接口不可见，需要先正式发布）"}
+                        "error": "GitHub 上没有可用的发布版本（草稿状态的发布对检查接口不可见，需要先正式发布）"}
             latest = picked["tag"]
             current = APP_VERSION
             has_update = is_newer(latest, current)
@@ -933,7 +904,8 @@ class WebUIServer:
         r.add_post("/api/config/profiles/save", self.handle_config_profiles_save)
         r.add_post("/api/config/profiles/delete", self.handle_config_profiles_delete)
         r.add_post("/api/config/profiles/open_dir", self.handle_config_profiles_open_dir)
-        # WebUI 当前的访问地址与安全状态（设置页「访问地址」那一行）
+        r.add_get("/api/model-library", self.handle_model_library_get)
+        r.add_post("/api/model-library/save", self.handle_model_library_save)
         r.add_get("/api/webui/access", self.handle_webui_access)
         # 插件系统
         r.add_get("/api/plugins/list", self.handle_plugins_list)
@@ -970,7 +942,6 @@ class WebUIServer:
         r.add_post("/api/llm/scan_models", self.handle_scan_models)
         r.add_post("/api/llm/list_remote_models", self.handle_list_remote_models)
         r.add_get("/api/roles", self.handle_get_roles)
-        r.add_post("/api/roles/save", self.handle_save_roles)
         r.add_get("/api/logs", self.handle_get_logs)
         # 情绪音频管理
         r.add_get("/api/emotions/list", self.handle_emotions_list)
@@ -984,7 +955,6 @@ class WebUIServer:
         r.add_get("/api/tts/voice_design/list", self.handle_voice_design_list)
         r.add_post("/api/tts/voice_design/create", self.handle_voice_design_create)
         r.add_post("/api/tts/voice_design/delete", self.handle_voice_design_delete)
-        # 云 TTS 声音复刻（用上传的音频克隆音色）
         r.add_get("/api/tts/voice_enrollment/list", self.handle_voice_enrollment_list)
         r.add_post("/api/tts/voice_enrollment/create", self.handle_voice_enrollment_create)
         r.add_post("/api/tts/voice_enrollment/delete", self.handle_voice_enrollment_delete)
@@ -992,9 +962,9 @@ class WebUIServer:
         r.add_get("/api/asr/status", self.handle_asr_status)
         r.add_post("/api/asr/scan_models", self.handle_asr_scan_models)
         r.add_post("/api/asr/list_remote_models", self.handle_asr_list_remote_models)
-        # 语音通话（打电话）：开场状态 + 一轮对话
         r.add_get("/api/call/status", self.handle_call_status)
         r.add_post("/api/call/turn", self.handle_call_turn)
+        r.add_get("/api/call/turn/poll", self.handle_call_turn_poll)
         # 聊天记录导入导出
         r.add_get("/api/memory/export", self.handle_memory_export)
         r.add_post("/api/memory/import", self.handle_memory_import)
@@ -1069,11 +1039,6 @@ class WebUIServer:
         r.add_post("/api/clear-ui-cache", self.handle_clear_ui_cache)
 
     async def handle_clear_ui_cache(self, request):
-        """「清理界面缓存」按钮：把界面缓存真的删掉。
-
-        拆界面进程会把当前页面一起带走，所以先把响应发回去，再在后台线程里
-        拆 → 删 → 重建；页面自己会带着新界面回来。
-        """
         window = app_context._WEBVIEW_WINDOW_HOLDER.get("window")
         try:
             alive = webview2_control_alive(window) if window is not None else False
@@ -1093,7 +1058,6 @@ class WebUIServer:
         return web.json_response({"ok": True, "desktop": alive})
 
     async def handle_favicon(self, request):
-        """浏览器每次打开页面都会自己来要 favicon，没有就报 404 刷控制台。"""
         paths = _candidate_icon_paths()
         if not paths:
             return web.Response(status=404)
@@ -1101,9 +1065,6 @@ class WebUIServer:
 
     async def handle_index(self, request):
         if self.html_path.exists():
-            # 界面是单文件前端，整个界面都在这个页面里，缓存它没有好处：
-            # 前端更新后旧页面会继续命中缓存，用户重装程序都看不到新界面。
-            # （WebView2 还有自己独立的一份缓存，由 purge_webview_cache 收拾。）
             return web.FileResponse(self.html_path, headers={"Cache-Control": "no-store"})
         return web.Response(text="WebUI 页面未找到", status=404)
 
@@ -1123,30 +1084,11 @@ class WebUIServer:
         return web.json_response({**masked, "defaults": self.config.default_config()})
 
     def _config_export_payload(self) -> dict:
-        """导出用配置：密钥一律保持 config.json 的 enc:.../enc2:... 密文形态。
-
-        内存里的配置是解密后的明文，直接导出等于把密钥写成明文送出去；这里做
-        两层处理：
-
-        1. 走 _encrypt_api_keys：已是 enc:/enc2: 密文的值原样保留，明文（无论
-           sk- 还是别的形式）全部重新加密；
-        2. 再做一次兜底扫描 _scrub_plaintext_secrets：凡是出现在敏感字段里、
-           或以 sk-/sk_ 之类已知密钥前缀开头的残留明文，一律替换成对应密文，
-           并对无法确认来源的值做打码，避免任何明文密钥出现在导出结果里。
-
-        导出结果里 WebUI 访问密码与 API 密钥只能是密文。
-        """
         payload = json.loads(json.dumps(self.config.config or {}, ensure_ascii=False))
         _encrypt_api_keys(payload)
         return _scrub_plaintext_secrets(payload)
 
     async def _save_export_via_dialog(self, default_name: str, content: bytes) -> str:
-        """桌面窗口模式下弹系统保存框写盘。
-
-        WebView2 默认禁止页面下载，前端 blob 下载在桌面窗口里是静默无效的；
-        所以桌面模式由服务端落盘，返回 "saved" / "cancelled"；浏览器访问没有
-        保存框可用，返回 "browser"，由前端按普通下载处理。
-        """
         try:
             import webview
         except Exception:
@@ -1165,15 +1107,9 @@ class WebUIServer:
         return path
 
     def _export_status_response(self, mode: str, path: str = ""):
-        """导出结果状态。
-
-        mode 取值：saved（服务端已写盘）/ cancelled（用户取消）/ error（导出出错）
-        / download（前端按浏览器下载处理）。error 时 path 承载错误信息。
-        """
         return web.json_response({"mode": mode, "path": path})
 
     async def handle_export_config(self, request):
-        """导出配置。任何异常都必须以 error 状态回给前端，不能静默失败。"""
         try:
             payload = self._config_export_payload()
             content = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
@@ -1190,15 +1126,6 @@ class WebUIServer:
             return self._export_status_response("error", f"{type(e).__name__}: {e}")
 
     def _apply_imported_config(self, data: dict) -> None:
-        """把一份配置并进当前配置、落盘并热重载。
-
-        导入的配置里密钥可能是打码值（来自 WebUI 导出）或密文，两者都要处理：
-        打码值沿用内存里已有的真密钥；密文统一走与读盘相同的解密路径 —— 内存里的
-        配置约定是明文（webui_password 也要一起解密，否则导入后原密码就再也登不
-        进来）。解不开的密文（换过电脑）由 _decrypt_value 返回 None，调用方保留原
-        密文而不是置空 —— 置空会让这份密文在下一次落盘时被空串永久覆盖，密钥不
-        可恢复。
-        """
         stored = self.config.config or {}
         for key in _SECRET_FIELD_KEYS:
             masked_value = data.get(key)
@@ -1213,6 +1140,14 @@ class WebUIServer:
         _decrypt_api_keys(data)
         _decrypt_webui_password(data)
         merged = {**self.config.default_config(), **stored, **data}
+        try:
+            lib = model_library.load_library(self._config_preset_dir())
+            if "role_ids" not in merged:
+                model_library.migrate_config_dict(merged, lib, "主配置")
+                model_library.save_library(self._config_preset_dir(), lib)
+            model_library.apply_library(merged, lib)
+        except Exception as lib_err:
+            print(f"[模型库] 导入配置迁移失败（沿用导入内容）：{type(lib_err).__name__}: {lib_err}")
         self.config.config = merged
         self.config._atomic_save(merged)
         self._after_config_reload()
@@ -1238,13 +1173,11 @@ class WebUIServer:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
     # ------------------------------------------------------------------
-    # 配置文件：整套配置按名字存成 data 下的 JSON，接入方式各用一份
     # ------------------------------------------------------------------
     def _config_preset_dir(self):
         return self.memory_manager.data_path
 
     def _config_profile_usage(self) -> dict:
-        """配置文件 → 正在用它的接入方式名字，供页面提示「谁在用」。"""
         usage = {}
         for conn in (self.config.get("connections", []) or []):
             if not isinstance(conn, dict):
@@ -1257,11 +1190,6 @@ class WebUIServer:
         return usage
 
     def _masked_config(self, data: dict, hide_secrets: bool = False) -> dict:
-        """读配置给前端时的密钥处理。
-
-        hide_secrets=True（配置文件页）：密钥一律回空串 —— 那一页不显示也不改动密钥，
-        密钥只在设置页统一管理；否则回头尾打码预览，让设置页能看出「填过了」。
-        """
         def render(value):
             if not isinstance(value, str):
                 return value
@@ -1276,14 +1204,17 @@ class WebUIServer:
                 masked[key] = render(value)
         return masked
 
-    def _write_config_profile(self, name: str, data: dict, rename_from: str = "") -> dict:
-        """把页面提交的配置写进配置文件。
+    def _fill_profile_selections(self, payload: dict) -> dict:
+        payload = dict(payload or {})
+        main = self.config.config or {}
+        payload.setdefault("role_ids", list(main.get("role_ids") or []))
+        payload.setdefault("active_character", str(main.get("active_character", "") or ""))
+        for kind in model_library.PROVIDER_KINDS:
+            payload.setdefault(f"{kind}_provider", str(main.get(f"{kind}_provider", "") or ""))
+        return payload
 
-        密钥字段空着（或原样带回打码值）表示这一项没被改动，沿用这份配置文件里已有的
-        值 —— 配置文件页根本不显示密钥，没有这条规则的话改一个开关就会把密钥清空；
-        其余统一加密后再落盘。
-        """
-        payload = dict(data or {})
+    def _write_config_profile(self, name: str, data: dict, rename_from: str = "") -> dict:
+        payload = self._fill_profile_selections(data)
         stored = {}
         for source in (name, rename_from):
             if not source or source == DEFAULT_CONFIG_PROFILE:
@@ -1303,6 +1234,7 @@ class WebUIServer:
                                 for k, v in value.items()} or stored_keys
             elif _is_kept_secret(value):
                 payload[key] = stored.get(key, "")
+        model_library.strip_derived(payload)
         _encrypt_api_keys(payload)
         _encrypt_webui_password(payload)
         profile = save_config_profile(self._config_preset_dir(), name, payload, rename_from)
@@ -1321,11 +1253,6 @@ class WebUIServer:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
     async def handle_config_profiles_read(self, request):
-        """读一份配置文件的内容；default 返回当前主配置，页面可以直接照着改。
-
-        密钥字段一律回空串，并把字段名清单一起给前端：那一页不显示密钥，保存时前端
-        据此把空着的密钥项摘掉，服务端按「没提交就沿用原值」处理。
-        """
         try:
             payload = await request.json()
             name = str(payload.get("name") or "")
@@ -1364,7 +1291,6 @@ class WebUIServer:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
     async def handle_config_profiles_open_dir(self, request):
-        """在资源管理器里打开配置文件目录，方便用户直接看/备份这些 JSON。"""
         try:
             work = config_preset_dir(self._config_preset_dir())
             work.mkdir(parents=True, exist_ok=True)
@@ -1378,16 +1304,13 @@ class WebUIServer:
     # 插件系统
     # ==================================================================
     def attach_plugin_runtime(self, runtime) -> None:
-        """由 run_backend 注入运行时（那时才拿得到 sender / 配置读取器）。"""
         self._plugin_runtime = runtime
 
     def _on_plugins_changed(self) -> None:
-        """插件启用/禁用/安装/卸载后的热重载入口。"""
         rt = self._plugin_runtime
         if rt is None:
             return
         if not self.config.get("plugins_enabled", True):
-            # 总开关关掉时，把已加载的全部卸掉（皮肤也会随之失效）
             try:
                 rt.unload_all()
             except Exception as e:
@@ -1402,20 +1325,15 @@ class WebUIServer:
             print(f"[插件] 热重载失败: {e}")
 
     async def handle_plugins_list(self, request):
-        """列出已安装插件及其启用状态。"""
         try:
             items = self.plugin_manager.list_plugins()
             for it in items:
-                # 皮肤设置面板、features 开关、插件自带功能页都要读插件私有设置，
-                # 少任一条件都会让前端拿到空 settings、开关显示错状态。
                 if it.get("skin") or it.get("features") or it.get("panel"):
                     it["settings"] = self.plugin_manager.plugin_settings(it["id"])
             return web.json_response({
                 "success": True,
                 "plugins": items,
                 "root": str(self.plugin_manager.root),
-                # 打开了「应用外观」的皮肤插件：前端据此给 html 加 skin-on，
-                # 没开的插件不改程序原本的背景。
                 "active_skins": (self.plugin_manager.active_skin_ids()
                                  if self.config.get("plugins_enabled", True) else []),
                 "loaded": sorted((self._plugin_runtime.loaded.keys()
@@ -1427,7 +1345,6 @@ class WebUIServer:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
     async def handle_plugins_upload(self, request):
-        """上传 .zip 安装插件。带 force=1 表示用户已确认风险清单。"""
         try:
             reader = await request.multipart()
             data = None
@@ -1454,7 +1371,6 @@ class WebUIServer:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
     async def handle_plugins_inspect(self, request):
-        """只审查不安装：让用户在装之前看到风险清单。"""
         try:
             reader = await request.multipart()
             data = None
@@ -1485,7 +1401,6 @@ class WebUIServer:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
     async def _timed_get(self, url: str, timeout: float = 6.0):
-        """取一次地址并计时，返回 (毫秒, 是否成功, 说明)。"""
         from modules.tls import verified_context
         t0 = time.monotonic()
         try:
@@ -1501,7 +1416,6 @@ class WebUIServer:
             return int((time.monotonic() - t0) * 1000), False, type(e).__name__
 
     async def _probe_mirror(self, template: str, repo: str) -> dict:
-        """测一个镜像模板：raw 与 api 各探一次，取最快的一次当它的速度。"""
         from modules.ghmirror import apply_template, probe_urls, template_host
         best = None
         kinds = []
@@ -1526,7 +1440,6 @@ class WebUIServer:
         }
 
     async def handle_github_mirror_test(self, request):
-        """给配置里的每个镜像测一次延迟，按快的在前返回。"""
         try:
             payload = await request.json()
         except Exception:
@@ -1552,7 +1465,6 @@ class WebUIServer:
         return web.json_response({"success": True, "repo": repo, "mirrors": items})
 
     async def handle_plugins_pin(self, request):
-        """置顶 / 取消置顶某个插件（只影响「插件」页的排序）。"""
         try:
             payload = await request.json()
             pid = str(payload.get("id") or "").strip()
@@ -1566,7 +1478,6 @@ class WebUIServer:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
     async def handle_plugins_delete(self, request):
-        """卸载插件。keep_settings / keep_data 为真时保留对应的配置与数据。"""
         try:
             payload = await request.json()
             pid = str(payload.get("id") or "").strip()
@@ -1574,8 +1485,6 @@ class WebUIServer:
             keep_data = bool(payload.get("keep_data"))
             if not self.plugin_manager.get(pid):
                 return web.json_response({"success": False, "error": "插件不存在"}, status=404)
-            # 先卸载运行时再删目录：Windows 上插件模块还在 sys.modules 里时
-            # 文件句柄没释放，rmtree 会失败（现象是"点卸载没反应"）。
             ok = self.plugin_manager.uninstall(pid, keep_settings=keep_settings,
                                                keep_data=keep_data)
             if ok:
@@ -1589,7 +1498,6 @@ class WebUIServer:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
     async def handle_plugins_theme(self, request):
-        """把所有启用插件的皮肤 CSS 拼起来给前端注入。"""
         try:
             if not self.config.get("plugins_enabled", True):
                 return web.Response(text="/* 插件系统已关闭 */",
@@ -1602,7 +1510,6 @@ class WebUIServer:
                                 content_type="text/css", charset="utf-8")
 
     async def handle_plugins_icon(self, request):
-        """返回插件图标，供列表展示。"""
         try:
             pid = str(request.query.get("id") or "").strip()
             f = self.plugin_manager.icon_file(pid)
@@ -1617,7 +1524,6 @@ class WebUIServer:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
     async def handle_plugins_open_dir(self, request):
-        """在资源管理器里打开插件目录，方便用户手动放插件。"""
         try:
             root = self.plugin_manager.ensure_root()
             if os.name == "nt":
@@ -1627,7 +1533,6 @@ class WebUIServer:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
     async def handle_plugins_asset(self, request):
-        """读取插件 data 目录下的静态资源（背景图、样式、字体等）。"""
         try:
             pid = str(request.query.get("id") or "").strip()
             name = str(request.query.get("name") or "").strip()
@@ -1639,7 +1544,6 @@ class WebUIServer:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
     async def handle_plugins_settings_get(self, request):
-        """读取某个插件的私有设置（插件未安装时返回空对象）。"""
         try:
             pid = str(request.query.get("id") or "").strip()
             if not self.plugin_manager.get(pid):
@@ -1651,16 +1555,6 @@ class WebUIServer:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
     async def handle_plugins_settings_set(self, request):
-        """保存某个插件的私有设置（只落盘，不立即生效）。
-
-        落盘前按插件声明的字段筛一遍：只有插件在清单里声明过的键会被保留，
-        值也按声明的类型收敛。否则设置文件会变成任意 JSON 的暂存区 ——
-        插件写进去什么，下次读出来就是什么。
-
-        落盘不等于生效：插件运行时与皮肤 CSS 都读磁盘上的这份文件，但要让
-        改动真的作用到已加载的插件上，得由「保存并重载」走 `plugins/reload`
-        重新加载运行时。这样用户一次调好几项也不会中途反复生效。
-        """
         try:
             payload = await request.json()
             pid = str(payload.get("id") or "").strip()
@@ -1680,14 +1574,6 @@ class WebUIServer:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
     async def handle_plugins_reload(self, request):
-        """重载插件运行时 + 提交设置草稿 + 刷新皮肤。
-
-        三件事缺一不可：
-          1. `commit_settings()` 把磁盘上的设置草稿提交成生效值 —— 皮肤变量
-             与插件读到的设置都以此为准；
-          2. `_on_plugins_changed()` 重新加载插件运行时（钩子、指令、开关）；
-          3. 回传最新 active_skins，前端重挂 theme 链接与 skin-on 类。
-        """
         try:
             pid = ""
             try:
@@ -1718,11 +1604,6 @@ class WebUIServer:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
     async def _serve_plugin_page_file(self, request, default_name: str):
-        """把插件目录里的界面文件原样回给浏览器（自带功能页 / webui 及其同目录资源）。
-
-        `?id=<插件>&name=<相对路径>`；name 留空时用 default_name。
-        页面本体（name 就是 default_name 的那次请求）会先注入桥接脚本。
-        """
         try:
             pid = str(request.query.get("id") or "").strip()
             info = self.plugin_manager.get(pid)
@@ -1742,7 +1623,6 @@ class WebUIServer:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
     def _inject_plugin_bridge(self, body: bytes, pid: str, info: dict) -> bytes:
-        """把桥接脚本插到插件页面最前面（插不进就当普通页面返回）。"""
         try:
             text = body.decode("utf-8")
         except UnicodeDecodeError:
@@ -1766,18 +1646,15 @@ class WebUIServer:
         return text.encode("utf-8")
 
     async def handle_plugins_panel(self, request):
-        """插件自带的功能页界面（清单里的 panel.html）。"""
         pid = str(request.query.get("id") or "").strip()
         info = self.plugin_manager.get(pid) or {}
         return await self._serve_plugin_page_file(
             request, str((info.get("panel") or {}).get("html") or "").strip())
 
     async def handle_plugins_webui(self, request):
-        """插件自带的 webui（插件根目录的 webui.html）。"""
         return await self._serve_plugin_page_file(request, PLUGIN_WEBUI_NAME)
 
     async def _market_raw_text(self, url: str):
-        """从 raw.githubusercontent.com 取一段文本，取不到返回 None。"""
         try:
             text, _ = await self._github_fetch(
                 url, "text", headers={"User-Agent": "lovomo-plugin-market"})
@@ -1786,11 +1663,6 @@ class WebUIServer:
             return None
 
     async def _market_manifest(self, repo: str, branch: str):
-        """取某条插件分支的清单，返回 (清单字典, 清单文件名)。
-
-        分支根目录放 plugin.yaml 或 plugin.json 都行，yaml 优先 —— 与
-        本地安装走的是同一套优先级（modules.plugins.MANIFEST_NAMES）。
-        """
         from modules.market import RAW_TMPL
         from modules.plugins import MANIFEST_NAMES, parse_manifest_text
         for name in MANIFEST_NAMES:
@@ -1804,11 +1676,6 @@ class WebUIServer:
         return None, ""
 
     async def _market_commit_time(self, repo: str, sha: str) -> float:
-        """按 SHA 单独查提交时间。
-
-        插件分支是独立根提交，不在默认分支的提交列表里，靠
-        `/commits` 那一次批量查询拿不到它的时间。
-        """
         from modules.market import parse_iso_time
         try:
             data, _ = await self._fetch_releases(
@@ -1821,11 +1688,6 @@ class WebUIServer:
 
 
     async def _market_branches(self, repo: str):
-        """列出仓库的全部分支（分页拉全，返回 (分支列表, 是否跳过证书校验)）。
-
-        GitHub 一次最多给 100 条，插件多了后面的会被截断成"不存在"，
-        所以按页取到不足一页为止。
-        """
         out, insecure = [], False
         for page in range(1, MAX_BRANCH_PAGES + 1):
             data, insecure_p = await self._fetch_releases(
@@ -1840,11 +1702,6 @@ class WebUIServer:
         return out, insecure
 
     async def _market_tags(self, repo: str, prefix: str) -> list:
-        """列出仓库里以插件前缀开头的标签名（分页拉全）。
-
-        只按前缀筛选，形状合不合法交给 `parse_version_tag()` 判定 ——
-        程序自己的版本标签不会被误认成插件。
-        """
         out = []
         for page in range(1, MAX_BRANCH_PAGES + 1):
             data, _ = await self._fetch_releases(
@@ -1859,7 +1716,6 @@ class WebUIServer:
         return out
 
     async def _market_branch_entries(self, repo: str, prefix: str) -> dict:
-        """扫插件分支并组装市场条目（branches / commits / releases / raw）。"""
         from modules.market import (ARCHIVE_TMPL, RAW_TMPL, build_entry,
                                     count_reactions, matches_branch_prefix,
                                     plugin_id_from_branch, release_belongs_to,
@@ -1902,8 +1758,6 @@ class WebUIServer:
 
         branch_meta = {b: {"id": plugin_id_from_branch(b, prefix)} for b in picked}
         live = [r for r in releases if not r.get("draft")]
-        # 收藏量要按 Release 单独查点赞数（列表接口不给总数），
-        # 只查确实属于这些插件的那些，并且设上限，别把配额烧光。
         targets = [r for r in live if any(release_belongs_to(r, b, branch_meta[b]["id"])
                                           for b in picked)]
         for rel in targets[:MAX_REACTION_LOOKUPS]:
@@ -1941,7 +1795,6 @@ class WebUIServer:
         return {"entries": entries, "warnings": warnings, "insecure": insecure}
 
     async def _market_default_branch(self, repo: str) -> str:
-        """仓库的默认分支名（取不到就退回 main）。"""
         try:
             data, _ = await self._fetch_releases(
                 f"https://api.github.com/repos/{repo}")
@@ -1952,12 +1805,6 @@ class WebUIServer:
         return str(data.get("default_branch") or "").strip() or "main"
 
     async def _market_sources(self, repo: str, path: str) -> list:
-        """读市场仓库里的第三方来源清单（每行一个「用户名/仓库名」）。
-
-        清单放在仓库里而不是用户配置里，是为了让别人能提 PR 加一行就上架 ——
-        改的是市场仓库、不是每个用户的本机配置。读的是仓库的默认分支，与
-        市场索引同一套口径；写回市场仓库自己的行会被剔掉，免得扫两遍。
-        """
         from modules.market import RAW_TMPL, parse_market_repos
         branch = await self._market_default_branch(repo)
         url = RAW_TMPL.format(repo=repo, branch=branch, path=path)
@@ -1971,11 +1818,6 @@ class WebUIServer:
 
 
     async def _market_releases(self, repo: str, pids) -> list:
-        """仓库里属于这些插件的 Release 列表，顺带补上点赞数。
-
-        下载量与收藏量都来自 Release：列表接口不给点赞总数，所以只对确实
-        属于这些插件的 Release 单独查一次，并且设上限，别把配额烧光。
-        """
         from modules.market import count_reactions, release_for_plugin
         try:
             data, _ = await self._fetch_releases(
@@ -2003,13 +1845,6 @@ class WebUIServer:
 
 
     async def _market_index_entries(self, repo: str, market_path: str) -> dict:
-        """读市场仓库里的 index.json 索引（官方市场的条目来源）。
-
-        索引条目要带 `source_repo`（或 `repo`）：安装时会拿它校验"插件是不是
-        真从这个仓库来的"。没写就按 `download` 链接的归属推断，再退回归属
-        索引自己所在的仓库。下载量与收藏量按插件 id 从 Release 汇总，
-        download 优先用 Release 里的 zip 附件。
-        """
         from modules.market import plugin_category, summarize_plugin_releases
         from modules.plugins import repo_slug
         branch = await self._market_default_branch(repo)
@@ -2056,12 +1891,6 @@ class WebUIServer:
 
     async def _market_scan_repos(self, repos, prefix: str,
                                  market_path: str = "") -> dict:
-        """逐个仓库取插件条目并合并（来源清单与第三方市场用）。
-
-        每个仓库先读索引（「发布到市场」写的就是它），索引里没有条目时再按
-        分支扫 —— 两种上架方式都能被扫到。单个仓库出错只记一条 warning，
-        不牵连别的仓库：地址是用户自己填的，写错一个不该让整个市场打不开。
-        """
         index_path = str(market_path or "").strip() or "plugins/index.json"
         entries, warnings, insecure = [], [], False
         for repo in repos:
@@ -2070,8 +1899,6 @@ class WebUIServer:
                 insecure = insecure or bool(got.get("insecure"))
                 warns = list(got.get("warnings") or [])
                 if not got["entries"]:
-                    # 索引里没有条目：这个仓库可能是按分支上架的，回退扫分支。
-                    # 分支里有插件时就不再提索引读不到 —— 那是这种上架方式的正常情况
                     by_branch = await self._market_branch_entries(repo, prefix)
                     insecure = insecure or bool(by_branch.get("insecure"))
                     if by_branch["entries"]:
@@ -2088,12 +1915,6 @@ class WebUIServer:
 
     async def _plugins_market_payload(self, force: bool = False, sort: str = "latest",
                                       market: str = "official") -> dict:
-        """插件市场数据：扫索引/分支、按排序键返回（条目缓存 30 分钟）。
-
-        market = official 读官方市场仓库里的索引（索引里没有条目时回退扫它的
-        分支），再叠加来源清单里的仓库；thirdparty 按 plugin_market_thirdparty
-        逐行列出的仓库扫分支。
-        """
         from modules.market import SORT_KEYS, parse_market_repos, sort_entries
         kind = "thirdparty" if str(market or "").strip().lower() == "thirdparty" \
             else "official"
@@ -2124,8 +1945,7 @@ class WebUIServer:
             source, warnings, insecure, error = "branches", [], False, ""
             entries = []
             if kind == "thirdparty" and not repos:
-                warnings.append("还没有配置第三方市场地址，"
-                                "按每行一个「用户名/仓库名」填好再刷新")
+                warnings.append("还没有配置第三方市场地址，按每行一个「用户名/仓库名」填好再刷新")
             elif kind == "thirdparty":
                 got = await self._market_scan_repos(repos, prefix, market_path)
                 entries, warnings = got["entries"], got["warnings"]
@@ -2139,7 +1959,6 @@ class WebUIServer:
                         warnings = warnings + list(index.get("warnings") or [])
                         source = "index"
                     else:
-                        # 自建市场仍可能只靠分支上架：索引里没东西时回退扫分支
                         got = await self._market_branch_entries(repo, prefix)
                         entries, warnings = got["entries"], got["warnings"]
                         source = "branches"
@@ -2197,11 +2016,6 @@ class WebUIServer:
             await self._plugins_market_payload(force, sort, market))
 
     async def _plugins_updates_payload(self, force: bool = False) -> dict:
-        """已安装插件里，市场上有更新版本的那些。
-
-        版本号按版本段比较（modules.updater.is_newer），市场里同一个插件出现
-        在多条来源时取版本最高的那一条。
-        """
         from modules.updater import is_newer
         installed = self.plugin_manager.list_plugins()
         found = {}
@@ -2241,7 +2055,6 @@ class WebUIServer:
         result = {"success": True, "count": len(updates), "plugins": updates,
                   "warnings": warnings}
         if errors and not updates:
-            # 市场都没拉到就别报「全部最新」：那会让用户以为已经检查过了
             result["success"] = False
             result["error"] = "；".join(errors[:2])
         return result
@@ -2256,7 +2069,6 @@ class WebUIServer:
                  "error": f"检查插件更新失败：{type(e).__name__}: {e}"}, status=400)
 
     async def handle_plugins_market_sources(self, request):
-        """保存第三方市场地址（每行一个「用户名/仓库名」）。"""
         try:
             payload = await request.json()
         except Exception:
@@ -2274,7 +2086,6 @@ class WebUIServer:
                                   "count": len(markets), "text": text})
 
     async def handle_plugins_readme(self, request):
-        """插件包内自带文档的内容（kind = readme / update）。"""
         pid = str(request.query.get("id") or "").strip()
         kind = str(request.query.get("kind") or "readme").strip().lower()
         if kind not in ("readme", "update"):
@@ -2286,7 +2097,6 @@ class WebUIServer:
         return web.json_response({"success": True, "id": pid, "kind": kind, **doc})
 
     async def handle_releases(self, request):
-        """仓库的全部 Releases（含各版本的资源与下载量）。"""
         from modules.updater import is_prerelease_version
         repo = str(self.config.get("plugin_release_repo", "") or "").strip() \
             or "slpk1ng/Lovomo"
@@ -2319,8 +2129,6 @@ class WebUIServer:
                     "tag": tag,
                     "name": str(rel.get("name") or tag or ""),
                     "draft": bool(rel.get("draft")),
-                    # 只看 GitHub 的 prerelease 标记会漏：作者常把 -beta 只写进 tag，
-                    # 没勾「预发布」，测试版就在历史版本页被标成正式版
                     "prerelease": bool(rel.get("prerelease")) or is_prerelease_version(tag),
                     "published_at": str(rel.get("published_at") or ""),
                     "created_at": str(rel.get("created_at") or ""),
@@ -2341,7 +2149,6 @@ class WebUIServer:
         return web.json_response(result)
 
     async def handle_release_download(self, request):
-        """下载 Release 资源并保存到本地（由服务端完成下载）。"""
         try:
             payload = await request.json()
         except Exception:
@@ -2350,7 +2157,6 @@ class WebUIServer:
         name = str(payload.get("name") or "").strip() or "download.bin"
         repo = str(self.config.get("plugin_release_repo", "") or "").strip() \
             or "slpk1ng/Lovomo"
-        # 只允许下本仓库 Release 的资源
         head = url.lower()
         allowed = (
             head.startswith(f"https://github.com/{repo.lower()}/releases/download/")
@@ -2375,7 +2181,6 @@ class WebUIServer:
             print(f"已保存 Release 资源：{safe} → {mode}")
             return web.json_response({"success": True, "mode": "saved",
                                       "path": mode, "name": safe})
-        # 浏览器访问：没有系统保存框，直接回流给浏览器下载
         from urllib.parse import quote as _quote
         return web.Response(
             body=content, content_type="application/octet-stream",
@@ -2391,18 +2196,6 @@ class WebUIServer:
 
     @staticmethod
     def _check_market_source(entry: dict, manifest: dict) -> str:
-        """校验"这个包是不是真来自市场条目记录的仓库"。
-
-        返回空串表示放行，否则返回给用户看的拒绝原因。
-
-        规则：
-        - 包内清单**一个来源都没声明**（github / repo / source_repo /
-          homepage / author 全空）→ 放行。全新插件本来就无从比对，
-          不能因为作者没写就把人挡在门外。
-        - 声明了来源，且能对上市场仓库（仓库名一致，或归属用户名一致）→ 放行。
-        - 声明了来源却对不上 → 拒绝。这正是"把别人的插件换个壳挂到自己
-          仓库上"的特征。
-        """
         from modules.plugins import manifest_logins, repo_owner, repo_slug
         want = repo_slug((entry or {}).get("source_repo"))
         if not want:
@@ -2416,11 +2209,9 @@ class WebUIServer:
         if repo_owner(want).lower() in owners:
             return ""
         return (f"插件声明的来源（{'、'.join(sorted(owners))}）与市场仓库 {want} "
-                "不一致，已拒绝安装。插件只能从作者本人的仓库安装，"
-                "如果你就是作者，请在清单里写上自己的 github / repo。")
+                "不一致，已拒绝安装。插件只能从作者本人的仓库安装，如果你就是作者，请在清单里写上自己的 github / repo。")
 
     async def handle_plugins_install_remote(self, request):
-        """从市场索引里下载并安装（同样过一遍安全审查）。"""
         try:
             payload = await request.json()
             pid = str(payload.get("id") or "").strip()
@@ -2462,7 +2253,6 @@ class WebUIServer:
                                           "report": report}, status=400)
             result = self.plugin_manager.install_zip(content, force=force)
             if result.get("success"):
-                # 记一笔来源，便于事后追溯插件是从哪条仓库/分支装来的
                 self.plugin_manager.set_source(result["id"],
                                                entry.get("source_repo") or "",
                                                entry.get("branch") or "",
@@ -2474,7 +2264,6 @@ class WebUIServer:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
     async def handle_plugins_publish_token(self, request):
-        """保存 GitHub PAT。配置落地走标准加密落盘流程。"""
         try:
             payload = await request.json()
             token = str(payload.get("token") or "").strip()
@@ -2511,8 +2300,6 @@ class WebUIServer:
         return state
 
     def _load_publish_state(self):
-        """读本机的推送记录。读不出来就沿用空记录，并且本次不再回写，
-        免得一次读取失败就把磁盘上完好的记录覆盖掉。"""
         from modules.jsonio import load_json_ex
         data, readable = load_json_ex(self._publish_state_file,
                                       {"published": {}, "unpublished": {}})
@@ -2543,7 +2330,6 @@ class WebUIServer:
         save_json(path, fresh)
 
     def _publish_memory(self) -> dict:
-        """本机记下的「已推送」版本 {插件 id: 版本}，过期的不算。"""
         now = time.time()
         out = {}
         for pid, rec in self._publish_state_get()["published"].items():
@@ -2555,7 +2341,6 @@ class WebUIServer:
         return out
 
     def _unpublish_memory(self) -> set:
-        """本机记下的「已下架」插件 id，过期的不算。"""
         now = time.time()
         out = set()
         for pid, rec in self._publish_state_get()["unpublished"].items():
@@ -2578,14 +2363,6 @@ class WebUIServer:
         self._save_publish_state()
 
     async def _published_versions(self, payload: dict = None) -> dict:
-        """已上架插件的版本号 {插件 id: 版本}。
-
-        官方市场的索引由「发布」写入，是权威来源；来源清单里的仓库仍靠
-        分支与版本标签判定（分支被删掉时标签仍在，两边取版本较大的那个）。
-        索引与镜像都有缓存，所以这里不吃条目缓存（payload 由调用方传入，
-        免得一次请求里重复拉两轮）；本机刚推送/刚下架的记录最后叠加，
-        撑住缓存还没刷新的那段时间。
-        """
         from modules.plugin_publisher import parse_version_tag
         from modules.updater import is_newer
         out = {}
@@ -2624,11 +2401,6 @@ class WebUIServer:
 
     @staticmethod
     def _market_entry_owned_by(entry, login: str) -> bool:
-        """市场索引条目是否属于这个 GitHub 账号（下架列表用）。
-
-        索引条目没有「已装插件」那套 owners 字段，只能看它自己声明的
-        github / author / source_repo 仓库主。
-        """
         who = str(login or "").strip().lower()
         if not who:
             return False
@@ -2641,11 +2413,6 @@ class WebUIServer:
 
     async def _published_entries(self, login: str, market_path: str,
                                  payload: dict = None) -> list:
-        """已上架的、属于当前账号的插件条目（下架列表的数据来源）。
-
-        市场索引有缓存，所以这里不吃条目缓存；本机刚下架的从列表里剔掉，
-        本机刚推送、索引还没更新的补进来（否则刚发布完没有「下架」按钮）。
-        """
         from modules.market import plugin_category, plugin_folder
         try:
             if payload is None:
@@ -2688,16 +2455,6 @@ class WebUIServer:
         return out
 
     def _publish_scope(self, login: str, published: dict = None):
-        """按 GitHub 登录身份把已装插件分成"能发布"和"被挡下"两拨。
-
-        归属校验必须在服务端做：前端隐藏只是顺手，真正的门禁在这里 ——
-        直接 POST /api/plugins/publish 也绕不过去。登录名为空（还没认证）
-        时全部归入"被挡下"，也就是"未认证就不参与插件制作"。
-
-        published 是已上架插件的版本号。本地版本不高于已上架版本（重复发布、
-        本地是 beta、或线上已经更高）时标成 needs_publish=False，前端据此把
-        「发布」换成「当前版本已发布过」。拿不到已上架版本时不挡人。
-        """
         from modules.market import plugin_category
         from modules.plugins import ownership_matches
         from modules.updater import is_newer
@@ -2728,8 +2485,6 @@ class WebUIServer:
         market_path = str(self.config.config.get("plugin_market_path") or "").strip() \
             or "plugins/index.json"
         from modules.market import plugin_folder
-        # 发布面板是决策面：不吃 30 分钟的市场条目缓存（别人在 GitHub 上改过
-        # 市场就得立刻看到），一次请求只强制拉一轮，两个列表共用
         payload = {}
         if login:
             try:
@@ -2742,8 +2497,6 @@ class WebUIServer:
             p["folder"] = plugin_folder(market_path, p.get("category"), p["id"])
         on_market = await self._published_entries(login, market_path, payload) if login else []
         info = {
-            # 只有「Token 在 + 身份校验过」才算认证完成：缺一个都退回
-            # 让用户重新填 Token，免得出现"显示已登录却什么都发不了"
             "configured": bool(token and login),
             "login": login,
             "name": str(self.config.config.get("plugin_publish_name") or ""),
@@ -2757,7 +2510,6 @@ class WebUIServer:
         return web.json_response(info)
 
     async def handle_plugins_publish(self, request):
-        """把 plugins/sources/<id>/ 写进市场仓库的分类目录并更新索引。"""
         try:
             payload = await request.json()
             pid = str(payload.get("id") or "").strip()
@@ -2813,12 +2565,10 @@ class WebUIServer:
               f"{len(result.get('files') or [])} 个文件）")
         if local_version:
             self._remember_published(pid, local_version)
-        # 刚推上去的版本还没进市场缓存，清掉才能让发布状态立刻看到新版本
         self._plugin_market_cache.clear()
         return web.json_response({"success": True, "version": local_version, **result})
 
     async def handle_plugins_unpublish(self, request):
-        """把插件从市场下架：删索引条目、插件目录与该插件的版本标签、Release。"""
         try:
             payload = await request.json()
             pid = str(payload.get("id") or "").strip()
@@ -2849,7 +2599,6 @@ class WebUIServer:
         return web.json_response({"success": True, **result})
 
     def _after_config_reload(self):
-        """配置变更后的统一热重载。"""
         app_context.global_config = self.config
         apply_log_max_size(self.config)
         self._refresh_auth_state()
@@ -2861,8 +2610,6 @@ class WebUIServer:
         app_context.memory_manager = MemoryManager(self.config)
         if app_context.sender is not None:
             app_context.sender.memory_manager = app_context.memory_manager
-        # WebUI 侧持有的也是构造时的快照：不同步的话，改了记忆目录/角色之后
-        # 页面上读写的仍是旧目录，只能重启才能自愈
         self.memory_manager = app_context.memory_manager
         self._update_state_file = app_context.memory_manager.data_path / "update_check.json"
         self._auth_file = app_context.memory_manager.data_path / "webui_auth.json"
@@ -2870,11 +2617,6 @@ class WebUIServer:
 
     # ---------------- 文件夹选择 / 模型列表 ----------------
     async def _pick_dialog(self, dialog_kind, file_types=None, allow_multiple=False):
-        """弹出系统选择对话框，返回 (ok, path_or_error)。
-
-        对话框是阻塞调用，丢进线程池避免卡住 WebUI 事件循环。
-        allow_multiple=True 时按 pywebview 的约定返回多条路径（用 \n 连接）。
-        """
         try:
             import webview
         except Exception:
@@ -2899,21 +2641,12 @@ class WebUIServer:
         return True, (str(result) if result else "")
 
     async def handle_pick_folder(self, request):
-        """弹出系统"选择文件夹"对话框；仅在 Lovomo 桌面窗口模式下可用。"""
         ok, path = await self._pick_dialog("FOLDER_DIALOG")
         if not ok:
             return web.json_response({"ok": False, "error": path}, status=400)
         return web.json_response({"ok": bool(path), "path": path})
 
     async def handle_pick_file(self, request):
-        """弹出系统"选择文件"对话框，可选把选中的文件复制到某个插件的数据目录。
-
-        payload:
-            filter    "图片 (*.png;*.jpg)" 这类过滤器描述，可选
-            exts      允许的扩展名列表（不含点），可选
-            multiple  true 时允许多选，返回 paths（换行分隔的绝对路径列表）
-            plugin_id 给了就把文件复制进该插件 data 目录，返回相对文件名
-        """
         try:
             payload = await request.json()
         except Exception:
@@ -2958,7 +2691,6 @@ class WebUIServer:
                 limit_mb = MAX_PLUGIN_ASSET_BYTES // (1024 * 1024)
                 return web.json_response(
                     {"ok": False, "error": f"文件超过 {limit_mb}MB 上限"}, status=400)
-            # 保留原文件名（只清非法字符），重名自动编号
             safe = unique_asset_name(data_dir, safe_asset_name(src.name, src.suffix))
             dst = data_dir / safe
             shutil.copyfile(src, dst)
@@ -2967,10 +2699,8 @@ class WebUIServer:
         return web.json_response({"ok": True, "path": str(dst), "name": safe,
                                   "orig_name": src.name, "cancelled": False})
 
-    # ---------------- 语音识别：本地模型扫描 / 服务模型列表 ----------------
     @staticmethod
     def _asr_model_keys(folder: Path, path: Path) -> List[str]:
-        """从一个本地识别模型文件/目录推出可填入「识别模型」的候选名。"""
         keys: List[str] = []
 
         def add(value) -> None:
@@ -3003,7 +2733,6 @@ class WebUIServer:
         return keys
 
     async def handle_asr_scan_models(self, request):
-        """扫描文件夹里的本地识别模型：faster-whisper / FunASR / whisper.cpp / GGUF。"""
         try:
             payload = await request.json()
         except Exception:
@@ -3028,7 +2757,6 @@ class WebUIServer:
             return web.json_response({"ok": False, "error": f"扫描失败: {e}"}, status=500)
 
     async def handle_asr_list_remote_models(self, request):
-        """从识别服务拉取可用模型列表（Ollama 的 /api/tags 或 OpenAI 兼容的 /models）。"""
         try:
             payload = await request.json()
         except Exception:
@@ -3078,16 +2806,10 @@ class WebUIServer:
             return web.json_response({"ok": True, "models": ids})
         error = "获取模型列表失败：\n" + "\n".join(tried)
         if looks_like_full_endpoint(base):
-            error += ("\n\n当前地址看起来是带业务路径的接口（…/services/xxx/xxx）。"
-                      "请填服务根地址，例如 https://dashscope.aliyuncs.com/compatible-mode/v1。")
+            error += ("\n\n当前地址看起来是带业务路径的接口（…/services/xxx/xxx）。请填服务根地址，例如 https://dashscope.aliyuncs.com/compatible-mode/v1。")
         return web.json_response({"ok": False, "error": error}, status=400)
 
     async def handle_scan_models(self, request):
-        """扫描文件夹里的 .gguf 模型，返回可填入 llm_model_name 的候选标识符。
-
-        候选键依次取 GGUF 元数据 general.name（LM Studio 模型 ID 的主要来源）、
-        发布者/模型文件夹名、文件名去量化后缀——按此顺序去重。
-        """
         try:
             payload = await request.json()
         except Exception:
@@ -3100,14 +2822,13 @@ class WebUIServer:
         try:
             for gguf in sorted(root.rglob("*.gguf")):
                 if "mmproj" in gguf.name.lower():
-                    continue  # 视觉投影适配器（mmproj-* 或 *.mmproj-*），不是主模型
+                    continue
                 parts = [p for p in gguf.parent.relative_to(root).parts if p]
                 candidates = []
                 meta_name = _gguf_general_name(gguf)
                 if meta_name:
                     # "Huihui Qwen3.5 9B Abliterated" → huihui-qwen3.5-9b-abliterated
                     candidates.append(re.sub(r"\s+", "-", meta_name).lower())
-                    # "Qwen_Qwen3.5 9B" 的下划线是发布者分隔符 → qwen/qwen3.5-9b
                     candidates.append(re.sub(r"\s+", "-", meta_name.replace("_", "/")).lower())
                 if len(parts) >= 2:
                     candidates.append(f"{parts[0]}/{parts[1]}".lower())
@@ -3125,7 +2846,6 @@ class WebUIServer:
             return web.json_response({"ok": False, "error": f"扫描失败: {e}"}, status=500)
 
     async def handle_list_remote_models(self, request):
-        """从 LLM 服务拉取可用模型 ID 列表（Ollama 与 OpenAI 兼容服务都支持）。"""
         try:
             payload = await request.json()
         except Exception:
@@ -3135,10 +2855,21 @@ class WebUIServer:
         if not base:
             return web.json_response({"ok": False, "error": "服务地址为空"}, status=400)
         headers = {}
-        api_key = ""
-        if payload.get("vision"):
-            api_key = str(self.config.get("image_caption_api_key", "") or "")
-        api_key = api_key or str(self.config.get("llm_api_key", "") or "")
+        api_key = str(payload.get("api_key", "") or "").strip()
+        if api_key and not api_key.isascii():
+            # 卡片里未改动的打码预览（如 sk-a****wxyz（51位））不是真密钥
+            api_key = ""
+        if not api_key and payload.get("provider_id"):
+            # 模型服务卡片里密钥留空 = 沿用库里已保存的密钥（load_library 会解密）
+            pid = str(payload.get("provider_id") or "")
+            for entry in model_library.load_library(self._config_preset_dir()).get("providers") or []:
+                if str(entry.get("id") or "") == pid:
+                    api_key = str(entry.get("api_key") or "").strip()
+                    break
+        if not api_key:
+            if payload.get("vision"):
+                api_key = str(self.config.get("image_caption_api_key", "") or "")
+            api_key = api_key or str(self.config.get("llm_api_key", "") or "")
         if backend != "ollama" and api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         tried = []
@@ -3150,8 +2881,6 @@ class WebUIServer:
             except Exception as e:
                 tried.append(f"{url} → {type(e).__name__}: {e}")
                 continue
-            # 服务端会在响应体里写明原因（url error / 模型不存在等）；
-            # 只报 raise_for_status 的异常，用户就只看到一个自己从没填过的地址
             if resp.status_code >= 400:
                 tried.append(f"{url} → HTTP {resp.status_code} {_brief_response(resp)}")
                 continue
@@ -3190,14 +2919,15 @@ class WebUIServer:
                         new_config[key] = {k: (stored.get(k, "") if _is_masked_value(v) else v)
                                            for k, v in masked_value.items()}
                 elif _is_masked_value(masked_value):
-                    # 前端提交的是头尾掩码预览（******** 或 abcd****wxyz（N位））：回填真实密钥
                     new_config[key] = self.config.config.get(key, "")
-            # WebUI 只提交它渲染出的字段：以【当前生效配置】为底合并，表单字段覆盖。
-            # 之前与 default_config() 合并——表单里没有的键（如搜索引擎设置
             # web_search_engine / web_search_url / web_search_custom_engines）会被
-            # 默认值顶掉，用户保存过的 SearXNG 接口每次保存配置页都被抹回 bing。
             base_config = self.config.config or {}
             new_config = {**base_config, **new_config}
+            try:
+                model_library.apply_library(
+                    new_config, model_library.load_library(self._config_preset_dir()))
+            except Exception as lib_err:
+                print(f"[模型库] 保存时投影失败（沿用配置自带值）：{type(lib_err).__name__}: {lib_err}")
             self.config.config = new_config
             self.config._atomic_save(new_config)
             try:
@@ -3246,7 +2976,6 @@ class WebUIServer:
                         old_config.get('napcat_token') != new_config.get('napcat_token') or
                         role_connection_snapshot(old_config) != role_connection_snapshot(new_config)):
                     napcat_changed = True
-                # 换模型：登记旧模型，等新模型首次调用成功后由 llm_helpers 自动卸载
                 if self.config.get("llm_auto_unload_old", True):
                     from modules.llm_helpers import queue_old_model_unload
                     for key in ("llm_model_name", "image_caption_model_name"):
@@ -3278,7 +3007,6 @@ class WebUIServer:
             return False, "模型文件夹路径无效或不存在，请检查路径后重试"
         return True, ""
 
-    # ---------------- 角色 ----------------
     async def handle_get_roles(self, request):
         roles = []
         for key, role in self.config.roles.items():
@@ -3289,30 +3017,46 @@ class WebUIServer:
             })
         return web.json_response({"roles": roles})
 
-    async def handle_save_roles(self, request):
+    # ---------------- 模型服务库与角色库 ----------------
+    def _model_library_payload(self) -> dict:
+        lib = model_library.load_library(self._config_preset_dir())
+        providers = []
+        for entry in lib.get("providers") or []:
+            item = dict(entry)
+            if item.get("api_key"):
+                item["api_key"] = _mask_preview(item["api_key"])
+            providers.append(item)
+        from .config_loader import DEFAULT_ROLES
+        return {"roles": lib.get("roles") or [], "providers": providers,
+                "default_roles": DEFAULT_ROLES}
+
+    async def handle_model_library_get(self, request):
         try:
-            new_data = await request.json()
-            roles = new_data.get("roles", [])
-            active = new_data.get("active_character", "")
-            self.config.config["roles"] = roles
-            self.config.config["active_character"] = active
-            self.config._atomic_save(self.config.config)
+            return web.json_response({"success": True, **self._model_library_payload()})
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_model_library_save(self, request):
+        try:
+            payload = await request.json()
+            lib = model_library.load_library(self._config_preset_dir())
+            roles, providers, err = model_library.normalize_library_items(
+                payload.get("roles"), payload.get("providers"), current=lib)
+            if err:
+                return web.json_response({"success": False, "error": err}, status=400)
+            if roles is not None:
+                lib["roles"] = roles
+            if providers is not None:
+                lib["providers"] = providers
+            model_library.save_library(self._config_preset_dir(), lib)
+            model_library.apply_library(self.config.config, lib)
+            forget_profile_loaders(self._config_preset_dir())
             self._after_config_reload()
-            return web.json_response({"success": True, "message": "角色配置已保存！"})
+            return web.json_response({"success": True, "message": "已保存并立即生效。"})
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
     async def handle_get_logs(self, request):
-        """WebUI 日志接口。
-
-        精简模式（默认）先按 webui_log_hide_patterns 剔除噪音行，再回尾部
-        webui_log_tail_lines 行；?full=1（前端"显示完整日志"开关）返回内存里
-        缓存的全部日志（上限 webui_log_buffer_lines 行），一行都不藏。
-
-        完整模式另有一道 40 万字符的极端上限（约等于上万行），只为了避免
-        极端情况下把整个响应撑爆；触发时会返回 truncated=true 并在日志里写明，
-        这样"搜索结果只显示前几条"不再可能是 WebUI 截断造成的。
-        """
         full = request.query.get("full", "") in ("1", "true", "yes")
         _, tail_lines = _runtime_log_limits()
         with log_lock:
@@ -3321,9 +3065,6 @@ class WebUIServer:
                 logs = "\n".join(global_log_buffer)
             else:
                 patterns = _log_hide_patterns()
-                # 被隐藏的那一行原本占着一行换行，直接丢掉会留下一个空行，
-                # 看起来就是「隐藏内容处莫名其妙空了一片」，所以连同它后面
-                # 紧跟的空白行一起去掉。
                 kept = []
                 blank_after_hidden = False
                 for line in global_log_buffer:
@@ -3340,8 +3081,7 @@ class WebUIServer:
         if full and len(logs) > _LOG_FULL_MAX_CHARS:
             logs = logs[-_LOG_FULL_MAX_CHARS:]
             truncated = True
-            print(f"完整日志超过 {_LOG_FULL_MAX_CHARS} 字符上限，已返回尾部内容"
-                  f"（可调小 webui_log_buffer_lines 控制日志体积）。")
+            print(f"完整日志超过 {_LOG_FULL_MAX_CHARS} 字符上限，已返回尾部内容（可调小 webui_log_buffer_lines 控制日志体积）。")
         return web.json_response({"logs": logs, "total_lines": total,
                                   "tail_lines": tail_lines, "full": full,
                                   "truncated": truncated})
@@ -3352,7 +3092,6 @@ class WebUIServer:
         return web.json_response({"memories": memories})
 
     async def handle_cache_image(self, request):
-        """聊天记录里的真实图片（缓存目录按内容哈希命名，只认哈希名防路径穿越）。"""
         if app_context.memory_manager is None:
             return web.json_response({"error": "unavailable"}, status=503)
         name = str(request.query.get("name") or "")
@@ -3366,7 +3105,6 @@ class WebUIServer:
                             headers={"Cache-Control": "max-age=86400"})
 
     async def handle_cache_images_clear(self, request):
-        """清空图片缓存：缓存文件全删，聊天记录里的引用同步移除，退回文字描述。"""
         if app_context.memory_manager is None:
             return web.json_response({"success": False, "error": "unavailable"}, status=503)
         freed = 0
@@ -3409,11 +3147,6 @@ class WebUIServer:
                                   "sessions": cleaned})
 
     async def handle_character_avatar(self, request):
-        """角色头像：数据目录或 ref_audio_root 下的 avatar.*（聊天记录页展示用）。
-
-        没有本地 avatar.* 时退回机器人 QQ 号的头像：QQ 里角色就是这个账号，
-        聊天气泡旁边显示的本来就是它的头像。
-        """
         candidates = []
         if app_context.memory_manager is not None:
             candidates.append(app_context.memory_manager.data_path)
@@ -3435,7 +3168,6 @@ class WebUIServer:
         return web.json_response({"error": "not found"}, status=404)
 
     async def handle_user_avatar(self, request):
-        """聊天记录里的用户头像：按 QQ 号取真实头像，取不到返回 404（前端退回首字）。"""
         data = await qq_avatar_bytes(request.query.get("user_id", ""))
         if not data:
             return web.json_response({"error": "not found"}, status=404)
@@ -3455,11 +3187,7 @@ class WebUIServer:
         try:
             payload = await request.json()
             filenames = payload.get("files", [])
-            # 两种删法由界面选：True = 连关系进度与用户画像一起清（含私聊、含群聊成员），
-            # False = 只删会话记录，关系与画像原样保留；None = 旧调用方（私聊清、群聊不动）
             clean_affection = payload.get("clean_affection")
-            # 清理范围必须在删文件之前算出来：文件名里的会话名把 @ / . 等字符换成了下划线，
-            # 照文件名回推的用户 ID 和运行时的对不上（微信 openid 尤其明显），
             # 真实 ID 只能从会话文件里取
             scopes = self._deleted_session_scopes(filenames)
             deleted = []
@@ -3487,13 +3215,6 @@ class WebUIServer:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
     def _purge_session_state(self, scope, clean_affection=None) -> bool:
-        """清掉一个会话依附的状态，返回它是不是私聊会话。
-
-        clean_affection 由界面给的两个选项决定：
-        True  = 连关系进度与用户画像一起清（私聊清这位用户；群聊清这个群里每位成员的关系）；
-        False = 只删会话自己的记录（心情、日记、承诺、主动消息与回忆），关系与画像原样保留；
-        None  = 老调用方（_purge_connection_sessions 等）：私聊清、群聊不动，保持原有行为。
-        """
         character_key, sid, stype, target_id = scope
         if app_context.mood_mgr is not None:
             app_context.mood_mgr.delete_session(sid)
@@ -3503,15 +3224,12 @@ class WebUIServer:
             app_context.promise_mgr.drop_session(sid)
         if app_context.recall_mgr is not None:
             app_context.recall_mgr.drop_session(sid)
-        # 群聊不碰关系进度：成员的关系记录是这位成员自己处出来的，
-        # 他可能同时在私聊里聊过，群记录被删不该把任何一条关系清掉。
         if clean_affection is None:
             clean_affection = stype == "private"
         if clean_affection and app_context.affection_mgr is not None:
             if stype == "private":
                 app_context.affection_mgr.reset(character_key, str(target_id), sid)
             else:
-                # 群聊里每位成员的关系记录都挂在这个会话上，选了清理就一起清
                 app_context.affection_mgr.drop_session(character_key, sid)
         if stype != "private":
             return False
@@ -3520,11 +3238,6 @@ class WebUIServer:
         return True
 
     def _purge_connection_sessions(self, session_ids: list) -> int:
-        """删掉这些会话的聊天记录与依附状态，返回清掉的会话数。
-
-        session_channels.json 是「会话属于哪条接入方式」的唯一线索，
-        接入方式被删掉后这些会话再也发不出去，记录也不该继续留在界面上。
-        """
         if not session_ids:
             return 0
         wanted = {str(sid) for sid in session_ids if str(sid)}
@@ -3544,12 +3257,6 @@ class WebUIServer:
         return purged
 
     def _deleted_session_scopes(self, filenames: list) -> dict:
-        """被删记忆文件 → (角色, 会话ID, 会话类型, 目标ID)。
-
-        会话 ID 里的前缀由记忆文件名拆出来：私聊的目标是那个人，群聊目标是群号
-        （群里的成员是各自独立的记录，不跟着群聊走）。私聊的用户 ID 以文件里
-        记的发送者为准，调用时必须赶在文件被删掉之前。
-        """
         out = {}
         for name in filenames:
             m = re.match(r'^([A-Za-z0-9_\-]+)_(private|group)_(.+)\.json$', str(name))
@@ -3564,7 +3271,6 @@ class WebUIServer:
         return out
 
     def _session_user_id(self, filename: str, fallback: str) -> str:
-        """会话文件里最后一条用户消息的发送者 ID；取不到时退回文件名里解析出来的。"""
         try:
             result = self.memory_manager.get_history(filename)
         except Exception as e:
@@ -3616,8 +3322,6 @@ class WebUIServer:
                 if not isinstance(data, dict) or "history" not in data:
                     continue
                 name = Path(part.filename).name
-                # 只允许写入会话记忆文件：data 目录里还躺着 webui_auth.json 等功能数据，
-                # 同一目录下的整份覆盖等于把认证态等数据交给上传者改写
                 if not _is_memory_filename(name):
                     skipped.append(name)
                     continue
@@ -3632,8 +3336,6 @@ class WebUIServer:
     async def handle_memory_export_all(self, request):
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            # 只打包会话记忆：同一目录下的 webui_auth.json 含 WebUI 令牌与口令散列，
-            # 打包进去等于把登录凭据随导出文件一起送出去
             for f in sorted(self.memory_manager.data_path.glob("*.json")):
                 if _is_memory_filename(f.name):
                     zf.write(f, f.name)
@@ -3647,12 +3349,10 @@ class WebUIServer:
         return self._export_status_response("saved", saved)
 
     async def handle_sessions(self, request):
-        """返回已知会话列表（供定时任务/事件/待办选择发送目标）。"""
         return web.json_response({"sessions": list_known_sessions()})
 
     # ---------------- 情绪音频管理 ----------------
     def _role_root(self, role_key: str, kind: str = "tone"):
-        """情绪音频目录：kind=mimic 取情绪模仿根目录（未配置返回 None），其余取语气根目录。"""
         role = self.config.roles.get(role_key, {}) if role_key else {}
         ctx = RoleContext(self.config.config, role or {})
         if str(kind or "") == "mimic":
@@ -3856,7 +3556,6 @@ class WebUIServer:
             target, AUDIO_MIMES.get(target.suffix.lower(), "application/octet-stream"))
 
     def _emotion_audio_targets(self, root: Path, payload: dict):
-        """解析请求里要处理的音频；返回 [(情绪名, 路径)]，出错时返回错误文案。"""
         items = payload.get("items")
         if not items:
             items = [{"emotion": payload.get("emotion", ""), "files": payload.get("files")}]
@@ -3881,7 +3580,6 @@ class WebUIServer:
         return targets
 
     async def handle_emotions_text(self, request):
-        """保存参考文字：texts 是每段音频自己的同名 txt，shared 是文件夹共用的 asr.txt；留空即删掉该文件。"""
         try:
             payload = await request.json()
         except Exception:
@@ -3916,7 +3614,6 @@ class WebUIServer:
         return web.json_response({"success": True, "saved": saved})
 
     async def handle_emotions_normalize(self, request):
-        """把参考音频规整到 GPT-SoVITS 要求的 3~10 秒。"""
         try:
             payload = await request.json()
         except Exception:
@@ -3960,7 +3657,6 @@ class WebUIServer:
 
     async def handle_stats(self, request):
         range_key = str(request.query.get("range", "30") or "30")
-        # 下钻：前端点击某天/某小时后带上具体窗口与粒度，只统计这个窗口
         window = None
         try:
             start_q = request.query.get("start")
@@ -3993,7 +3689,6 @@ class WebUIServer:
             moods.sort(key=lambda m: -float(m["updated"]))
         stats["moods"] = moods
         roles_map = getattr(self.config, "roles", None) or {}
-        # 曲线按会话分开：同一个角色跟不同的人各有一条线，不再是所有会话揉成一条
         curves = []
 
         def add_curves(kind: str, manager, character_key: str, name: str, scopes: list):
@@ -4037,7 +3732,6 @@ class WebUIServer:
 
     async def handle_token_stats(self, request):
         range_key = str(request.query.get("range", "30") or "30")
-        # 下钻：前端点击某天/某小时后带上具体窗口与粒度，只统计这个窗口
         window = None
         try:
             start_q = request.query.get("start")
@@ -4059,21 +3753,41 @@ class WebUIServer:
         return web.json_response(perf)
 
     # ---------------- 聊天测试台 ----------------
+    def _test_role(self, character_key: str):
+        roles = getattr(self.config, "roles", None) or {}
+        role = roles.get(character_key)
+        if isinstance(role, dict):
+            return role
+        lib = model_library.load_library(self._config_preset_dir())
+        for entry in lib.get("roles") or []:
+            if str(entry.get("character_key") or "") != character_key:
+                continue
+            resolved = model_library.resolve_roles(lib, [entry.get("id")])
+            return resolved[0] if resolved else None
+        return None
+
     async def handle_test_roles(self, request):
         roles = getattr(self.config, "roles", None) or {}
-        return web.json_response({"roles": [
-            {"character_key": key, "character_name": (role or {}).get("character_name") or key}
-            for key, role in roles.items()]})
+        out = [{"character_key": key, "character_name": (role or {}).get("character_name") or key}
+               for key, role in roles.items()]
+        seen = {item["character_key"] for item in out}
+        lib = model_library.load_library(self._config_preset_dir())
+        for entry in lib.get("roles") or []:
+            key = str(entry.get("character_key") or "")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append({"character_key": key, "character_name": entry.get("name") or key})
+        return web.json_response({"roles": out})
 
     async def handle_test_chat(self, request):
-        """聊天测试台：不走 QQ，直接跑「审判 → 生成 → 心情/好感落盘」这条链路。"""
         try:
             payload = await request.json()
         except Exception:
             return web.json_response({"success": False, "error": "参数错误"}, status=400)
         character_key = str(payload.get("character_key", "") or "").strip()
         text = str(payload.get("text", "") or "").strip()
-        role = (getattr(self.config, "roles", None) or {}).get(character_key)
+        role = self._test_role(character_key)
         if role is None or not text:
             return web.json_response({"success": False, "error": "参数不完整"}, status=400)
         mem = role_memory(role)
@@ -4135,7 +3849,6 @@ class WebUIServer:
                             "speaker": role.get("character_name", character_key),
                             "emotion": sentences[0]["emotion"] if sentences else ""})
             mem.save_session_data(session_id, {"history": history})
-            # 承诺追踪与真实消息同链路：台词命中承诺字样就提取入库
             if app_context.promise_mgr is not None \
                     and bool(self.config.get("promise_enabled", True)) \
                     and PROMISE_HINT_RE.search(zh_text):
@@ -4172,11 +3885,6 @@ class WebUIServer:
 
     # ---------------- 语音通话（打电话） ----------------
     def _call_targets(self, role) -> list:
-        """通话能打给谁：只列已有私聊历史的会话。
-
-        通话记忆要落进真实私聊（聊天记录里看得见、心情/好感按那个联系人算），
-        所以只允许挑已经存在的私聊；没有聊过的会话没有历史可接，选中也是空的。
-        """
         mem = role_memory(role)
         if mem is None:
             return []
@@ -4184,7 +3892,6 @@ class WebUIServer:
         out = []
         for item in mem.list_memories():
             filename = str(item.get("filename") or "")
-            # 记忆目录是所有角色共用一份，先按文件名前缀挑出本角色自己的档案
             if not filename.startswith(prefix):
                 continue
             session_id = _memory_session_id(filename)
@@ -4198,7 +3905,6 @@ class WebUIServer:
         return out
 
     async def handle_call_status(self, request):
-        """通话面板开场信息：可选角色、每个角色能打给谁、当前语音引擎、留痕档位。"""
         roles = getattr(self.config, "roles", None) or {}
         characters = []
         targets = {}
@@ -4223,21 +3929,19 @@ class WebUIServer:
         })
 
     async def handle_call_turn(self, request):
-        """通话一轮：音频（或文字）→ 识别 → 角色回复 → 合成语音 → 回 base64 wav。
-
-        和聊天测试台共用「审判 → 生成 → 心情/好感落盘」链路，只把会话换成本通话专用。
-        留痕三档：none 不写记忆、text 只写文字、full 再另存一份原始录音。
-        """
         import tempfile
         from modules.asr import transcribe_file
 
         tmp_dir = None
+        turn_id = ""
         try:
             try:
                 payload = await request.json()
             except Exception:
                 return web.json_response({"ok": False, "error": "参数错误"}, status=400)
             character_key = str(payload.get("character_key", "") or "").strip()
+            turn_id = str(payload.get("turn_id", "") or "").strip()
+            _call_turn_note(turn_id)
             text = str(payload.get("text", "") or "").strip()
             audio_b64 = str(payload.get("audio", "") or "")
             lang = str(payload.get("lang", "auto") or "auto")
@@ -4246,7 +3950,6 @@ class WebUIServer:
             if retention not in ("none", "text", "full"):
                 retention = "text"
             remember = bool(payload.get("remember", True))
-            # 逐句合成开关：multi 默认开，最多念 3 句；multi=false 或 max_sentences=1 时只念第一句
             multi = bool(payload.get("multi", True))
             try:
                 max_sentences = int(payload.get("max_sentences") or 3)
@@ -4261,24 +3964,18 @@ class WebUIServer:
             mem = role_memory(role)
             if mem is None:
                 return web.json_response({"ok": False, "error": "角色记忆不可用"}, status=400)
-            # 文字优先；没带文字才拿录音去识别。录音落在临时目录，最后连目录一起清，
-            # 所以 text/none 档天然不留音频文件。
             raw_audio_path = None
             if not text and audio_b64:
                 tmp_dir = tempfile.mkdtemp(prefix="lovomo_call_")
                 raw_audio_path = Path(tmp_dir) / "input.wav"
                 raw_audio_path.write_bytes(b64decode(audio_b64))
-                # 通话界面的「语言=自动」= 用配置页的「识别语言」（配置页也是自动时才是
-                # 真正逐句自判）。否则配置页老老实实写着中文，通话里却一句句乱判语种，
-                # 识别出来的文字会整句变成外语。
                 asr_lang = lang
                 if not asr_lang or asr_lang == "auto":
                     asr_lang = str(self.config.get("asr_lang", "") or "").strip() or "auto"
                 text = str(await transcribe_file(self.config.config, raw_audio_path, asr_lang) or "").strip()
             if not text:
                 return web.json_response({"ok": False, "error": "没能听清这句话，再说一次试试"})
-            # 通话落到哪条会话：默认仍是旧的通话专用会话；选了某条私聊就打进那条私聊，
-            # 「我」就是该联系人，和真实私聊共用同一条记忆、同一份心情与好感。
+            _call_turn_note(turn_id, text=text)
             session_id = CALL_SESSION
             user_id = CALL_USER
             mood_user = CALL_USER
@@ -4290,14 +3987,11 @@ class WebUIServer:
                     allowed = set()
                 if target_session in allowed:
                     session_id = target_session
-                    # 私聊的 uid 就是会话号去掉 private_ 前缀（与消息链路写法一致，
-                    # 带 @im.wechat 这类后缀的要还原，否则好感会开成第二条线）
                     user_id = restore_session_id(session_id)[len("private_"):]
                     mood_user = ""
                 else:
                     print(f"语音通话：目标会话 {target_session} 不是可拨打的私聊，"
                           f"本轮回退到 {CALL_SESSION}")
-            # 写记忆看两处：勾了「记住这次通话」，或留痕档不是 none
             write_text = bool(remember) or retention != "none"
             lock = app_context._SESSION_LOCKS.setdefault(f"{session_id}::{character_key}",
                                                          asyncio.Lock())
@@ -4305,7 +3999,6 @@ class WebUIServer:
                 ctx = RoleContext(self.config.config, role)
                 emotions = get_role_emotions(role)
                 history = mem.load_history(session_id)
-                # 打进私聊时沿用这条会话里原来的称呼，聊天记录里不会凭空多出一个「我」
                 is_private_call = session_id.startswith("private_")
                 caller_name = "通话用户"
                 if is_private_call:
@@ -4346,9 +4039,6 @@ class WebUIServer:
                 reply = reply or {}
                 raw_sentences = [s for s in (reply.get("sentences") or [])
                                  if isinstance(s, dict)]
-                # 与真实消息链路（message_pipeline 的发送前修复）保持一致：模型把中文
-                # 填进台词字段时先重译成角色语言，否则同一个音色会一会儿念日语、
-                # 一会儿把中文原文照念出来——听起来就是「一会中文一会外语」。
                 try:
                     await repair_sentence_lang(raw_sentences, ctx)
                 except Exception as e:
@@ -4358,18 +4048,16 @@ class WebUIServer:
                               "lang": str(s.get("lang") or "")}
                              for s in raw_sentences]
                 zh_text = "".join(s["zh"] for s in sentences)
+                _call_turn_note(turn_id, reply=zh_text)
                 if write_text:
                     history.append({"role": "user", "content": text, "sender_id": user_id,
                                     "sender_name": caller_name, "timestamp": time.time()})
                     history.append({"role": "assistant", "content": zh_text, "timestamp": time.time(),
                                     "speaker": role.get("character_name", character_key),
                                     "emotion": sentences[0]["emotion"] if sentences else ""})
-                    # 整份读回再写：打进私聊时要保住原文件的 meta 等字段，
-                    # 只写 {"history": ...} 会把那条会话的其他状态一起抹掉
                     data = mem.load_session_data(session_id)
                     data["history"] = history
                     mem.save_session_data(session_id, data)
-                    # 承诺追踪与真实消息同链路：台词命中承诺字样就提取入库
                     if app_context.promise_mgr is not None \
                             and bool(self.config.get("promise_enabled", True)) \
                             and PROMISE_HINT_RE.search(zh_text):
@@ -4386,8 +4074,6 @@ class WebUIServer:
                                               acceptance=bool(verdict.get("acceptance")),
                                               reply_text=zh_text,
                                               session_id=session_id)
-                # 逐句合成：前 max_sentences 句依次念，优先原文台词（lang），没有原文再念中文。
-                # audios 逐句给 {text, emotion, data}；audio 保留第一句，兼容老前端。
                 audios = []
                 for raw in raw_sentences[:max_sentences]:
                     spoken_text = str(raw.get("lang") or "").strip() \
@@ -4400,15 +4086,16 @@ class WebUIServer:
                             app_context.memory_manager.data_path,
                             stats=app_context.stats_mgr)
                         if wav_path:
-                            audios.append({
+                            piece = {
                                 "text": spoken_text,
                                 "emotion": str(raw.get("emotion") or ""),
                                 "data": b64encode(Path(wav_path).read_bytes()).decode("ascii"),
-                            })
+                            }
+                            audios.append(piece)
+                            _call_turn_note(turn_id, sentence=dict(piece))
                     except Exception as e:
                         print(f"语音通话：合成失败（忽略）: {type(e).__name__}: {e}")
                 audio_out = audios[0]["data"] if audios else ""
-                # full 档才留原始录音，文件名带时间戳；text/none 档什么都不留
                 retained_audio = False
                 if retention == "full" and raw_audio_path is not None:
                     calls_dir = Path(app_context.memory_manager.data_path) / "calls"
@@ -4417,6 +4104,8 @@ class WebUIServer:
                     keep = calls_dir / (time.strftime("%Y%m%d_%H%M%S") + "_" + safe_key + ".wav")
                     shutil.copyfile(raw_audio_path, keep)
                     retained_audio = True
+                _call_turn_note(turn_id, done=True, session_id=session_id,
+                                retained={"text": bool(write_text), "audio": retained_audio})
                 return web.json_response({
                     "ok": True,
                     "text": text,
@@ -4429,15 +4118,39 @@ class WebUIServer:
                     "retained": {"text": bool(write_text), "audio": retained_audio},
                 })
         except Exception as e:
+            logging.getLogger("lovomo.call").exception("语音通话这一轮失败")
+            _call_turn_note(turn_id, error=f"{type(e).__name__}: {e}", done=True)
             return web.json_response({"ok": False,
                                       "error": f"{type(e).__name__}: {e}"}, status=400)
         finally:
             if tmp_dir:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    async def handle_call_turn_poll(self, request):
+        turn_id = str(request.query.get("turn") or "").strip()
+        item = _CALL_TURNS.get(turn_id)
+        if item is None:
+            return web.json_response({"ok": False, "error": "通话进度已过期"}, status=404)
+        try:
+            already = max(0, int(request.query.get("from") or 0))
+        except (TypeError, ValueError):
+            already = 0
+        sentences = item.get("sentences") or []
+        return web.json_response({
+            "ok": True,
+            "text": item.get("text", ""),
+            "reply": item.get("reply", ""),
+            "total": len(sentences),
+            "sentences": sentences[already:],
+            "done": bool(item.get("done")),
+            "error": item.get("error", ""),
+            "session_id": item.get("session_id", ""),
+            "retained": item.get("retained") or {},
+        })
+
     async def handle_test_history(self, request):
         character_key = str(request.query.get("character_key", "") or "").strip()
-        role = (getattr(self.config, "roles", None) or {}).get(character_key)
+        role = self._test_role(character_key)
         mem = role_memory(role) if role else None
         if mem is None:
             return web.json_response({"success": False, "error": "角色不存在"}, status=404)
@@ -4464,7 +4177,7 @@ class WebUIServer:
         except Exception:
             payload = {}
         character_key = str(payload.get("character_key", "") or "").strip()
-        role = (getattr(self.config, "roles", None) or {}).get(character_key)
+        role = self._test_role(character_key)
         mem = role_memory(role) if role else None
         if mem is None:
             return web.json_response({"success": False, "error": "角色不存在"}, status=404)
@@ -4472,7 +4185,6 @@ class WebUIServer:
             mem.get_memory_file(TEST_CHAT_SESSION).unlink(missing_ok=True)
         except OSError as e:
             return web.json_response({"success": False, "error": str(e)}, status=500)
-        # 清空对话时把测试会话的状态一起清掉：只删记录会让心情、好感、承诺留着
         cleared = {}
         try:
             if app_context.mood_mgr is not None:
@@ -4506,10 +4218,22 @@ class WebUIServer:
         return web.json_response({"success": True, "diary": out})
 
     # ---------------- 角色档案导出 / 导入 ----------------
+    def _library_role_by_key(self, character_key: str) -> dict:
+        lib = model_library.load_library(self._config_preset_dir())
+        for entry in lib.get("roles") or []:
+            if str(entry.get("character_key") or "") == character_key:
+                return entry
+        return None
+
     async def handle_character_export(self, request):
         from modules.updater import APP_VERSION
         character_key = str(request.query.get("character_key", "") or "").strip()
-        role = (getattr(self.config, "roles", None) or {}).get(character_key)
+        entry = self._library_role_by_key(character_key)
+        if entry is not None:
+            role = {k: entry.get(k if k != "character_name" else "name")
+                    for k in _ROLE_EXPORT_KEYS}
+        else:
+            role = (getattr(self.config, "roles", None) or {}).get(character_key)
         if role is None:
             return web.json_response({"success": False, "error": "角色不存在"}, status=404)
         payload = {"app": "Lovomo", "kind": "character",
@@ -4547,13 +4271,23 @@ class WebUIServer:
         key = str(character["character_key"]).strip()
         role = {k: character.get(k) for k in _ROLE_EXPORT_KEYS if k in character}
         role["character_key"] = key
-        roles = self.config.roles
-        if key in roles and not bool(payload.get("overwrite", False)):
+        lib = model_library.load_library(self._config_preset_dir())
+        entries = [r for r in (lib.get("roles") or [])
+                   if str(r.get("character_key") or "") == key]
+        if entries and not bool(payload.get("overwrite", False)):
             return web.json_response({"success": False,
                                       "error": f"角色 {key} 已存在；勾选覆盖后重试"}, status=409)
-        roles[key] = role
-        self.config.config["roles"] = list(roles.values())
-        self.config._atomic_save(self.config.config)
+        entry = model_library.normalize_library_items(roles=[{**character, "character_key": key}],
+                                                      current=lib)[0][0]
+        if entries:
+            entry["id"] = str(entries[0].get("id") or entry["id"])
+            lib["roles"] = [(entry if str(r.get("id") or "") == entry["id"] else r)
+                            for r in lib["roles"]]
+        else:
+            lib.setdefault("roles", []).append(entry)
+        model_library.save_library(self._config_preset_dir(), lib)
+        model_library.apply_library(self.config.config, lib)
+        forget_profile_loaders(self._config_preset_dir())
         mem = role_memory(role)
         if mem is not None and isinstance(payload.get("memories"), dict):
             for session_part, data in payload["memories"].items():
@@ -4575,7 +4309,8 @@ class WebUIServer:
 
     # ---------------- 定时任务 ----------------
     async def handle_jobs(self, request):
-        return web.json_response({"jobs": app_context.job_mgr.describe() if app_context.job_mgr else [],
+        job_mgr = _job_manager(self)
+        return web.json_response({"jobs": job_mgr.describe(),
                                   "scheduler_enabled": bool(self.config.get("scheduler_enabled", False))})
 
     async def handle_jobs_save(self, request):
@@ -4592,19 +4327,15 @@ class WebUIServer:
                     "target": job.get("target") or {},
                     "action": job.get("action") or {"mode": "llm", "llm_prompt": ""},
                 })
-            app_context.job_mgr.jobs = cleaned
-            app_context.job_mgr.save()
-            app_context.job_mgr.reload()
-            return web.json_response({"success": True, "jobs": app_context.job_mgr.describe()})
+            job_mgr = _job_manager(self)
+            job_mgr.jobs = cleaned
+            job_mgr.save()
+            job_mgr.reload()
+            return web.json_response({"success": True, "jobs": job_mgr.describe()})
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
     async def handle_jobs_batch(self, request):
-        """批量修改定时任务的发送目标（会话类型 / 会话 ID）。
-
-        ids 为空表示应用到全部任务；两个字段都留空表示"清空会话 ID"，
-        也就是回到"发给所有聊过的会话"。
-        """
         try:
             payload = await request.json()
         except Exception:
@@ -4621,7 +4352,8 @@ class WebUIServer:
         has_voice = "use_voice" in payload
         use_voice = bool(payload.get("use_voice"))
         changed = 0
-        for job in app_context.job_mgr.jobs:
+        job_mgr = _job_manager(self)
+        for job in job_mgr.jobs:
             if wanted is not None and str(job.get("id")) not in wanted:
                 continue
             target = job.setdefault("target", {})
@@ -4632,19 +4364,20 @@ class WebUIServer:
             if has_voice:
                 job.setdefault("action", {})["use_voice"] = use_voice
             changed += 1
-        app_context.job_mgr.save()
-        app_context.job_mgr.reload()
+        job_mgr.save()
+        job_mgr.reload()
         return web.json_response({"success": True, "changed": changed,
-                                  "jobs": app_context.job_mgr.describe()})
+                                  "jobs": job_mgr.describe()})
 
     async def handle_jobs_run(self, request):
         try:
             payload = await request.json()
             jid = str(payload.get("id", ""))
-            job = next((j for j in app_context.job_mgr.jobs if str(j.get("id")) == jid), None)
+            job_mgr = _job_manager(self)
+            job = next((j for j in job_mgr.jobs if str(j.get("id")) == jid), None)
             if not job:
                 return web.json_response({"success": False, "error": "任务不存在"}, status=404)
-            ok = await app_context.job_mgr._run_job(job)
+            ok = await job_mgr._run_job(job)
             return web.json_response(
                 {"success": True, "sent": bool(ok),
                  "message": "任务已手动执行一次" if ok else
@@ -4693,7 +4426,6 @@ class WebUIServer:
         try:
             payload = await request.json()
             todo_id = int(payload.get("id", 0))
-            # status 必填且必须在白名单内：漏传时默认标成"已完成"会静默改错状态，
             # 任意字符串又会直接落库
             status = str(payload.get("status", "") or "")
             if status not in TODO_STATUSES:
@@ -4704,7 +4436,6 @@ class WebUIServer:
             elif status == "cancelled":
                 app_context.todo_mgr.delete(todo_id)
             elif status == "pending":
-                # 改回「待提醒」要同时重排提醒，否则这条待办在本次运行里不会再触发
                 app_context.todo_mgr.resume(todo_id)
             else:
                 app_context.todo_mgr.db.execute("UPDATE todos SET status=? WHERE id=?", (status, todo_id))
@@ -4721,7 +4452,6 @@ class WebUIServer:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
     async def handle_todos_batch(self, request):
-        """批量修改待办的会话类型 / 会话 ID（与定时任务/节日共用同一套规则）。"""
         try:
             payload = await request.json()
         except Exception:
@@ -4784,9 +4514,7 @@ class WebUIServer:
                     "template": str(ev.get("template", "")),
                     "llm_prompt": str(ev.get("llm_prompt", "")),
                     "use_voice": bool(ev.get("use_voice", False)),
-                    # 内置默认节日标记：请求里没带就沿用原值，丢了它"无目标时发给全部会话"的兜底会失效
                     "default": bool(ev.get("default", known.get(eid, {}).get("default", False))),
-                    # 会话 ID 留空等于清空目标，存成空目标占位会顶掉默认节日的兜底
                     "targets": [t for t in (ev.get("targets") or [])
                                 if isinstance(t, dict) and str(t.get("session_id") or "").strip()],
                 })
@@ -4797,11 +4525,6 @@ class WebUIServer:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
     async def handle_events_batch(self, request):
-        """批量修改节日/纪念日问候的发送目标（会话类型 / 会话 ID）。
-
-        ids 为空表示应用到全部事件；两个字段都留空表示"清空会话 ID"
-        即回到"发给所有聊过的会话"。
-        """
         try:
             payload = await request.json()
         except Exception:
@@ -4821,8 +4544,6 @@ class WebUIServer:
         for ev in (app_context.event_mgr.events if app_context.event_mgr else []):
             if wanted is not None and str(ev.get("id")) not in wanted:
                 continue
-            # 只改语音时别碰发送目标：给本来没有目标的事件补一个空目标，会顶掉
-            # "内置默认节日发给全部会话"的兜底，问候从此永远发不出去。
             if has_type or has_id:
                 targets = ev.get("targets") or []
                 if not targets:
@@ -4832,7 +4553,6 @@ class WebUIServer:
                     tg["session_type"] = session_type
                 if has_id:
                     tg["session_id"] = session_id
-                # 会话 ID 留空 = 清空目标，回到"发给所有聊过的会话"，不能留空目标占位
                 ev["targets"] = targets if str(tg.get("session_id") or "").strip() else []
             if has_voice:
                 ev["use_voice"] = use_voice
@@ -4859,7 +4579,6 @@ class WebUIServer:
                                   "enabled": bool(self.config.get("tools_enabled", False))})
 
     async def handle_search_engines(self, request):
-        """搜索引擎下拉框数据：内置 + 自定义引擎，全部来自注册表（不硬编码）。"""
         from modules.tools import available_engines, default_engine_key, parse_api_keys
         engines = available_engines(self.config)
         key_names = sorted({spec.get("api_key_env", "") for spec in engines.values()
@@ -4879,7 +4598,6 @@ class WebUIServer:
         })
 
     async def handle_search_engine_save(self, request):
-        """保存默认搜索引擎、自定义引擎、API key（写进 config.json 后热重载）。"""
         try:
             from modules.tools import available_engines, parse_api_keys, invalid_custom_engines
             payload = await request.json()
@@ -4900,7 +4618,6 @@ class WebUIServer:
             if "url_override" in payload:
                 new_config["web_search_url"] = str(payload.get("url_override", "") or "").strip()
             if "api_keys" in payload:
-                # 只并入非空值：WebUI 回显不了已保存的 key，空值不能把旧 key 抹掉
                 merged = {**parse_api_keys(self.config.get("web_search_api_keys", {})),
                           **parse_api_keys(payload.get("api_keys"))}
                 new_config["web_search_api_keys"] = merged
@@ -4999,7 +4716,6 @@ class WebUIServer:
 
     # ---------------- 接入方式 ----------------
     async def handle_connection_qr(self, request):
-        """把一段文本渲染成二维码 PNG（接入方式的扫码登录用）。"""
         text = str(request.query.get("text", "") or "")
         if not text:
             return web.Response(status=400, text="缺少 text")
@@ -5014,7 +4730,6 @@ class WebUIServer:
                             headers={"Cache-Control": "no-store"})
 
     async def handle_connection_login_qr(self, request):
-        """取一张扫码用的二维码：微信 ClawBot 扫码登录、QQ 官方机器人扫码绑定。"""
         try:
             payload = await request.json()
         except Exception:
@@ -5040,7 +4755,6 @@ class WebUIServer:
             return web.json_response(
                 {"success": False, "error": f"取二维码失败: {type(e).__name__}: {e}"},
                 status=400)
-        # qrcode 是轮询票据，qrcode_img_content 才是要编进二维码的内容
         qrcode = str(_adapter_first(data, "qrcode") or "")
         qr_content = str(_adapter_first(data, "qrcode_img_content", "qrcode_url") or "")
         if not qrcode or not qr_content:
@@ -5048,14 +4762,12 @@ class WebUIServer:
                 {"success": False,
                  "error": f"二维码响应里没有可用字段: {data.get('err_msg') or data}"},
                 status=400)
-        # 用一次性 token 认这次登录：新建时还没有接入方式 id，也能先把码取回来
         token = os.urandom(6).hex()
         _CONNECTION_LOGIN_STATE[token] = {"qrcode": qrcode, "id": conn_id}
         return web.json_response({"success": True, "token": token, "qrcode": qrcode,
                                   "qr_content": qr_content})
 
     async def handle_connection_login_status(self, request):
-        """轮询扫码状态；扫到就把 bot_token / bot_id 写回接入方式。"""
         try:
             payload = await request.json()
         except Exception:
@@ -5094,29 +4806,24 @@ class WebUIServer:
                     target["account_id"] = account_id
                 if base_url:
                     target["base_url"] = base_url
-                # 重新登录等于换了一次会话：旧游标与旧 context_token 都不能再用
                 target["cursor"] = ""
                 target["context_tokens"] = {}
                 self.config._atomic_save(data_cfg)
                 _CONNECTION_LOGIN_STATE.pop(token, None)
                 return web.json_response({"success": True, "confirmed": True,
                                           "bot_id": account_id, "saved": True})
-        # 这条接入方式已经不在（或本来就还没保存）：凭据交给前端随这条一起存。
-        # 这里绝不能回 saved=True —— 界面会显示"已登录"，磁盘上却什么都没有。
         _CONNECTION_LOGIN_STATE.pop(token, None)
         return web.json_response({"success": True, "confirmed": True, "bot_id": account_id,
                                   "bot_token": str(bot_token), "base_url": base_url,
                                   "saved": False})
 
     async def _qq_bind_start(self, conn_id: str):
-        """取一张 QQ 机器人的扫码绑定二维码（扫完自动拿回 AppID 与 AppSecret）。"""
         try:
             bind = await qq_bind_create()
         except Exception as e:
             return web.json_response(
                 {"success": False, "error": f"取二维码失败: {type(e).__name__}: {e}"},
                 status=400)
-        # 与微信那边一样用一次性 token 认这次绑定：新建时还没有接入方式 id
         token = os.urandom(6).hex()
         _CONNECTION_LOGIN_STATE[token] = {"kind": "qq_bind", "id": conn_id,
                                           "task_id": bind["task_id"],
@@ -5125,7 +4832,6 @@ class WebUIServer:
                                   "qr_content": bind["qr_content"]})
 
     async def _qq_bind_status(self, token: str, state: dict):
-        """轮询 QQ 机器人扫码绑定；扫到就把 AppID / AppSecret 写回接入方式。"""
         try:
             result = await qq_bind_poll(str(state.get("task_id") or ""),
                                         str(state.get("bind_key") or ""))
@@ -5154,18 +4860,11 @@ class WebUIServer:
                 return web.json_response({"success": True, "confirmed": True,
                                           "platform": "qq_official", "app_id": app_id,
                                           "saved": True})
-        # 这条接入方式还没保存：凭据交给前端随这条一起存
         return web.json_response({"success": True, "confirmed": True,
                                   "platform": "qq_official", "app_id": app_id,
                                   "app_secret": app_secret, "saved": False})
 
     async def handle_connection_selftest(self, request):
-        """给这条接入方式最近说过话的人发一条自检消息，看看服务端到底怎么答。
-
-        微信侧会「收下请求却不投递」，App 侧完全看不出来——这条自检把
-        「服务端收下了」与「微信里真的收到了」分开：前者看返回值，后者只能人看，
-        所以自检消息本身就是那句"看到这条说明能正常送达"。
-        """
         try:
             payload = await request.json()
         except Exception:
@@ -5214,7 +4913,6 @@ class WebUIServer:
         })
 
     async def handle_connections(self, request):
-        """接入方式清单；凭据只回掩码预览，不把明文发给前端。"""
         out = []
         for conn in connections_of(self.config):
             item = dict(conn)
@@ -5228,7 +4926,6 @@ class WebUIServer:
                           for p in CONNECTION_PLATFORMS]})
 
     async def handle_connections_save(self, request):
-        """新建或修改一条接入方式。"""
         try:
             payload = await request.json()
         except Exception:
@@ -5242,15 +4939,12 @@ class WebUIServer:
         conn_id = str(payload.get("id") or "").strip()
         target = next((c for c in conns if str(c.get("id")) == conn_id), None)
         if target is None:
-            # 同一个平台的同一个账号只留一条，重复触发不会堆出第二条
             identity = connection_identity(platform, payload)
             if identity:
                 target = next((c for c in conns
                                if str(c.get("platform")) == platform
                                and connection_identity(platform, c) == identity), None)
         if target is None and platform == "wechat_clawbot":
-            # 微信是先建一条空的、扫完码再回填凭据：还没有账号标识时认不出是同一个账号，
-            # 扫码回填会另起一条，界面里那条空的就永远显示「未登录（需扫码）」
             target = next((c for c in conns
                            if str(c.get("platform")) == platform
                            and not c.get("bot_token")), None)
@@ -5265,6 +4959,12 @@ class WebUIServer:
         if "config_profile" in payload:
             target["config_profile"] = (str(payload.get("config_profile") or "").strip()
                                         or DEFAULT_CONFIG_PROFILE)
+        if "role_id" in payload:
+            target["role_id"] = str(payload.get("role_id") or "").strip()
+        for kind in model_library.PROVIDER_KINDS:
+            key = f"{kind}_provider"
+            if key in payload:
+                target[key] = str(payload.get(key) or "").strip()
         for key in connection_defaults(platform):
             if key not in payload:
                 continue
@@ -5275,8 +4975,6 @@ class WebUIServer:
             target[key] = value
         self.config._atomic_save(data)
         try:
-            # 只重解析角色绑定：接入方式由连接监督器周期对齐，保存后几秒内
-            # 自动重连/停用，不必走整份配置的热重载（那会重建各管理器）
             self.config.roles = self.config._parse_roles()
         except Exception as e:
             return web.json_response({"success": True, "id": conn_id,
@@ -5297,7 +4995,6 @@ class WebUIServer:
             return web.json_response({"success": False, "error": "没有这条接入方式"},
                                      status=404)
         data["connections"] = keep
-        # 角色还指着它的话一起解绑，避免留下悬空引用
         roles = data.get("roles")
         roles = list(roles.values()) if isinstance(roles, dict) else (roles or [])
         for role in roles:
@@ -5318,11 +5015,6 @@ class WebUIServer:
 
     # ---------------- 用户画像 ----------------
     async def handle_profiles(self, request):
-        """用户画像列表；顺带带上当前角色与这位用户的关系进度。
-
-        关系按会话分开，所以这里给的是这位用户在每个会话里各自的一份，
-        表格里那一列取关系最靠前的一份。
-        """
         character_key = get_active_ctx().character_key
         profiles = []
         for uid, p in (app_context.profile_mgr.profiles or {}).items():
@@ -5459,7 +5151,6 @@ class WebUIServer:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
     async def handle_stickers_auto_import(self, request):
-        """「一键识别」：把选中的图片/文件夹交给识图模型分类命名后归档。"""
         try:
             payload = await request.json()
         except Exception:
@@ -5509,13 +5200,10 @@ class WebUIServer:
         if Path(fname).suffix.lower() not in IMAGE_EXTS:
             return web.Response(status=404, text="not found")
         target = folder / fname
-        # 类型按扩展名给出：aiohttp 内置的 MIME 表里没有 .webp，
-        # 猜不出类型会退回 application/octet-stream，配上 nosniff 后浏览器拒绝渲染
         return await _local_file_response(
             target, MIME_BY_EXT.get(target.suffix.lower(), "application/octet-stream"))
 
     async def handle_webui_access(self, request):
-        """当前 WebUI 的访问地址与安全状态（设置页「访问地址」那一行用）。"""
         configured_https = bool(self.config.get("webui_https"))
         scheme = str(getattr(self, "scheme", "") or ("https" if configured_https else "http"))
         host = str(getattr(self, "host", "") or self.config.get("webui_host", "127.0.0.1"))
@@ -5531,6 +5219,10 @@ class WebUIServer:
             "port": port,
             "running": getattr(self, "runner", None) is not None,
             "urls": _webui_access_urls(scheme, host, port),
+            "lan_urls": [u for u in _webui_access_urls(scheme, "0.0.0.0", port)
+                         if "127.0.0.1" not in u and "localhost" not in u and "[::1]" not in u],
+            "desktop_url": self.desktop_url(),
+            "local_port": int(getattr(self, "local_port", 0) or 0),
             "https": scheme == "https",
             "https_configured": configured_https,
             "cert_file": cert_text or str(_cert_dir() / "webui_cert.pem"),
@@ -5541,15 +5233,55 @@ class WebUIServer:
             "lan_exposed": not _is_loopback_host(host),
         })
 
+    def desktop_url(self) -> str:
+        local_port = int(getattr(self, "local_port", 0) or 0)
+        if local_port:
+            return f"http://127.0.0.1:{local_port}"
+        port = int(getattr(self, "port", 0) or 0)
+        if not port:
+            port = int(self.config.get("webui_port", 11500) or 11500)
+            return f"http://127.0.0.1:{port}"
+        scheme = str(getattr(self, "scheme", "") or "")
+        if not scheme:
+            scheme = "https" if self.config.get("webui_https") else "http"
+        return f"{scheme}://127.0.0.1:{port}"
+
+    async def _start_local_plain_site(self, base_port: int) -> None:
+        for attempt in range(10):
+            local_port = base_port + 1 + attempt
+            try:
+                runner = web.AppRunner(self.app)
+                await runner.setup()
+                site = web.TCPSite(runner, "127.0.0.1", local_port)
+                await site.start()
+                self.local_runner = runner
+                self.local_port = local_port
+                return
+            except OSError as e:
+                print(f"本机明文通道端口 {local_port} 不可用（{e}），尝试下一个端口...")
+                try:
+                    await runner.cleanup()
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"启动本机明文通道失败（{type(e).__name__}: {e}），"
+                      "桌面窗口会退回 HTTPS 地址（自签证书可能导致窗口打不开）")
+                return
+        print("找不到可用的本机明文端口，桌面窗口可能打不开界面：HTTPS 自签证书 WebView2 不认。")
+
     async def start(self):
+        try:
+            await self._start_impl()
+        finally:
+            self.ready.set()
+
+    async def _start_impl(self):
         host = self.config.get("webui_host", "127.0.0.1")
         base_port = int(self.config.get("webui_port", 11500))
         if not HAS_AIOHTTP:
             print("未安装 aiohttp，WebUI 不可用")
             return
 
-        # 暴露到本机以外却没有访问密码时，整站（聊天记录、删除、发布、插件安装）
-        # 对同网段任何人都敞开，所以这里直接退回只监听本机
         password = str(self.config.get("webui_password", "") or "")
         if bool(self.config.get("webui_force_password", True)) and not password                 and not _is_loopback_host(host):
             print(f"⚠ WebUI 监听地址是 {host}，但没有设置「WebUI 访问密码」："
@@ -5558,8 +5290,9 @@ class WebUIServer:
             host = "127.0.0.1"
         ssl_context = _build_ssl_context(self.config)
         scheme = "https" if ssl_context is not None else "http"
+        self.local_port = 0
+        self.local_runner = None
 
-        # 尝试多个端口，若被占用则自动递增，最多尝试 10 次
         max_tries = 10
         for attempt in range(max_tries):
             port = base_port + attempt
@@ -5573,9 +5306,13 @@ class WebUIServer:
                 self.host = host
                 self.port = port
                 self.runner = runner
+                if scheme == "https":
+                    await self._start_local_plain_site(port)
                 print("WebUI 已启动：" + "  ".join(_webui_access_urls(scheme, host, port)))
                 if scheme == "https":
                     print("HTTPS 用的是自签证书，浏览器会提示不安全，选择继续访问即可。")
+                    if getattr(self, "local_port", 0):
+                        print(f"桌面窗口走本机明文通道：{self.desktop_url()}")
                 # 若使用了非默认端口，更新配置
                 if port != base_port:
                     self.config.config["webui_port"] = port
@@ -5583,7 +5320,6 @@ class WebUIServer:
                     self.config._atomic_save(self.config.config)
                 return
             except OSError as e:
-                # 端口被占用或其他系统错误，尝试下一个端口
                 print(f"端口 {port} 不可用（{e}），尝试下一个端口...")
                 await runner.cleanup()  # 清理失败的 runner
             except Exception as e:
@@ -5607,15 +5343,15 @@ class WebUIServer:
     async def shutdown(self):
         if not HAS_AIOHTTP:
             return
-        runner = getattr(self, "runner", None)
-        if runner is not None:
-            # 只 cleanup app 不会停止 TCPSite 的监听，端口仍被占用；
-            # 热重启/测试流程会因此碰到 "Address already in use"
-            try:
-                await runner.cleanup()
-            except Exception as e:
-                print(f"关闭 WebUI 监听失败: {type(e).__name__}: {e}")
-            self.runner = None
+        for name in ("runner", "local_runner"):
+            runner = getattr(self, name, None)
+            if runner is not None:
+                try:
+                    await runner.cleanup()
+                except Exception as e:
+                    print(f"关闭 WebUI 监听失败: {type(e).__name__}: {e}")
+                setattr(self, name, None)
+        self.local_port = 0
         await self.app.cleanup()
 
 

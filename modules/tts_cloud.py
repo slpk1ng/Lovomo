@@ -1,8 +1,3 @@
-"""云端 TTS：OpenAI 兼容 /audio/speech 与阿里云百炼（通义千问）两套协议。
-
-本地 GPT-SoVITS 走 GET /tts 并把参数摊在查询串里，云端走 POST + JSON，两者只有
-「拿到一段音频」这点相同，所以单独成模块，由 synthesize_sentence 按 tts_backend 分流。
-"""
 import asyncio
 import base64
 import re
@@ -21,29 +16,24 @@ CLOUD_BACKEND = "cloud"
 PROTOCOL_OPENAI = "openai"
 PROTOCOL_DASHSCOPE = "dashscope"
 
-# 百炼非实时语音合成：地址填 DashScope 的 API 根地址，路径固定
 _DASHSCOPE_PATH = "/services/aigc/multimodal-generation/generation"
 
-# 百炼只回音频 URL、不回 Base64，所以每句都要再下载一次，抖动一次就丢一句语音
 DOWNLOAD_ATTEMPTS = 3
 DOWNLOAD_BACKOFF_SECONDS = 0.6
 DOWNLOAD_CONNECT_TIMEOUT = 10.0
 DOWNLOAD_READ_TIMEOUT = 60.0
 
-# 台词语言 → 百炼 language_type；它不认识的语言一律不传，交给上游自动判定
 _DASHSCOPE_LANGS = {"zh": "Chinese", "ja": "Japanese", "en": "English"}
 
 _VOICE_MAP_SPLIT_RE = re.compile(r"[=:：]")
 
 
 def is_cloud_tts(config) -> bool:
-    """tts_backend 为 cloud 时用云端合成，其余（含配置缺失）都走本地 GPT-SoVITS。"""
     return str(config.get("tts_backend", LOCAL_BACKEND) or LOCAL_BACKEND) \
         .strip().lower() == CLOUD_BACKEND
 
 
 def parse_voice_map(raw) -> dict:
-    """解析「每行一个 情绪=音色」的音色映射表，忽略空行与 # 开头的注释行。"""
     mapping = {}
     for line in str(raw or "").splitlines():
         line = line.strip()
@@ -59,17 +49,12 @@ def parse_voice_map(raw) -> dict:
 
 
 def resolve_voice(config, emotion: str) -> str:
-    """情绪 → 云端音色：先查每情绪映射，没有则用全局默认音色。"""
     mapping = parse_voice_map(config.get("cloud_tts_voice_map", ""))
     return mapping.get(str(emotion or "").strip()) \
         or str(config.get("cloud_tts_voice", "") or "").strip()
 
 
 def cloud_emotion_names(config) -> list:
-    """云端模式下的情绪清单：默认情绪 + 音色映射表里出现的情绪名。
-
-    云端没有参考音频目录可扫，情绪列表只能由这两处推导，否则模型拿不到可选情绪。
-    """
     names = []
     for name in [str(config.get("default_voice", "") or "").strip()] \
             + list(parse_voice_map(config.get("cloud_tts_voice_map", ""))):
@@ -79,7 +64,6 @@ def cloud_emotion_names(config) -> list:
 
 
 async def _download_audio(url: str) -> Tuple[Optional[bytes], str]:
-    """下载百炼返回的音频地址，失败重试几次；每次都用新连接，避开卡住的旧连接。"""
     last = ""
     for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
         try:
@@ -102,7 +86,6 @@ async def _download_audio(url: str) -> Tuple[Optional[bytes], str]:
 
 
 async def _dashscope_audio(resp) -> Tuple[Optional[bytes], str]:
-    """从百炼响应里取出音频字节：优先 Base64，其次按返回的 URL 再下载一次。"""
     try:
         data = resp.json()
     except Exception:
@@ -122,11 +105,6 @@ async def _dashscope_audio(resp) -> Tuple[Optional[bytes], str]:
 
 async def synthesize_cloud(config, text: str, emotion: str, data_path: Path,
                            stats=None) -> Optional[Path]:
-    """云端合成一句话，返回 wav 路径；配置不全或合成失败返回 None（调用方只发文本）。
-
-    文本清洗、语言判定与时长校验都沿用本地那套工具，保证两条链路的日志与
-    「绝不把半截语音发出去」的约束一致。
-    """
     from .tts import (_audio_too_long, _audio_too_short, _configured_char_map,
                       _log_tts_payload, _looks_like_audio, _normalize_tts_output,
                       _safe_print, _sanitize_tts_text, _unique_stamp, _wav_duration,
@@ -172,7 +150,6 @@ async def synthesize_cloud(config, text: str, emotion: str, data_path: Path,
             payload["input"]["language_type"] = _DASHSCOPE_LANGS[lang]
     else:
         endpoint = f"{base_url}/audio/speech"
-        # 时长校验与合并都按 wav 处理，这里统一要 wav
         payload = {"model": model, "input": clean_text, "voice": voice,
                    "response_format": "wav"}
     timeout = config.get("timeout_seconds", 120)

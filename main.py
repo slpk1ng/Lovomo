@@ -1,4 +1,5 @@
 # 注：代码大部分由 Deepseek、GLM、混元等大模型协助生成，可能存在不准确或不完整的地方，请谨慎使用。 
+
 import asyncio
 import hashlib
 import hmac
@@ -33,7 +34,6 @@ from modules.app_paths import (
     user_data_dir,
 )
 
-# 凭据加解密/明文密钥清扫/二级密码判定已搬至 modules.security，此处再导出兼容旧引用
 from modules.security import (
     _API_KEY_KEYS,
     _CONNECTION_SECRET_KEYS,
@@ -81,8 +81,6 @@ from modules.app_context import (
 )
 from modules import app_context
 
-# 陪伴域定时任务（主动消息巡检/心情日记/日常陪伴/问候/上下文复核/任务注册/热重载）
-# 已搬至 modules.companion_tasks，此处再导出兼容旧引用（tests 与 _ui_server 经 import main 使用）
 from modules.companion_tasks import (
     _SELF_REFERENCE_RE, _ATTRIBUTED_SELF_RE, _REAL_SESSION_RE,
     CONTEXT_RECHECK_MIN_INTERVAL, RELATION_RECHECK_PROMPT,
@@ -118,10 +116,8 @@ from modules.log_console import (
     console_log_level, console_log_line, _LogFormatter, _CappedFileHandler,
     apply_log_max_size, global_log_buffer, LOG_BUFFER_MAX, LOG_TAIL_DEFAULT,
     _LOG_FULL_MAX_CHARS, _LOG_PENDING_MAX_CHARS, log_lock,
-    _runtime_log_limits, StdoutRedirector, log_window_event,
+    _runtime_log_limits, StdoutRedirector, log_window_event, dump_log_buffer,
 )
-# 在线更新状态机（下载/安装状态、就绪安装包检测、进度行刷新）已搬至
-# modules.updater_tools，此处再导出兼容旧引用（WebUIServer 更新方法群、
 # __main__ 块 install_update_package、tests 与 _ui_server 经 import main 使用）
 from modules.updater_tools import (
     _APP_RELEASE_REPO, _PROGRESS_LINE, _UPDATE_LOCK, _UPDATE_STATE,
@@ -207,7 +203,6 @@ from modules.llm_helpers import (RoleContext, build_chat_messages, chat_once,
                                 available_mimics, set_mimics_provider,
                                 model_list_endpoints, looks_like_full_endpoint,
                                 error_reply_text, auto_load_local_models)
-# 回复生成管线已搬至 modules.reply_pipeline，此处再导出兼容旧引用
 from modules.reply_pipeline import (
     _URL_RE, _LINK_REQUEST_RE, _SEARCH_ENTRY_URL_RE, _SEARCH_ENTRY_ABS_RE,
     _SEARCH_ENTRY_TITLE_RE, _USER_ECHO_MIN_CHARS, _RETRY_TEMPERATURE,
@@ -223,7 +218,6 @@ from modules.reply_pipeline import (
     repeat_guard_active, _log_mood_commit, _judge_mood_text,
     _judge_gate_cause, _image_reply_override,
 )
-# 媒体缓存/语音转写/转发引用拉取已搬至 modules.media_cache，此处再导出兼容旧引用
 from modules.media_cache import (
     _IMAGE_EXT, VOICE_OUT_FORMAT, VOICE_FALLBACK_SUFFIX,
     _PENDING_IMAGES, _PENDING_IMAGE_TTL, _PENDING_IMAGE_MAX_TRIES,
@@ -246,6 +240,7 @@ from modules.asr import (start_job as start_asr_job, get_job as get_asr_job,
                          AUDIO_MIMES)
 from modules.tts_service import (process_manager, ensure_tts_service,
                                  auto_start_and_switch_tts, mark_exiting)
+from modules import machine_capacity
 from modules.tts_cloud import cloud_emotion_names, is_cloud_tts
 from modules.config_presets import (DEFAULT_PROFILE as DEFAULT_CONFIG_PROFILE,
                                     delete_profile as delete_config_profile,
@@ -255,7 +250,6 @@ from modules.config_presets import (DEFAULT_PROFILE as DEFAULT_CONFIG_PROFILE,
                                     preset_dir as config_preset_dir,
                                     profile_loader as config_profile_loader,
                                     save_profile as save_config_profile)
-# 窗口几何记忆与 WebView2 控件运行时已搬至 modules，此处再导出兼容旧引用
 from modules.window_geometry import (
     _GEOMETRY_VERSION,
     _WINDOW_GEOMETRY,
@@ -291,8 +285,6 @@ from modules.window_geometry import (
 )
 import modules.webview_runtime
 # 三个模块内可变状态（_WEBVIEW_PROCESS_DEAD/_FAILED_WATCHED/_WEBVIEW_LOCK）
-# 被 webview_runtime 内的函数就地改写，必须经模块属性访问拿活引用，
-# 不能进 from-import 名单当裸名副本
 from modules.webview_runtime import (
     _WEBVIEW_CACHE_DIRS,
     _WEBVIEW_CACHE_KEY_FILE,
@@ -307,7 +299,6 @@ from modules.webview_runtime import (
     webview2_control_alive,
     webview_cache_key,
 )
-# 配置装载/迁移/接入方式辅助已搬至 modules.config_loader，此处再导出兼容旧引用
 from modules.config_loader import (
     CHAT_STYLE_PROMPT,
     LEGACY_AFFECTION_PHRASES,
@@ -331,7 +322,6 @@ from modules.config_loader import (
     _sanitize_connections,
     _dedupe_connections,
 )
-# 情绪/模仿参考音频扫描与 EmotionManager 已搬至 modules.emotion_voices，此处再导出兼容旧引用
 from modules.emotion_voices import (
     EmotionManager,
     _AUDIO_EXTS,
@@ -346,7 +336,6 @@ from modules.emotion_voices import (
     _median_pitch,
     _scan_ref_root,
 )
-# 会话记忆存取与会话 ID 净化/还原辅助已搬至 modules.memory_store，此处再导出兼容旧引用
 from modules.memory_store import (
     MemoryManager,
     _MEMORY_FILE_RE,
@@ -356,7 +345,6 @@ from modules.memory_store import (
     merge_restored_keys,
     _memory_session_id,
 )
-# 会话/角色上下文辅助与多角色连接路由已搬至 modules.session_context，此处再导出兼容旧引用
 from modules.session_context import (
     list_known_sessions,
     _log_hide_patterns,
@@ -384,7 +372,6 @@ from modules.session_context import (
     build_connection_profiles,
     resolve_target_roles,
 )
-# WebUI 通用件（响应/文件名净化/中间件/插件分发桥/GGUF 头解析）已搬至 modules.webui_common，此处再导出兼容旧引用
 from modules.webui_common import (
     _json_file_response,
     _local_file_response,
@@ -404,8 +391,6 @@ from modules.webui_common import (
     _gguf_general_name,
 )
 
-# 消息入口管线已搬至 modules.message_pipeline，此处再导出兼容旧引用
-# （tests 与 _ui_server 经 import main 使用；连接循环也调用 handle_message_event）
 from modules.message_pipeline import (
     _SESSION_PENDING, _COALESCE_WINDOW,
     _touch_pending, _extract_event_info, _merge_event_info, _merged_payload,
@@ -415,8 +400,6 @@ from modules.message_pipeline import (
 )
 
 
-# WebUI 服务（WebUIServer 整类 + WebUI 域常量 + TTS 服务可用性检查）已搬至
-# modules.webui_server，此处再导出兼容旧引用（main() 构造 WebUIServer、
 # tests 与 _ui_server 经 import main 使用）
 from modules.webui_server import (
     MAX_REACTION_LOOKUPS, MAX_BRANCH_PAGES, MARKET_SOURCE_REPOS_MAX,
@@ -528,7 +511,6 @@ async def main(stop_event: threading.Event = None):
     app_context.global_config = ConfigLoader()
     apply_log_max_size(app_context.global_config)
     app_context.global_emotion_manager = EmotionManager(app_context.global_config)
-    # 情绪模仿列表要按角色扫描参考音频目录，只有主程序有文件系统上下文，注入给提示词层
     set_mimics_provider(get_role_mimics)
     if not app_context.global_emotion_manager.emotions:
         print("\n[警告] 未找到任何情绪配置（请检查 ref_audio_root 目录），将降级为纯文本模式。")
@@ -555,6 +537,10 @@ async def main(stop_event: threading.Event = None):
     except Exception as e:
         print(f"LLM 服务探测异常: {type(e).__name__}: {e}")
 
+    preload_configs = []
+    tts_first = (bool(app_context.global_config.get("auto_start_tts", False))
+                 and bool(app_context.global_config.get("llm_auto_load_local", True))
+                 and machine_capacity.tts_first_recommended())
     try:
         preload_configs = [app_context.global_config]
         for conn in connections_of(app_context.global_config):
@@ -563,7 +549,10 @@ async def main(stop_event: threading.Event = None):
             cfg = config_for_connection(str(conn.get("id") or ""))
             if cfg is not None and cfg not in preload_configs:
                 preload_configs.append(cfg)
-        auto_load_local_models(preload_configs)
+        if tts_first:
+            print(f"[启动顺序] {machine_capacity.summary()}：内存/显存偏紧，先启动 TTS，就绪后再加载本地模型")
+        else:
+            auto_load_local_models(preload_configs)
     except Exception as e:
         print(f"本地模型预加载异常: {type(e).__name__}: {e}")
 
@@ -582,7 +571,6 @@ async def main(stop_event: threading.Event = None):
     app_context.rag_mgr = rag_mgr
     lexicon_mgr = LexiconManager(app_context.global_config, app_context.memory_manager.data_path)
     app_context.lexicon_mgr = lexicon_mgr
-    # 回忆检索复用 RAG 那套嵌入（embed_texts 只读配置，不依赖 rag_enabled）
     recall_mgr = HistoryRecallManager(app_context.global_config, app_context.memory_manager.data_path,
                                       embedder=rag_mgr)
     app_context.recall_mgr = recall_mgr
@@ -611,15 +599,16 @@ async def main(stop_event: threading.Event = None):
     job_mgr.register_all()
 
     if app_context.global_config.get("auto_start_tts", False):
-        threading.Thread(target=auto_start_and_switch_tts, args=(app_context.global_config,), daemon=True).start()
+        if tts_first and preload_configs:
+            def _tts_then_models():
+                auto_start_and_switch_tts(app_context.global_config)
+                auto_load_local_models(preload_configs)
+            threading.Thread(target=_tts_then_models, daemon=True).start()
+        else:
+            threading.Thread(target=auto_start_and_switch_tts,
+                             args=(app_context.global_config,), daemon=True).start()
 
     def _run_on_main_loop(coro_factory, timeout: float = 10.0) -> bool:
-        """把插件调用的协程丢到主事件循环执行，返回是否成功。
-
-        插件的钩子是同步函数，而 sender 的方法是协程；主事件循环在前端
-        线程里跑（MAIN_EVENT_LOOP），这里做跨线程投递。已经在循环线程里
-        时不能再 run_until_complete（会死锁），只能交给任务调度。
-        """
         async def _do():
             try:
                 return bool(await coro_factory())
@@ -648,7 +637,6 @@ async def main(stop_event: threading.Event = None):
         return False
 
     def _as_plugin_target(value) -> str:
-        """插件给的会话/用户 ID：数字保持数字写法，openid 这类长字符串原样保留。"""
         text = str(value or "").strip()
         if not text:
             return ""
@@ -656,16 +644,10 @@ async def main(stop_event: threading.Event = None):
         return match.group(1) if match else text
 
     async def _plugin_send_with_session(session_id: str, action):
-        """先按会话选连接再发：插件发到微信/QQ 官方会话时不能落到默认连接。"""
         with sender.for_session(session_id):
             return bool(await action())
 
     def plugin_send_text(session_type, target_id, text: str) -> bool:
-        """给插件用的同步发消息桥（支持群聊与私聊）。
-
-        目标 ID 不能强转 int：微信 ClawBot / QQ 官方的用户 ID 是 openid 那种长字符串，
-        强转会直接抛错，插件在这些会话上就永远发不出消息（而且没有日志）。
-        """
         tid = _as_plugin_target(target_id)
         if not tid:
             print(f"[插件] 发送目标为空或非法：{target_id!r}")
@@ -677,11 +659,6 @@ async def main(stop_event: threading.Event = None):
 
     def plugin_send_voice(session_type, target_id, text: str,
                           emotion: str = "") -> bool:
-        """给插件用的同步发语音桥：复用主程序的 TTS 链路合成后发出。
-
-        情绪名无效时退回角色默认音色（synthesize_sentence 内部已有兜底），
-        合成失败只返回 False，插件自行决定是否降级为纯文本。
-        """
         tid = _as_plugin_target(target_id)
         if not tid:
             print(f"[插件] 发送目标为空或非法：{target_id!r}")
@@ -692,7 +669,6 @@ async def main(stop_event: threading.Event = None):
 
         async def _do():
             if not client_supports(sender._active_client() or sender.client, "voice"):
-                # 这条通道发不出语音（微信 ClawBot / QQ 官方）：交给插件降级为文字
                 return False
             if not await ensure_tts_service(app_context.global_config):
                 return False
@@ -717,14 +693,12 @@ async def main(stop_event: threading.Event = None):
         return _run_on_main_loop(_send, timeout=120.0)
 
     def plugin_send_message(group_id, text: str) -> bool:
-        """兼容旧签名：早期只有群聊，现在转发到通用桥。"""
         return plugin_send_text("group", group_id, text)
 
     webui_server = None
     if HAS_AIOHTTP and app_context.global_config.get("webui_enabled", True):
         webui_server = WebUIServer(app_context.global_config, app_context.memory_manager)
         _WEBUI_SERVER_HOLDER["server"] = webui_server
-        # 注入插件运行时：这时 sender 已就绪，插件才能真的发消息。
         if app_context.global_config.get("plugins_enabled", True):
             try:
                 from modules.plugin_runtime import PluginRuntime
@@ -785,20 +759,12 @@ async def main(stop_event: threading.Event = None):
             return
         if err is None:
             return
-        # 这里吞掉异常等于"机器人没反应"且一行日志都没有，排查时无从下手
         print(f"[消息处理异常] {type(err).__name__}: {err}")
         traceback.print_exception(type(err), err, err.__traceback__)
 
     _cursor_written = {}
 
     def _persist_cursor(profile: dict, client):
-        """把长轮询进度写回接入方式。
-
-        游标落盘后重启不会重收旧消息；微信的 context_token 也要存，
-        否则重启后没有它，回复发不出去。
-        """
-        # 游标只认 snapshot：NapCat 客户端连 getattr(client, "cursor") 都会
-        # 返回一个函数（__getattr__ 动态造 API），不能拿它兜底
         snap = client_snapshot(client)
         cursor = str(snap.get("cursor") or "")
         contexts = snap.get("context_tokens") or {}
@@ -821,7 +787,6 @@ async def main(stop_event: threading.Event = None):
             print(f"保存收消息游标失败: {type(e).__name__}: {e}")
 
     async def _run_profile(profile: dict):
-        """一条接入方式的重连循环。角色绑定的连接只服务该角色。"""
         label = profile["label"]
         role_key = profile["role_key"]
         platform = str(profile.get("platform") or "napcat")
@@ -832,7 +797,6 @@ async def main(stop_event: threading.Event = None):
                 client = NapCatClient(ws_url=profile["ws_url"], token=profile["token"])
             else:
                 conn = profile.get("connection") or {}
-                # 没登录/没填凭据的连接别去连：连不上还会一直重试刷日志
                 missing = ("还没扫码登录，去接入方式里点「刷新二维码」扫码"
                            if platform == "wechat_clawbot" and not conn.get("bot_token")
                            else "还没填 AppID / AppSecret" if platform == "qq_official"
@@ -845,7 +809,6 @@ async def main(stop_event: threading.Event = None):
                     print(f"{label}：暂不支持的接入方式（{platform}），本条跳过。")
                     return
             active_clients.append(client)
-            # 接入方式 id → 客户端：重启后靠它把"会话属于哪条接入方式"接回来
             channel_key = str((profile.get("connection") or {}).get("id")
                               or f"{platform}:{label}")
             try:
@@ -854,7 +817,7 @@ async def main(stop_event: threading.Event = None):
                     if role_key:
                         sender.set_role_client(role_key, client)
                         ROLE_CONNECTIONS[id(client)] = role_key
-                    elif profile.get("default", True):
+                    if profile.get("default"):
                         sender.client = client
                     print(f"已连接！{label}（{client.self_id}）")
                     print("等待消息中...")
@@ -864,12 +827,10 @@ async def main(stop_event: threading.Event = None):
                         task = asyncio.create_task(handle_message_event(event, client))
                         task.add_done_callback(_consume_task_result)
                         _persist_cursor(profile, client)
-                # 连接被服务端正常关闭（非异常路径）：稍候重连，避免紧密循环
                 if stop_event is None or not stop_event.is_set():
                     print(f"{label} 连接已断开，3秒后重连...")
                     await asyncio.sleep(3)
             except ILinkSessionExpired as e:
-                # 登录态失效重试没有意义，停下来提示重新扫码
                 print(f"{label}：{e}")
                 return
             except Exception as e:
@@ -881,7 +842,7 @@ async def main(stop_event: threading.Event = None):
                 if role_key:
                     sender.set_role_client(role_key, None)
                     ROLE_CONNECTIONS.pop(id(client), None)
-                elif sender.client is client:
+                if sender.client is client:
                     sender.client = None  # 避免主动消息/定时任务使用失效连接
                 try:
                     active_clients.remove(client)
@@ -891,12 +852,6 @@ async def main(stop_event: threading.Event = None):
     _CONN_VOLATILE_KEYS = ("cursor", "context_tokens")
 
     def _profile_signature(profiles):
-        """接入方式（清单或单个）的配置指纹：配置内容变了才值得断线重连。
-
-        cursor / context_tokens 是运行进度（收消息游标、微信会话令牌），会随
-        收发消息不断写回配置——它们不算配置变化，否则微信每收一条消息这条
-        连接就会被重启一次。
-        """
         def strip_one(prof):
             prof = dict(prof)
             conn = {k: v for k, v in (prof.get("connection") or {}).items()
@@ -910,12 +865,6 @@ async def main(stop_event: threading.Event = None):
                           sort_keys=True, ensure_ascii=False, default=str)
 
     async def _connections_supervisor():
-        """接入方式热生效：周期比对配置与运行中的连接任务，变了才重建。
-
-        以前只在本函数启动时构建一次 profiles，WebUI 里新增/修改/删除接入方式
-        都必须重启程序才生效。现在每 2 秒对齐一次：配置没变的连接原样运行
-        （不断线），新增的补起，修改或删除的取消旧任务、按新配置重连。
-        """
         running = {}
         last_sig = None
         while not (stop_event is not None and stop_event.is_set()):
@@ -958,8 +907,6 @@ async def main(stop_event: threading.Event = None):
         watcher.cancel()
     print("正在关闭所有子进程...")
     save_proactive_state()
-    # 关闭顺序按「先关网络服务、再断子进程、最后落盘」：
-    # WebUI 先停能立刻释放端口，用户看到的是窗口立刻消失，而不是等 TTS 收尾。
     if webui_server:
         try:
             await webui_server.shutdown()
@@ -970,8 +917,6 @@ async def main(stop_event: threading.Event = None):
         await scheduler.stop()
     except Exception as e:
         print(f"停止调度器失败（忽略）：{e}")
-    # 子进程清理放到最后，且给一个明确预算：超时就交给 _force_quit 兜底，
-    # 不让 taskkill 的等待时间叠加到用户可感知的退出耗时上。
     process_manager.shutdown_all(budget=3.0)
     if db is not None:
         db.close()
@@ -981,8 +926,6 @@ if __name__ == "__main__":
     import threading
     import time
 
-    # DPI 感知必须在这里声明：pywebview 创建窗口之后再调就无效了，
-    # 而它决定了 create_window 的尺寸会不会被系统二次缩放。
     _ensure_dpi_aware()
 
     stop_event = threading.Event()
@@ -997,16 +940,12 @@ if __name__ == "__main__":
             while _pid_alive(target_pid) and time.time() < deadline:
                 time.sleep(0.3)
             if _pid_alive(target_pid):
-                # 旧进程一直不退：宁可放弃这次重启/安装，也绝不能变成第二个实例
                 print(f"旧进程({target_pid}) 20 秒仍未退出，放弃本次"
                       f"{'安装' if run_exe else '重启'}（不会启动第二个实例）")
                 sys.exit(0)
         except Exception:
             pass
     if run_exe:
-        # 在线更新的助手：旧进程已经退干净，替它把安装包拉起来再走人。
-        # 安装包要替换正在运行的程序文件，所以必须等这边完全退出（这里不加
-        # CREATE_NO_WINDOW —— 安装界面要正常显示给用户）。
         try:
             import subprocess
             subprocess.Popen([run_exe], close_fds=True)
@@ -1015,13 +954,8 @@ if __name__ == "__main__":
             print(f"[更新] 拉起安装包失败：{type(e).__name__}: {e}")
         sys.exit(0)
 
-    # 单实例判定放在等待之后：「重启 Lovomo」是旧进程退出、新进程才启动，
-    # 那时名额已经释放，不会被自己的上一世挡在门外。
     acquired = _acquire_single_instance()
     if not acquired and wait_pid:
-        # 重启/安装派生出来的这个进程可能正好撞上「上一个实例已经退出、名额还
-        # 没交还」的一瞬间。直接放弃的话这次重启会无声落空 —— 旧进程已走、新
-        # 进程也没起，用户看到的就是程序整个消失。多试几拍再认输。
         deadline = time.time() + 5.0
         while time.time() < deadline:
             time.sleep(0.25)
@@ -1035,7 +969,6 @@ if __name__ == "__main__":
             print("Lovomo 已在运行，未重复启动。")
         sys.exit(0)
 
-    # 更新过之后把用过的安装包收掉（新版本的那个留着，下次「检查更新」还能用）
     try:
         cleanup_old_installers()
     except Exception as e:
@@ -1045,7 +978,6 @@ if __name__ == "__main__":
 
     def run_backend():
         try:
-            # 记下主事件循环，供插件从同步钩子里回调发消息用
             app_context.MAIN_EVENT_LOOP = asyncio.new_event_loop()
             asyncio.set_event_loop(app_context.MAIN_EVENT_LOOP)
             app_context.MAIN_EVENT_LOOP.run_until_complete(main(stop_event))
@@ -1065,18 +997,41 @@ if __name__ == "__main__":
     time.sleep(1)
     webui_port = int(config.get("webui_port", 11500))
 
+    def window_url() -> str:
+        server = _WEBUI_SERVER_HOLDER.get("server")
+        if server is not None:
+            try:
+                url = str(server.desktop_url() or "")
+                if url:
+                    return url
+            except Exception:
+                pass
+        return f"http://127.0.0.1:{webui_port}"
+
+    def _wait_webui_ready(timeout: float = 20.0) -> None:
+        if not config.get("webui_enabled", True):
+            return
+        deadline = time.time() + max(0.0, float(timeout))
+        server = None
+        while time.time() < deadline:
+            server = _WEBUI_SERVER_HOLDER.get("server")
+            if server is not None:
+                break
+            time.sleep(0.05)
+        if server is None:
+            print("等 WebUI 服务对象超时：窗口先按设置里的地址打开")
+            return
+        event = getattr(server, "ready", None)
+        if event is not None and not event.wait(max(0.0, deadline - time.time())):
+            print(f"等 WebUI 就绪超时（{timeout:.0f}s）：窗口先按设置里的地址打开")
+
     holder = {"window": None}
     close_state = {"hidden": False, "quitting": False, "quitting_at": 0.0}
     tray_state = {"icon": None}
-    # 重启/安装只会安排一次：重建失败、托盘「重启」、安装更新可能在极短时间
-    # 内接连触发，各自 spawn 一个新进程就会变成多实例。
     relaunch_pending = {"flag": False}
-    # 唤醒（托盘/任务栏点开）期间暂停几何记录：这段窗口连续做
-    # show/maximize/move/resize，事件回调读到的都是过渡态。
     _geometry_paused = [0]
 
     def _wake_geometry_guard(seconds: float = 1.5):
-        """唤醒期间给几何记录加一个静默期，避免把过渡态写进记忆。"""
         _geometry_paused[0] += 1
 
         def _release():
@@ -1086,11 +1041,7 @@ if __name__ == "__main__":
         threading.Thread(target=_release, daemon=True).start()
 
     def _release_webview_now() -> None:
-        """收进托盘后立刻释放 WebView2（跑在隐藏线程里，不占 UI 线程）。"""
         with modules.webview_runtime._WEBVIEW_LOCK:
-            # 「关窗」和「点托盘打开」可能撞在一起，抢到锁后要再确认一眼状态；
-            # 而且必须确认窗口**确实已经藏住** —— 拆掉一个还看得见的界面，
-            # 屏幕上就只剩一个白屏窗口了。
             if not close_state.get("hidden"):
                 return
             window = holder["window"]
@@ -1104,13 +1055,6 @@ if __name__ == "__main__":
                 return
 
     def _ensure_webview_alive() -> None:
-        """唤醒前先确保界面还在，不在就重建，让窗口带着页面一起回来。
-
-        「不在」有两种：被外部结束的（任务管理器里结束那组 msedgewebview2 ——
-        它在任务管理器里显示成「浏览器」）、以及内核崩溃的。只能看控件的真实
-        状态和内核失败标记，否则窗口会被拉出来却是一片空白，再也恢复不了。
-        重建不出来就先藏窗口再重启一次程序，绝不把白屏窗口留给用户。
-        """
         window = holder["window"]
         if window is None:
             return
@@ -1123,11 +1067,10 @@ if __name__ == "__main__":
                     or not webview2_control_alive(window))
             if not need:
                 return
-            if _webview2_rebuild(window, f"http://127.0.0.1:{webui_port}",
+            if _webview2_rebuild(window, window_url(),
                                  _webview_profile_dir()):
                 modules.webview_runtime._WEBVIEW_PROCESS_DEAD["flag"] = False
             else:
-                # 重建不出来就别把白屏窗口摆给用户：藏起来，重启一次程序
                 log_window_event("打开窗口时界面没重建起来：先隐藏窗口，再重启一次程序")
                 try:
                     window.hide()
@@ -1140,24 +1083,10 @@ if __name__ == "__main__":
                     log_window_event("没有可用的重启入口，请手动退出后重开")
 
     def open_console():
-        """托盘/任务栏「打开 Lovomo」：把窗口唤醒到前台，并保持上次的几何。
-
-        以前这里调 w.restore()，pywebview 会把「最大化时记录的全屏矩形」
-        按 DPI 缩放当成 Normal 矩形还原，窗口就跑到右下角去了。现在改成
-        读自己的几何记忆：该最大化就最大化，否则 move+resize 回原位。
-
-        另外 pywebview 的 show() 只做 Show+Activate，在 Windows 前台锁下会被
-        忽略 —— 表现就是「放到后台后点任务栏/托盘没反应」。
-
-        顺序上刻意把「抢前台」放在最后一步：_apply_saved_geometry 里的
-        maximize/move/resize 都会重新排布窗口并可能把前台交还给系统，
-        只有把它放在几何之后，最后一次抢前台的结果才会被保留下来。
-        """
         w = holder["window"]
         if w is None:
             return
         close_state["hidden"] = False
-        # 释放过就先重建，让窗口带着页面一起回到屏幕上
         _ensure_webview_alive()
         _wake_geometry_guard()
         _raise_to_foreground(w)
@@ -1168,16 +1097,10 @@ if __name__ == "__main__":
                 w.restore()
             except Exception:
                 pass
-        # 几何应用后窗口可能被系统重新排列、甚至重新落到后台，
-        # 这里必须再抢一次前台，并以这次的结果为准。
         _raise_to_foreground(w)
-        # 前台锁在个别时序下会连吞两次调用（例如从托盘还原时焦点还在
-        # 弹出菜单上）。补一次延迟重试，等菜单收起、系统空闲下来再抢一次，
-        # 这样「点开窗口仍压在别的窗口后面」的情况就基本消失了。
         def _retry(win=w):
             try:
                 time.sleep(0.12)
-                # 这一拍里用户可能又把窗口收进托盘了，那就别再把它拉出来。
                 if close_state.get("hidden"):
                     return
                 _raise_to_foreground(win)
@@ -1194,29 +1117,19 @@ if __name__ == "__main__":
                 pass
 
     def request_quit():
-        """真正的退出入口：任何"关掉程序"的路径都收敛到这里。
-
-        以前 tray 的「退出 Lovomo」直接调 quit_app()，而 quit_app 在销毁窗口时
-        又会触发一次 on_closing，两条路径各做一半清理，容易出现"清理跑了两遍
-        但都没跑完"的观感。现在统一：先立起 quitting 标记（on_closing 见到它
-        就直接放行、不再取消关闭），再走唯一的 quit_app()。
-        """
         close_state["quitting"] = True
         close_state["quitting_at"] = time.time()
         quit_app()
 
     def _force_quit(delay: float = 1.2):
-        """硬退出兜底：到点直接 os._exit，不让任何一处阻塞拖住退出。
-
-        delay 是「留给优雅清理的时间」。清理本身已经改得快了，这里从原来的
-        2.5~3 秒压到 1.2 秒，用户几乎感觉不到等待。
-        """
         def _run():
             time.sleep(max(0.0, delay))
             log_window_event("进程正在退出（硬退出兜底到点）")
             try:
-                # 先立起"正在退出"：此后任何一处都不许再拉起新的子进程，
-                # 否则会留下"父进程已经没了、子进程还在跑"的独立进程。
+                dump_log_buffer(user_data_dir() / "last_session.log")
+            except Exception:
+                pass
+            try:
                 mark_exiting()
                 process_manager.shutdown_all(budget=1.0)
             except Exception:
@@ -1225,12 +1138,6 @@ if __name__ == "__main__":
         threading.Thread(target=_run, daemon=True).start()
 
     def _spawn_detached(args, env):
-        """无窗口地拉起子进程。
-
-        Windows 上从 GUI 进程 spawn python.exe（控制台版解释器）一定会弹一个
-        黑框；所以这里即使退回到 python.exe，也统一加 CREATE_NO_WINDOW +
-        SW_HIDE 双保险，保证退出/重启时不再闪出 CMD 窗口。
-        """
         import subprocess
         kwargs = {}
         if os.name == "nt":
@@ -1243,12 +1150,6 @@ if __name__ == "__main__":
         subprocess.Popen(args, env=env, close_fds=True, **kwargs)
 
     def _resolve_spawn_exe() -> tuple:
-        """挑一个不会弹控制台窗口的解释器来重启。
-
-        优先 pythonw.exe（无控制台子系统）；找不到才退回 python.exe，
-        但那时 _spawn_detached 会补上 CREATE_NO_WINDOW，同样不会闪窗。
-        冻结成 exe 后直接用自身。
-        """
         if getattr(sys, "frozen", False):
             return sys.executable, []
         exe = sys.executable
@@ -1262,16 +1163,12 @@ if __name__ == "__main__":
         return args[0], args[1:]
 
     def relaunch_console():
-        # 只安排一次重启：重建失败、托盘「重启」可能接连触发，重复 spawn 会
-        # 变成多个实例。已经安排过就直接返回，让正在进行的退出流程收尾。
         if relaunch_pending["flag"]:
             log_window_event("重启已在进行，忽略重复的重启请求")
             return
         relaunch_pending["flag"] = True
         close_state["quitting"] = True
         close_state["quitting_at"] = time.time()
-        # 重活放到独立线程：destroy 走 Invoke 会阻塞当前线程（这里是 pystray
-        # 的托盘回调线程），堵住消息循环后旧进程的退出会被拖住，跟新进程并存。
         threading.Thread(target=_do_relaunch, daemon=True).start()
 
     def _do_relaunch():
@@ -1281,9 +1178,6 @@ if __name__ == "__main__":
             _capture_geometry(w)
             _finalize_geometry(w)
             _finish_geometry_save()
-        # 先把新进程拉起来，成功了再拆窗口。反过来的话，spawn 失败就会留下
-        # 「旧界面已经没了、新程序又没起来」的空档，用户看到的是程序整个消失。
-        # 新进程带 LOVOMO_WAIT_PID，会等本进程退干净才开始，不怕端口冲突。
         try:
             exe, extra = _resolve_spawn_exe()
             env = dict(os.environ)
@@ -1291,13 +1185,12 @@ if __name__ == "__main__":
             _spawn_detached([exe, *extra], env)
             log_window_event("已安排重启：新实例等待本进程退出后启动")
         except Exception as e:
-            # 新进程没起来就别退：回滚退出状态，把界面还给用户，这次重启当失败。
             log_window_event(f"重启失败，继续使用当前进程：{type(e).__name__}: {e}")
             relaunch_pending["flag"] = False
             close_state["quitting"] = False
             close_state["quitting_at"] = 0.0
             if w is not None and not webview2_control_alive(w):
-                _webview2_rebuild(w, f"http://127.0.0.1:{webui_port}",
+                _webview2_rebuild(w, window_url(),
                                   _webview_profile_dir())
             if w is not None:
                 try:
@@ -1306,15 +1199,8 @@ if __name__ == "__main__":
                     pass
             return
         stop_event.set()
-        # 硬退出兜底必须先跑起来再拆窗口：下面 _webview2_release / Form.Close 会在
-        # 界面线程上同步 Dispose 控件，卡住时可能一直不返回（quit_app 就是这个顺序）。
-        # 放到 destroy 之后的话，一旦卡住这一行永远执行不到，旧进程会残留成
-        # 占着单实例锁的孤儿，而新进程还在等它退出 —— 表现就是同时有两个 Lovomo.exe。
         _force_quit(1.5)
         if w is not None:
-            # 先释放 WebView2：Form.Close 会同步 Dispose 界面控件，内核进程
-            # 卡住时 Close 可能一直不返回，导致旧进程迟迟不退、和新进程并存。
-            # 先主动拆掉界面进程，Close 就只剩一个空窗体，能立刻走完退出。
             try:
                 _webview2_release(w)
             except Exception:
@@ -1325,15 +1211,11 @@ if __name__ == "__main__":
                 pass
 
     def quit_app():
-        # 立起 quitting：此后 on_closing 一律放行，destroy 才能真正关掉窗口。
         close_state["quitting"] = True
         close_state["quitting_at"] = time.time()
         stop_event.set()
-        # 先启动硬退出计时：托盘线程里调用窗口销毁可能阻塞数秒，
-        # 计时器必须先跑起来，退出耗时才不受销毁速度影响。
         _force_quit(1.2)
         stop_tray_icon()
-        # 先把窗口过程还原再销毁窗口，避免退出过程中回调悬空触发异常
         try:
             _uninstall_taskbar_activate_hook()
         except Exception:
@@ -1343,7 +1225,6 @@ if __name__ == "__main__":
             _capture_geometry(w)
             _finalize_geometry(w)
             _finish_geometry_save()
-            # 先释放 WebView2，避免 Form.Close 卡在界面进程清理上、退出拖很久
             try:
                 _webview2_release(w)
             except Exception:
@@ -1354,16 +1235,9 @@ if __name__ == "__main__":
                 pass
 
     def install_update_package(installer_path: str) -> str:
-        """启动安装包并退出本程序；返回空串表示已安排，否则是给用户看的原因。
-
-        安装包要替换正在运行的程序文件，直接在自己进程里拉会被文件占用挡下来，
-        所以起一个「自己」当助手（LOVOMO_RUN_EXE），等本进程退干净再由它拉起
-        安装包 —— 复用重启那套 LOVOMO_WAIT_PID 机制。
-        """
         path = Path(str(installer_path or ""))
         if not path.is_file():
             return "安装包不存在或已被删除"
-        # 已经安排过安装/重启就不再重复起助手：重复 spawn 会拉起多个安装包
         if relaunch_pending["flag"]:
             print("安装已在进行，跳过重复的安装请求。")
             return ""
@@ -1419,25 +1293,13 @@ if __name__ == "__main__":
     tray_ok = try_start_tray()
 
     def _hide_to_tray(w) -> None:
-        """把窗口收进系统托盘：从屏幕和任务栏上一起消失，只留托盘图标。
-
-        隐藏动作必须延后一拍，不能在 on_closing 里直接做：WinForms 的关闭
-        序列会把在 FormClosing 期间改的窗口状态覆盖回去，表现出来就是
-        「偶尔没关干净、屏幕上还留一层窗口」。
-        """
         if not tray_ok:
-            # 没有托盘图标就藏不得：窗口既不在屏幕上也不在任务栏里，用户就
-            # 再也叫不回来了。退化成最小化，至少留一个任务栏入口。
             close_state["hidden"] = False
         else:
             close_state["hidden"] = True
 
         def _do():
             if tray_ok:
-                # 在 UI 线程调 form.Hide()：同步 WinForms 的 Visible 状态。但
-                # FormClosing 被 Cancel 后，WinForms 会在 UI 线程里把窗口恢复
-                # 到关闭前的状态 —— 那一步是异步的，可能落在我们隐藏之后又把
-                # 窗口拉回屏幕。所以这里多等几拍、反复确认，直到窗口真的藏住。
                 for _ in range(5):
                     try:
                         _window_hide(w)
@@ -1457,39 +1319,18 @@ if __name__ == "__main__":
                 _finish_geometry_save()
             except Exception:
                 pass
-            # 藏好了立刻释放界面进程：内存现在就拿回来。释放函数内部还会再确认一次
-            # 「窗口确实不可见」 —— 没藏住就跳过，绝不会把可见的界面拆成白屏。
             _release_webview_now()
 
         threading.Thread(target=_do, daemon=True).start()
 
     def on_closing():
-        """窗口关闭事件的唯一入口。
-
-        这里必须能区分「用户主动要关掉程序」和「窗口被别人关了一下」——
-        两种情况在 on_closing 里长得一模一样，只能靠状态区分：
-
-        · 已经在退出流程里（close_state["quitting"]，由 request_quit 立起，
-          或 quit_app/relaunch_console 自己 destroy 窗口触发）：直接返回 None
-          放行，让关闭真的发生。**这里返回 False 是非常危险的** ——
-          pywebview 的 Event.set() 只要收到一个 False 就判定取消关闭，
-          于是"销毁窗口"变成"什么都没发生"，进程卡住不退出。
-        · 用户点右上角 ×：按产品约定不是退出，而是收进系统托盘。
-          返回 False 取消这次关闭，再交给 _hide_to_tray 把窗口藏起来。
-
-        退出本身一律走 request_quit()（托盘菜单）或 quit_app()，它们在
-        destroy 之前会先把 quitting 立起来，所以不会在这里被拦下。
-        """
         if close_state.get("quitting") and time.time() - close_state.get("quitting_at", 0) < 15:
             return None
         if close_state.get("quitting"):
-            # 上一次退出流程没走完，标记却被留下了：不清掉的话，这次「关闭到托盘」
-            # 会被当成真退出 —— 窗口直接销毁、程序跟着没了。
             log_window_event("上一次退出流程没有完成，已重置退出标记（本次仍收进托盘）")
             close_state["quitting"] = False
             close_state["quitting_at"] = 0.0
         w = holder["window"]
-        # 窗口一旦隐藏/销毁就读不到几何了，先抓一次再动手。
         if w is not None:
             _capture_geometry(w)
             _finalize_geometry(w)
@@ -1497,12 +1338,6 @@ if __name__ == "__main__":
         return False
 
     def _finalize_geometry(w) -> None:
-        """退出前的最终校准，再落盘。
-
-        只做一件事：把「当前是不是最大化」记准。Normal 矩形一律不在这里读，
-        理由见 _capture_geometry 的注释 —— 最大化退出时 rcNormalPosition 给的
-        是全屏矩形，读它只会污染记忆。
-        """
         if w is None:
             return
         try:
@@ -1510,52 +1345,25 @@ if __name__ == "__main__":
             if cmd == 3:
                 _WINDOW_GEOMETRY["maximized"] = True
             elif cmd == 1:
-                # 真正处于 Normal 状态，此时读到的矩形才是可信的 Normal
                 rect = _window_rect(w)
                 if rect and not _rect_is_degenerate(rect):
                     _WINDOW_GEOMETRY["maximized"] = False
                     _WINDOW_GEOMETRY["normal"] = rect
-            # cmd == 2（最小化退出）：什么都不改，保留之前记下的值
         except Exception:
             pass
 
     def _capture_geometry(w, force: bool = False) -> None:
-        """把窗口当前的位置/大小/最大化状态记到内存（落盘由定时器去抖）。
-
-        核心原则：**Normal 矩形只在窗口真的处于 Normal 状态时才记录。**
-        最大化/最小化时一律只更新 maximized 标记，不碰 normal 字段。
-
-        这条原则来之不易，踩过两个坑：
-        · 用 pywebview 的 window.state 判断最大化 —— 它返回 State(dict)，
-          str() 是 "{}"，判断永远为 False，于是最大化被记成了 Normal，
-          存下 2582x1390 这种全屏尺寸（150% 缩放下超出 2560 屏幕宽）。
-        · 改用 GetWindowPlacement 的 rcNormalPosition 想「最大化时也能拿到
-          Normal 矩形」—— 实测发现：窗口以 maximized=True 创建时，
-          Windows 根本没设置 rcNormalPosition，它返回的就是全屏矩形
-          （实测请求 2048x1152 却读到 2586x1466 = 屏幕+边框）。
-          照着记同样会污染。
-
-        所以现在的策略很朴素：只有 Normal 状态下读到的 GetWindowRect 才可信。
-        用户从 Normal 切到最大化时，normal 字段保持上一次 Normal 时的值不变
-        —— 这正是我们想要的行为。
-        """
         if w is None:
             return
         if not _window_visible(w):
-            # 窗口已经收进托盘了：隐藏窗口的 GetWindowPlacement 不报告正常状态，
-            # 这时读到的几何没有意义（最大化过的窗口会读到全屏尺寸），
-            # 记下来只会把记忆弄脏。
             return
         try:
             state = _window_state_name(w)
             if not state:
-                # 原生拿不到 HWND（极早期/异常后端）就退回 pywebview 属性
                 return _capture_geometry_fallback(w)
             if state == "maximized":
                 _WINDOW_GEOMETRY["maximized"] = True
             elif state == "minimized":
-                # 最小化不动任何几何：GetWindowRect 是 (-32000,-32000)，
-                # rcNormalPosition 又不可靠，保留旧值最安全。
                 pass
             else:
                 rect = _window_rect(w)
@@ -1567,16 +1375,6 @@ if __name__ == "__main__":
         _schedule_geometry_save(0.4 if force else 1.2)
 
     def _capture_geometry_fallback(w) -> None:
-        """pywebview 属性兜底路径（拿不到 HWND 时才会走到，例如非 Windows）。
-
-        pywebview 读出来的是逻辑像素，统一乘 scale 转成物理像素再存，
-        保证落盘的口径始终一致。
-
-        这里**不能**用 w.state 判断最大化：pywebview 的 state 是 State(dict)，
-        str() 是 "{}"，永远不等于 "maximized"，会把最大化误判成 Normal、
-        把全屏尺寸存下来。拿不到原生 HWND 时就保守处理：只更新 Normal 矩形，
-        不动 maximized 标记（保留上次的结论），宁可不更新也不写错。
-        """
         try:
             scale = _window_scale(w)
             x = getattr(w, "x", None)
@@ -1599,21 +1397,6 @@ if __name__ == "__main__":
         _schedule_geometry_save(1.2)
 
     def _bind_geometry_events(w) -> None:
-        """监听窗口变化，持续更新几何记忆。
-
-        最大化/还原这些事件在 winforms 后端上不一定带尺寸，而且还原动画期间
-        GetWindowRect 读到的是中间态，所以统一延迟一点再读；读的是
-        rcNormalPosition，不受动画影响。
-
-        启动阶段（窗口还没定型）的事件一律忽略：那时候读到的往往是
-        MinimumSize 或者动画中间态，记下来就是把垃圾写进记忆。
-
-        唤醒期间（托盘/任务栏点开）同样忽略：open_console 会连续做
-        show/maximize/move/resize，这些动作触发的事件读到的是过渡态，
-        照记会把"最大化时的全屏矩形"当成 Normal 存下来，下次启动位置就漂了。
-        """
-        # 启动后 5 秒内不记录。窗口初始化 + 最大化动画 + 页面首屏都在这段
-        # 时间里发生，几何值还没稳定。
         started = time.time()
         startup_grace = 5.0
 
@@ -1633,8 +1416,6 @@ if __name__ == "__main__":
 
     def run_webview_loop():
         import webview
-        # 界面更新过就先清 WebView2 的缓存：它有自己的缓存目录，浏览器那边
-        # 清缓存对它无效，不清就会「重装了还是老界面」
         freed = purge_webview_cache()
         if freed:
             print(f"[窗口] 界面已更新，已清理 WebView2 缓存（{freed / 1048576:.1f} MB）")
@@ -1642,9 +1423,6 @@ if __name__ == "__main__":
         normal = _sanitize_normal_geometry(geom.get("normal") or {})
         scale = _window_scale()
         to_logical = _phys_to_logical
-        # ---- 尺寸计算全程在「逻辑像素」域里做，最后才交给 create_window ----
-        # 混用物理/逻辑是这个 bug 的老毛病，这里刻意把两个域的边界划清楚：
-        # 屏幕尺寸是物理的，先换算成逻辑上限；候选尺寸也是逻辑的，直接比。
         _fb = _default_normal_geometry()
         start_w = to_logical(int(normal.get("width") or _fb["width"]), scale)
         start_h = to_logical(int(normal.get("height") or _fb["height"]), scale)
@@ -1653,7 +1431,6 @@ if __name__ == "__main__":
 
         sw, sh = _primary_screen_size()
         if sw > 0 and sh > 0:
-            # 窗口再大也不该超过屏幕的 92%（留出标题栏和任务栏的余量）
             max_w = to_logical(int(sw * 0.92), scale)
             max_h = to_logical(int(sh * 0.92), scale)
             start_w = max(400, min(start_w, max_w))
@@ -1666,15 +1443,14 @@ if __name__ == "__main__":
             "width": start_w, "height": start_h,
             "resizable": True, "maximized": bool(geom.get("maximized")),
         }
-        # 只在记忆的坐标仍落在当前屏幕内时才传给 create_window；
-        # 否则交给系统居中，避免窗口开在屏幕外看不见。
         if (not geom.get("maximized") and start_x is not None
                 and start_y is not None and _is_geometry_valid(normal)):
             kwargs["x"] = to_logical(int(start_x), scale)
             kwargs["y"] = to_logical(int(start_y), scale)
+        _wait_webui_ready()
         holder["window"] = webview.create_window(
             'Lovomo',
-            f'http://127.0.0.1:{webui_port}',
+            window_url(),
             **kwargs)
         w = holder["window"]
         _WEBVIEW_WINDOW_HOLDER["window"] = w
@@ -1684,28 +1460,16 @@ if __name__ == "__main__":
             print(f"绑定窗口关闭事件失败，关闭将直接退出: {e}")
         _bind_geometry_events(w)
         try:
-            # 界面进程被外部结束后要能被发现（页面加载完成时控件已就绪）
             w.events.loaded += lambda: attach_process_failed_watch(w)
         except Exception:
             pass
 
         def _wake_from_system():
-            """窗口被系统激活（点任务栏图标 / 从任务栏还原）时补一次抢前台。
-
-            已经收进托盘时什么都不做 —— 那时窗口本该是隐藏的，把它拉出来
-            就成了"关掉之后又冒出一层窗口"。
-            """
             if close_state.get("hidden"):
                 return
             open_console()
 
         def _install_foreground_hook(*_args, **_kwargs):
-            """窗口首次显示后装任务栏唤醒钩子。
-
-            放在 shown 之后是因为此刻 HWND 才真正有效（create_window 返回时
-            WinForms 窗体可能还没建好原生句柄）。装钩子本身很轻，失败也只是
-            退化成"任务栏还原不抢前台"，不影响程序其余部分。
-            """
             def _do():
                 time.sleep(0.3)
                 _install_taskbar_activate_hook(
@@ -1716,19 +1480,11 @@ if __name__ == "__main__":
             w.events.shown += _install_foreground_hook
         except Exception as e:
             print(f"绑定窗口显示事件失败（任务栏唤醒钩子未安装）: {e}")
-        # 窗口和 open_console 都就绪了，开始监听"又有人双击了 exe"。
         _start_instance_show_waiter(open_console)
-        # 这里刻意不做启动后再 apply 几何的操作。
         #
-        # 曾经加过一个 events.loaded + Timer(0.6) 的兜底，想把历史脏几何纠正
-        # 回来，结果制造了更严重的 bug：定时器在窗口还没初始化完成时触发，
         # 此时 GetWindowRect 拿到的是 MinimumSize(200x100)，_apply_saved_geometry
-        # 就照着 200x100 去 resize，窗口被压成一个 200x100 的小方块
 
         #
-        # 正确策略：几何只在 create_window 时决定一次（上面已经算好了正确值），
-        # 之后只「观察」不「干预」。历史脏数据由 _load_window_geometry 的版本
-        # 校验和 _sanitize_normal_geometry 负责清理，不需要事后补救。
         webview.start(private_mode=False,
                       storage_path=_webview_profile_dir() or None)
         icon = tray_state.get("icon")

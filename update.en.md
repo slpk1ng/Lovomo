@@ -5,31 +5,103 @@
 
 #### ✨ Added
 
-- Interface refresh: the settings page is now a card-based list — every group is a rounded white card, each row inside puts the title and its description on the left and the control on the right, and only a hairline separates one row from the next; spacing is roomier overall, wide screens fit two fields per row, and narrow screens stack each row vertically.
+- Cold shoulder: when cornered out of words or simply fuming, a character can leave the conversation on read for a while and send one sticker when it ends; messages arriving meanwhile are still recorded.
 
-- Sidebar and settings polish: while the sidebar is open only the collapse button at the right end of the brand row stays visible; once collapsed, an expand button waits in the content area's top-left corner (clicking slides the sidebar out to the left, clicking again slides it back, and so on). Controls sit flush right (a number field or dropdown now packs together with the reset button on its right instead of floating mid-row), every settings row keeps just the switch itself pinned to its far right, descriptions and hints wrap instead of running off the screen, number-only fields grow to fit their content (about four digits by default, capped at 140px), and wide screens fit two fields per row.
+- Breaking the silence: after a bold line, if the other side stays silent, the character speaks first on its own; a reply within the window voids it.
 
-- Statistics and scheduled-task panels: an always-there refresh button in the bottom-right corner drops that panel's cache and reloads it on click.
+- Characters and models are chosen per connection: each connection uses one character plus one service each for chat, vision, embedding, cloud TTS and speech recognition.
 
-- Collapsible sidebar: a collapse button now sits at the right end of the sidebar's brand row; collapsing slides the sidebar out to the left and hands the horizontal space back to the content, while an always-there expand button in the content area's top-left corner brings it back. Ctrl / Cmd + B toggles it as well, the state is remembered, and on screens 760px and narrower (where the sidebar is already a top bar) neither button is shown.
+- Creating a character, a model service or a configuration profile now opens a dialog, and the new card is brought into view.
 
-- WebUI access URLs and HTTPS: a new "Access URLs" row in WebUI settings lists the addresses you can actually open (local and LAN), each with a one-click copy, and shows whether the page is served over http or https and whether an access password is set. The new "Enable HTTPS" option generates a 10-year self-signed certificate automatically (your browser warns once — continue past it), or you can supply your own PEM certificate and key. The new "Require a password for non-local access" option makes the program refuse to listen on a non-local address when no WebUI access password is set: it falls back to 127.0.0.1 only and explains why in the log.
+- Two new sidebar pages, Model services and Characters, keep endpoints, keys, model names and personas in one place.
 
-- Speech recognition: the settings now mirror the language-model field and are no longer tied to one vendor, cloud or local. "Recognition channel" picks local or online; "Recognition model" ships with presets grouped by provider (OpenAI whisper-1, the Groq whisper-large-v3 family, SiliconFlow SenseVoice, Alibaba Cloud Bailian qwen3-asr-flash / qwen2-audio-instruct, Google Gemini, a local Speaches / whisper.cpp group, and the local Faster Whisper sizes medium / large-v3 / large-v3-turbo) plus Service List to pull the available model IDs straight from the recognition service, so Choose Folder is no longer needed; "Recognition service address" now ships with speech-recognition-specific presets listing only services that really work — OpenAI Whisper, Groq and SiliconFlow over the standard /v1/audio/transcriptions endpoint (a new "whisper" API style, which also talks to a local recognition server with no API key), Alibaba Cloud Bailian and its international site, and Google Gemini (audio handed to the chat model directly), plus local Speaches / faster-whisper-server, whisper.cpp server, vLLM / LM Studio and Ollama — falling back to the LLM address when empty; the new "Recognition API Key" is stored encrypted and falls back to the LLM key; the new "Recognition API style" (auto / openai / dashscope / ollama / whisper) is inferred from the service. The local channel gains "Local recognition engine" (auto / funasr / whisper) and "Recognition root folder" (defaults to the GPT-SoVITS folder, can point at another recognition project).
+- The settings page is now a card-based list with controls flush right and two fields per row on wide screens.
+
+- The sidebar can be collapsed, with an expand button left in the content area, a keyboard shortcut and a remembered state.
+
+- The statistics and scheduled-task panels gained a refresh button.
+
+- WebUI settings list the access URLs with one-click copy, support HTTPS, and can require a password for non-local access.
+
+- Speech recognition can run in the cloud or locally, with presets for common providers and local models plus a model list pulled from the service.
+
+- Local speech recognition gained a device option, defaulting to the CPU so it no longer competes with TTS and local models for VRAM.
+
+- The configuration page now opens on the profile that is in use, with a persistent label above the save button showing what is being edited and whether it is in use.
 
 #### 🛠 Fixed
 
-- Model service: fixed a local service's HTTP 500 dumping a whole page of HTML into the log with no clue as to the real cause — the error page's title and body are now read out, together with a note that "returning an HTML error page" is not the same as "the model output HTML", plus the usual causes (model not fully loaded, evicted for lack of VRAM, service rejecting llm_extra_body and so on); server 5xx replies are retried once automatically.
+- Model services: the "Fetch models" button is back, listing the models the service offers.
 
-- Local models: fixed a trailing extra JSON fragment in llm_extra_body raising "Extra data: line 1 column 18" and causing the whole value to be ignored — the first complete JSON object is now used and the surplus is only mentioned once in the log.
+- Fixed replies quoting the user's wording being judged as repetition and rewritten.
 
-- QQ official bot: fixed the frequent "connection closed" reconnects — the heartbeat now follows the interval the gateway sends in HELLO instead of a hard-coded 30 seconds, a failed heartbeat send is no longer swallowed silently, and reconnect / invalid-session signals and close frames write their reason and close code to the log.
+- Fixed every model call failing when the timeout setting was stored as a string.
 
-- Statistics panel: fixed line-chart legends with long names being drawn past the canvas so the values were invisible — the legend now wraps, individual names are truncated with an ellipsis, and the hover tooltip is placed against its own measured width instead of overflowing off the right edge of the screen.
+- On exit the Logs page content is saved to the user data folder for troubleshooting.
 
-- Repeated requests: switching sidebar panels no longer re-downloads everything on every visit — a panel's result is reused while it is fresh (10 seconds to 5 minutes, depending on the panel), any write invalidates it immediately, and concurrent GETs to the same endpoint are merged into one request; the Advanced features page, which used to fire five requests at once when opened, no longer repeats them inside that window.
+- Fixed the delete/import result message hugging the far left edge of the panel.
 
-- Deleting a session: there used to be just one way to delete; the dialog now offers two choices — "clear relations & profile" (wiping relationship progress and the user profile back to "stranger", per user for private chats and per member for group chats) or "keep them" (only the session records go, relationship progress and profiles stay exactly as they are; "keep them" is the default button and "clear relations & profile" is a red secondary one, so an irreversible wipe can never be one stray click away).
+- Fixed saving a scheduled task failing, which made new tasks impossible to create.
+
+- Fixed the chat history list and detail title showing the character identifier instead of the name.
+
+- Fixed the dialogue translation leaking into the sent message body; it now stays in the voice only.
+
+- Fixed un-ticking the active character leaving it in the dropdown only for the save to switch silently.
+
+- Fixed connections bound to a profile reading an empty persona and the model skipping the format.
+
+- Fixed a reply that drifts into plain text falling back to the default emotion on every sentence.
+
+- Fixed a service returning an error page dumping a whole page of HTML into the log.
+
+- Fixed extra JSON in a local model's request body causing the whole value to be ignored.
+
+- Fixed the official QQ bot reconnecting frequently.
+
+- Fixed long line-chart legends drawing past the canvas and hiding the values.
+
+- Fixed every sidebar panel being re-downloaded on each visit.
+
+- Fixed deleting a session offering no choice about clearing relationship progress and profiles.
+
+- Fixed the narrow-screen menu taking up a large part of the view; it is now a top bar with a drawer.
+
+- Fixed oversized blank space, a bottom bar swallowing scroll and a floating window losing touch on mobile.
+
+- Fixed every voice-call turn erroring out after the first one.
+
+- Fixed a failed voice-call turn leaving nothing in the log.
+
+- Fixed an expired voice-call login only reporting that one sentence failed.
+
+- Fixed voice calls waiting for the whole turn before showing anything; each stage now appears as it is ready.
+
+- Fixed local speech recognition re-checking the model hub on every turn.
+
+- Fixed the expired-login password dialog being covered by the call window.
+
+- Fixed the page jumping back to the top after the login reload.
+
+- Fixed TTS startup and local model preloading fighting over memory.
+
+- Fixed one sentence playing repeatedly in voice calls.
+
+- Fixed the reply interrupting itself in push-to-talk mode when the button is not held.
+
+- Fixed repeated and missing sentences in voice calls.
+
+- Fixed TTS switching to weights already loaded at startup, saving a second copy in memory.
+
+- When a reply is not voiced, the text is no longer re-translated for speech and no extra request is spent on forcing the structured format.
+
+- Fixed chat history, context summaries and proactive messages being written to the active character's memory.
+
+- Fixed the chat test panel listing only the characters enabled in the current profile.
+
+- Fixed turning off "attach voice to replies" still starting the TTS service.
+
+- Fixed the settings page section tree and bottom action bar blocking content with no way to move them.
 
 ### v1.2.4.0
 
@@ -159,6 +231,8 @@
 
 
 #### ⚡ Improved
+
+- Search: the bodies of the top results are fetched and checked; pages whose body does not match the topic (typical clickbait) sink behind normal ones instead of being passed to the model verbatim. Bodies carry their source site, and key facts such as prices are only trusted when several different sites agree, so fake data planted by traffic-funneling pages gets caught and rewritten.
 
 - UI: list pages such as Chat History, Plugin Market, Scheduled Tasks and User Profiles show skeleton placeholders first and fade in when the data arrives.
 

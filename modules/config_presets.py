@@ -1,9 +1,3 @@
-"""配置文件：把整套配置按名字存成 data 下的 JSON，接入方式可以各用一份。
-
-文件内容就是一份配置对象（与导出的 config.json 同构），文件名（不含后缀）即
-配置文件名；内置的 default 代表「跟随主配置」，不落盘也不能删除。
-接入方式列表属于主配置，不进配置文件——否则「接入方式选配置文件」会自己绕成环。
-"""
 import re
 import time
 from pathlib import Path
@@ -15,15 +9,13 @@ PRESET_DIR_NAME = "config_presets"
 DEFAULT_PROFILE = "default"
 MAX_NAME_CHARS = 40
 
-# 文件名净化：挡掉路径分隔符与 Windows 非法字符，避免拼出目录外的路径
 _ILLEGAL_CHARS_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 
-# 已读过的配置文件：(绝对路径) -> (mtime_ns, 配置访问器)，文件改动后自动重读
 _LOADERS = {}
 
 
 class ConfigPresetError(Exception):
-    """配置文件操作失败的原因，文案可直接展示给用户。"""
+    pass
 
 
 def preset_dir(data_path) -> Path:
@@ -38,7 +30,6 @@ def _name_ok(value: str) -> bool:
 
 
 def clean_name(name) -> str:
-    """校验用户填写的配置文件名；不合法时抛出可直接展示的原因。"""
     value = " ".join(str(name or "").split())
     if not value:
         raise ConfigPresetError("请填写配置文件名")
@@ -62,7 +53,6 @@ def _read_config(path: Path) -> dict:
     data = load_json_ex(path, None)[0]
     if not isinstance(data, dict):
         raise ConfigPresetError("配置文件读不出来，可能已损坏")
-    # 旧版本存的是 {note, created_at, config} 包装，读的时候兼容一下
     inner = data.get("config")
     if isinstance(inner, dict) and ("note" in data or "created_at" in data):
         return inner
@@ -81,7 +71,6 @@ def _entry(name: str, path: Path, builtin: bool = False) -> dict:
 
 
 def list_profiles(data_path) -> List[dict]:
-    """列出全部配置文件，default 固定排在最前。"""
     out = [{"name": DEFAULT_PROFILE, "builtin": True, "updated_at": "", "size": 0}]
     work = preset_dir(data_path)
     if not work.is_dir():
@@ -95,7 +84,6 @@ def list_profiles(data_path) -> List[dict]:
 
 
 def save_profile(data_path, name, config, rename_from="") -> dict:
-    """把一份配置存成配置文件；rename_from 非空表示这是重命名，旧文件一并删掉。"""
     target = clean_name(name)
     payload = dict(config or {})
     payload.pop("connections", None)
@@ -111,7 +99,6 @@ def save_profile(data_path, name, config, rename_from="") -> dict:
 
 
 def load_profile(data_path, name) -> dict:
-    """读一份配置文件的配置对象；default 与不存在时返回空 dict。"""
     value = str(name or "")
     if not value or value == DEFAULT_PROFILE:
         return {}
@@ -133,7 +120,6 @@ def delete_profile(data_path, name) -> str:
 
 
 def profile_loader(data_path, name):
-    """配置文件对应的配置访问器；default / 读不出来时返回 None（调用方用主配置）。"""
     value = str(name or "")
     if not value or value == DEFAULT_PROFILE:
         return None
@@ -152,7 +138,6 @@ def profile_loader(data_path, name):
 
 
 def forget_profile_loaders(data_path) -> None:
-    """配置文件目录被改动后清掉缓存（删除/重命名时用）。"""
     work = str(preset_dir(data_path).resolve())
     for key in [k for k in _LOADERS if k.startswith(work)]:
         _LOADERS.pop(key, None)

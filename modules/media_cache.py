@@ -1,9 +1,6 @@
 # -*- coding: utf-8 -*-
-# 消息媒体处理（自 main.py 搬迁）：图片缓存/待识图状态/头像缓存、语音转写、
-# OB11 段渲染、转发/引用拉取、表情自动收藏。
 # 管理器槽位（sticker_mgr/memory_manager/global_config/sender/mood_mgr）统一经
 # modules.app_context 读写；_PENDING_IMAGES 与 _image_cache_last_check 是本模块
-# 自有的可变状态，随模块走。
 import asyncio
 import hashlib
 import io
@@ -30,8 +27,6 @@ from modules.tts_service import no_window_kwargs
 async def auto_capture_from_images(ctx: RoleContext, capture: dict, image_urls: list,
                                    image_result: Optional[dict] = None):
     from modules.stickers import auto_capture_image
-    # 识图时已经把原图读进内存了，优先用这份字节：QQ 图床直链的 rkey 很短命，
-    # 到这里再下载一次经常已经 403/400，收藏就会在下载这一步悄悄失败。
     preloaded = (image_result or {}).get("capture_image") or {}
     image_data = preloaded.get("data")
     source = str(preloaded.get("source") or "")
@@ -67,15 +62,11 @@ async def auto_capture_from_images(ctx: RoleContext, capture: dict, image_urls: 
             return
         category = str(capture.get("category", "") or "").strip()
         reason = str(capture.get("reason", "") or "")
-        # 分类与命名一律以中立判定为准：识图那次调用处在角色立场上，归类会被角色
-        # 此刻的情绪带偏；只有中立判定失败时才沿用识图给出的结果。
         judgement = await _sticker_judgement_from_llm(ctx, image_result) if image_result else None
         if judgement is not None:
             category = judgement["category"]
             if judgement["name"]:
                 reason = judgement["name"]
-        # 分类判定为"不适合当表情包"时直接跳过：以前这种情况会被兜底塞进 wuyu 目录，
-        # 等于把无关图片污染表情库。这条规则写在收藏指令里，不再单独配置。
         if not category:
             print("【表情收藏】这张图未被判定为适合当表情包，跳过收藏。")
             return
@@ -89,11 +80,6 @@ async def auto_capture_from_images(ctx: RoleContext, capture: dict, image_urls: 
 
 
 def _sticker_capture_args(reply: Optional[dict], image_sources: list) -> Optional[dict]:
-    """识图结果里的收藏判定能否落盘：能则返回 auto_capture_from_images 的入参，不能则 None。
-
-    条件集中在这里：收藏触发同时挂在「正常回复」与「审判判不回」两条路径上，
-    判定写两份迟早会漏掉一处（漏掉的那条路径会静默不收藏）。
-    """
     capture = (reply or {}).get("capture") or {}
     if not capture.get("should") or not image_sources or app_context.sticker_mgr is None:
         return None
@@ -111,13 +97,6 @@ def _spawn_sticker_capture(ctx: RoleContext, reply: Optional[dict], image_source
 
 
 def pick_media_source(seg, kind: str = "图片") -> Optional[str]:
-    """从图片/语音消息段里挑一个可用的来源。
-
-    优先级：本地缓存文件 > 网络 URL > 原始 file 标识。
-    最后一项是"裸文件名"（如 1E4D5FAB.image，文件并不在本地也不是 URL）：
-    此时不能返回 None，否则调用方既拿不到文件、日志里也看不出是哪一个出了问题；
-    保留原值可以让后续 download/日志明确指出问题来源，再由调用方自行跳过。
-    """
     # 优先使用本地缓存文件（如果有）
     local_path = getattr(seg, "path", None) or getattr(seg, "file", None)
     if local_path and os.path.isfile(str(local_path)):
@@ -133,9 +112,6 @@ def pick_media_source(seg, kind: str = "图片") -> Optional[str]:
     return None
 
 async def refresh_image_urls(client, image_urls: list, file_ids: dict) -> list:
-    """QQ NT 图床直链带 rkey，有效期很短，过期后返回 400。
-    优先走 OneBot get_image 换取本地缓存文件或新链接；
-    失败时下载一次落盘缓存，仍失败则丢弃该链接，避免识图链路反复 400。"""
     getter = getattr(client, "get_image", None)
     refreshed = []
     for src in image_urls:
@@ -170,27 +146,17 @@ async def refresh_image_urls(client, image_urls: list, file_ids: dict) -> list:
 
 _IMAGE_EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
               "image/bmp": ".bmp", "image/webp": ".webp"}
-# 让 OneBot 把用户语音转成 wav：本地 ASR 脚本与线上接口都吃这个格式
 VOICE_OUT_FORMAT = "wav"
 VOICE_FALLBACK_SUFFIX = ".wav"
-# 识别脚本要的采样率，转码（含 silk 解码）一律出 16k 单声道 wav
 VOICE_SAMPLE_RATE = 16000
 
 
 # ============================================================================
-# 「用户刚发的图还没被真正看过」的状态
 # ============================================================================
-# 事故背景：用户发一张图（比如示意图/表情包），回复审判判定"这条不需要回复"，
-# 于是识图链路整个没跑、画面描述也没回填进历史（历史里只留 "[图片]"）。
-# 用户紧接着发"这个怎么样""那这个呢"这类相关追问时，系统又只当纯文本处理，
-# 识图模型完全没被调用——回复节奏和上下文全对不上。
-# 现在：图片消息在"没有真正产出画面描述"时记下来；紧接着的下一条消息若和
-# 这张图相关，就把识图模型叫回来重跑一次。
 _PENDING_IMAGES: Dict[str, dict] = {}
 _PENDING_IMAGE_TTL = 900.0        # 15 分钟内的图才算"刚发的"
-_PENDING_IMAGE_MAX_TRIES = 2      # 同一张图最多为追问重跑几次识图，避免反复触发
+_PENDING_IMAGE_MAX_TRIES = 2
 
-# 明确指向"上一张图"的说法：命中就直接重跑识图模型
 _IMAGE_REF_RE = re.compile(
     r"这张|那张|这个图|那个图|这图|那图|图上|图里|图片|照片|截图|表情包|"
     r"刚才(?:发|那|的)|刚发|上一条|上面(?:那|这)|之前(?:发|那)|看看这个|"
@@ -199,7 +165,6 @@ _IMAGE_REF_RE = re.compile(
 
 def _remember_pending_image(session_id: str, image_urls: list, file_ids: dict,
                             user_text: str = ""):
-    """记下"用户刚发了一张还没被看过的图"，供下一条相关消息复用。"""
     if not session_id or not image_urls:
         return
     _PENDING_IMAGES[session_id] = {
@@ -209,11 +174,6 @@ def _remember_pending_image(session_id: str, image_urls: list, file_ids: dict,
 
 
 def _take_pending_image(session_id: str, user_text: str) -> Optional[dict]:
-    """取回"刚发过、还没被真正看过"的图片，供本条追问复用识图模型。
-
-    只在用户本条消息明确指向那张图时复用（"这个怎么样""图里是谁""刚才那张"…），
-    避免给纯文字闲聊硬塞一张旧图；同一张图最多复用两次，防止无限重跑。
-    """
     info = _PENDING_IMAGES.get(session_id)
     if not info:
         return None
@@ -234,12 +194,6 @@ def _clear_pending_image(session_id: str):
 
 
 def _backfill_image_description(history: list, description: str) -> None:
-    """把识图模型的画面描述回填到历史里最近一条用户消息上。
-
-    旧实现写死 `history[-1]["content"] = ...`：只有当被回填的消息恰好是最后一条时
-    才对；一旦本条消息是被识图叫回来的"追问"（历史里最后一条可能是别的），
-    画面描述就丢了。改成按角色倒查，永远落在真正那条用户消息上。
-    """
     desc = str(description or "").strip()
     if not history or not desc:
         return
@@ -253,7 +207,6 @@ def _backfill_image_description(history: list, description: str) -> None:
 
 
 def _image_cache_dir():
-    """聊天记录真实图片的缓存目录（data/image_cache，按内容哈希去重存放）。"""
     return app_context.memory_manager.data_path / "image_cache"
 
 
@@ -262,11 +215,6 @@ _image_cache_last_check = 0.0
 
 
 def _cache_image_bytes(data: bytes, ext: str = ".jpg") -> str:
-    """图片字节存进缓存（内容哈希命名），返回文件名；失败返回空串。
-
-    聊天记录里只存文件名：缓存被清理或图片丢失时，记录页自动退回文字描述。
-    超过 image_cache_max_mb 后按最旧先删（检查按间隔做，避免每条消息全目录扫描）。
-    """
     global _image_cache_last_check
     if app_context.memory_manager is None or not data:
         return ""
@@ -302,10 +250,6 @@ def _cache_image_bytes(data: bytes, ext: str = ".jpg") -> str:
 
 
 async def _attach_history_image(history: list, source) -> None:
-    """把收到的真实图片放进缓存，并在最近一条用户消息上记下缓存文件名。
-
-    内容里的 [图片: 描述] 保持原样：缓存清理或图片丢失时自动退回文字描述。
-    """
     if app_context.memory_manager is None or not source:
         return
     src_text = str(source or "")
@@ -335,13 +279,11 @@ async def _attach_history_image(history: list, source) -> None:
 
 _AVATAR_CACHE_TTL = 7 * 86400
 _AVATAR_CACHE_MAX_FILES = 300
-# QQ 号头像：qlogo 按号码直接返回，不需要登录态
 _QQ_AVATAR_URL = "https://q1.qlogo.cn/g?b=qq&nk={qq}&s=100"
 _QQ_NUMBER_RE = re.compile(r"^\d{5,12}$")
 
 
 def _avatar_cache_dir():
-    """聊天记录头像的缓存目录（data/avatar_cache，按 QQ 号存放）。"""
     return app_context.memory_manager.data_path / "avatar_cache"
 
 
@@ -361,7 +303,6 @@ def _prune_avatar_cache(cache_dir):
 
 
 def _active_bot_qq() -> str:
-    """当前接入方式登录的机器人 QQ 号（拿不到或不是 QQ 号时返回空串）。"""
     if app_context.sender is None:
         return ""
     self_id = str(getattr(app_context.sender._active_client(), "self_id", "") or "")
@@ -369,10 +310,6 @@ def _active_bot_qq() -> str:
 
 
 async def qq_avatar_bytes(user_id) -> bytes:
-    """取用户头像字节（目前只有 QQ 号能直接取），带本地缓存。
-
-    微信 openid 这类 ID 取不到真实头像，返回空字节由前端退回名字首字。
-    """
     uid = str(user_id or "").strip()
     if app_context.memory_manager is None or not _QQ_NUMBER_RE.match(uid):
         return b""
@@ -396,11 +333,6 @@ async def qq_avatar_bytes(user_id) -> bytes:
 
 
 def _diary_recognition_note(ctx, user_text: str) -> str:
-    """对方把角色自己写的日记（或其中一段）贴回来时，让角色认出这是自己的文字。
-
-    日记只发出去、角色自己仍以为那是私密的东西；但用户把原文贴回来时角色
-    "毫无印象"就很出戏。按归一化文本的包含关系在最近若干篇日记里找命中。
-    """
     if app_context.mood_mgr is None or not str(user_text or "").strip():
         return ""
     norm_user = _norm_text(user_text)
@@ -447,7 +379,6 @@ async def _download_image_to_cache(url: str) -> Optional[str]:
 
 
 async def _download_audio_to_temp(url: str) -> Optional[str]:
-    """把语音直链下载到 data 目录下，返回本地路径（失败返回 None）。"""
     if app_context.memory_manager is None:
         return None
     try:
@@ -472,7 +403,6 @@ async def _download_audio_to_temp(url: str) -> Optional[str]:
 
 
 def _find_ffmpeg() -> str:
-    """找 ffmpeg：优先 GPT-SoVITS 自带的（识别脚本那套 runtime 里有），其次 PATH。"""
     try:
         from modules.asr import resolve_sovits_root
         root = resolve_sovits_root(app_context.active_config() or {})
@@ -489,15 +419,9 @@ def _find_ffmpeg() -> str:
 
 
 def _decode_silk_to_wav(path: str) -> str:
-    """把腾讯 silk 解成 16k 单声道 wav。
-
-    silk 是腾讯私有格式，ffmpeg 没有它的解码器，只能靠 pysilk（SILK SDK 的
-    绑定）解；解出来的采样率由 pysilk 自己认，传入的值只决定输出重采样到多少。
-    """
     import pysilk
 
     raw = Path(path).read_bytes()
-    # 微信/QQ 的语音在 SILK 头前多带一个 0x02 标记，解之前要去掉
     if raw[:1] == b"\x02":
         raw = raw[1:]
     pcm = io.BytesIO()
@@ -512,10 +436,6 @@ def _decode_silk_to_wav(path: str) -> str:
 
 
 def _convert_audio_to_wav(path: str) -> str:
-    """把识别脚本啃不动的语音格式（silk/amr/mp3…）转成 16k 单声道 wav。
-
-    转换失败时原样返回原路径：识别那边至少还能试一次，错误信息也更真实。
-    """
     suffix = Path(path).suffix.lower()
     if suffix == ".wav":
         return path
@@ -550,14 +470,6 @@ def _convert_audio_to_wav(path: str) -> str:
 
 
 async def transcribe_voice_message(client, sources: list, file_ids: dict) -> str:
-    """用户发来的语音转文字，取「语音识别」那几项配置（识别不出来返回空串）。
-
-    QQ 里的语音常是 silk/amr 这类识别脚本啃不动的格式，先让 OneBot 转成 wav
-    并落到本地；转不了就退回直接下载直链。微信 ClawBot 没有转码接口，
-    语音按原始格式落盘后在这里统一转成 wav（silk 走 pysilk，其余走 ffmpeg）
-    再交给识别。
-    多段语音只取第一段识别出文字的。
-    """
     from modules.asr import transcribe_file
     getter = getattr(client, "get_record", None)
     temp_files = []
@@ -604,11 +516,6 @@ async def transcribe_voice_message(client, sources: list, file_ids: dict) -> str
 
 
 def _render_ob11_segments(segments) -> dict:
-    """把 OneBot 形态的消息段渲染成纯文本（图片/语音/表情只留占位符）。
-
-    返回 {"text", "image_urls", "image_file_ids"}。引用消息与转发的聊天记录
-    拿到的是同一种段列表，渲染规则只需要一份。
-    """
     parts = []
     image_urls = []
     image_file_ids = {}
@@ -640,19 +547,12 @@ def _render_ob11_segments(segments) -> dict:
             "image_urls": image_urls, "image_file_ids": image_file_ids}
 
 
-# 转发的聊天记录可能很长：只取前若干条、总字数也封顶，免得挤掉整段上下文
 FORWARD_MAX_NODES = 20
 FORWARD_MAX_CHARS = 1500
-# 转发里的图片同样交给识图，但一张图就是一次识图调用，张数必须封顶
 FORWARD_MAX_IMAGES = 4
 
 
 async def fetch_forward_text(client, forward_ids) -> Optional[dict]:
-    """回查合并转发消息的内容。
-
-    转发过来的聊天记录在消息里只有一个 id，正文得再问一次服务端才拿得到。
-    取不到就返回 None，这条消息按原样继续走。
-    """
     getter = getattr(client, "get_forward_msg", None)
     if getter is None:
         return None
@@ -690,7 +590,6 @@ async def fetch_forward_text(client, forward_ids) -> Optional[dict]:
 
 
 async def fetch_quoted_context(client, reply_seg) -> Optional[dict]:
-    """回查被引用消息的内容与发送者。"""
     getter = getattr(client, "get_msg", None)
     if getter is None:
         return None

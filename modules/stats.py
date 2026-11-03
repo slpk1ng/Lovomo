@@ -1,4 +1,3 @@
-"""性能监控与统计：内存中的实时指标 + 数据库聚合查询。"""
 import time
 from collections import deque
 from typing import Optional
@@ -7,7 +6,6 @@ from .database import DatabaseManager
 
 
 class StatsManager:
-    # 聚合粒度：区间本身按天，下钻到某天后按小时、再下钻到某小时后按分钟
     BUCKET_SECONDS = {"day": 86400, "hour": 3600, "minute": 60}
 
     def __init__(self, db: DatabaseManager, start_time: float = None):
@@ -50,12 +48,6 @@ class StatsManager:
         }
 
     def _range_bounds(self, range_key: str, table: str = "llm_usage"):
-        """把前端传来的区间标识换算成 (start, end, days)。
-
-        today/yesterday 以本地 0 点为界；7/14/30 为"含今天的最近 N 天"；
-        all 从最早一条记录算起，并把起点对齐到当天的本地 0 点，
-        这样"逐天"分桶的格子在图上就是真实的日期。
-        """
         now = time.time()
         lt = time.localtime(now)
         today0 = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
@@ -80,7 +72,6 @@ class StatsManager:
 
     def record_tokens(self, label: str, prompt_tokens: int, completion_tokens: int,
                       model: str = "", local: bool = False):
-        """记一次 LLM 调用的 token 用量（带上打到哪个模型、是本地还是云端）。"""
         prompt_tokens = int(prompt_tokens or 0)
         completion_tokens = int(completion_tokens or 0)
         self.db.record_llm_usage(label, prompt_tokens, completion_tokens,
@@ -88,13 +79,11 @@ class StatsManager:
                                  local=local)
 
     def get_token_stats(self, range_key: str = "30", window=None, granularity: str = "") -> dict:
-        """区间内 token 用量：逐桶趋势 + 按用途/模型拆分，供统计面板画图与下钻。"""
         start, end, days = self._range_bounds(range_key, table="llm_usage")
         if window:
             start, end = float(window[0]), float(window[1])
             days = max(1, (int(end) - int(start) + 86399) // 86400)
         if not granularity:
-            # 不足两天的窗口按天聚合只会得到一个点：改成按小时
             granularity = "hour" if (range_key in ("today", "yesterday") or days <= 1) \
                 else "day"
         bucket = self.BUCKET_SECONDS.get(granularity, 86400)
@@ -121,7 +110,6 @@ class StatsManager:
                 " IFNULL(SUM(completion_tokens),0) AS completion,"
                 " IFNULL(SUM(total_tokens),0) AS total FROM llm_usage"
                 " WHERE ts >= ? AND ts < ? GROUP BY label ORDER BY total DESC", (start, end))
-            # 按模型与云端/本地拆分：老记录没有模型名，归到「未知模型」
             out["by_model"] = self.db.query_all(
                 "SELECT IFNULL(NULLIF(model,''),'未知模型') AS model, local, COUNT(*) AS calls,"
                 " IFNULL(SUM(prompt_tokens),0) AS prompt,"
@@ -139,13 +127,11 @@ class StatsManager:
         now = time.time()
         day = 86400
         start, end, days = self._range_bounds(range_key, table="interactions")
-        # 点开某一天/某一小时下钻时，由前端给出具体窗口与粒度
         if window:
             start, end = float(window[0]), float(window[1])
             span = int(end) - int(start)
             days = max(1, (span + day - 1) // day)
         if not granularity:
-            # 今天/昨天、以及不足两天的窗口（比如「总共」只跨了一天）只跨一天，
             # 按天聚合只会得到一个点：改成按小时
             granularity = "hour" if (range_key in ("today", "yesterday") or days <= 1) else "day"
         bucket = self.BUCKET_SECONDS.get(granularity, day)
@@ -155,7 +141,6 @@ class StatsManager:
             out["totals"] = self.db.query_one(
                 "SELECT COUNT(*) AS n, IFNULL(AVG(llm_ms),0) AS avg_llm, IFNULL(AVG(tts_ms),0) AS avg_tts,"
                 " IFNULL(AVG(sentence_count),0) AS avg_sentences FROM interactions") or {}
-            # 区间内汇总：回复数与 LLM/TTS/工具 API 调用次数
             out["range_totals"] = self.db.query_one(
                 "SELECT COUNT(*) AS n, IFNULL(SUM(llm_calls),0) AS llm_calls,"
                 " IFNULL(SUM(tts_calls),0) AS tts_calls, IFNULL(SUM(tool_calls),0) AS tool_calls,"
@@ -181,8 +166,6 @@ class StatsManager:
                 " FROM interactions WHERE ts >= ? AND ts < ? AND IFNULL(emotion,'') != ''"
                 " GROUP BY idx, emotion ORDER BY idx",
                 (start, bucket, start, end))
-            # 三个 TOP 榜同样只在所选区间内统计，之前无 WHERE 会与区间汇总对不上
-            # 会话榜的「用户」列取该会话里发言最多的那个人（群聊才有意义，
             # 私聊就是会话对方）
             out["top_sessions"] = self.db.query_all(
                 "SELECT session_id, MAX(session_type) AS session_type, COUNT(*) AS n,"

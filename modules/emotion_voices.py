@@ -1,9 +1,4 @@
 # -*- coding: utf-8 -*-
-"""情绪/模仿参考音频扫描、音频质量体检与 EmotionManager（情绪目录发现）。
-
-自 main.py 原样搬迁（refactor_plan 第 8 节）：参考音频根目录扫描、
-参考音频质量体检、情绪模仿候选收集与情绪/模仿目录发现管理器。
-"""
 import os
 from pathlib import Path
 
@@ -23,7 +18,6 @@ _AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".flac", ".m4a"}
 
 
 def _read_sidecar_text(audio: Path) -> str:
-    """读取与音频同名的 .txt（这段音频自己的参考文字）。"""
     try:
         return audio.with_suffix(".txt").read_text(encoding="utf-8", errors="ignore").strip()
     except OSError:
@@ -60,7 +54,6 @@ def _is_emotion_folder(folder: Path) -> bool:
 _SYSTEM_DIRS = {"WpSystem", "System Volume Information", "$Recycle.Bin",
                 "Recovery", "PerfLogs", "Config.Msi"}
 
-# 每个目录最多体检多少个音频（避免别人放了上百个情绪音频时启动变慢）
 _MAX_QUALITY_CHECK = 60
 
 
@@ -73,7 +66,6 @@ def _audio_note_kind(note: str) -> str:
 
 
 def _report_audio_quality(label: str, folder_name: str, issues: list) -> None:
-    """参考音频的质量问题汇总：单文件直接写细节，多文件按问题归类写一行。"""
     if not issues:
         return
     if len(issues) == 1:
@@ -93,7 +85,6 @@ def _report_audio_quality(label: str, folder_name: str, issues: list) -> None:
 
 def _check_ref_audio_quality(audios: list, folder_name: str, label: str,
                              collect_all: bool, pitch_ref: float = 0.0) -> tuple:
-    """体检参考音频、剔除基本没声音的模仿候选；返回 (可用候选, 各音频音高)。"""
     if not audios:
         return audios, []
     checked, issues = [], []
@@ -124,7 +115,6 @@ def _check_ref_audio_quality(audios: list, folder_name: str, label: str,
 
 
 def _median_pitch(entries: dict) -> float:
-    """各情绪目录参考音频的音高中位数（角色本体的音高基准）。"""
     values = sorted(float(v.get("pitch_hz") or 0) for v in (entries or {}).values())
     values = [v for v in values if v > 0]
     if not values:
@@ -135,11 +125,6 @@ def _median_pitch(entries: dict) -> float:
 
 def _scan_ref_root(root: str, fallback_prompt: str, label: str,
                    collect_all: bool = False, pitch_ref: float = 0.0) -> dict:
-    """扫描参考音频根目录：每个子文件夹一条（ref.<ext> 或 <文件夹名>.<ext>，文字取同名 txt）。
-
-    collect_all=True 时把文件夹里所有音频都收进 candidates，供情绪模仿每次随机挑一个；
-    pitch_ref 给的是角色本体音高，用来判断模仿音频是不是同一个人。
-    """
     entries = {}
     if not root:
         return entries
@@ -189,7 +174,6 @@ def _scan_ref_root(root: str, fallback_prompt: str, label: str,
                 except (PermissionError, OSError):
                     continue
             if not ref_audio:
-                # 名字没按 ref.<ext> / <文件夹名>.<ext> 起也认：目录里的音频按文件名顺序取第一个
                 try:
                     found = sorted(p for p in folder.iterdir()
                                    if p.is_file() and p.suffix.lower() in _AUDIO_EXTS)
@@ -201,7 +185,6 @@ def _scan_ref_root(root: str, fallback_prompt: str, label: str,
                     continue
                 ref_audio = found[0]
                 if not collect_all:
-                    # 情绪模仿目录的音频本来就按情绪命名，逐个提示只会刷屏
                     print(f"[{label}] {folder.name}：没有 ref.* 也没有 {folder.name}.*，"
                           f"改用目录里的 {ref_audio.name} 当参考音频")
             if ref_audio not in audios:
@@ -223,7 +206,6 @@ def _scan_ref_root(root: str, fallback_prompt: str, label: str,
             ref_key = str(ref_audio).replace("\\", "/")
             entries[folder.name] = {
                 "ref_path": ref_key,
-                # 每段音频自己的文字优先，文件夹共用的 asr.txt 只作兜底
                 "prompt_text": candidate_texts.get(ref_key) or shared_text or fallback_prompt,
                 "candidates": [str(p).replace("\\", "/") for p in audios],
                 "candidate_texts": candidate_texts,
@@ -238,7 +220,6 @@ class EmotionManager:
     def __init__(self, config):
         self.config = config
         self.ref_audio_root = resolve_tts_path(config.get("ref_audio_root", "C:/tts"))
-        # 情绪模仿根目录可留空：留空表示不做情绪模仿，不能像 ref_audio_root 那样兜底到 C:/tts
         mimic_root = str(config.get("emotion_mimic_root", "") or "").strip()
         self.mimic_root = resolve_tts_path(mimic_root) if mimic_root else ""
         self.default_voice = config.get("default_voice", "pingjing")
@@ -254,14 +235,12 @@ class EmotionManager:
             self.config.get("prompt_text", "ふむ、おぬしが我輩のご主人か?"),
             "参考音频根目录")
         if is_cloud_tts(self.config):
-            # 云端合成不看参考音频，情绪清单改由「默认情绪 + 音色映射表」推导
             for name in cloud_emotion_names(self.config):
                 self.emotions.setdefault(name, {"ref_path": "", "prompt_text": ""})
             print(f"云端 TTS：可用情绪 {list(self.emotions.keys())}")
             return
         if self.emotions:
             print(f"成功扫描到 {len(self.emotions)} 个情绪配置: {list(self.emotions.keys())}")
-            # 默认情绪不在目录里时，解析不出的情绪都会落到它身上、却没有音频可合成
             if self.default_voice not in self.emotions:
                 print(f"警告：默认情绪 {self.default_voice!r} 不在已扫描到的情绪目录里，"
                       f"回退到它的句子不会合成语音。请把配置里的「默认情绪」改成以下之一："
@@ -306,6 +285,4 @@ class EmotionManager:
         print(f"手动配置情绪已加载，当前情绪总数：{len(self.emotions)}")
 
     def get_emotion(self, name):
-        # 情绪目录为空/被改名时兜底也为空：调用方按空 dict 处理，
-        # 不能返回 None 让下游取 ["ref_path"] 时炸掉
         return self.emotions.get(name) or self.emotions.get(self.default_voice) or {}

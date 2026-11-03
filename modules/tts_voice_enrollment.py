@@ -1,9 +1,3 @@
-"""云端声音复刻：用上传的音频克隆音色（百炼 /services/audio/tts/customization）。
-
-模型固定 qwen-voice-enrollment，驱动模型（target_model）必须与合成时用的模型一致，
-复刻出来的 voice 填进云 TTS 的音色字段即可。接口一次只收一段音频，上传多个时先合并：
-有 ffmpeg 就统一转成单声道 24kHz WAV，没有则只支持单个音频原样提交。
-"""
 import base64
 import re
 import shutil
@@ -18,13 +12,11 @@ from .tts_voice_design import VoiceDesignError
 from .tts_voice_design import _call as customization_call
 
 ENROLLMENT_MODEL = "qwen-voice-enrollment"
-# Qwen-TTS 复刻要求采样率不低于 24kHz 且只收单声道
 TARGET_SAMPLE_RATE = 24000
 MAX_AUDIO_BYTES = 10 * 1024 * 1024
 MAX_AUDIO_SECONDS = 60.0
 FFMPEG_TIMEOUT_SECONDS = 300.0
 
-# 音频文本支持的语言，顺序即界面下拉的顺序
 LANGUAGES = ("zh", "en", "de", "it", "pt", "es", "ja", "ko", "fr", "ru")
 DEFAULT_LANGUAGE = "zh"
 
@@ -33,7 +25,7 @@ _MIME_BY_SUFFIX = {".wav": "audio/wav", ".mp3": "audio/mpeg", ".m4a": "audio/mp4
 
 
 class VoiceEnrollmentError(Exception):
-    """复刻失败的原因，文案可直接展示给用户。"""
+    pass
 
 
 async def _call(config, body: dict) -> dict:
@@ -68,7 +60,6 @@ def _run_ffmpeg(exe: str, inputs: List[Path], out: Path) -> None:
 
 
 def _prepare_audio(audios: Sequence[Tuple[str, bytes]]) -> Tuple[bytes, str]:
-    """把上传的音频整成一段可提交的音频，返回 (音频字节, MIME)。"""
     if not audios:
         raise VoiceEnrollmentError("请先选择要上传的音频")
     for name, data in audios:
@@ -104,7 +95,6 @@ def _prepare_audio(audios: Sequence[Tuple[str, bytes]]) -> Tuple[bytes, str]:
 async def create_voice(config, *, audios: Sequence[Tuple[str, bytes]], name: str,
                        text: str = "", language: str = "",
                        target_model: str = "") -> dict:
-    """用上传的音频复刻一个音色，返回 voice / target_model / 降级信息。"""
     model = str(target_model or config.get("cloud_tts_model", "") or "").strip()
     if not model:
         raise VoiceEnrollmentError("先在「云 TTS 模型」里填要驱动的模型")
@@ -125,7 +115,6 @@ async def create_voice(config, *, audios: Sequence[Tuple[str, bytes]], name: str
 
 
 async def list_voices(config, *, page_index: int = 0, page_size: int = 50) -> List[dict]:
-    """列出已复刻的音色，返回 voice_list 原样条目。"""
     out = await _call(config, {"model": ENROLLMENT_MODEL,
                                "input": {"action": "list", "page_index": page_index,
                                          "page_size": page_size}})

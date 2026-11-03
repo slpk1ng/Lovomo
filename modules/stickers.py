@@ -1,4 +1,3 @@
-"""表情包管理：按情绪目录扫描本地表情图片，回复时按概率附加。"""
 import asyncio
 import hashlib
 import json
@@ -18,23 +17,14 @@ from .llm_helpers import RoleContext, resolve_emotion_key, sniff_image_mime
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 _MIME_EXT = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
              "image/webp": ".webp", "image/bmp": ".bmp"}
-# 扩展名 → MIME 的反查表：Windows 的 mimetypes 认不出 .webp，交给它猜会退回
-# application/octet-stream，浏览器就不再把缩略图当图片渲染
 MIME_BY_EXT = {ext: mime for mime, ext in _MIME_EXT.items()}
 MIME_BY_EXT[".jpeg"] = "image/jpeg"
 
 STRICT_ALLOWED = {"gaoxing", "shengqi", "haixiu", "wuyu", "jingya", "sajiao", "weixie", "pingjing"}
 
-# 「屏幕截图形态」的长宽比区间：手机截图约 0.45（9:20）、桌面截图约 1.78（16:9），
-# 而表情包都是接近方形的单一画面（用户库里那批的比值都在 0.99~1.21）。
-# 收藏前除画面内容外再按整张图的形状拦一道：截图里往往嵌着一张有趣的图，
-# 只看画面内容会被它骗过去。
 SCREEN_SHOT_ASPECT_MIN = 0.6
 SCREEN_SHOT_ASPECT_MAX = 1.7
 
-# 每个分类「适合什么互动场景」的说明，用于指导 LLM 归类。
-# 事故背景：纯风景/阴森图被判成 gaoxing，根因是分类说明太粗糙 +
-# 指令强调"必须给出分类"，模型于是随便挑了个正向情绪。
 CATEGORY_GUIDE = {
     "gaoxing": "开心大笑、庆祝、起哄、搞笑沙雕、炫耀",
     "shengqi": "生气、不满、警告、凶人",
@@ -46,8 +36,6 @@ CATEGORY_GUIDE = {
     "pingjing": "平静的日常回应；只在确实找不到更贴切分类时才用",
 }
 
-# 各分类之间的区分要点（减少"一律高兴/一律平静"的误判）。
-# 分类名取自表情库的实际文件夹（可能是中文），所以这里只用通用说法描述，不写死分类名。
 CATEGORY_DISAMBIGUATION = (
     "区分要点："
     "① 阴森、恐怖、诡异、压抑、病态的画面绝不算开心/庆祝一类的正向情绪分类，"
@@ -60,16 +48,13 @@ CATEGORY_DISAMBIGUATION = (
 
 
 def sticker_root(config) -> Path:
-    """表情库根目录（与 StickerManager.dir 同一套解析）。"""
     return Path(config.get("stickers_dir", "") or Path("data/stickers"))
 
 
-# any 是「任意情绪都能用」的通用池、default 是内置兜底池，两者都不是分类
 _NON_CATEGORY_DIRS = {"any", "default"}
 
 
 def _has_images(folder: Path) -> bool:
-    """目录里是否真有一张图片：一张都没有的目录不算分类。"""
     try:
         return any(p.suffix.lower() in IMAGE_EXTS for p in folder.iterdir())
     except OSError:
@@ -77,11 +62,6 @@ def _has_images(folder: Path) -> bool:
 
 
 def _category_dirs(root) -> dict:
-    """分类目录：小写名 → 真实目录名。只算有图片的目录。
-
-    空目录不算分类：面板不显示它，用户看不见；把它当分类会让模型选中它，
-    收藏落进一个用户看不到的目录。
-    """
     out = {}
     try:
         folders = list(Path(root).iterdir())
@@ -95,28 +75,19 @@ def _category_dirs(root) -> dict:
 
 
 def category_folders(root) -> list:
-    """表情库根目录下的分类文件夹名（按名称排序，不含 any/default 池）。"""
     return sorted(_category_dirs(root).values())
 
 
 def category_candidates(config) -> list:
-    """可作为收藏分类的候选名。
-
-    以磁盘上实际存在的分类文件夹为准（用户可以把目录命名成中文或任何词）；
-    一个分类目录都没有时（全新安装）退回内置拼音分类，否则模型无从可选。
-    """
     return category_folders(sticker_root(config)) or sorted(STRICT_ALLOWED)
 
 
 def category_candidates_text(config) -> str:
-    """候选分类清单：一行一个，便于模型逐一比较后再选。"""
     return "\n".join(
         f"- {n}({CATEGORY_GUIDE[n]})" if n in CATEGORY_GUIDE else f"- {n}"
         for n in category_candidates(config))
 
 
-# 「收藏判定指令」的默认值。分类清单由 category_candidates_text 在运行时按表情库
-# 实际文件夹生成，所以这里不写死分类名，只要求模型照抄清单里的名称。
 DEFAULT_CAPTURE_PROMPT = (
     "附加收藏指令：如果你认为这张图片有趣、可爱、有梗或有纪念意义，"
     "请在输出完主要回复JSON之后，再单独输出一个JSON对象（不要放进sentences数组），"
@@ -127,7 +98,6 @@ DEFAULT_CAPTURE_PROMPT = (
     "不适合当表情包的图片一律不要收藏，直接输出 {\"sticker_capture\": false}。"
 )
 
-# 完整映射表：模型说中文/英文，自动翻译成白名单里的拼音
 _COMMON_EMOTION_MAP = {
     # 高兴/搞笑/沙雕
     "高兴": "gaoxing", "开心": "gaoxing", "快乐": "gaoxing", "兴奋": "gaoxing", "喜悦": "gaoxing",
@@ -154,7 +124,6 @@ _COMMON_EMOTION_MAP = {
     # 害怕
     "害怕": "haipa", "恐惧": "haipa", "慌张": "huangzhang", "瑟瑟发抖": "haipa",
     "scared": "haipa", "terrified": "haipa", "panic": "huangzhang",
-    # 冷静/疲惫/等等（不在白名单，映射后会自动转成wuyu兜底，绝不建新文件夹）
     "平静": "pingjing", "淡定": "pingjing", "冷漠": "lengdan", "严肃": "yansu",
     "疲惫": "pibei", "困": "pibei", "无聊": "wuliao", "犯困": "fankun",
 }
@@ -162,23 +131,12 @@ _COMMON_EMOTION_MAP = {
 _capture_state = {"date": "", "count": 0, "last": 0.0}
 
 def normalize_capture_category(name) -> str:
-    """清洗模型给的表情分类名。
-
-    非法名（含路径分隔符、`.`/`..`、空）不能返回空串——空串会被当成"目录名"使用，
-    也可能让上层误以为分类有效。统一回退到白名单里的兜底分类 wuyu（无语），
-    与下面「不认识的词强制进 wuyu」的策略保持一致，绝不新建 default/any 之外的怪目录。
-    """
     s = str(name or "").strip()
     if not s or s in (".", "..") or any(ch in s for ch in '/\\:*?"<>|'):
         return "wuyu"
     return s[:48] if len(s) > 48 else s
 
 def _capture_quota_block(config, now: float) -> str:
-    """返回被节流拦住的原因；可以收藏时返回空串。
-
-    返回原因而不是布尔值：收藏被静默跳过的样子和"功能坏了"完全一样，
-    用户只能看到识图的提取结果，之后什么都没有。
-    """
     st = _capture_state
     today = time.strftime("%Y-%m-%d")
     if st["date"] != today:
@@ -214,7 +172,6 @@ def _ext_for_bytes(data: bytes, hint: str) -> str:
 def _index_path(root: Path) -> Path: return root / ".auto_index.json"
 
 _REASON_NAME_MAX = 24
-# 文件名只当短标签：全角标点换成空格，完整说明存在 .auto_index.json 里
 _REASON_SEP_RE = re.compile(r"[，。、；：！？…～〜·—―「」『』（）〔〕()\[\]【】“”‘’\s]+")
 _NAME_ILLEGAL_CHARS = set('/\\:*?"<>|')
 
@@ -222,7 +179,6 @@ SEND_MODES = ("off", "random", "emotion", "description")
 
 
 def safe_sticker_name(name) -> str:
-    """校验表情包文件名：合法返回原名，空/带路径分隔符/穿越时返回空串。"""
     s = str(name or "").strip()
     if not s or s in (".", "..") or s != Path(s).name or (_NAME_ILLEGAL_CHARS & set(s)):
         return ""
@@ -230,7 +186,6 @@ def safe_sticker_name(name) -> str:
 
 
 def role_names_from_config(config) -> list:
-    """配置里所有角色的名字（收藏的表情名里不该出现它们）。"""
     names = {str(config.get("character_name", "") or "").strip()}
     roles = config.get("roles")
     if isinstance(roles, list):
@@ -241,7 +196,6 @@ def role_names_from_config(config) -> list:
 
 
 def drop_role_names(text, names) -> str:
-    """去掉文本里的角色名：表情是按用途命名才能换角色继续用。"""
     out = str(text or "")
     for name in names or ():
         out = out.replace(name, "")
@@ -249,7 +203,6 @@ def drop_role_names(text, names) -> str:
 
 
 def sticker_name_from_reason(reason: str, fallback: str = "") -> str:
-    """把模型给的 reason 洗成简短通用的表情名（同时用作文件名）。"""
     name = re.sub(r'[\\/:*?"<>|\r\n\t]+', " ", str(reason or ""))
     name = _REASON_SEP_RE.sub(" ", name).strip().strip(". ")
     if len(name) > _REASON_NAME_MAX:
@@ -258,7 +211,6 @@ def sticker_name_from_reason(reason: str, fallback: str = "") -> str:
 
 
 def _unique_path(folder: Path, base: str, ext: str) -> Path:
-    """同一句 reason 被多次命中时加序号，不覆盖已有的表情。"""
     target = folder / f"{base}{ext}"
     if not target.exists():
         return target
@@ -270,7 +222,6 @@ def _unique_path(folder: Path, base: str, ext: str) -> Path:
 
 
 def _entry_path(entry) -> str:
-    """索引值兼容两种形态：新版的 {path, reason, category} 与旧版的纯路径字符串。"""
     if isinstance(entry, dict):
         return str(entry.get("path") or "")
     return str(entry or "")
@@ -281,7 +232,6 @@ def _entry_reason(entry) -> str:
 
 
 def sticker_descriptions(root: Path) -> dict:
-    """相对路径 -> 说明文字（模型给的 reason；没有则退回分类说明）。"""
     index = _load_index(root)
     by_path = {}
     for entry in index.values():
@@ -302,17 +252,10 @@ def sticker_descriptions(root: Path) -> dict:
             out[rel] = by_path.get(rel) or f"{guide}（{img.stem}）"
     return out
 
-# 默认不重编码的格式：这些格式可能带动画（多帧），重编码会丢帧。
-# 可通过 sticker_capture_preserve_formats 配置（逗号/空格/换行分隔）。
 DEFAULT_PRESERVE_FORMATS = (".gif", ".webp")
 
 
 def send_mode(config) -> str:
-    """发送方式：off=关闭 / random=随机 / emotion=按情绪 / description=按描述让模型挑。
-
-    老配置只有 stickers_enabled 没有 sticker_send_mode，这里按开关折算一次，
-    避免升级后表情包被静默关掉。
-    """
     mode = str(config.get("sticker_send_mode", "") or "").strip().lower()
     if mode in SEND_MODES:
         return mode
@@ -344,11 +287,6 @@ def _sticker_max_side(config) -> int:
 
 
 def screen_shot_size(data: bytes):
-    """像屏幕截图/长图时返回它的 (宽, 高)，否则 None（认不出尺寸也返回 None）。
-
-    判据只有长宽比：真正的表情包是接近方形的单一画面，截图是一整屏界面
-    （手机 9:20、桌面 16:9）。
-    """
     try:
         from io import BytesIO
         from PIL import Image
@@ -365,7 +303,6 @@ def screen_shot_size(data: bytes):
 
 
 def _reencode_for_sticker(data: bytes, ext: str, config) -> tuple:
-    """静态图重编码：缩小体积并统一为 PNG/JPEG。失败时原样返回。"""
     try:
         from io import BytesIO
         from PIL import Image
@@ -391,7 +328,6 @@ def _reencode_for_sticker(data: bytes, ext: str, config) -> tuple:
 
 
 def output_max_side(config) -> int:
-    """发送表情包时的最长边上限；0 表示不缩放。"""
     try:
         return max(0, int(config.get("sticker_output_max_side", 400) or 0))
     except (TypeError, ValueError):
@@ -399,12 +335,6 @@ def output_max_side(config) -> int:
 
 
 def resize_for_output(path, config) -> tuple:
-    """把要发送的表情包缩到统一边长，返回 (发送用文件, 临时文件或 None)。
-
-    表情库里的图尺寸参差不齐，直接发出去在聊天窗里忽大忽小。
-    不超过上限时原样返回，不重编码；动图跳过，重编码会丢帧。
-    返回的临时文件由调用方发送完删除。
-    """
     src = Path(path)
     limit = output_max_side(config)
     if not limit or not src.exists():
@@ -475,11 +405,6 @@ def _prune_index(root: Path) -> int:
     return len(stale)
 
 def _sync_index_digests(root: Path, index: dict) -> int:
-    """把表情库里已有的图片按内容摘要补进索引，返回新增条数。
-
-    索引原本只记「本程序收藏过」的图：用户自己放进目录的图不在其中，
-    同一张图会被当成新图再收藏一次，库里于是出现两份。
-    """
     known = {_entry_path(entry) for entry in index.values()}
     added = 0
     try:
@@ -505,17 +430,8 @@ def _sync_index_digests(root: Path, index: dict) -> int:
 
 
 def resolve_capture_category(root, category_hint) -> str:
-    """把模型给的分类名对到表情库里真实的文件夹名（必要时建一个内置分类目录）。
-
-    分类名由用户自己命名（可以是中文），大小写不敏感地匹配；模型给中文/英文
-    说法时先翻成内置分类，再对回用户那个目录，避免同一种情绪被拆成两个文件夹。
-    认不出来的词一律落到 wuyu，绝不新建 default/any 之外的怪目录 ——
-    "文件夹命名不能乱命名"这条约束就靠这里兜住。
-    """
     cat = normalize_capture_category(category_hint)
-    # 文件夹名 → 原名；空目录不算分类，否则模型会选中一个用户看不见的目录
     on_disk = _category_dirs(root)
-    # 内置拼音分类 → 磁盘上的真实目录名
     pinyin_alias = {}
     for low, real in on_disk.items():
         builtin = _COMMON_EMOTION_MAP.get(low, "")
@@ -524,32 +440,26 @@ def resolve_capture_category(root, category_hint) -> str:
 
     print(f"【表情分类】模型提供的原始分类 hint: '{category_hint}'")
 
-    # 1. 先认表情库里已有的文件夹：分类名由用户命名，绕过它去查内置拼音表
-    #    会按拼音另建一个目录，把同一种情绪拆成两个文件夹
     if cat.lower() in on_disk:
         cat = on_disk[cat.lower()]
         print(f"【表情分类-命中已有分类】'{category_hint}' -> '{cat}'")
     else:
         cat = cat.lower()
-        # 2. 翻译：模型说中文/英文，转成内置分类名
         mapped_cat = _COMMON_EMOTION_MAP.get(cat, "") or _COMMON_EMOTION_MAP.get(str(category_hint or "").lower(), "")
         if mapped_cat:
             cat = mapped_cat
             print(f"【表情分类-映射成功】'{category_hint}' -> '{cat}'")
         elif cat in STRICT_ALLOWED:
-            # 模型直接给了内置分类名：本来就合法，别打印成"映射失败"，会被误读成分类被拒
             print(f"【表情分类-分类合法】'{cat}' 已是内置分类，无需映射")
         else:
             print(f"【表情分类-映射失败】'{category_hint}' 未找到对应分类，进入兜底校验")
 
-        # 3. 兜底校验：绝对不进 any / default，不认识的词全部强制扔进 wuyu
         if cat not in STRICT_ALLOWED:
             print(f"【表情分类-兜底拦截】'{cat}' 不是已有分类，强制改为 'wuyu'")
             cat = "wuyu"
         else:
             print(f"【表情分类-最终归类】图片将保存到: '{cat}' 文件夹")
 
-        # 4. 收敛到内置分类名之后，再对一次磁盘上的原名
         if cat.lower() not in on_disk and cat in pinyin_alias:
             print(f"【表情分类-对回已有目录】'{cat}' -> '{pinyin_alias[cat]}'")
             cat = pinyin_alias[cat]
@@ -565,11 +475,6 @@ def resolve_capture_category(root, category_hint) -> str:
 
 async def auto_capture_image(config, sticker_manager, source, category_hint="",
                              image_data=None, reason="") -> bool:
-    """把一张图收藏进表情库。
-
-    每一步跳过都必须写明原因：全部静默 return False 的时候，
-    "设了开关却没收藏"根本无从排查（用户只能看到提取结果，之后什么都没了）。
-    """
     if sticker_manager is None:
         print("[表情收藏] 跳过：表情包管理器不可用。")
         return False
@@ -630,7 +535,6 @@ async def auto_capture_image(config, sticker_manager, source, category_hint="",
     index = _load_index(root)
     if _sync_index_digests(root, index):
         _save_index(root, index)
-    # 库里存的是原图（用户自己放的）或本程序重编码后的图，两种摘要都查一次
     hit = digest if digest in index else raw_digest
     existing = index.get(hit)
     if existing:
@@ -645,7 +549,6 @@ async def auto_capture_image(config, sticker_manager, source, category_hint="",
 
     dirs = [cat]
 
-    # 表情名与说明都按用途来：带上角色名的话，换了角色这套名字就不好用了
     reason = drop_role_names(reason, role_names_from_config(config))
     base = sticker_name_from_reason(reason, f"auto_{int(now * 1000)}")
     saved, primary = [], None
@@ -708,7 +611,6 @@ class StickerManager:
         else: print(f"表情包目录为空（{root}），可在 WebUI「表情包」页上传图片。")
     def rescan(self): self.__init__(self.config)
     def _candidates_for(self, emotion: str) -> list:
-        # 情绪名可能是中文（角色情绪目录自定义），分类目录是拼音时靠同义组对上
         key = resolve_emotion_key(emotion, self.map)
         candidates = []
         if key and key in self.map: candidates = [p for p in self.map[key] if p.exists()]
@@ -745,7 +647,6 @@ class StickerManager:
         return sticker
 
     async def pick_async(self, ctx=None, emotion: str = "", text: str = ""):
-        """按当前发送方式挑一张；description 模式会问一次模型。"""
         if self.mode == "off":
             return None
         if self.mode == "description":
@@ -801,10 +702,8 @@ class StickerManager:
 
 
 # ===========================================================================
-# 一键识别：把选中的图片/文件夹交给识图模型，自动归档到「表情包目录」
 # ===========================================================================
 
-# 一次最多识别多少张：每张都要过一次识图模型，条数失控时会烧掉大量额度
 IMPORT_MAX_IMAGES = 300
 IMPORT_JOB_LOG_LINES = 40
 _IMPORT_JOBS = {}
@@ -813,13 +712,6 @@ IMPORT_JOBS_KEPT = 10
 
 
 def collect_import_images(paths, library=None) -> tuple:
-    """把用户选的文件/文件夹展开成待识别的图片清单。
-
-    返回 (图片列表, 跳过原因列表)：文件夹会递归找图片；文件夹里的非图片杂物
-    直接跳过（一个文件夹里什么都可能有，逐条报出来只会刷屏），单独选中的
-    非图片文件、不存在的路径、表情库自己目录里的文件、重复项都会写明原因；
-    超过上限时截断并提示。
-    """
     images, skipped, seen = [], [], set()
     roots = []
     for raw in paths or []:
@@ -866,7 +758,6 @@ def collect_import_images(paths, library=None) -> tuple:
 
 
 def _import_prompt(candidates_text: str) -> str:
-    """一键识别的识图指令：只要分类与命名，不要台词、不要画面描述。"""
     return (
         "看这张图，判断它以后当表情包发出去时该放进哪个情绪文件夹，"
         "并给它起一个通用名字。\n"
@@ -883,7 +774,6 @@ def _import_prompt(candidates_text: str) -> str:
 
 
 async def classify_sticker_image(ctx, source: str, data: bytes, mime: str) -> dict:
-    """让识图模型看一眼这张图，返回 {category, name}（拿不到就返回空字典）。"""
     from .llm_helpers import base64_b64, extract_json_objects, vision_chat_once
     prompt = _import_prompt(category_candidates_text(ctx))
     content, _ms = await vision_chat_once(
@@ -897,12 +787,6 @@ async def classify_sticker_image(ctx, source: str, data: bytes, mime: str) -> di
 
 
 async def import_sticker_images(config, sticker_manager, paths, log=None) -> dict:
-    """识别并归档一批图片，返回 {total, saved, skipped, failed, items, skipped_paths}。
-
-    每张图都过一次识图模型（只要分类与命名），再按「表情包目录」里已有的
-    分类文件夹归档；分类名清洗与新建目录都走 resolve_capture_category，
-    所以文件夹不会被乱命名。
-    """
     emit = log or (lambda line: None)
     root = sticker_manager.dir if sticker_manager is not None else None
     images, skipped_paths = collect_import_images(paths, library=root)
@@ -1005,7 +889,6 @@ async def import_sticker_images(config, sticker_manager, paths, log=None) -> dic
 
 
 class StickerImportJob:
-    """一次「一键识别」任务：后台线程跑识图与归档，前端轮询进度。"""
 
     def __init__(self, config, sticker_manager, paths):
         self.id = uuid.uuid4().hex

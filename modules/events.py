@@ -1,19 +1,3 @@
-"""事件监听问候：节假日/纪念日/用户生日自动问候。
-
-配置存于 data/events.json（WebUI「定时任务」页编辑）：
-  [{"id": "newyear", "name": "元旦", "type": "date", "date": "01-01", "enabled": true,
-    "mode": "llm|template", "template": "新年快乐！", "llm_prompt": "今天是元旦，向主人送上祝福",
-    "use_voice": false, "targets": [{"session_type": "private", "session_id": "10001"}]}]
-
-问候默认由角色按人设现场生成（mode=llm），失败或显式配成 template 时才直接发预设话术。
-
-生日问候（type=birthday）可绑定 user_id（从用户画像读取生日）；
-另提供全局「画像生日问候」：所有画像中生日匹配今天的用户都会收到私信祝福。
-
-内置默认节日（default_events_enabled 开启后自动注入 events.json，可在 WebUI 停用/修改）：
-只包含公历固定日期的节日——春节、中秋等农历节日日期逐年不同，请按当年公历日期自行添加，
-写错日期的节日问候比没有更糟，所以不做硬编码猜测。
-"""
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -60,11 +44,6 @@ class EventManager:
         self.load_log()
 
     def ensure_default_events(self):
-        """把内置默认节日合并进 events.json（default_events_enabled 开启时）。
-
-        合并策略：按 id 判断，列表里没有的默认节日才追加；已存在的（含被用户
-        修改/停用的）绝不覆盖。想永久关掉某个默认节日，在 WebUI 里把它停用即可。
-        """
         if not self.config.get("default_events_enabled", False):
             return
         existing_ids = {str(e.get("id")) for e in self.events}
@@ -101,8 +80,6 @@ class EventManager:
         from .jsonio import load_json_ex
         data, readable = load_json_ex(self.log_file, {})
         self._log_readable = readable
-        # 只认 list 值：值不是 list 时 _mark_sent 会 append 到字符串上抛 AttributeError，
-        # _sent 的 `key in str` 还会变成子串匹配、误判成"今天已发过"
         self._log = ({k: v for k, v in data.items() if isinstance(v, list)}
                      if isinstance(data, dict) else {})
 
@@ -118,7 +95,6 @@ class EventManager:
             print("问候记录本次未能读取，已跳过保存以免覆盖磁盘上的原有内容。")
             return
         try:
-            # 必须原子写：写一半被强杀会让日志损坏，当天问候会被重复发送一遍
             from .jsonio import save_json
             save_json(self.log_file, self._log)
         except Exception as e:
@@ -132,13 +108,6 @@ class EventManager:
                               emotions_provider: Callable[[], dict],
                               sessions_provider: Optional[Callable[[], list]] = None,
                               history_provider: Optional[Callable] = None) -> int:
-        """每日问候检查（由调度器在 greeting_check_hour 触发）。
-
-        sessions_provider 返回 [(session_type, session_id)]：默认节日事件没有
-        指定 targets 时，据此把问候发给全部已知会话（default_events_to_all）。
-        history_provider(session_id, ctx) 返回对话历史提示块，让问候能承接之前的聊天。
-        返回本次真正发出的问候条数（补发链据此判断"到底补发了没有"）。
-        """
         events_on = bool(self.config.get("greeting_events_enabled", False))
         birthday_on = bool(self.config.get("birthday_greeting_enabled", False))
         if not events_on and not birthday_on:
@@ -159,8 +128,6 @@ class EventManager:
             if self._sent(key):
                 print(f"[节日问候] {event.get('name', event.get('id'))} 今天已经发过了，跳过。")
                 continue
-            # 只认填了会话号的条目：WebUI 里点了"添加目标"但没填号码时会留下
-            # session_id 为空的行，这种真值占位会顶掉下面"默认节日发给全部会话"的兜底
             targets = [t for t in (event.get("targets") or [])
                        if isinstance(t, dict) and str(t.get("session_id") or "").strip()]
             if not targets and event.get("default") \
@@ -176,7 +143,6 @@ class EventManager:
                 continue
             is_llm = str(event.get("mode", "llm")) != "template"
             if not is_llm:
-                # 模板模式：文案与目标无关，生成一次即可
                 text = await self._render_event_text(event, ctx)
                 if not text:
                     print(f"[节日问候] {event.get('name', event.get('id'))} 文案生成失败，"
@@ -184,7 +150,6 @@ class EventManager:
                     continue
                 sent_any = await self._send_to_targets(sender, targets, text, emotions, ctx, event)
             else:
-                # LLM 模式：逐个目标生成，带上该会话的聊天历史，让问候承接得上前文
                 sent_any = False
                 for target in targets:
                     session_key = (f"{target.get('session_type', 'private')}_"
@@ -249,10 +214,6 @@ class EventManager:
         return sent_total
 
     async def _send_to_targets(self, sender, targets, text, emotions, ctx, event) -> bool:
-        """把同一段话发给多个目标；返回是否至少成功发送了一个。
-
-        目标先去重：同一天同一个会话收到两遍问候，基本都是目标列表里有重复项。
-        """
         sent_any = False
         seen = set()
         for target in targets:

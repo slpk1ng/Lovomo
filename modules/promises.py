@@ -1,8 +1,3 @@
-"""承诺追踪：角色在对话里答应过用户的事记下来，之后由每日检查主动兑现。
-
-承诺的识别搭在回复定稿之后：先用触发词粗筛，命中才发一次 LLM 提取，
-避免每轮回复都多一次调用。兑现走主动消息通道，发完即标记完成。
-"""
 import re
 import time
 from pathlib import Path
@@ -10,7 +5,6 @@ from typing import Optional
 
 from .llm_helpers import RoleContext, chat_once, extract_json
 
-# 角色台词里出现这些字样才值得跑一次承诺提取
 PROMISE_HINT_RE = re.compile(r"下次|改天|回头|以后|之后|答应你|保证|明天|后天|周末|择日")
 
 EXTRACT_SYSTEM = (
@@ -72,7 +66,6 @@ class PromiseManager:
         return promise
 
     def due(self, min_age_days: float, limit: int) -> list:
-        """到期未兑现的承诺（创建时间早于 N 天前），每次检查每条只取一次由调用方控制。"""
         cutoff = time.time() - max(0.0, float(min_age_days)) * 86400
         out = [p for p in self.items
                if p.get("status") == "pending" and float(p.get("created") or 0) <= cutoff]
@@ -81,12 +74,10 @@ class PromiseManager:
     def mark_fulfilled(self, promise: dict):
         promise["status"] = "fulfilled"
         promise["fulfilled_at"] = time.time()
-        # 只保留最近 200 条，兑现已久的历史没有留档价值
         self.items = self.items[-200:]
         self._save()
 
     def drop_session(self, session_id: str) -> int:
-        """清掉某个会话的承诺；返回清掉几条。"""
         keep = [p for p in self.items if p.get("session_id") != session_id]
         removed = len(self.items) - len(keep)
         if removed:
@@ -96,7 +87,6 @@ class PromiseManager:
 
 
 async def extract_promise(ctx: RoleContext, reply_text: str) -> Optional[str]:
-    """从角色回复里提取承诺内容；没有承诺或调用失败返回 None。"""
     if not str(reply_text or "").strip():
         return None
     messages = [{"role": "system", "content": EXTRACT_SYSTEM},

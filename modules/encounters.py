@@ -1,8 +1,3 @@
-"""随机奇遇：每天按概率给角色安排一件小遭遇，由角色在后续对话里自然聊起。
-
-遭遇由角色自己现场想（不预置池子）：每天只安排一次，角色开口讲过之后就消耗掉，
-后续走向交回给对话本身。
-"""
 import random
 import time
 from pathlib import Path
@@ -46,7 +41,6 @@ class EncounterManager:
         return min(1.0, max(0.0, value))
 
     def should_roll(self, character_key: str, today: str) -> bool:
-        """今天还没安排过、且概率命中时，该由角色现场想一件遭遇。"""
         if not self.enabled():
             return False
         current = self.state.get(character_key)
@@ -55,12 +49,10 @@ class EncounterManager:
         return random.random() < self.daily_chance()
 
     def mark_none(self, character_key: str, today: str):
-        """今天没有遭遇：记一个空档期，避免同一天反复掷骰子。"""
         self.state[character_key] = {"date": today, "text": "", "used": True}
         self._save()
 
     def set_event(self, character_key: str, today: str, text: str):
-        """把角色想好的遭遇记进当天。"""
         text = str(text or "").strip()
         if not text:
             self.mark_none(character_key, today)
@@ -69,7 +61,6 @@ class EncounterManager:
         self._save()
 
     def take(self, character_key: str, today: str) -> str:
-        """取走今天尚未讲过的奇遇；没有返回空串。"""
         current = self.state.get(character_key)
         if not isinstance(current, dict) or current.get("date") != today:
             return ""

@@ -1,5 +1,3 @@
-"""JSON 状态文件的原子写入与损坏保护：进程被强杀时不会留下半截文件，
-损坏的旧文件会被改名保留（.corrupt）而不是静默当作空数据。"""
 import json
 import os
 import uuid
@@ -7,12 +5,6 @@ from pathlib import Path
 
 
 def load_json_ex(path, default):
-    """返回 (data, readable)。
-
-    readable=False 表示文件没能读进来（被占用/权限/IO 错误），此时调用方
-    应当放弃本次自动保存，否则空数据会被写回、覆盖掉磁盘上完好的内容。
-    内容损坏（JSON 解析失败）会先备份成 .corrupt，再按"可读"处理。
-    """
     path = Path(path)
     try:
         if not path.exists():
@@ -42,8 +34,6 @@ def load_json(path, default):
 def save_json(path, data):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # 临时文件名必须唯一：同一文件的两次并发保存（WebUI 线程与 bot 协程）
-    # 若共用同一个 .tmp，会互相覆盖，最终提交的内容可能来自另一次写入
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -52,7 +42,6 @@ def save_json(path, data):
             os.fsync(fh.fileno())
         os.replace(str(tmp), str(path))
     except BaseException:
-        # 写入或提交失败时清掉半成品：临时名带唯一后缀，不清理会永久残留在数据目录
         try:
             tmp.unlink(missing_ok=True)
         except OSError:

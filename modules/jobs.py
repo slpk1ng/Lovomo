@@ -1,21 +1,3 @@
-"""用户自定义定时任务：interval / daily / weekly 触发，向指定会话发送模板或 LLM 生成消息。
-
-配置存于 data/scheduled_jobs.json（WebUI「定时任务」页可视化编辑）：
-  {
-    "id": "morning_greet",
-    "name": "每日早安",
-    "enabled": true,
-    "trigger": {"type": "daily", "time": "08:30"},        # 或 {"type":"interval","seconds":3600}
-    "weekdays": [0,1,2,3,4],                              # daily 可选，0=周一
-    "target": {"session_type": "private", "session_id": "10001"},   # 空 ID = 发给所有聊过的会话
-    "action": {"mode": "template", "template": "主人早上好呀～今天是 {date} {weekday}",
-               "use_voice": true}
-  }
-mode=llm 时使用 action.llm_prompt 生成开场白（可使用 {character_name} 等占位符）。
-
-每个任务当天是否已经跑过记在 data/scheduled_jobs_state.json：
-程序在任务时刻之后才启动时，catch_up_missed_daily 会把当天漏掉的每日任务补跑一次。
-"""
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -32,10 +14,6 @@ _CLAUSE_MARKS = "，、；,;"
 
 
 def clip_to_limit(text: str, limit: int) -> str:
-    """把超长台词压回 limit 以内：优先断在句末标点，其次断在逗号/顿号/分号。
-
-    截出来的部分不足上限一半时说明没截到有用的内容，返回空串交给调用方丢弃。
-    """
     head = text[:limit]
     for marks in (_SENTENCE_END_MARKS, _CLAUSE_MARKS):
         cut = max(head.rfind(m) for m in marks)
@@ -62,18 +40,6 @@ def render_template(template: str, character_name: str = "") -> str:
 async def generate_in_character_text(ctx: RoleContext, instruction: str,
                                      max_tokens: int = 200,
                                      history_block: str = "") -> str:
-    """让角色以其人设说一句话（用于欢迎语 / 提醒话术等辅助生成）。
-
-    instruction 形如「把『吃药』这件事提醒主人」；history_block 是对话历史
-    （见主程序 dialog_history_block），用于让主动消息/问候承接之前的聊天，
-    避免"凭空开场、话题对不上"。返回纯文本，失败返回空串。
-
-    安全约束（血泪教训）：推理型模型可能把思维链写进输出，
-    一旦被当成台词就会合成出一分多钟的"思考内容语音"。因此：
-      1. 统一剥离 thinking（strip_thinking / chat_once 双重清洗）；
-      2. 输出仍带思考特征时，判定为失败返回空串（调用方走预设模板或跳过）；
-      3. 输出超长时按标点截断到字数上限内（见 clip_to_limit），绝不把整段丢给 TTS。
-    """
     raw_limit = max(40, int(ctx.get("proactive_text_max_chars", 120) or 120))
     system = (
         f"{ctx.get('personality_prompt', '')}\n"
@@ -86,7 +52,6 @@ async def generate_in_character_text(ctx: RoleContext, instruction: str,
             "你的这句话必须自然承接历史里的内容（延续同一话题、呼应主人的状态与称呼），"
             "禁止假装之前什么都没发生过，禁止问历史里刚刚已经聊过、已经回答过的问题。"
         )
-    # 推理型模型补一道强关思考的模板开关，减少"思考被当成台词"的概率
     prompt_parts = [str(history_block or "").strip(), instruction]
     user_prompt = "\n\n".join(p for p in prompt_parts if p) + no_think_suffix(ctx)
     try:
@@ -95,8 +60,6 @@ async def generate_in_character_text(ctx: RoleContext, instruction: str,
     except Exception as e:
         print(f"角色话术生成失败: {type(e).__name__}: {e}")
         return ""
-    # 原始输出只要带思考特征就整段丢弃：主动消息会直接变成语音，
-    # 宁可这次不发，也不能把思考过程念给主人听。
     if thinks := looks_like_thinking(text):
         print(f"角色话术疑似思考内容，已整段丢弃：{str(text)[:80]!r}")
         return ""
@@ -116,10 +79,6 @@ async def generate_in_character_text(ctx: RoleContext, instruction: str,
 
 async def generate_proactive_text(ctx: RoleContext, instruction: str,
                                   history_block: str = "") -> str:
-    """让角色以其人设生成一段主动开口的话（纯文本，无 JSON）。
-
-    history_block 非空时随请求一起发给模型，用于主动消息/节日问候承接上下文。
-    """
     return await generate_in_character_text(ctx, instruction, max_tokens=200,
                                             history_block=history_block)
 
@@ -161,7 +120,6 @@ class ScheduledJobManager:
         try:
             from .jsonio import save_json
             cutoff = time.strftime("%Y-%m-%d", time.localtime(time.time() - 14 * 86400))
-            # 非字符串的值（旧格式的浮点时间戳）一律淘汰：既过不了 >= 比较，
             # 又会永久留在文件里
             self.run_state = {k: v for k, v in self.run_state.items()
                               if isinstance(v, str) and v >= cutoff}
@@ -175,7 +133,6 @@ class ScheduledJobManager:
         self.save_state()
 
     def _clear_ran(self, job_id: str):
-        """撤掉"今天已执行"的占位（补发时先占位、发送失败再撤回）。"""
         if self.run_state.pop(str(job_id), None) is not None:
             self.save_state()
 
@@ -218,7 +175,6 @@ class ScheduledJobManager:
         trigger = job.get("trigger") or {}
         ttype = trigger.get("type")
         if ttype == "weekly":
-            # 调度器以 daily+weekdays 表示每周任务；兼容 weekly 类型避免退化为分钟级循环
             trigger = {"type": "daily", "time": trigger.get("time", "08:00"),
                        "weekdays": trigger.get("weekdays")}
             ttype = "daily"
@@ -231,14 +187,12 @@ class ScheduledJobManager:
         return True
 
     def reload(self):
-        """WebUI 保存后重新注册全部任务。"""
         self.load()
         for job_id in [jid for jid in list(self.scheduler.jobs) if jid.startswith(JOB_PREFIX)]:
             self.scheduler.remove_job(job_id)
         self.register_all()
 
     def describe(self):
-        """返回任务定义 + 实时运行状态。"""
         infos = []
         for job in self.jobs:
             info = dict(job)
@@ -254,7 +208,6 @@ class ScheduledJobManager:
 
     # ---------------- 发送目标 ----------------
     def known_sessions(self) -> list:
-        """所有留下过聊天记录的会话，形如 [("private", "10001"), ...]。"""
         if self.sessions_provider is None:
             return []
         try:
@@ -266,12 +219,6 @@ class ScheduledJobManager:
                 for s in items if str(s.get("session_id", "")).strip()]
 
     def resolve_targets(self, target: dict) -> list:
-        """把任务里填的目标解析成一到多个 (session_type, session_id)。
-
-        没填会话 ID 时按"发给所有聊过的会话"处理；填了但类型与已知会话不符时
-        （群号被填进私聊），按已知会话的真实类型纠正 —— 否则 NapCat 会拿群号
-        去查用户，返回 retcode 1200「无法获取用户信息」。
-        """
         session_type = str(target.get("session_type") or "private")
         session_id = str(target.get("session_id") or "").strip()
         known = self.known_sessions()
@@ -293,7 +240,6 @@ class ScheduledJobManager:
         return [(session_type, session_id)]
 
     def _history_block(self, session_key: str, ctx) -> str:
-        """取该会话最近的对话历史块，让 LLM 模式的话术承接前文。"""
         if self.history_provider is None:
             return ""
         try:
@@ -304,7 +250,6 @@ class ScheduledJobManager:
 
     # ---------------- 执行 ----------------
     async def _run_job(self, job: dict) -> bool:
-        """跑一条任务；返回是否真的发出去了（发出去了才算"今天已执行"）。"""
         target = job.get("target") or {}
         action = job.get("action") or {}
         if self.sender is None or self.sender.client is None:
@@ -325,12 +270,8 @@ class ScheduledJobManager:
         sent_any = False
         composed = 0
         for session_type, session_id in targets:
-            # 每个目标各取一份上下文：定时消息要按"这条会话从哪条接入方式来的"
-            # 那份配置生成（模型、接口地址与人设），否则绑了配置文件也没用
             session_key = f"{session_type}_{session_id}"
             session_ctx = reply_ctx_of(ctx.role, session_id=session_key)
-            # LLM 模式按目标逐个生成：各会话的上下文不同，共用一句话会让
-            # 每个会话都收到一句对不上话题的开场白
             if mode == "llm":
                 instruction = render_template(
                     str(action.get("llm_prompt", "") or "主动打个招呼"),
@@ -354,8 +295,6 @@ class ScheduledJobManager:
                 continue
             composed += 1
             try:
-                # 按会话选连接：定时消息要发给"这条会话从哪条接入方式来的"那条通道，
-                # 否则微信/QQ 官方的会话会落到默认的 NapCat 上，根本发不出去
                 with self.sender.for_session(session_key):
                     ok = await self.sender.speak_and_send(
                         session_type, session_id, text, emotions, session_ctx,
@@ -363,7 +302,6 @@ class ScheduledJobManager:
                         sticker=bool(self.config.get("proactive_sticker", False)),
                         session_id=session_key)
             except Exception as e:
-                # 单个目标失败不能中断整轮，更不能冒到调度器变成任务的 last_error
                 print(f"[定时任务] {job.get('name') or job.get('id', '')} 向 "
                       f"{session_type} {session_id} 发送失败: {type(e).__name__}: {e}")
                 ok = False
@@ -371,14 +309,12 @@ class ScheduledJobManager:
         if not composed:
             return False
         if not sent_any:
-            # 发送没成功就不能标记"今天已执行"，否则当天不会再重试
             print(f"定时任务 {job.get('id', '')} 发送未成功，本次不标记已执行。")
             return False
         self._mark_ran(job.get("id", ""))
         return True
 
     def _daily_time_passed_today(self, job: dict) -> Optional[float]:
-        """返回该每日任务今天应执行的时刻；今天没有该任务的时刻时返回 None。"""
         trigger = job.get("trigger") or {}
         if trigger.get("type") not in ("daily", "weekly"):
             return None
@@ -404,12 +340,6 @@ class ScheduledJobManager:
         return due if due <= now else None
 
     async def catch_up_missed_daily(self) -> int:
-        """补跑当天已到点但还没执行过的每日任务，返回补跑成功的条数。
-
-        程序在问候/早安这类任务时刻之后才启动时，任务不会再被触发；
-        这里按当天应执行时刻判断并补跑一次，每个任务每天最多补一次
-        （已跑过的记在 scheduled_jobs_state.json）。
-        """
         if not self.config.get("scheduler_enabled", True):
             return 0
         if self.sender is None or self.sender.client is None:
@@ -433,8 +363,6 @@ class ScheduledJobManager:
                 continue
             print(f"[定时任务] 补发今天漏掉的每日任务：{job.get('name', job_id)}"
                   f"（应执行于 {time.strftime('%H:%M', time.localtime(due))}）")
-            # 先占位再发送：发送成功到落盘之间崩溃时，重启后不会把同一条问候再补发一遍；
-            # 真没发出去（含抛异常）再把占位撤掉，当天还能重试
             self._mark_ran(job_id)
             sent = False
             try:

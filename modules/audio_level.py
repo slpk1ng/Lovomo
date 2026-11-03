@@ -1,8 +1,3 @@
-"""音频电平工具：测量峰值/响度/静音，做响度归一与合成前的参考音频预处理。
-
-参考音频的响度差异会直接传到合成结果上（太轻的参考音频合成出来也轻、
-削波的参考音频合成出来发哑），所以参考音频要在送进 TTS 之前先统一。
-"""
 import hashlib
 import math
 import os
@@ -19,11 +14,9 @@ from .tts_service import no_window_kwargs
 CLIP_LEVEL = 0.999
 SILENCE_FLOOR_DB = -50.0
 SPEECH_MIN_RATIO = 0.2
-# TTS 服务端只接受 3~10 秒的参考音频，裁静音不能把长度裁到下限以下
 REF_MIN_SECONDS = 3.0
 REF_MAX_SECONDS = 10.0
 DECODE_RATE = 32000
-# 音高差到这个倍数（约 ±35%）就提醒"不像同一个人"
 PITCH_WARN_RATIO = 1.35
 DEFAULT_TARGET_DB = -20.0
 DEFAULT_PEAK_DB = -1.0
@@ -83,7 +76,6 @@ def write_pcm16(path, audio, rate: int) -> bool:
 
 
 def _source_rate(path) -> int:
-    """源文件采样率：按原采样率解码才不会被重采样出来的过冲误判成削波。"""
     exe = _ffmpeg()
     if not exe:
         return DECODE_RATE
@@ -102,7 +94,6 @@ def _source_rate(path) -> int:
 
 
 def _decode_any(path, rate: int = 0) -> Optional[np.ndarray]:
-    """非 16bit WAV 时用 ffmpeg 解码成单声道 float32；rate=0 表示保持原采样率。"""
     exe = _ffmpeg()
     if not exe:
         return None
@@ -129,11 +120,6 @@ def _to_mono_float(audio: np.ndarray) -> np.ndarray:
 
 
 def _median_f0(mono: np.ndarray, rate: int) -> float:
-    """估个基频中位数（Hz）：用自相关找每帧的周期，判断是不是同一个人的音高。
-
-    只用来做"模仿音频和角色本体差太多"的提醒，不需要很精确：
-    帧长 25ms、最多看 24 帧，相关度太低的帧（气声/噪声）直接丢掉。
-    """
     win = int(rate * 0.025)
     if win <= 8 or mono.size < win * 4:
         return 0.0
@@ -161,7 +147,6 @@ def _median_f0(mono: np.ndarray, rate: int) -> float:
 
 
 def measure(path, rate: int = 0) -> dict:
-    """测一段音频：时长、峰值、RMS、削波与静音占比。"""
     pcm = read_pcm16(path)
     if pcm is not None:
         audio, sr, _ch = pcm
@@ -188,7 +173,6 @@ def measure(path, rate: int = 0) -> dict:
 
 
 def pitch_note(stats: dict, ref_f0: float) -> str:
-    """模仿音频和角色本体音高差得多时给一句提醒（音色会被平均、听起来不像同一个人）。"""
     if not stats or not stats.get("ok") or ref_f0 <= 0:
         return ""
     f0 = float(stats.get("f0_hz") or 0)
@@ -202,7 +186,6 @@ def pitch_note(stats: dict, ref_f0: float) -> str:
 
 
 def quality_notes(stats: dict) -> list:
-    """把测量结果翻译成"这段参考音频有什么问题"（空列表表示没问题）。"""
     if not stats or not stats.get("ok"):
         return []
     notes = []
@@ -223,7 +206,6 @@ def normalize_file(path, target_db: float = DEFAULT_TARGET_DB,
                    peak_db: float = DEFAULT_PEAK_DB,
                    max_gain_db: float = DEFAULT_MAX_GAIN_DB,
                    trim_silence: bool = False, warn: str = "") -> dict:
-    """按目标响度做增益归一（原地写回 16bit PCM WAV）。"""
     pcm = read_pcm16(path)
     if pcm is None:
         if warn:
@@ -254,7 +236,6 @@ def normalize_file(path, target_db: float = DEFAULT_TARGET_DB,
 
 
 def _trim_keep_length(audio: np.ndarray, rate: int) -> np.ndarray:
-    """裁首尾静音；裁完短于服务端下限（3 秒）就保持原样，别把参考音频裁到被拒。"""
     trimmed = _trim_edges(audio, 1, rate)
     if len(trimmed) < int(REF_MIN_SECONDS * rate):
         return audio
@@ -263,7 +244,6 @@ def _trim_keep_length(audio: np.ndarray, rate: int) -> np.ndarray:
 
 def _trim_edges(audio: np.ndarray, channels: int, rate: int, keep_ms: int = 60,
                 level: int = 240) -> np.ndarray:
-    """裁掉首尾的纯数字静音（保留一点呼吸感）。"""
     if audio is None or len(audio) == 0:
         return audio
     mono = np.abs(np.asarray(audio, dtype=np.int64))
@@ -281,10 +261,6 @@ def _trim_edges(audio: np.ndarray, channels: int, rate: int, keep_ms: int = 60,
 def prepare_reference(path, cache_dir: Path, target_db: float = DEFAULT_TARGET_DB,
                       peak_db: float = DEFAULT_PEAK_DB,
                       max_gain_db: float = DEFAULT_MAX_GAIN_DB) -> str:
-    """合成前的参考音频：单声道 + 裁首尾静音 + 电平归一，结果缓存复用。
-
-    处理不了（非 16bit WAV 又没有 ffmpeg）时原样返回原路径，合成照常进行。
-    """
     src = Path(str(path or ""))
     if not src.exists():
         return str(path or "")
@@ -325,8 +301,6 @@ def prepare_reference(path, cache_dir: Path, target_db: float = DEFAULT_TARGET_D
 
     if mono.size == 0:
         return str(path or "")
-    # 先写唯一临时文件、归一完成后再提交：直接写 cached 的话，文件一被创建
-    # （内容还没写完）并发的第二个调用就会在 cached.exists() 处拿到半截音频
     tmp = cached.with_name(f"{cached.stem}.{os.getpid()}.{os.urandom(4).hex()}.tmp.wav")
     if not write_pcm16(tmp, mono, rate):
         tmp.unlink(missing_ok=True)

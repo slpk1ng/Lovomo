@@ -55,11 +55,6 @@ def _parse_clock(value: str, default_minutes: int) -> int:
 
 
 def env_bias(ctx) -> float:
-    """时间环境对心情的临时偏置（不落盘）：深夜走低、周末回暖。
-
-    只影响这一轮的回复概率与语气档位；落盘的变化量仍以未偏置的值为基准，
-    否则偏置会在每轮提交时越滚越多。
-    """
     if not _truthy(ctx.get("mood_env_enabled", True)):
         return 0.0
     bias = 0.0
@@ -95,12 +90,10 @@ def reply_probability(ctx, mood: float) -> float:
     return p
 
 
-# 概率回复：不看心情，直接按配置的一个固定概率决定这条消息回不回
 DEFAULT_REPLY_PROBABILITY = 0.5
 
 
 def fixed_reply_probability(ctx) -> Optional[float]:
-    """启用「概率回复」时返回那个固定概率（0~1），没启用返回 None。"""
     try:
         raw = ctx.get("reply_probability_enabled", None)
     except Exception:
@@ -121,7 +114,6 @@ def _parse_key(key: str) -> tuple:
 
 
 class MoodManager:
-    # 单条心情记录最多保留的历史点（统计曲线用），超出丢最旧的
     HISTORY_MAX_POINTS = 500
     # 每个角色最多保留多少篇心情日记
     DIARY_MAX_ENTRIES = 200
@@ -194,7 +186,6 @@ class MoodManager:
         self._save()
 
     def decay_lonely(self, idle_days: int, drop: float, lo: float) -> int:
-        """连续多天没人聊的会话心情每天走低一点（不重置 updated，持续生效）。"""
         cutoff = time.time() - max(1, int(idle_days)) * 86400
         drop = abs(float(drop or 0))
         if drop <= 0:
@@ -213,7 +204,6 @@ class MoodManager:
         return changed
 
     def curve_points(self, character_key: str, session_id: str = "") -> list:
-        """某角色（可只取某个会话）的心情历史点（[[ts, mood], ...]，按时间排序）。"""
         target = str(session_id or "")
         pts = []
         for key, rec in self.records.items():
@@ -228,11 +218,6 @@ class MoodManager:
         return pts
 
     def mood_points_for_day(self, character_key: str, day: str, session_id: str = "") -> list:
-        """某角色某一天（本地日期 YYYY-MM-DD）的心情历史点。
-
-        给了 session_id 就只取那个会话的：日记按会话各写一篇，
-        把别的会话的起伏算进来会让「那天心情最低多少」对不上。
-        """
         start = 0.0
         try:
             start = time.mktime(time.strptime(day, "%Y-%m-%d"))
@@ -263,10 +248,6 @@ class MoodManager:
         return start, start + 86400
 
     def sessions_for_day(self, character_key: str, day: str) -> list:
-        """那天有心情记录的会话（按记录条数从多到少）。
-
-        日记要按当天真实发生的事来写，而心情点就是"这个会话当天真的聊过"的凭据。
-        """
         start, end = self._day_bounds(day)
         if start <= 0:
             return []
@@ -289,10 +270,6 @@ class MoodManager:
                    for entry in (self.diary.get(character_key) or []))
 
     def drop_diary_session(self, session_id: str) -> int:
-        """删掉某个会话的日记，返回删掉的篇数。
-
-        会话记录被删掉后，那些日记既不该再补发，也不该留在列表里假装那段对话还在。
-        """
         target = str(session_id or "")
         if not target:
             return 0
@@ -324,7 +301,6 @@ class MoodManager:
         self._save_diary()
 
     def unsent_diaries(self, limit: int = 3) -> list:
-        """还没发出去给对方的日记：[(角色, 日记条目), ...]，按日期从早到晚。"""
         out = []
         for character_key, entries in self.diary.items():
             for entry in (entries or []):
@@ -361,11 +337,6 @@ class MoodManager:
 
     def recover_daily(self, session_id: str, character_key: str, initial: float,
                       amount: float, today: str, user_id: str = "") -> float:
-        """隔天的低心情在新的一天第一次被读到时，朝初始值回补一截。
-
-        记录最后更新就在今天的，说明心情状态还是新的、不补；心情不低于
-        初始值也不需要补。回补后写回存档，更新时间随之刷新，当天不会反复补。
-        """
         key = self._key(session_id, character_key, user_id)
         rec = self.records.get(key)
         if not isinstance(rec, dict):
@@ -431,11 +402,6 @@ def _truthy(raw) -> bool:
 
 
 def judge_enabled(ctx) -> bool:
-    """是否让 LLM 审判"这条消息要不要回复"。
-
-    兼容旧配置：老版本没有 reply_judge_enabled 这个键，而是"填了提示词就等于开启"。
-    因此显式开关为真、或者显式开关缺失但提示词已配置时，都算开启。
-    """
     try:
         raw = ctx.get("reply_judge_enabled", None)
     except Exception:
@@ -449,12 +415,6 @@ def judge_enabled(ctx) -> bool:
 
 
 def mood_enabled(ctx) -> bool:
-    """是否更新/记录角色心情值（与"要不要回复"完全无关的独立开关）。
-
-    兼容旧配置：老版本心情判定是搭在回复审判里的，没有独立开关。
-    显式配置了 mood_enabled 就以它为准；没配时跟随"是否在跑审判"，
-    保证升级前后行为一致。
-    """
     try:
         raw = ctx.get("mood_enabled", None)
     except Exception:
@@ -465,7 +425,6 @@ def mood_enabled(ctx) -> bool:
 
 
 def affection_enabled(ctx) -> bool:
-    """是否判定/累积关系进度（与回复审判、心情都是独立开关）。"""
     try:
         raw = ctx.get("affection_enabled", None)
     except Exception:
@@ -475,7 +434,6 @@ def affection_enabled(ctx) -> bool:
     return _truthy(raw)
 
 
-# 每轮把心情朝初始值拉回的比例：只加不减会一路顶到上限，心情值就失去了意义
 DEFAULT_MOOD_REGRESS_RATE = 0.1
 MOOD_STYLE_COLD = (
     "【心情影响语气·冷淡】你此刻心情偏低，提不起兴致：语气平淡、话少、略显敷衍，"
@@ -490,7 +448,6 @@ MOOD_STYLE_IRRITATED = (
 
 
 def _mood_style_active(ctx) -> bool:
-    """风格约束是否生效：心情记录与风格映射都开启时才生效。"""
     if not mood_enabled(ctx):
         return False
     try:
@@ -503,11 +460,6 @@ def _mood_style_active(ctx) -> bool:
 
 
 def mood_style(ctx, mood) -> tuple:
-    """按心情值给出（档位名, 本轮风格指令）；未生效或心情正常时返回两个空串。
-
-    档位边界直接复用「回复审判」的心情低迷下限/上限，让"心情低"在概率门控
-    与语气表现两处含义一致，不必再单独配一套阈值。
-    """
     if not _mood_style_active(ctx):
         return "", ""
     lo, hi = mood_bounds(ctx)
@@ -524,7 +476,6 @@ def mood_style(ctx, mood) -> tuple:
 
 
 def _apply_daily_recover(ctx, mood_mgr, session_id: str, user_id: str) -> Optional[float]:
-    """按配置做每日心情恢复；功能关闭或恢复量为 0 时返回 None（表示无需介入）。"""
     if not mood_enabled(ctx) or not mood_mgr:
         return None
     amount = _to_float(ctx.get("mood_daily_recover", 0), 0.0)
@@ -538,10 +489,6 @@ def _apply_daily_recover(ctx, mood_mgr, session_id: str, user_id: str) -> Option
 
 
 def stored_mood(ctx, mood_mgr, session_id: str, user_id: str = "") -> float:
-    """落盘的心情值（跨天先做每日恢复；没有记录时用配置的初始值）。
-
-    环境偏置不在此列：落盘的增减都以这个值为基准。
-    """
     lo, hi = mood_bounds(ctx)
     initial = clamp(_to_float(ctx.get("reply_judge_mood_initial", 60), 60.0), lo, hi)
     recovered = _apply_daily_recover(ctx, mood_mgr, session_id, user_id)
@@ -552,14 +499,12 @@ def stored_mood(ctx, mood_mgr, session_id: str, user_id: str = "") -> float:
 
 
 def current_mood(ctx, mood_mgr, session_id: str, user_id: str = "") -> float:
-    """本轮判定用的心情值：落盘值 + 时间环境偏置（深夜走低、周末回暖）。"""
     lo, hi = mood_bounds(ctx)
     return clamp(stored_mood(ctx, mood_mgr, session_id, user_id=user_id)
                  + env_bias(ctx), lo, hi)
 
 
 def _flag(obj: dict, key: str, words: tuple) -> bool:
-    """审判结果里的开关字段：布尔、字符串真值或列出的词都算 true。"""
     raw = obj.get(key, False)
     if isinstance(raw, bool):
         return raw
@@ -567,10 +512,6 @@ def _flag(obj: dict, key: str, words: tuple) -> bool:
 
 
 def parse_affection(obj: Optional[dict], ctx) -> tuple:
-    """从审判结果里取（好感变化量, 是否为表白, 是否带上了恋爱意味, 是否明确答应交往）。
-
-    好感只做小幅累积：这里先按上限夹一次，日累计上限在 affection 模块里管。
-    """
     if not isinstance(obj, dict):
         return 0, False, False, False
     limit = abs(_to_float(ctx.get("affection_turn_delta_max", 3), 3.0)) or 3.0
@@ -611,7 +552,6 @@ AFFECTION_FIELDS_NOTE = (
 async def _ask_judge(ctx: RoleContext, mood_mgr: MoodManager, session_id: str,
                      user_text: str, history: list, user_id: str,
                      want_mood: bool, want_affection: bool = False) -> Optional[dict]:
-    """向 LLM 询问一次 verdict；失败返回 None（调用方自行决定回退行为）。"""
     prompt = str(ctx.get("reply_judge_prompt", "") or "").strip()
     if not prompt:
         return None
@@ -638,27 +578,12 @@ async def _ask_judge(ctx: RoleContext, mood_mgr: MoodManager, session_id: str,
 async def judge_and_decide(ctx: RoleContext, mood_mgr: MoodManager, session_id: str,
                            user_text: str, history: list, user_id: str = "",
                            reply_floor: float = 0.0) -> dict:
-    """回复审判 +（可选）心情判定 +（可选）关系进度判定。
-
-    三个开关彼此独立：
-      reply_judge_enabled —— 让 LLM 决定"这条要不要回"（本函数返回的 should_reply）；
-      mood_enabled        —— 是否顺带判定心情变化量；
-      affection_enabled   —— 是否顺带判定好感变化量与是否表白。
-    只开心情/关系、不开审判时判定照常进行，但回复永远交给角色自己（不会被拦）。
-
-    reply_floor 是关系阶段解锁的回复概率下限：LLM 愿意回时，门控概率取
-    max(配置概率, 下限)，关系越近越不容易被概率门控拦下。
-
-    本函数只**判定**变化量（verdict["mood_delta"] / verdict["affection_delta"]），
-    不落盘：变化量要等 LLM 回复生成之后由 commit_mood / commit_affection 落盘。
-    """
     lo, hi = mood_bounds(ctx)
     base = stored_mood(ctx, mood_mgr, session_id, user_id=user_id)
     mood = clamp(base + env_bias(ctx), lo, hi)
     want_mood = mood_enabled(ctx)
     want_judge = judge_enabled(ctx)
     want_affection = affection_enabled(ctx)
-    # 固定概率不依赖心情，也不依赖审判：只开了它时不必调用 LLM
     fixed_prob = fixed_reply_probability(ctx)
     verdict = {"should_reply": True, "mood": mood, "mood_base": base,
                "mood_delta": None, "probability": 1.0,
@@ -699,15 +624,12 @@ async def judge_and_decide(ctx: RoleContext, mood_mgr: MoodManager, session_id: 
     if probability > 0 and reply_floor > 0:
         probability = min(1.0, max(probability, reply_floor))
     if verdict.get("breakup"):
-        # 对方在说分手 / 绝交：这类消息必须让她自己回应（挽留也好、答应也好），
-        # 不能被心情概率挡掉——那会变成"她想挽留却张不开口"
         probability = 1.0
     if probability >= 1.0:
         decide = bool(should_reply)
     elif probability <= 0.0:
         decide = False
     else:
-        # 掷出的那个随机数要留着：日志只说"概率 0.92 未通过"看不出到底差在哪，
         # 会被当成概率是假的
         verdict["roll"] = random.random()
         decide = bool(should_reply) and verdict["roll"] < probability
@@ -717,27 +639,12 @@ async def judge_and_decide(ctx: RoleContext, mood_mgr: MoodManager, session_id: 
 
 
 def mood_regress_rate(ctx) -> float:
-    """每轮把心情朝初始值拉回的比例（0~1，0 = 关闭回稳）。
-
-    只加不减的话心情会一路顶到上限再下不来（一直 100 等于心情系统失效），
-    所以每次落盘后朝初始值回一点，让最近发生的事说了算。
-    """
     rate = _to_float(ctx.get("mood_regress_rate", DEFAULT_MOOD_REGRESS_RATE),
                      DEFAULT_MOOD_REGRESS_RATE)
     return min(1.0, max(0.0, rate))
 
 
 def commit_mood(ctx, mood_mgr, session_id: str, verdict, user_id: str = "") -> Optional[float]:
-    """把本轮审判判定的心情变化量落盘，返回更新后的心情值；无需更新时返回 None。
-
-    一轮只落一次（verdict["mood_committed"] 标记）。调用点在 LLM 回复生成之后：
-    本轮的语气与回复概率都用更新前的心情值判定，否则角色会拿"被这条消息改变之后"
-    的心情去回应这条消息本身。落盘基准是未含环境偏置的 stored 值（mood_base），
-    偏置只影响判定，不写进存档。
-
-    落盘值 = 基准 + 判定变化量，再朝初始值回稳一段（mood_regress_rate）。
-    回稳量写回 verdict["mood_regress"]，日志据此说明这段变化从哪来。
-    """
     if not isinstance(verdict, dict) or verdict.get("mood_committed") \
             or not verdict.get("mood_enabled") or verdict.get("mood_delta") is None:
         return None

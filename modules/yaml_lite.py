@@ -1,28 +1,3 @@
-"""零依赖的 YAML 子集读写，专门服务插件清单（plugin.yaml）。
-
-为什么不直接上 PyYAML
---------------------
-主程序是 PyInstaller 单文件打包发布，多一个第三方依赖就多一份"打包环境里
-忘了装"的风险。插件清单只用得到 YAML 里很小的一块语法，自己实现反而更可控。
-
-支持的语法（覆盖清单需要的全部形态）
-------------------------------------
-- `key: value` 映射，靠缩进嵌套；缩进用空格，同一层必须对齐
-- `- item` 序列；`- key: value` 的映射序列（后续行缩进比 `-` 深即属同一条）
-- 序列可以与其父键同缩进（`features:` 换行后直接 `- key: ...`）
-- 行内集合 `[a, b]` / `{a: b}`
-- 单引号 / 双引号字符串（含 `\\n` `\\t` `\\uXXXX` 转义、`''` 表示单引号）
-- 块标量 `|` / `>`（可带 `-` 去尾），常用于长描述
-- `true` / `false`（大小写不敏感）、`null` / `~`、整数、小数
-- 行尾 `#` 注释（引号内与块标量内不算注释）
-
-明确**不**支持的（清单里也用不到）：锚点/别名、多文档、复杂键、标签、
-时间戳类型、`yes/no/on/off` 这类 YAML 1.1 布尔别名 —— 后者一律当字符串，
-免得把 `author: on` 这种正常文本吃掉。
-
-`dumps()` 只负责输出程序自己生成的那一份清单（缺清单的 zip 兜底），
-形态固定、可被 `loads()` 原样读回（有测试钉住往返一致）。
-"""
 import re
 
 _PLAIN_SAFE = re.compile(r"^[A-Za-z0-9\u4e00-\u9fff]"
@@ -36,14 +11,13 @@ _ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "0": "\0", '"': '"',
 
 
 class YamlError(ValueError):
-    """清单不是合法 YAML 时抛出，消息里带行号，便于定位。"""
+    pass
 
 
 # ------------------------------------------------------------------ 读取
 
 
 def _strip_comment(text: str) -> str:
-    """去掉行尾注释（引号内的 # 不算）。"""
     in_s = in_d = False
     for i, ch in enumerate(text):
         if ch == "'" and not in_d:
@@ -61,7 +35,6 @@ def _is_seq(text: str) -> bool:
 
 
 def _split_key(text: str):
-    """在第一个"顶层"的 `:` 处切开键与值，切不开返回 (None, "")。"""
     in_s = in_d = False
     depth = 0
     for i, ch in enumerate(text):
@@ -112,7 +85,6 @@ def _unescape_double(body: str) -> str:
 
 
 def _split_flow(body: str) -> list:
-    """把 `a, b, c` 按顶层逗号切开（引号与嵌套括号内的逗号不切）。"""
     parts, buf = [], []
     in_s = in_d = False
     depth = 0
@@ -152,7 +124,6 @@ def _parse_flow(text: str):
 
 
 def _scalar(text: str):
-    """把一个标量字面量转成 Python 值。"""
     t = text.strip()
     if t == "":
         return None
@@ -175,7 +146,6 @@ def _scalar(text: str):
 
 
 def _collect_block(raw_lines: list, start: int, parent_indent: int):
-    """收集块标量的正文行（缩进比父键深，空行保留）。"""
     body, i = [], start
     while i < len(raw_lines):
         line = raw_lines[i]
@@ -197,7 +167,6 @@ def _collect_block(raw_lines: list, start: int, parent_indent: int):
 
 
 def _tokenize(text: str) -> list:
-    """把文本切成 [indent, content, block_payload] 三元组列表。"""
     raw = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     tokens = []
     i = 0
@@ -237,7 +206,6 @@ def _render_block(payload) -> str:
 
 
 def _parse_block(tokens: list, pos: int, min_indent: int):
-    """从 pos 开始解析一层块，返回 (值, 下一个位置)。"""
     if pos >= len(tokens):
         return None, pos
     indent = tokens[pos][0]
@@ -260,7 +228,6 @@ def _parse_seq(tokens: list, pos: int, indent: int):
             val, pos = _parse_block(tokens, pos + 1, indent + 1)
             items.append(val)
         elif _split_key(rest)[0] is not None:
-            # "- key: value"：把剩余部分当成缩进 +2 的一行，与后续行一起解析
             sub = [[indent + 2, rest, payload]]
             pos += 1
             while pos < len(tokens) and tokens[pos][0] > indent:
@@ -301,7 +268,6 @@ def _parse_map(tokens: list, pos: int, indent: int):
 
 
 def loads(text: str):
-    """解析一段 YAML 文本，返回 dict / list / 标量。"""
     tokens = _tokenize(str(text or ""))
     if not tokens:
         return {}
@@ -310,7 +276,6 @@ def loads(text: str):
 
 
 def load_file(path):
-    """读一个 YAML 文件，读不了或解析失败时抛 YamlError / OSError。"""
     with open(path, "r", encoding="utf-8") as f:
         return loads(f.read())
 
@@ -319,7 +284,6 @@ def load_file(path):
 
 
 def _quote(text: str) -> str:
-    """需要引号时用双引号并转义，否则给裸标量（可读性优先）。"""
     t = str(text)
     if not t:
         return '""'
@@ -356,8 +320,6 @@ def _dump_lines(value, indent: int) -> list:
                 out.append(f"{pad}{k}:")
                 out.extend(_dump_lines(val, indent))
             elif isinstance(val, (dict, list)):
-                # 空容器必须写成流式空字面量：走 _scalar_out 会被当成字符串加引号，
-                # 读回来就变成 "[]" / "{}" 这种字符串，类型漂移
                 out.append(f"{pad}{k}: {'{}' if isinstance(val, dict) else '[]'}")
             else:
                 out.append(f"{pad}{k}: {_scalar_out(val)}")
@@ -381,5 +343,4 @@ def _dump_lines(value, indent: int) -> list:
 
 
 def dumps(value) -> str:
-    """把 dict / list 序列化成 YAML 文本（末尾带一个换行）。"""
     return "\n".join(_dump_lines(value, 0)) + "\n"

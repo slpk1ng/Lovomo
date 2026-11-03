@@ -13,7 +13,6 @@ from .tls import unverified_context, verified_context
 
 APP_VERSION = "1.2.5.0"
 
-# 发布里可能直接挂 .exe，也可能打成压缩包；压缩包的扩展名（下载后自动解压取 exe）
 ARCHIVE_SUFFIXES = (".zip",)
 
 _VERSION_RE = re.compile(
@@ -42,18 +41,12 @@ def version_key(v) -> Tuple:
 
 
 def is_newer(latest, current) -> bool:
-    """latest 是否比 current 更新（支持 beta/rc 等预发布版本号）。"""
     if not str(latest or "").strip():
         return False
     return version_key(latest) > version_key(current)
 
 
 def is_prerelease_version(v) -> bool:
-    """版本号是否带预发布后缀（1.2.0.0-beta、1.3.0.0-rc.1 等）。
-
-    发布页不能只看 GitHub 的 prerelease 标记：作者常常只把 -beta 写进 tag、
-    没勾「预发布」，于是测试版会被当成正式版。
-    """
     return version_key(v)[1] == 0
 
 
@@ -71,12 +64,6 @@ def _asset_size(item: dict) -> int:
 
 
 def pick_installer_asset(release: dict) -> dict:
-    """从一次发布里挑出安装包资源。
-
-    优先直接给 .exe；只挂了压缩包（.zip）时就返回压缩包，下载后由
-    extract_installer 自动解出里面的 exe —— 发布时打不打包都能更新。
-    返回 {"name","url","size","kind"}，kind 为 "exe" 或 "archive"；没有可用资源时 {}。
-    """
     assets = (release or {}).get("assets")
     if not isinstance(assets, list):
         return {}
@@ -98,12 +85,6 @@ def pick_installer_asset(release: dict) -> dict:
 
 
 def extract_installer(archive_path, dest_path) -> dict:
-    """把压缩包里的安装包解出来写进 dest_path，返回 {"entry","size"}。
-
-    挑法：名字带 Lovomo 的优先，其次取体积最大的那个 .exe（压缩包里常同时放着
-    说明文档与依赖，只看体积容易挑错，所以先按名字认）。解出来还要是 PE 文件
-    （头两个字节 MZ）且不是几百字节的占位物。
-    """
     archive_path = Path(archive_path)
     dest_path = Path(dest_path)
     if archive_path.suffix.lower() not in ARCHIVE_SUFFIXES:
@@ -129,12 +110,6 @@ def extract_installer(archive_path, dest_path) -> dict:
 
 
 def pick_latest_release(releases, include_prerelease: bool = False) -> dict:
-    """从 GitHub 发布列表里挑出最新的一个版本。
-
-    include_prerelease 关闭时只看正式版；打开时把 beta/rc 这类预发布版也算进来
-    （同一版本号的预发布版永远小于正式版，由 version_key 保证）。
-    返回 {"tag", "url", "name", "prerelease", "installer"}；没有可用发布时返回空字典。
-    """
     items = releases if isinstance(releases, list) else ([releases] if releases else [])
     candidates = [r for r in items if isinstance(r, dict) and not r.get("draft")
                   and (include_prerelease or not r.get("prerelease"))]
@@ -150,7 +125,6 @@ def pick_latest_release(releases, include_prerelease: bool = False) -> dict:
 
 
 async def probe_candidate(client, url: str) -> tuple:
-    """只取 1 字节（Range），以「拿到响应头」的耗时当测速结果。"""
     started = time.time()
     async with client.stream("GET", url, headers={"Range": "bytes=0-0"}) as resp:
         if resp.status_code >= 400:
@@ -159,11 +133,6 @@ async def probe_candidate(client, url: str) -> tuple:
 
 
 async def race_candidates(urls, *, timeout: float = 8.0, verify: bool = True) -> tuple:
-    """并发试所有候选地址，**谁先响应就用谁**，不等其余跑完。
-
-    返回 (胜出的地址, 耗时秒)。全都不通时抛最后一个异常 —— 一个慢镜像不该拖住
-    整次更新，所以是「先到先得」而不是「全部测完再挑最快」。
-    """
     urls = [str(u).strip() for u in (urls or []) if str(u or "").strip()]
     if not urls:
         raise RuntimeError("没有可用的下载地址")
@@ -189,11 +158,6 @@ async def race_candidates(urls, *, timeout: float = 8.0, verify: bool = True) ->
 async def download_asset(url: str, dest, *, expected_size: int = 0, verify: bool = True,
                          timeout: float = 60.0, chunk: int = 256 * 1024,
                          on_progress=None) -> int:
-    """流式下载到 dest（先写 .part 再原子改名），返回拿到的字节数。
-
-    这里只管「完整地拿下来」；拿到的东西是不是那个类型，交给
-    check_downloaded_head 按资源类型判定（exe 看 MZ、压缩包看 PK）。
-    """
     dest = Path(dest)
     tmp = dest.with_name(dest.name + ".part")
     ctx = verified_context() if verify else unverified_context()
@@ -224,7 +188,6 @@ async def download_asset(url: str, dest, *, expected_size: int = 0, verify: bool
 
 
 def check_downloaded_head(path, kind: str = "exe") -> None:
-    """校验下下来的是不是该有的类型 —— 镜像挂掉时经常回一个 200 的 HTML 错误页。"""
     magic, what = (b"PK", "压缩包") if kind == "archive" else (b"MZ", "可执行文件")
     path = Path(path)
     with open(path, "rb") as fh:

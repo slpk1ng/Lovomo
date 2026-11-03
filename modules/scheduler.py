@@ -1,13 +1,3 @@
-"""轻量级异步调度器（纯 asyncio 实现，零第三方依赖）。
-
-替代 apscheduler，避免打包（PyInstaller）与依赖冲突问题，
-同时保证所有用户开箱即用。支持：
-- interval  循环间隔任务
-- daily     每日固定时刻任务（可指定星期几）
-- oneshot   一次性任务（指定 unix 时间戳）
-
-所有任务回调异常都会被捕获并记录，不会中断调度循环。
-"""
 import asyncio
 import random
 import time
@@ -17,11 +7,6 @@ WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "�
 
 
 def _normalize_weekdays(value) -> List[int]:
-    """把 weekdays 收敛成 0-6 的整数列表。
-
-    配置/WebUI 存下来的可能是字符串（"1"），不归一成 int 会让 `wday in weekdays`
-    永远不命中、任务被排到一周之后，describe() 里还会直接抛 TypeError。
-    """
     if not isinstance(value, (list, tuple, set)):
         return []
     days: List[int] = []
@@ -108,7 +93,6 @@ def _next_daily(hhmm: str, weekdays: Optional[List[int]], now: float) -> float:
 
 
 class SchedulerManager:
-    """在主事件循环内运行的轻量调度器。"""
 
     def __init__(self):
         self.jobs: Dict[str, Job] = {}
@@ -169,20 +153,14 @@ class SchedulerManager:
                     continue
                 if job.next_run <= now:
                     if getattr(job, "busy", False):
-                        # 上一轮还没跑完（LLM/TTS 慢于间隔）：跳过本次点火，防止堆积并发。
-                        # 判断必须在摘除之前，否则忙时摘掉一次性任务就再也不会点火了
                         job.next_run = now + 5
                     else:
                         if job.trigger and job.trigger.get("type") == "oneshot":
-                            # 一次性任务先摘除再执行：回调里常有 LLM 生成等慢操作，
-                            # 若执行期间任务仍留在列表里，下一轮循环会再次点火，
-                            # 造成同一条提醒发送两遍（模板话术+LLM话术各来一条）。
                             self.jobs.pop(job.id, None)
                         job.busy = True
                         asyncio.create_task(self._run_job(job))
                         job.compute_next_run(now)
                         if job.next_run <= now:
-                            # 间隔过短或已过期的一次性任务，强制前进避免死循环
                             job.next_run = now + 5
                 if job.next_run < next_wake:
                     next_wake = job.next_run
@@ -211,7 +189,6 @@ class SchedulerManager:
         try:
             await asyncio.wait_for(task, timeout=3)
         except Exception:
-            # cancel 之后必须等它真正结束：不等会留下 pending 任务
             # （"Task was destroyed but it is pending"）和在途回调
             task.cancel()
             try:

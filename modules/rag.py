@@ -1,13 +1,3 @@
-"""RAG 检索增强生成：本地轻量向量库（JSON 分块 + numpy 向量，零外部向量数据库依赖）。
-
-文档存于 data/rag/：
-  index.json             文档索引
-  docs/{id}.json         分块文本
-  docs/{id}.npy          分块向量矩阵 (float32)
-嵌入后端默认跟随 LLM 接口类型，模型默认 nomic-embed-text（Ollama 可换成任何
-已拉取的 embedding 模型；OpenAI 兼容后端则用 llm_embedding_model /
-rag_embedding_model 指定）。
-"""
 import json
 import time
 import uuid
@@ -58,7 +48,6 @@ class RAGManager:
 
     # ---------------- 嵌入 ----------------
     async def embed_texts(self, texts: List[str]) -> Optional[np.ndarray]:
-        """分批嵌入：大文档一次性全量请求容易 OOM / 超时，按批请求后按序拼接。"""
         if not texts:
             return await self._embed_texts_once(texts)
         vecs = []
@@ -80,10 +69,8 @@ class RAGManager:
         if backend == "ollama":
             model = self.config.get("llm_embedding_model", "") or self.config.get("rag_embedding_model", "") or "nomic-embed-text"
         else:
-            # 与 ollama 分支保持一致的回退顺序：
             # llm_embedding_model（外部 API 专用）→ rag_embedding_model → llm_model_name。
             # 历史 bug：只认 llm_embedding_model / llm_model_name，
-            # 用户在 WebUI 只填了「嵌入模型 (rag_embedding_model)」时会被判成"未配置"。
             model = (self.config.get("llm_embedding_model", "")
                      or self.config.get("rag_embedding_model", "")
                      or self.config.get("llm_model_name", ""))
@@ -170,7 +157,6 @@ class RAGManager:
         return chunks or ([text.strip()] if text.strip() else [])
 
     def _ensure_index_loaded(self) -> bool:
-        """索引读取失败过就重试一次，仍失败才拒绝写入，避免拿空索引覆盖磁盘。"""
         if not self._index_load_failed:
             return True
         self.load_index()
@@ -231,8 +217,6 @@ class RAGManager:
             try:
                 mat = np.load(self.docs_dir / f"{doc['id']}.npy")
                 chunk_data = json.loads((self.docs_dir / f"{doc['id']}.json").read_text(encoding="utf-8"))
-                # 换过嵌入模型后旧文档的向量维度与新查询不一致，矩阵乘法会抛异常；
-                # 与"文档读不出来"同等对待，跳过这一篇即可，不能让整次检索失败。
                 sims = mat @ q
             except Exception as e:
                 print(f"读取 RAG 文档失败 {doc.get('name')}: {e}")
@@ -248,16 +232,12 @@ class RAGManager:
                     text = chunks[int(idx)] if int(idx) < len(chunks) else ""
                     hits.append({"doc": doc.get("name", ""), "sim": round(sim, 3), "text": text})
         if not hits and best_sim > 0 and verbose:
-            # 「没找到」时把最接近的分数打出来：只看"无结果"分不清是差一点还是完全不相干，
-            # 调 rag_min_similarity 就成了盲调。只在手动检索测试时打，自动注入那一路不打，
-            # 否则知识库与话题无关的每一轮都会刷一行
             print(f"RAG 检索：没有片段达到相似度下限 {min_sim}（最接近的一段 {best_sim:.3f}）。"
                   f"查询越短越泛分数越低，想更宽松可调小 rag_min_similarity。")
         hits.sort(key=lambda h: -h["sim"])
         return hits[:top_k]
 
     async def build_context(self, query: str) -> str:
-        """检索并构建注入系统提示词的参考资料段落。"""
         if not self.config.get("rag_enabled", False) or not self.index:
             return ""
         hits = await self.search(query)
@@ -286,7 +266,6 @@ def _normalize(mat: np.ndarray) -> np.ndarray:
 
 
 def _response_error(resp) -> str:
-    """提取 HTTP 错误响应中的可读信息（Ollama 返回 {"error": "..."}），避免只报状态码。"""
     try:
         data = resp.json()
         if isinstance(data, dict) and data.get("error"):
@@ -303,7 +282,6 @@ def re_sub_spaces(text: str) -> str:
 
 
 def extract_text_from_file(path: Path) -> str:
-    """从上传的文件提取纯文本（txt/md/code/json/csv 直接读取；pdf 依赖 pypdf）。"""
     suffix = path.suffix.lower()
     if suffix == ".pdf":
         try:

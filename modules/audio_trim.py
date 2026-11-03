@@ -1,9 +1,4 @@
 # -*- coding: utf-8 -*-
-"""参考音频时长规整：短于下限前后补静音，长于上限压缩内部停顿。
-
-优先用 ffmpeg（任意格式），找不到 ffmpeg 时退回内置 WAV 处理；
-两条路都走不通时只回报原因，不改动原文件。
-"""
 import array
 import math
 import os
@@ -18,17 +13,13 @@ from .tts_service import no_window_kwargs
 
 MIN_SECONDS = 3.0
 MAX_SECONDS = 10.0
-# 补静音时多补一点，避免编码器取整后落到下限以下
 PAD_MARGIN_SECONDS = 0.05
-# 压缩时多压一点，避免取整后仍卡在上限上
 TRIM_MARGIN_SECONDS = 0.05
-# 压缩停顿后保留的最短静音，避免把一句话切成碎片
 KEEP_SILENCE_SECONDS = 0.06
 # 只有长于该时长的停顿才值得压缩
 MIN_SILENCE_TO_TRIM = 0.3
 # 判定静音的峰值阈值（占满量程比例）
 SILENCE_THRESHOLD = 0.02
-# 依次加强的压缩参数（停顿判定时长, 保留静音时长），够用就停
 TRIM_STEPS = ((MIN_SILENCE_TO_TRIM, KEEP_SILENCE_SECONDS),
               (0.15, 0.05), (0.08, 0.04))
 FFMPEG_TIMEOUT_SECONDS = 300.0
@@ -54,7 +45,6 @@ def _ffprobe() -> Optional[str]:
 
 
 def probe_duration(path) -> Optional[float]:
-    """音频时长（秒）：优先 ffprobe，其次内置 wave（仅 WAV）。"""
     path = Path(path)
     ffprobe = _ffprobe()
     if ffprobe:
@@ -92,14 +82,11 @@ def _run_ffmpeg(exe: str, args) -> None:
 
 
 def _temp_path(path: Path) -> Path:
-    # 临时名必须唯一（扩展名保留在末尾给 ffmpeg 推断格式）：同一音频被并发规整时
-    # 共用固定的 xxx__fix.wav 会互相覆盖，失败清理还会删掉对方正在写的文件
     return path.parent / f"{path.stem}.{os.getpid()}.{os.urandom(4).hex()}{path.suffix}"
 
 
 def normalize_audio(path, min_seconds: float = MIN_SECONDS,
                     max_seconds: float = MAX_SECONDS, log=None) -> dict:
-    """把音频时长规整到 [min_seconds, max_seconds]，原地替换成功时返回新时长。"""
     path = Path(path)
     result = {"name": path.name, "path": str(path), "before": None, "after": None,
               "action": "skipped", "message": ""}
@@ -263,7 +250,6 @@ def _trim_wav(src: Path, dst: Path, target_seconds: float, min_silence: float,
 
     min_run = max(1, int(min_silence * rate))
     keep_frames = max(0, int(keep_silence * rate))
-    # [起始帧, 原始长度, 当前保留长度]，从最长的停顿开始砍，砍够目标时长就停
     runs = [[start, length, length] for start, length in runs if length >= min_run]
     need = int(math.ceil((total_frames / float(rate) - target_seconds) * rate))
     while need > 0:
