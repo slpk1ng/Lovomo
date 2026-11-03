@@ -88,7 +88,7 @@ def voice_mode_allows(config, session_type: str) -> bool:
     return _voice_mode(config) != VOICE_MODE_PRIVATE or str(session_type or "") == "private"
 
 
-def voice_wanted(config, session_type: str, client) -> bool:
+def voice_planned(config, session_type: str, client) -> bool:
     """确定这一轮不会发语音时返回 False，用于省掉只为配音做的额外请求。"""
     if not (config or {}).get("tts_reply_enabled", True):
         return False

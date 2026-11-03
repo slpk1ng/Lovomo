@@ -394,7 +394,7 @@ def config_for_connection(connection_id: str):
             target = base
     overrides = {}
     lib = _library()
-    if conn and lib:
+    if conn:
         try:
             from .model_library import connection_overrides
             overrides = connection_overrides(conn, lib)

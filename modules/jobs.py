@@ -48,8 +48,8 @@ async def generate_in_character_text(ctx: RoleContext, instruction: str,
     )
     if str(history_block or "").strip():
         system += (
-            "\n【承接上文】下面会给出你和主人的真实对话历史："
-            "你的这句话必须自然承接历史里的内容（延续同一话题、呼应主人的状态与称呼），"
+            "\n【承接上文】下面会给出你和对方的真实对话历史："
+            "你的这句话必须自然承接历史里的内容（延续同一话题、呼应对方的状态与称呼），"
             "禁止假装之前什么都没发生过，禁止问历史里刚刚已经聊过、已经回答过的问题。"
         )
     prompt_parts = [str(history_block or "").strip(), instruction]

@@ -348,6 +348,59 @@ async def check_tts_service(config) -> bool:
 
 _ensure_fail_until = 0.0
 
+_WEIGHT_LOCK = threading.Lock()
+_APPLIED_WEIGHTS: dict = {}
+
+
+def _weight_target(model_dir: str):
+    folder = Path(model_dir)
+    if not folder.is_dir():
+        return None
+    gpt_file = next((f for f in folder.iterdir() if f.suffix == ".ckpt"), None)
+    sovits_file = next((f for f in folder.iterdir() if f.suffix == ".pth"), None)
+    if gpt_file is None or sovits_file is None:
+        return None
+    return (str(gpt_file.resolve()), str(sovits_file.resolve()), gpt_file.stem)
+
+
+def apply_local_weights(config) -> bool:
+    """服务已在线时把权重切到这条配置的模型目录，让每个接入方式用自己的角色模型。"""
+    if is_cloud_tts(config):
+        return True
+    model_dir = str(config.get("model_dir", "") or "").strip()
+    base_url = str(config.get("client_base_url", "") or "").strip().rstrip("/")
+    if not model_dir or not base_url:
+        return False
+    target = _weight_target(model_dir)
+    if target is None:
+        print(f"模型目录 {model_dir} 里没有 .ckpt / .pth，跳过权重切换。")
+        return False
+    gpt_path, sovits_path, name = target
+    with _WEIGHT_LOCK:
+        if _APPLIED_WEIGHTS.get(base_url) == (gpt_path, sovits_path):
+            return True
+    ok = True
+    for endpoint, path, label in (("set_gpt_weights", gpt_path, "GPT"),
+                                  ("set_sovits_weights", sovits_path, "SoVITS")):
+        try:
+            resp = httpx.get(f"{base_url}/{endpoint}",
+                             params={"weights_path": path.replace("\\", "/")},
+                             timeout=120, trust_env=False,
+                             verify=verified_context())
+        except Exception as e:
+            print(f"{label} 权重切换失败：{type(e).__name__}: {e}")
+            ok = False
+            continue
+        if resp.status_code != 200:
+            print(f"{label} 权重切换失败: {resp.text[:200]}")
+            ok = False
+    if ok:
+        with _WEIGHT_LOCK:
+            _APPLIED_WEIGHTS[base_url] = (gpt_path, sovits_path)
+        print(f"[ {name} ] 已按接入方式切换 TTS 权重")
+    return ok
+
+
 _ADOPT_LOCK = threading.Lock()
 _ADOPT_DONE = {"value": False}
 
@@ -409,9 +462,11 @@ def adopt_existing_tts(config) -> bool:
 
 async def ensure_tts_service(config) -> bool:
     global _ensure_fail_until
+    import asyncio
     if await check_tts_service(config):
         _ensure_fail_until = 0.0
         adopt_existing_tts(config)
+        await asyncio.to_thread(apply_local_weights, config)
         return True
     if time.time() < _ensure_fail_until:
         return False  # 冷却期内直接失败，不阻塞消息管线
@@ -419,11 +474,11 @@ async def ensure_tts_service(config) -> bool:
         return False
     _ensure_fail_until = time.time() + 60
     threading.Thread(target=auto_start_and_switch_tts, args=(config,), daemon=True).start()
-    import asyncio
     for _ in range(12):
         await asyncio.sleep(5)
         if await check_tts_service(config):
             _ensure_fail_until = 0.0
+            await asyncio.to_thread(apply_local_weights, config)
             return True
     return False
 
@@ -497,6 +552,8 @@ def auto_start_and_switch_tts(config):
         python_candidates = [
             Path(root_dir) / "runtime" / "python.exe",
             Path(root_dir) / "runtime" / "python",
+            Path(root_dir) / "venv" / "Scripts" / "python.exe",
+            Path(root_dir) / "venv" / "bin" / "python",
             Path("python.exe"),
             Path("python"),
         ]

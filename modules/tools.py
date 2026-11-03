@@ -38,7 +38,7 @@ DEFAULT_TOOLS = [
     {
         "name": "get_weather",
         "type": "builtin", "builtin": "weather",
-        "description": "查询某个城市的当前天气。【必须调用】用户询问**明确地点**的天气、气温、温度、降雨、下雨、下雪、要不要带伞等与天气相关的话题时，必须调用本工具并把用户问题里的城市名原样传给 city，严禁凭常识或印象回答。city 只能填【用户本条消息里真的出现过的城市名】或下面【默认城市】里配置的城市；如果用户没说是哪里、而你也不知道主人在哪个城市，绝对不要自己猜（严禁拿上海/北京等任何城市顶替），此时不要调用本工具，直接以角色身份问一句主人在哪个城市。",
+        "description": "查询某个城市的当前天气。【必须调用】用户询问**明确地点**的天气、气温、温度、降雨、下雨、下雪、要不要带伞等与天气相关的话题时，必须调用本工具并把用户问题里的城市名原样传给 city，严禁凭常识或印象回答。city 只能填【用户本条消息里真的出现过的城市名】或下面【默认城市】里配置的城市；如果用户没说是哪里、而你也不知道对方在哪个城市，绝对不要自己猜（严禁拿上海/北京等任何城市顶替），此时不要调用本工具，直接以角色身份问一句对方在哪个城市。",
         "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "用户本条消息里明确说出的城市名（中文或拼音）；用户没说地点时留空，不要猜"}}, "required": []},
         "enabled": False, "allowed_users": [], "max_calls_per_reply": 2,
     },
@@ -1339,9 +1339,9 @@ def _resolve_weather_city(args: dict, tool: dict, user_text: str) -> Tuple[str, 
     if said:
         return said, ""          # 用户明确说了地点：以用户说的为准
     if _is_weather_question(text):
-        msg = ("主人本条消息里没有说明地点，你也不知道主人在哪个城市。"
+        msg = ("对方本条消息里没有说明地点，你也不知道对方在哪个城市。"
                "绝不允许自行假设（例如上海/北京）报出任何城市的天气："
-               "请直接用角色身份问一句「主人现在在哪个城市呀？」，"
+               "请直接用角色身份问一句「你现在在哪个城市呀？」，"
                "不要调用任何工具、不要提任何城市名。")
         if city or default:
             print(f"[工具] 天气：模型想用「{city or default}」，但用户本条消息没说地点"
@@ -1354,8 +1354,8 @@ def _resolve_weather_city(args: dict, tool: dict, user_text: str) -> Tuple[str, 
     if city:
         print(f"[工具] 天气：模型给的城市「{city}」不在用户本条消息里，"
               f"判定为模型自行猜测，已拦下（消息={text[:60]!r}）")
-        return "", ("你填的城市并不在主人本条消息里，属于你自己猜的地点。"
-                    "请直接用角色身份问一句主人现在在哪个城市，不要调用任何工具。")
+        return "", ("你填的城市并不在对方本条消息里，属于你自己猜的地点。"
+                    "请直接用角色身份问一句对方现在在哪个城市，不要调用任何工具。")
     return "", ""
 
 
@@ -1735,9 +1735,9 @@ class ToolRegistry:
             city = resolved
             if not city and (lat is None or lon is None):
                 return True, (hint or
-                              "主人本条消息里没有说明地点，系统也不知道主人在哪个城市。"
+                              "对方本条消息里没有说明地点，系统也不知道对方在哪个城市。"
                               "绝不允许自行假设（例如上海/北京）：请直接用角色身份问一句"
-                              "「主人现在在哪个城市呀？」，不要调用任何工具、"
+                              "「你现在在哪个城市呀？」，不要调用任何工具、"
                               "不要报任何城市的天气。")
             custom = str(tool.get("url", "") or "").strip()
             if custom and "{city}" in custom and city:

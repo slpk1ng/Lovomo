@@ -11,7 +11,7 @@ import httpx
 
 from .tls import unverified_context, verified_context
 
-APP_VERSION = "1.2.5.0"
+APP_VERSION = "1.2.5.1"
 
 ARCHIVE_SUFFIXES = (".zip",)
 

@@ -1,5 +1,33 @@
 [简体中文](update.md) · English
 
+### v1.2.5.1
+
+
+#### ✨ Added
+
+- Each connection can now pick its own TTS source (cloud or local) and local model folder.
+
+#### 🛠 Fixed
+
+- The emotion audio page lists every character in the library instead of only the one enabled in the current profile.
+
+- When a local model is not loaded, an incoming message now loads it and retries instead of failing outright.
+
+- Fixed reply generation failing outright because a boolean was called as a function.
+
+- The fallback apology now uses a neutral form of address.
+
+- Fixed proactive follow-ups, sulk closing stickers and plugin replies going out through the wrong connection.
+
+- Fixed TTS starting with the wrong Python interpreter when the project ships its own virtual environment.
+
+- Fixed the local TTS folder set on a connection not switching the character's model, so the default character's weights kept being used.
+
+- Fixed startup loading TTS weights from the main profile, which made a connection's model folder apply only from the first voiced reply.
+
+- Example lines and forms of address in the prompt are now neutral.
+
+
 ### v1.2.5.0
 
 
@@ -49,11 +77,19 @@
 
 - Fixed un-ticking the active character leaving it in the dropdown only for the save to switch silently.
 
+- Fixed a service returning an error page dumping a whole page of HTML into the log.
+
+- Fixed chat history, context summaries and proactive messages being written to the active character's memory.
+
+- Fixed the chat test panel listing only the characters enabled in the current profile.
+
+- Fixed turning off "attach voice to replies" still starting the TTS service.
+
+- Fixed the settings page section tree and bottom action bar blocking content with no way to move them.
+
 - Fixed connections bound to a profile reading an empty persona and the model skipping the format.
 
 - Fixed a reply that drifts into plain text falling back to the default emotion on every sentence.
-
-- Fixed a service returning an error page dumping a whole page of HTML into the log.
 
 - Fixed extra JSON in a local model's request body causing the whole value to be ignored.
 
@@ -95,13 +131,6 @@
 
 - When a reply is not voiced, the text is no longer re-translated for speech and no extra request is spent on forcing the structured format.
 
-- Fixed chat history, context summaries and proactive messages being written to the active character's memory.
-
-- Fixed the chat test panel listing only the characters enabled in the current profile.
-
-- Fixed turning off "attach voice to replies" still starting the TTS service.
-
-- Fixed the settings page section tree and bottom action bar blocking content with no way to move them.
 
 ### v1.2.4.0
 

@@ -90,30 +90,30 @@ TASK_REFUSE_RE = re.compile(
     r"才不|偏不|偏要|不干|拒绝|懒得|休想|没门|免谈|想得美|凭什么|不奉陪|恕难"
     r"|做不到|办不到|撤不掉|删不掉|没权限|没有权限|权限不足|无权|无能为力")
 ACTION_NOW_HINT = (
-    "【不要空转】主人已经明确要求的事，本轮要直接给出结果本身（内容、答案、东西），"
+    "【不要空转】对方已经明确要求的事，本轮要直接给出结果本身（内容、答案、东西），"
     "不要只说「这就开始」「马上做」这类答应的话；上一条回复只是在答应、并没有真做时，"
     "这一轮必须直接动手，不要再答应一次。"
-    "动作（戳一戳 / 引用 / @人 / 撤回 / 禁言）想做什么自己决定就行，不用等主人先开口；"
+    "动作（戳一戳 / 引用 / @人 / 撤回 / 禁言）想做什么自己决定就行，不用等对方先开口；"
     "只在台词里写「（戳回去）」「（撤回这条）」这种描述不算做了，必须填对应的动作字段；"
     "也不要在台词里宣布结果（「已成功禁言…」「已经戳了你一下」），那同样不算做。"
-    "戳一戳 / @人 这些是你对主人做的动作：对话里出现「被戳」时那是你戳的主人，"
-    "不要说成主人戳了你。"
+    "戳一戳 / @人 这些是你对对方做的动作：对话里出现「被戳」时那是你戳的对方，"
+    "不要说成对方戳了你。"
 )
 TASK_PROGRESS_PROMPT = (
-    "你负责判断角色有没有真的把主人要的事做出来。输入是主人最近说的话、这个会话最近几轮对话、"
+    "你负责判断角色有没有真的把对方要的事做出来。输入是对方最近说的话、这个会话最近几轮对话、"
     "角色刚刚发出的回复、这条回复声明的动作字段、系统给出的动作执行回执，以及实际发出的消息条数。"
-    "以下情况都算没做：只是答应、表示「这就开始 / 马上做」、反问主人要不要开始；"
-    "只顾撒娇打岔而没有任何实际内容；主人要的是某个动作"
+    "以下情况都算没做：只是答应、表示「这就开始 / 马上做」、反问对方要不要开始；"
+    "只顾撒娇打岔而没有任何实际内容；对方要的是某个动作"
     "（戳一戳 / @人 / 引用 / 撤回 / 撤回别人的消息 / 禁言 / 一个字一条），"
     "却只在台词里嘴上说要这么做、动作字段是空的；或者声明了动作字段但实际没有做出来"
     "（要@人却一条带@的消息都没发出、要逐字发却只发了一条、要禁言却谁都没被禁言）。"
     "回执是动作的真实执行结果：显示成功就是真的做了；显示失败（这条接入方式不支持 / 发送失败）"
     "就是没做成——这时不要把「重做同一个动作」当成办法，action 里写「如实说明或换个方式」。"
-    "主人只要求了某个动作时，回执显示成功就算做成了：台词只是撒娇、打岔或随口一句，"
+    "对方只要求了某个动作时，回执显示成功就算做成了：台词只是撒娇、打岔或随口一句，"
     "也不必再让她重做一遍。"
     "已经把内容本身说出来（要讲的事、要写的段子、要给的答案、要办的事的进展）"
     "并且要求的动作确实做了，才算做了。"
-    "主人只是在抱怨、感慨、描述一件事、自言自语，或者话里带过某个词时，都不算要求——"
+    "对方只是在抱怨、感慨、描述一件事、自言自语，或者话里带过某个词时，都不算要求——"
     "只有他明确要角色去做某事才算；角色并没有答应要做什么、只是照常回应时也算做了。"
     "角色明确拒绝做这件事、或者说自己做不了这件事（「才不」「不做」「不想」「偏不」「拒绝」"
     "「做不到」「没权限」这类话）时也算做了——那是她自己的决定或能力所限，不要逼她重做。"
@@ -130,7 +130,7 @@ TASK_PROGRESS_PROMPT = (
     "② 要输出内容的，写清这一轮该直接说出什么（讲什么、答什么、写什么），可以只给要点；"
     "③ steps 里最多 3 条，按先后顺序写，让她照着做就行。"
     '只输出一个 JSON 对象：{"done": true 或 false,'
-    '"task": "主人要角色做的事，没有就填空串",'
+    '"task": "对方要角色做的事，没有就填空串",'
     '"steps": ["照做就能完成的步骤，1~3 条；写清动作名与该说的内容"],'
     '"action": "第一步，一句话"}，不要输出其它文字。'
 )
@@ -148,7 +148,7 @@ def refuses_task(text) -> bool:
 async def check_task_progress(ctx: RoleContext, user_text: str, reply_text: str,
                               actions: str = "", sent: str = "",
                               context_lines: list = None, receipts: str = "") -> dict:
-    prompt = (f"主人最近说的话：{str(user_text or '').strip()}\n"
+    prompt = (f"对方最近说的话：{str(user_text or '').strip()}\n"
               f"角色刚刚发出的回复：{str(reply_text or '').strip()[:400]}\n"
               f"这条回复声明的动作字段：{str(actions or '').strip() or '无'}\n"
               f"动作执行回执：{str(receipts or '').strip() or '无'}\n"
@@ -438,7 +438,7 @@ async def proactive_idle_check():
             continue
         session_type, target_id = parse_session_target(session_id)
         ctx = reply_ctx_of(get_active_role(), session_id=session_id)
-        instruction = str(app_context.global_config.get("proactive_prompt", "主动找个话题和主人聊聊。"))
+        instruction = str(app_context.global_config.get("proactive_prompt", "主动找个话题聊聊。"))
         try:
             mem = memory_for_session(session_id) or app_context.memory_manager
             hist_block = dialog_history_block(
@@ -808,7 +808,7 @@ async def deliver_mood_diaries() -> int:
             diary_text = str(entry.get("text") or "").strip()
             if not diary_text:
                 continue
-            # 重发一次主人就会收到两篇同样的日记
+            # 重发一次对方就会收到两篇同样的日记
             with app_context.sender.for_session(session_id), app_context.sender.send_once():
                 ok = await app_context.sender.speak_and_send(
                     session_type, target_id, f"【日记】{diary_text}",
@@ -1054,7 +1054,7 @@ def dialog_history_block(history: list, ctx=None, session_id: str = "",
     elif older_msgs and len(older_msgs) > 6:
         older_msgs = older_msgs[:3] + older_msgs[-3:]
 
-    header = ("【对话历史】以下是主人和你之前的真实聊天记录，"
+    header = ("【对话历史】以下是对方和你之前的真实聊天记录，"
               "本次发言必须承接这些内容（延续上次的话题、语气和称呼），"
               "绝对不要凭空换一个不相干的话题。")
     parts = [header]
@@ -1063,13 +1063,13 @@ def dialog_history_block(history: list, ctx=None, session_id: str = "",
     if older_msgs:
         brief = []
         for msg in older_msgs:
-            who = "主人" if msg.get("role") == "user" else "你"
+            who = "对方" if msg.get("role") == "user" else "你"
             brief.append(f"{who}：{str(msg.get('content', '')).strip()[:60]}")
         parts.append("更早的对话（简略）：" + "；".join(brief))
     if recent_msgs:
         lines = []
         for msg in recent_msgs:
-            who = "主人" if msg.get("role") == "user" else "你"
+            who = "对方" if msg.get("role") == "user" else "你"
             lines.append(f"{who}：{str(msg.get('content', '')).strip()[:200]}")
         parts.append("最近的对话（按时间顺序，全文）：\n" + "\n".join(lines))
     else:

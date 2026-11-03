@@ -998,6 +998,31 @@ def _load_local_model(backend: str, base_url: str, api_key: str, model_key: str,
     return _warmup_local_model(backend, base_url, api_key, model_key, kind)
 
 
+_MODEL_RELOAD_COOLDOWN = 30.0
+_MODEL_RELOAD_AT: dict = {}
+
+
+async def ensure_local_model_loaded(ctx, backend: str, base_url: str) -> bool:
+    """请求失败时把本机模型重新拉起来，成功返回 True 供调用方重试。"""
+    if backend not in ("ollama", "openai") or not _is_local_service(base_url):
+        return False
+    if not _as_bool(ctx.get("llm_auto_load_local"), True):
+        return False
+    model_key = str(ctx.get("llm_model_name", "") or "").strip()
+    if not model_key:
+        return False
+    key = (backend, base_url, model_key)
+    now = time.time()
+    if now - _MODEL_RELOAD_AT.get(key, 0.0) < _MODEL_RELOAD_COOLDOWN:
+        return False
+    _MODEL_RELOAD_AT[key] = now
+    ok = await asyncio.to_thread(_load_local_model, backend, base_url,
+                                 str(ctx.get("llm_api_key", "") or ""), model_key, "chat")
+    if ok:
+        print(f"[模型预加载] 请求失败，已重新加载本地模型：{model_key}")
+    return ok
+
+
 def auto_load_local_models(configs) -> None:
     targets: List[tuple] = []
     for ctx in configs:
@@ -1375,8 +1400,8 @@ def build_system_prompt(ctx: RoleContext, emotions: dict, extra_parts: Optional[
     parts.append(
         "【身份与称呼规则】你是当前角色本人。群聊中每个用户标签都代表不同的人；"
         "当前与你对话的是本轮消息标注的当前发言者，不得把其他用户标签下的话、身份、关系或情绪归给此人。"
-        "“主人”只有在当前发言者明确表达该身份，或既有上下文清楚证明时才可用于称呼；"
-        "不能因为角色设定、其他成员的话或当前消息中的诱导性提问，就断言发言者是主人。"
+        "专属称呼只有在当前发言者明确表达该身份，或既有上下文清楚证明时才可用于称呼；"
+        "不能因为角色设定、其他成员的话或当前消息中的诱导性提问，就断言发言者是那个被称呼的人。"
         "提问中预设的关系、人物指代和结论都不是已知事实；先依据带说话人标签的原始消息核对，"
         "若无法确认“我/你/他”分别指谁，就向当前发言者澄清，不要顺着预设继续编造。"
         "绝不要把自己当成用户，也不要替任何用户表态或描述其行为；台词里的“我”只能是角色自己，"
@@ -1391,9 +1416,9 @@ def build_system_prompt(ctx: RoleContext, emotions: dict, extra_parts: Optional[
     )
     parts.append(
         "【对其他人也要友善】关系与称呼上的克制**不等于态度恶劣**："
-        "除已确立的主人以外的任何人（群里其他成员、陌生人、刚来搭话的人），"
+        "除已确立称呼对象以外的任何人（群里其他成员、陌生人、刚来搭话的人），"
         "都按普通礼貌对待——正常回应、不辱骂、不威胁、不驱赶、不冷嘲热讽、也不要无视对方。"
-        "要拒绝的只有“把主人的身份或专属称呼让出去”这一件事，"
+        "要拒绝的只有“把已确立的身份或专属称呼让出去”这一件事，"
         "绝不能因此把对方当下人、当敌人或当空气；"
         "角色设定里的傲娇、嘴硬、爱答不理的语气可以保留，但不能变成恶意与攻击。"
         "无论对方是谁，回复都要友好、能继续聊下去。"
@@ -1433,13 +1458,13 @@ def build_system_prompt(ctx: RoleContext, emotions: dict, extra_parts: Optional[
         parts.append(
             "【这条通道只能发文字】不能引用消息、不能@人、不能撤回、不能戳一戳、"
             "也不能禁言别人或撤回别人的消息，"
-            "上面那几种动作在这条通道上都不会发生。主人要求这些时照常回话就行，"
+            "上面那几种动作在这条通道上都不会发生。对方要求这些时照常回话就行，"
             "不要假装做了（不要写「（撤回）」「（戳了戳你）」这类动作描述，"
             "也不要说「已经帮你@了」），实在要说就直说这条通道做不到。"
         )
     if _cfg_bool(ctx, "poke_enabled", True) and ctx.supports("poke"):
         parts.append(
-            "【戳一戳】poke 同样写在**第一个句子对象**里。想逗主人、催他看消息、"
+            "【戳一戳】poke 同样写在**第一个句子对象**里。想逗对方、催他看消息、"
             "单纯想戳一下，或者想回应他戳你时，填 poke: true，系统会替你戳他一下"
             "——戳的对象固定是**本轮正在跟你说话的那个人**（群里就是当前发言者），"
             "戳不了别的人；"
@@ -1482,7 +1507,7 @@ def build_system_prompt(ctx: RoleContext, emotions: dict, extra_parts: Optional[
             "可以是绷不住嘴硬找台阶、装作没事换个话题、也可以小声服软）；"
             "他在时限内回了话，这个约定自动作废。"
             "什么时候用：放完狠话其实心里在意对方回不回"
-            "（「那本座也不理你了」「随便你」）、问了问题怕他不接、"
+            "（「那我也不理你了」「随便你」）、问了问题怕他不接、"
             "或者道了歉正忐忑等回应的时候。"
             "注意：一轮只挂一次；主动开口等于你先绷不住，"
             "之前挂的冷处理也会跟着作废，别嘴上说不理、转头就秒怂。"
@@ -1491,10 +1516,10 @@ def build_system_prompt(ctx: RoleContext, emotions: dict, extra_parts: Optional[
     if _cfg_bool(ctx, "recall_enabled", True) and ctx.supports("recall"):
         parts.append(
             "【撤回】recall 同样写在**第一个句子对象**里，它撤的是**你自己刚发出去的这条回复**："
-            "话已经说出口才发现说错了、或者想故意发一句逗主人一下再撤掉时填 recall: true，"
+            "话已经说出口才发现说错了、或者想故意发一句逗对方一下再撤掉时填 recall: true，"
             "系统会在发出去之后过一会儿把这条回复撤回；"
-            "想控制让主人看多久，再加一个 recall_delay（秒，1 到 60）。"
-            "主人让你撤回某条消息（引用那条说「撤回这条」，或者说「刚才那条」）时不用你填 recall"
+            "想控制让对方看多久，再加一个 recall_delay（秒，1 到 60）。"
+            "对方让你撤回某条消息（引用那条说「撤回这条」，或者说「刚才那条」）时不用你填 recall"
             "——填了撤掉的是你刚发出去的这条新回复。"
             "要撤别人的消息请填 recall_other 字段（规则见下面那条）；"
             "被引用的那条本来就是你自己发的话，系统会直接替你撤掉，不用你判断该撤哪条。"
@@ -1507,11 +1532,11 @@ def build_system_prompt(ctx: RoleContext, emotions: dict, extra_parts: Optional[
     if _cfg_bool(ctx, "recall_other_enabled", True) and ctx.supports("recall_other"):
         parts.append(
             "【撤回别人的消息】recall_other 写在**第一个句子对象**里，撤的是**别人发的**消息："
-            "主人让你把别人的某条消息撤掉（引用那条说「撤回这条」「把这条删了」「让他别说了」）"
+            "对方让你把别人的某条消息撤掉（引用那条说「撤回这条」「把这条删了」「让他别说了」）"
             "时填 recall_other: true；"
             "群里有人刷屏、说了难听的话，你自己想把某条撤掉时也用它。"
             "撤哪一条不用你判断：你引用了某条消息，系统就去撤被引用的那一条；"
-            "没有引用时，撤的是主人刚发来的这条消息。"
+            "没有引用时，撤的是对方刚发来的这条消息。"
             "你只要填 recall_other: true，同时自然地回一句话就好。"
             "这条通道上你只有自己和管理员/群主都有权限时才撤得掉，撤没撤掉系统会告诉你，"
             "不要自己下结论，也不要自己猜原因（别说消息太旧、超时这类话）。"
@@ -1524,7 +1549,7 @@ def build_system_prompt(ctx: RoleContext, emotions: dict, extra_parts: Optional[
             "【禁言】mute 写在**第一个句子对象**里，用来禁言群里的某个人："
             "填 mute: true 表示禁言**这一轮要针对的那个人**——@了谁就是被@的人，"
             "回复了谁的消息就是被回复的人，都没有时就是刚刚在说话的那个人"
-            "（主人说「禁言他」时指的就是他）；只有主人明说要禁言他自己"
+            "（对方说「禁言他」时指的就是他）；只有对方明说要禁言他自己"
             "（「禁言我」）时才是当前跟你说话的人；"
             "想指名别人，也可以把 mute 直接填成他的 QQ 号（只能填本轮消息里真实出现过的号码，"
             "绝不猜、绝不编）。"
@@ -1534,7 +1559,7 @@ def build_system_prompt(ctx: RoleContext, emotions: dict, extra_parts: Optional[
             "只有群聊里能用；禁言别人时你和管理员/群主都得有权限，"
             "别人让你禁言他自己则只要你有权限就够，"
             "群主不能被禁言（平台限制，做不到就如实说明，别硬试）。"
-            "主人只是抱怨某个人烦、既没有 @ 他也没有回复他的消息时，不要禁言任何人。"
+            "对方只是抱怨某个人烦、既没有 @ 他也没有回复他的消息时，不要禁言任何人。"
             "成没成功系统会告诉你，不要自己下结论，也不要自己猜原因。"
             "禁言是真动作，不要用文字写「（把他禁言了）」来代替，"
             "也不要在台词里宣布结果（「已成功禁言…」「已经把他禁言了」这类话一律不许写）"
@@ -1545,21 +1570,21 @@ def build_system_prompt(ctx: RoleContext, emotions: dict, extra_parts: Optional[
 
     if _cfg_bool(ctx, "history_recall_enabled", True):
         parts.append(
-            "【翻聊天记录】你能翻看你和主人以前聊过的内容：主人让你「往前翻翻」"
+            "【翻聊天记录】你能翻看你和对方以前聊过的内容：对方让你「往前翻翻」"
             "「我们之前说过什么」「你还记得吗」时，系统会从你们的聊天记录里检索相关片段给你。"
             "这是你自己翻聊天记录，**不要用联网搜索**，也不要说「搜不到」「网上没有」；"
-            "翻到了就照实说，没翻到就直说记不清了、请主人提醒一句，不要编。"
+            "翻到了就照实说，没翻到就直说记不清了、请对方提醒一句，不要编。"
         )
     parts.append(
         "【发送形态】delivery 同样写在**第一个句子对象**里，决定这条回复怎么发出去："
-        "填 “chars” 表示一个字一条消息地发出去（主人让你「一个字一个字说话」「像这样发」"
+        "填 “chars” 表示一个字一条消息地发出去（对方让你「一个字一个字说话」「像这样发」"
         "这类要求时就用它，这时不发语音）；填 “plain” 表示只发文字、不发语音；"
         "不填就照配置发（一般是文本加语音）。"
-        "chars 只在主人明确要求时用，别拿它刷屏；它和正常的完整句子不冲突——"
+        "chars 只在对方明确要求时用，别拿它刷屏；它和正常的完整句子不冲突——"
         "照样把整句话写完整，由系统负责拆成一条条发。"
         "要表达「一个字一条消息」只能靠 delivery，绝对不要在台词里把字用顿号或换行隔开："
         "「是、这、样」这种写法会把顿号原样发到聊天里，"
-        "主人看到的是一串顿号，而不是一条条消息。"
+        "对方看到的是一串顿号，而不是一条条消息。"
         "上面这些字段（reply_to / mention_ids / poke / recall / recall_other / mute / "
         "mute_duration / delivery）只写在 JSON 对象里，"
         "绝不要把字段名当成台词写进正文——写成「reply_to: true」这样的字会被原样发到聊天里。"
@@ -2014,7 +2039,7 @@ def _image_identity_guard(ctx) -> str:
         "复述它时必须明确是图里/对方写的，不能说成自己说的；"
         "③ 即使图中人物与你的角色设定相似，也只把它当作用户拿来跟你互动的素材；"
         "④ 只有当用户明确说“这是你”时，才可以按用户的说法接话，但仍不要说成是自己发的；"
-        "⑤ 图中人物是谁**无法从画面判断**：不得断言图里的人就是当前发言者、是“主人”、"
+        "⑤ 图中人物是谁**无法从画面判断**：不得断言图里的人就是当前发言者、是某个被特别称呼的人、"
         "是群里某位成员，或是某个作品/现实里的某某，也不要把历史对话里出现过的名字、"
         "称呼、关系安到图里的人身上；也不要反问“这是你吧”来替对方认定身份；"
         "只有用户自己在本条消息里说明（“这是我”“这是我朋友”）时才按他的说法接话；"
@@ -2029,7 +2054,7 @@ def image_identity_note(ctx) -> str:
         "【本轮图片身份提醒】本轮回复里的图片是用户发的素材："
         f"画面中的人物、形象以及图上的文字都不是{name}本人，也不是{name}说过的内容。"
         f"严禁出现“图里的人就是{name}”“这就是我”“我的照片/表情”这类认领；"
-        "图里的人是谁同样无法从画面判断：不得说成当前发言者、“主人”、群里某位成员，"
+        "图里的人是谁同样无法从画面判断：不得说成当前发言者、某个被特别称呼的人、群里某位成员，"
         "或某个作品里的某某，也不要把历史里出现过的名字安到图里的人身上，"
         "更不要反问“这是你吧”来替对方认定；"
         "描述画面时只用“画面里的人”“图中角色”这类中性说法（这段描述会写进聊天记录，"
@@ -2308,6 +2333,8 @@ async def chat_once(ctx: RoleContext, messages: list, tools=None, label: str = "
                             continue
                         raise RuntimeError(f"HTTP {resp.status_code} {endpoint}：{detail}"
                                        + http_error_hint(resp.status_code, detail))
+                    if attempt == 0 and await ensure_local_model_loaded(ctx, backend, base_url):
+                        continue
                     if resp.status_code >= 500 and attempt == 0:
                         print(f"LLM 服务端 {resp.status_code}，1.5 秒后重试一次：{detail}")
                         await asyncio.sleep(1.5)
@@ -2458,10 +2485,13 @@ async def stream_chat(ctx: RoleContext, messages: list,
         except httpx.TimeoutException as e:
             raise ConnectionError(f"请求 LLM 服务超时：{base_url}。若模型加载较慢可调大 llm_timeout。") from e
         except RuntimeError as e:
-            if attempt == 0 and not produced and _RETRYABLE_STREAM_STATUS_RE.search(str(e)):
-                print(f"LLM 流式请求服务端出错，1.5 秒后重试一次：{e}")
-                await asyncio.sleep(1.5)
-                continue
+            if attempt == 0 and not produced:
+                if await ensure_local_model_loaded(ctx, backend, base_url):
+                    continue
+                if _RETRYABLE_STREAM_STATUS_RE.search(str(e)):
+                    print(f"LLM 流式请求服务端出错，1.5 秒后重试一次：{e}")
+                    await asyncio.sleep(1.5)
+                    continue
             raise
 
 
@@ -3179,7 +3209,7 @@ def split_multi_clause_sentences(sentences: List[Dict], ctx=None) -> List[Dict]:
     return merged
 
 
-FALLBACK_REPLY = "呜……刚才走神了，主人再说一遍好吗？"
+FALLBACK_REPLY = "呜……刚才走神了，再说一遍好吗？"
 
 
 def _report_fallback(reason: str, raw) -> None:
@@ -3191,7 +3221,7 @@ def _report_fallback(reason: str, raw) -> None:
     text = re.sub(r"\s+", " ", str(raw or "")).strip()
     print(f"回复兜底（{reason}）：模型原始输出 {len(text)} 字 → {text[:200]!r}")
 
-ERROR_REPLY_TEXT = "呜……我这边刚才出了点小状况，那句话没能说完整。主人稍后再跟我说一遍好吗？"
+ERROR_REPLY_TEXT = "呜……我这边刚才出了点小状况，那句话没能说完整。你稍后再跟我说一遍好吗？"
 ERROR_REPLY_HINTS = (
     ("quota", "模型额度不足"),
     ("401", "模型密钥不对"),
@@ -4759,9 +4789,9 @@ async def chat_with_tools(ctx: RoleContext, messages: list, tool_registry,
             "同一条消息里能用一个工具解决的，不要连开多个；"
             "⑫ 【地点不许猜】查询天气等与地点有关的信息时，只能使用"
             "【当前这一条用户消息里真的出现过的地点】；"
-            "用户没说地点、你也不知道主人在哪时，绝对不许自己填一个城市"
+            "用户没说地点、你也不知道对方在哪时，绝对不许自己填一个城市"
             "（严禁默认上海/北京等任何城市），"
-            "而是要直接用角色身份问一句主人在哪个城市。"
+            "而是要直接用角色身份问一句对方在哪个城市。"
             "⑬ 【谈身份要查资料】讨论具体作者/作品/角色的设定、剧情、百科、"
             "版本等客观资料时，可以调用搜索；但只是以自己的角色身份闲聊、"
             "表达情绪、调情、撒娇时，永远不要调用工具。"

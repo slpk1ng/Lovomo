@@ -15,19 +15,19 @@ def _default_event(eid: str, name: str, date: str, prompt: str) -> dict:
 
 DEFAULT_EVENTS = [
     _default_event("default_yuandan", "元旦", "01-01",
-                   "今天是元旦、新年的第一天，向主人送上新年祝福，可以聊聊新一年的期待"),
+                   "今天是元旦、新年的第一天，向对方送上新年祝福，可以聊聊新一年的期待"),
     _default_event("default_valentine", "情人节", "02-14",
-                   "今天是情人节，用你的角色口吻向主人表达心意与陪伴的感谢"),
+                   "今天是情人节，用你的角色口吻向对方表达心意与陪伴的感谢"),
     _default_event("default_women", "妇女节", "03-08",
-                   "今天是妇女节，向主人送上节日问候与感谢"),
+                   "今天是妇女节，向对方送上节日问候与感谢"),
     _default_event("default_labour", "劳动节", "05-01",
-                   "今天是五一劳动节，向辛苦的主人送上慰问，提醒主人好好休息"),
+                   "今天是五一劳动节，向辛苦的对方送上慰问，提醒对方好好休息"),
     _default_event("default_children", "儿童节", "06-01",
-                   "今天是儿童节，用轻松俏皮的方式祝主人节日快乐，保持童心"),
+                   "今天是儿童节，用轻松俏皮的方式祝对方节日快乐，保持童心"),
     _default_event("default_national", "国庆节", "10-01",
-                   "今天是国庆节，向主人送上国庆假期的祝福"),
+                   "今天是国庆节，向对方送上国庆假期的祝福"),
     _default_event("default_christmas", "圣诞节", "12-25",
-                   "今天是圣诞节，向主人送上圣诞祝福，营造节日气氛"),
+                   "今天是圣诞节，向对方送上圣诞祝福，营造节日气氛"),
 ]
 
 
@@ -189,7 +189,7 @@ class EventManager:
                 key = f"birthday:{user_id}"
                 if self._sent(key):
                     continue
-                text = template.replace("{nickname}", profile.get("nickname") or "主人")
+                text = template.replace("{nickname}", profile.get("nickname") or "你")
                 session_key = f"private_{user_id}"
                 user_ctx = reply_ctx_of(ctx.role, session_id=session_key)
                 if self.config.get("birthday_greet_mode", "template") == "llm":
@@ -244,7 +244,7 @@ class EventManager:
         mode = event.get("mode", "llm")
         if mode != "template":
             instruction = render_template(str(event.get("llm_prompt", "") or
-                                              f"今天是{event.get('name', '节日')}，向主人送上问候"),
+                                              f"今天是{event.get('name', '节日')}，向对方送上问候"),
                                           character_name=ctx.character_name)
             try:
                 return await generate_proactive_text(ctx, instruction,

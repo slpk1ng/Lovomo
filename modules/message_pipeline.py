@@ -45,7 +45,7 @@ from modules.mood import (clamp, commit_mood, current_mood, judge_and_decide,
                           fixed_reply_probability)
 from modules.promises import PROMISE_HINT_RE
 from modules.proactive_state import save_proactive_state
-from modules.sender import RECALL_DENY, can_recall_others, voice_wanted
+from modules.sender import RECALL_DENY, can_recall_others, voice_planned
 from modules.reply_pipeline import (SentenceSink, generate_reply, _spawn,
                                     _norm_text, _repeat_ratio, _repeat_ratio_user,
                                     _strip_image_claims,
@@ -533,7 +533,7 @@ async def _send_sulk_sticker_later(role: dict, ctx, session_type: str, target_id
     if app_context.sticker_mgr is None or not config.get("stickers_enabled", False) \
             or not config.get("sulk_sticker_enabled", True):
         return
-    client = app_context.sender._active_client()
+    client = app_context.sender.session_client(session_id) or app_context.sender._active_client()
     if client is not None and not client_supports(client, "sticker"):
         return
     emotions = get_role_emotions(role)
@@ -545,8 +545,9 @@ async def _send_sulk_sticker_later(role: dict, ctx, session_type: str, target_id
         return
     speaker = str(role.get("character_name")
                   or (ctx.character_key if ctx is not None else "") or "角色")
-    if not await app_context.sender.send_text(session_type, target_id, "", sticker=sticker):
-        print("冷处理：收尾表情发送失败。")
+    with app_context.sender.for_session(session_id):
+        if not await app_context.sender.send_text(session_type, target_id, "", sticker=sticker):
+            print("冷处理：收尾表情发送失败。")
         return
     try:
         spath = Path(str(sticker))
@@ -632,7 +633,7 @@ async def _speak_first_after_silence(role: dict, session_type: str, target_id: s
         return
     if app_context.last_user_activity.get(session_id, 0) >= sent_at:
         return  # 等待期内对方回过话（正常应已取消，这里兜底）
-    client = app_context.sender._active_client()
+    client = app_context.sender.session_client(session_id) or app_context.sender._active_client()
     if client is None:
         print(f"先开口：[{target_id}] 当前没有可用接入方式，本轮放弃。")
         return
@@ -674,7 +675,7 @@ async def _speak_first_after_silence(role: dict, session_type: str, target_id: s
             generate_reply(ctx, emotions, trigger, history, None, [],
                            last_user_id, session_id=session_id,
                            speaker_labels=build_speaker_labels(history),
-                           wants_voice=voice_wanted(config, session_type, client)),
+                           wants_voice=voice_planned(config, session_type, client)),
             timeout=budget)
     except Exception as e:
         print(f"先开口：生成失败（放弃）: {type(e).__name__}: {e}")
@@ -686,8 +687,9 @@ async def _speak_first_after_silence(role: dict, session_type: str, target_id: s
         and client_supports(client, "voice")
     if use_voice:
         await ensure_tts_service(config)
-    send_result = await app_context.sender.send_reply(
-        session_type, target_id, reply["sentences"], emotions, ctx, use_voice=use_voice)
+    with app_context.sender.for_session(session_id):
+        send_result = await app_context.sender.send_reply(
+            session_type, target_id, reply["sentences"], emotions, ctx, use_voice=use_voice)
     speaker = str(role.get("character_name") or character_key or "角色")
     zh_text = strip_mention_placeholder(
         "".join(str(s.get("zh") or s.get("display") or "")
@@ -883,7 +885,8 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                                                      sender_name, event)
     if handled:
         if plugin_reply:
-            await app_context.sender.send_text(session_type, target_id, str(plugin_reply))
+            with app_context.sender.for_session(session_id):
+                await app_context.sender.send_text(session_type, target_id, str(plugin_reply))
         return
     # ------------------------------------------------------
     meta["user_msg_count"] = int(meta.get("user_msg_count", 0)) + 1
@@ -931,11 +934,11 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
         elif mode == "llm":
             recent_lines = []
             for msg in history[:-1][-6:]:
-                who = "主人" if msg.get("role") == "user" else "你"
+                who = "对方" if msg.get("role") == "user" else "你"
                 content = str(msg.get("content", "")).strip()
                 if content:
                     recent_lines.append(f"{who}：{content[:100]}")
-            recent_lines.append(f"主人：{user_text}")
+            recent_lines.append(f"对方：{user_text}")
             _spawn(app_context.todo_mgr.extract_and_add(get_active_ctx(), user_text, session_type,
                                             session_id, sender_id,
                                             recent_context=recent_lines))
@@ -1002,7 +1005,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                         session_type, target_id, quoted_mid) if allowed else 0
                 else:
                     done = await app_context.sender.recall_recent(session_type, target_id)
-                print(f"撤回：主人要求撤回上一条，已撤回 {done} 条消息。")
+                print(f"撤回：对方要求撤回上一条，已撤回 {done} 条消息。")
                 system_receipts.append({
                     "action": "撤回别人的消息" if (quoted_mid and not quoted_own) else "撤回",
                     "ok": bool(done), "count": done or None,
@@ -1011,18 +1014,18 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                     "at": time.time()})
                 if done:
                     extra_parts.append(
-                        "【本轮动作】主人这条消息是在要求撤回消息，系统已经撤掉了；"
+                        "【本轮动作】对方这条消息是在要求撤回消息，系统已经撤掉了；"
                         "你只要自然地回一句就好，不要在台词里写「（撤回）」这类动作描述。")
                 else:
-                    why = ("：主人没有撤回别人消息的管理权限"
+                    why = ("：对方没有撤回别人消息的管理权限"
                            if quoted_mid and not allowed else "")
                     extra_parts.append(
-                        f"【本轮动作】主人这条消息是在要求撤回消息，但系统这次没撤成{why}；"
+                        f"【本轮动作】对方这条消息是在要求撤回消息，但系统这次没撤成{why}；"
                         "你只要如实回一句就好，不要说已经撤掉了，也不要自己猜原因"
                         "（别说消息太旧、超时这类话）。")
             elif recall_mode:
                 extra_parts.append(
-                    "【本轮动作】主人这条消息是在要求撤回消息，系统已经处理；"
+                    "【本轮动作】对方这条消息是在要求撤回消息，系统已经处理；"
                     "你只要自然地回一句就好，不要在台词里写「（撤回）」这类动作描述。")
             at_targets = [str(q) for q in at_ids
                           if str(q) != str(client.self_id)
@@ -1049,22 +1052,22 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                         + ("已禁言" if r.get("ok")
                            else f"没禁成（{_ACTION_FAIL_REASONS.get(str(r.get('reason') or ''), '失败')}）")
                         for t, r in zip(targets, mute_receipts))
-                    print(f"禁言：主人这条消息在要求禁言，结果 {outcome}。")
+                    print(f"禁言：对方这条消息在要求禁言，结果 {outcome}。")
                     if all(r.get("ok") for r in mute_receipts):
                         extra_parts.append(
-                            f"【本轮动作】主人这条消息是在要求禁言，系统已经把 "
+                            f"【本轮动作】对方这条消息是在要求禁言，系统已经把 "
                             f"{outcome}；你只要自然地回一句就好，"
                             "不要在台词里宣布结果"
                             "（「已成功禁言…」这类话一律不要写）。")
                     else:
                         extra_parts.append(
-                            f"【本轮动作】主人这条消息是在要求禁言，结果：{outcome}；"
+                            f"【本轮动作】对方这条消息是在要求禁言，结果：{outcome}；"
                             "你只要如实回一句就好，禁成的可以说已处理，"
                             "没禁成的那个人要如实说明没禁成，"
                             "不要把没禁成的也说成已经禁言了，也不要自己猜原因。")
                 else:
                     extra_parts.append(
-                        "【本轮动作】主人这条消息是在要求禁言，但没说清是谁；"
+                        "【本轮动作】对方这条消息是在要求禁言，但没说清是谁；"
                         "你只要反问一句要禁言谁就好，不要自己挑一个人禁言。")
             if gate_reply:
                 if app_context.encounter_mgr is not None:
@@ -1134,7 +1137,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
             repeat_requested = wants_repeat_request(user_text)
             if repeat_requested:
                 extra_parts.append(
-                    "【本轮要求】主人本条消息明确要求你复述/重复他指定的内容："
+                    "【本轮要求】对方本条消息明确要求你复述/重复他指定的内容："
                     "按他的要求原样说出来即可，【禁止复读】这一轮不适用。")
             use_history = history
             if app_context.active_config().get("summary_enabled", False) and meta.get("summary"):
@@ -1231,7 +1234,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                         desc = str((pending_reply or {}).get("description", "") or "").strip()
                         if desc:
                             _backfill_image_description(history, desc)
-                            print(f"审判未回复：画面描述已写入历史，供主人下一条追问使用 → {desc[:60]}")
+                            print(f"审判未回复：画面描述已写入历史，供对方下一条追问使用 → {desc[:60]}")
                         _spawn_sticker_capture(ctx, pending_reply, image_sources)
                     _log_mood_commit(commit_mood(ctx, app_context.mood_mgr, session_id, verdict, mood_user),
                                      verdict)
@@ -1305,8 +1308,8 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                                    parts, sender_id, on_sentence=on_sentence,
                                    session_id=session_id,
                                    speaker_labels=speaker_labels,
-                                   wants_voice=voice_wanted(app_context.active_config(),
-                                                            session_type, client)),
+                                   wants_voice=voice_planned(app_context.active_config(),
+                                                             session_type, client)),
                     timeout=gen_budget)
 
             reply_started = time.time()
@@ -1365,7 +1368,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
             print(f"相似度检查：与最近 {len(recent_replies)} 条回复最高 {self_ratio:.2f}，"
                   f"与用户本条 {user_ratio:.2f}"
                   + ("" if can_retry else "（流式内容已发送，无法打回）")
-                  + ("（主人明确要求复述，本轮不判重复）" if repeat_requested else "")
+                  + ("（对方明确要求复述，本轮不判重复）" if repeat_requested else "")
                   + repeat_guard_summary(repeat_flags))
             if not repeat_flags["regen"]:
                 print("防复读：整段生成后校验已关闭（repeat_guard_regen_check=false），"
@@ -1478,7 +1481,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                         reply = fixed
 
             if sink is None or sink.sent == 0:
-                if voice_wanted(app_context.active_config(), session_type, client):
+                if voice_planned(app_context.active_config(), session_type, client):
                     await repair_sentence_lang(reply.get("sentences", []), ctx)
                 if pushed_down and quote_reply_id and reply.get("sentences") \
                         and not reply["sentences"][0].get("reply_to"):
@@ -1712,7 +1715,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
             if receipts and "失败" in receipts:
                 receipt_note += "被挡下的动作这轮做不了。"
             trigger = ("（系统提示：你上一条回复只是在答应，并没有真的把这件事做出来。"
-                       + (f"主人要的是：{task}。" if task else "")
+                       + (f"对方要的是：{task}。" if task else "")
                        + (f"接下来照这么做：{how}。" if how else "")
                        + receipt_note
                        + "现在就直接做出来，不要再答应一次、不要再问一句、也不要只说准备。"

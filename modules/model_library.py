@@ -7,6 +7,9 @@ from pathlib import Path
 
 from .jsonio import load_json_ex
 from .security import _decrypt_value, _encrypt_value, _is_kept_secret
+from .tts_cloud import LOCAL_BACKEND as TTS_BACKEND_LOCAL, CLOUD_BACKEND as TTS_BACKEND_CLOUD
+
+TTS_BACKENDS = (TTS_BACKEND_LOCAL, TTS_BACKEND_CLOUD)
 
 LIBRARY_FILE_NAME = "model_library.json"
 PRESET_DIR_NAME = "config_presets"
@@ -201,8 +204,9 @@ def load_library_cached(data_path) -> dict:
 
 
 def connection_overrides(conn: dict, lib: dict) -> dict:
-    if not isinstance(conn, dict) or not isinstance(lib, dict):
+    if not isinstance(conn, dict):
         return {}
+    lib = lib if isinstance(lib, dict) else {}
     out = {}
     role_id = str(conn.get("role_id") or "").strip()
     if role_id:
@@ -219,6 +223,12 @@ def connection_overrides(conn: dict, lib: dict) -> dict:
         out[f"{kind}_provider"] = picked
         for field, cfg_key in PROVIDER_FIELD_MAP[kind].items():
             out[cfg_key] = entry.get(field, "")
+    tts_backend = str(conn.get("tts_backend") or "").strip().lower()
+    if tts_backend in TTS_BACKENDS:
+        out["tts_backend"] = tts_backend
+        model_dir = str(conn.get("model_dir") or conn.get("tts_start_script") or "").strip()
+        if tts_backend == TTS_BACKEND_LOCAL and model_dir:
+            out["model_dir"] = model_dir
     return out
 
 

@@ -3009,7 +3009,7 @@ class WebUIServer:
 
     async def handle_get_roles(self, request):
         roles = []
-        for key, role in self.config.roles.items():
+        for key, role in self._all_roles().items():
             roles.append({
                 "character_key": key,
                 "character_name": role["character_name"],
@@ -3352,8 +3352,16 @@ class WebUIServer:
         return web.json_response({"sessions": list_known_sessions()})
 
     # ---------------- 情绪音频管理 ----------------
+    def _all_roles(self) -> dict:
+        lib = model_library.load_library(self._config_preset_dir())
+        entries = lib.get("roles") or []
+        if entries:
+            resolved = model_library.resolve_roles(lib, [r.get("id") for r in entries])
+            return {r["character_key"]: r for r in resolved if r.get("character_key")}
+        return dict(self.config.roles)
+
     def _role_root(self, role_key: str, kind: str = "tone"):
-        role = self.config.roles.get(role_key, {}) if role_key else {}
+        role = self._all_roles().get(role_key, {}) if role_key else {}
         ctx = RoleContext(self.config.config, role or {})
         if str(kind or "") == "mimic":
             root = str(ctx.get("emotion_mimic_root", "") or "").strip()
@@ -4961,6 +4969,19 @@ class WebUIServer:
                                         or DEFAULT_CONFIG_PROFILE)
         if "role_id" in payload:
             target["role_id"] = str(payload.get("role_id") or "").strip()
+        if "tts_backend" in payload:
+            backend = str(payload.get("tts_backend") or "").strip().lower()
+            if backend in model_library.TTS_BACKENDS:
+                target["tts_backend"] = backend
+            else:
+                target.pop("tts_backend", None)
+        if "model_dir" in payload:
+            model_dir = str(payload.get("model_dir") or "").strip()
+            if model_dir:
+                target["model_dir"] = model_dir
+            else:
+                target.pop("model_dir", None)
+            target.pop("tts_start_script", None)
         for kind in model_library.PROVIDER_KINDS:
             key = f"{kind}_provider"
             if key in payload:

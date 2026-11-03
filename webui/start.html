@@ -3778,6 +3778,12 @@
 
         .conn-model-grid select { width: 100%; }
 
+        .conn-model-grid input { width: 100%; }
+
+        .conn-tts-path { display: flex; gap: 6px; align-items: center; }
+
+        .conn-tts-path input { flex: 1 1 auto; min-width: 0; }
+
         .conn-modal-actions {
 
             position: sticky;
@@ -8619,7 +8625,39 @@
 
                     <div class="conn-model-grid" id="conn-model-grid"></div>
 
-                    <div class="muted" style="margin-top:4px;">五类模型各选一条，留空则跟随上面的配置文件。</div>
+                    <div class="conn-model-grid" id="conn-tts-grid" style="margin-top:var(--sp-3);">
+
+                        <div>
+
+                            <label>TTS 来源</label>
+
+                            <select id="conn-tts-backend">
+
+                                <option value="">（跟随配置文件）</option>
+
+                                <option value="local">本地 GPT-SoVITS</option>
+
+                                <option value="cloud">云端</option>
+
+                            </select>
+
+                        </div>
+
+                        <div id="conn-tts-path-field" hidden>
+
+                            <label>本地 TTS 模型目录</label>
+
+                            <div class="conn-tts-path" id="conn-tts-path-row">
+
+                                <input type="text" id="conn-tts-path" placeholder="含 .ckpt / .pth 的文件夹">
+
+                            </div>
+
+                        </div>
+
+                    </div>
+
+                    <div class="muted" style="margin-top:4px;">五类模型各选一条，留空则跟随上面的配置文件；TTS 来源选本地时可单独指定模型目录。</div>
 
                 </div>
 
@@ -9890,6 +9928,18 @@
             "此接入方式用哪个角色，留空则跟随上面的配置文件。": "Which character this connection uses; one connection, one character — leave empty to follow the profile above.",
 
             "五类模型各选一条，留空则跟随上面的配置文件。": "Pick one service per model type; leave empty to follow the configuration profile above.",
+
+            "五类模型各选一条，留空则跟随上面的配置文件；TTS 来源选本地时可单独指定模型目录。": "Pick one service per model type; leave empty to follow the configuration profile above. Choosing a local TTS source lets this connection point at its own model folder.",
+
+            "TTS 来源": "TTS source",
+
+            "本地 GPT-SoVITS": "Local GPT-SoVITS",
+
+            "云端": "Cloud",
+
+            "本地 TTS 模型目录": "Local TTS model folder",
+
+            "含 .ckpt / .pth 的文件夹": "Folder containing .ckpt / .pth",
 
             "（跟随配置文件）": "(follow profile)",
 
@@ -17584,6 +17634,38 @@
 
             }
 
+            fillConnectionTtsFields(conn);
+
+        }
+
+
+
+        function syncConnTtsFields() {
+
+            const sel = document.getElementById('conn-tts-backend');
+
+            const field = document.getElementById('conn-tts-path-field');
+
+            if (!sel || !field) return;
+
+            field.hidden = sel.value !== 'local';
+
+        }
+
+
+
+        function fillConnectionTtsFields(conn) {
+
+            const sel = document.getElementById('conn-tts-backend');
+
+            const input = document.getElementById('conn-tts-path');
+
+            if (sel) sel.value = String((conn && conn.tts_backend) || '');
+
+            if (input) input.value = String((conn && (conn.model_dir || conn.tts_start_script)) || '');
+
+            syncConnTtsFields();
+
         }
 
 
@@ -17620,6 +17702,9 @@
 
                 role_id: (document.getElementById('conn-role') || {}).value || '',
 
+                tts_backend: (document.getElementById('conn-tts-backend') || {}).value || '',
+
+                model_dir: ((document.getElementById('conn-tts-path') || {}).value || '').trim(),
             };
 
             document.querySelectorAll('#conn-model-grid [data-conn-provider]').forEach(sel => {
@@ -25912,6 +25997,20 @@
                 startScanOrShowBound(null);
 
             });
+
+            document.getElementById('conn-tts-backend').addEventListener('change', syncConnTtsFields);
+
+            (function bindConnTtsBrowse() {
+
+                const row = document.getElementById('conn-tts-path-row');
+
+                const input = document.getElementById('conn-tts-path');
+
+                if (!row || !input || row.querySelector('button')) return;
+
+                row.appendChild(makeBrowseButton(input, 'path'));
+
+            })();
 
             document.getElementById('conn-cancel-btn')
 

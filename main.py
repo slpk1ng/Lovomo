@@ -599,14 +599,17 @@ async def main(stop_event: threading.Event = None):
     job_mgr.register_all()
 
     if app_context.global_config.get("auto_start_tts", False):
+        startup_tts_config = next(
+            (cfg for cfg in preload_configs[1:] if str(cfg.get("tts_backend") or "").strip()),
+            app_context.global_config)
         if tts_first and preload_configs:
             def _tts_then_models():
-                auto_start_and_switch_tts(app_context.global_config)
+                auto_start_and_switch_tts(startup_tts_config)
                 auto_load_local_models(preload_configs)
             threading.Thread(target=_tts_then_models, daemon=True).start()
         else:
             threading.Thread(target=auto_start_and_switch_tts,
-                             args=(app_context.global_config,), daemon=True).start()
+                             args=(startup_tts_config,), daemon=True).start()
 
     def _run_on_main_loop(coro_factory, timeout: float = 10.0) -> bool:
         async def _do():
