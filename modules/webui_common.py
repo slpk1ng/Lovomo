@@ -4,7 +4,7 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from modules import app_context
@@ -12,6 +12,9 @@ from modules.app_paths import runtime_path
 from modules.security import _needs_second_password
 from modules.emotion_voices import _AUDIO_EXTS
 from modules.app_context import HAS_AIOHTTP
+
+if TYPE_CHECKING:
+    from modules.webui_server import WebUIServer
 
 if HAS_AIOHTTP:
     from aiohttp import web
@@ -137,12 +140,11 @@ def _make_auth_middleware(server: "WebUIServer"):
             return web.json_response({"success": False, "error": "跨站请求已被拒绝"}, status=403)
         if path.startswith("/api") and path not in ("/api/auth/login", "/api/auth/status",
                                                     "/api/auth/second"):
-            token = server._auth_token
-            if token:
-                if request.cookies.get("lovomo_auth") != token:
-                    return web.json_response({"success": False, "error": "需要密码"}, status=401)
+            session = server._auth_session(request)
+            if server._password and not (session and session.get("primary")):
+                return web.json_response({"success": False, "error": "需要密码"}, status=401)
             if _needs_second_password(path) and server._second_password \
-                    and not server._second_unlocked():
+                    and not server._second_unlocked(request):
                 return web.json_response({"success": False, "error": "需要二级密码",
                                           "need_second_password": True}, status=403)
         return await handler(request)

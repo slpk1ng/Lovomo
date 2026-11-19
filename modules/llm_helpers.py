@@ -1,4 +1,6 @@
 import asyncio
+from . import process_lifecycle as child_processes
+
 import ipaddress
 import json
 import re
@@ -13,67 +15,9 @@ import httpx
 
 from .tts import strip_urls_for_tts
 from .tls import verified_context
-
-_VERSION_SEG_RE = re.compile(r"/v\d+(?:\.\d+)*$")
-_CHAT_ENDPOINT_SUFFIXES = ("/chat/completions", "/completions", "/api/chat",
-                           "/api/generate")
-_MODEL_LIST_ENDPOINT_SUFFIXES = ("/models", "/api/tags")
-
-
-def _ends_with_any(base: str, suffixes) -> bool:
-    low = base.lower()
-    return any(low.endswith(suffix) for suffix in suffixes)
-
-
-def _strip_endpoint_suffix(base: str, suffixes) -> str:
-    low = base.lower()
-    for suffix in suffixes:
-        if low.endswith(suffix):
-            return base[: -len(suffix)]
-    return base
-
-
-def chat_endpoint(base_url: str, backend: str = "openai") -> str:
-    base = str(base_url or "").strip().rstrip("/")
-    if not base:
-        return ""
-    if _ends_with_any(base, _CHAT_ENDPOINT_SUFFIXES):
-        return base
-    base = _strip_endpoint_suffix(base, _MODEL_LIST_ENDPOINT_SUFFIXES)
-    return f"{base}/api/chat" if backend == "ollama" else f"{base}/chat/completions"
-
-
-def model_list_endpoints(base_url: str, backend: str = "openai") -> List[str]:
-    base = str(base_url or "").strip().rstrip("/")
-    if not base:
-        return []
-    if _ends_with_any(base, _MODEL_LIST_ENDPOINT_SUFFIXES):
-        return [base]
-    stripped = _strip_endpoint_suffix(base, _CHAT_ENDPOINT_SUFFIXES)
-    if stripped != base:
-        base = stripped
-    if backend == "ollama":
-        return [f"{base}/api/tags"]
-    if _VERSION_SEG_RE.search(base):
-        return [f"{base}/models"]
-    return [f"{base}/v1/models", f"{base}/models"]
-
-
-def looks_like_full_endpoint(base_url: str) -> bool:
-    base = str(base_url or "").strip().rstrip("/")
-    if not base:
-        return False
-    base = _strip_endpoint_suffix(base, _CHAT_ENDPOINT_SUFFIXES
-                                  + _MODEL_LIST_ENDPOINT_SUFFIXES)
-    try:
-        path = urlsplit(base).path
-    except ValueError:
-        return False
-    segments = [seg for seg in path.split("/") if seg]
-    if segments and _VERSION_SEG_RE.search("/" + segments[-1]):
-        segments = segments[:-1]
-    return len(segments) >= 2
-
+from .model_endpoints import (chat_endpoint, looks_like_full_endpoint, model_list_endpoints,
+                              service_api_key)
+from .local_model_lifecycle import local_models
 
 def conn_fail_hint(endpoint: str, base_url: str, backend: str) -> str:
     return (f"无法连接 LLM 服务：{endpoint}（配置 llm_base_url={base_url}，"
@@ -827,7 +771,7 @@ def _lmstudio_unload(model_key: str) -> bool:
         si.wShowWindow = 0
         kwargs["startupinfo"] = si
     try:
-        r = subprocess.run([exe, "unload", model_key], capture_output=True,
+        r = child_processes.run([exe, "unload", model_key], capture_output=True,
                            timeout=60, **kwargs)
         return r.returncode == 0
     except Exception as e:
@@ -839,7 +783,7 @@ def maybe_unload_old_models(ctx) -> None:
     if not _PENDING_MODEL_UNLOAD:
         return
     backend = str(ctx.get("llm_backend", "ollama") or "")
-    if backend != "openai" or not _is_local_service(ctx.get("llm_base_url", "")):
+    if backend != "openai":
         _PENDING_MODEL_UNLOAD.clear()
         return
     still_used = _models_in_use(ctx)
@@ -849,6 +793,9 @@ def maybe_unload_old_models(ctx) -> None:
         return
 
     def _work():
+        if not _is_lmstudio_service(ctx.get("llm_base_url", ""), ctx.get("llm_api_key", ""),
+                                  ctx.get("local_model_service", "auto")):
+            return
         for m in to_unload:
             if _lmstudio_unload(m):
                 print(f"[模型切换] 旧模型已卸载：{m}")
@@ -893,7 +840,7 @@ def _lms_command(exe: str, args: List[str], timeout: int):
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         si.wShowWindow = 0
         kwargs["startupinfo"] = si
-    return subprocess.run([exe, *args], capture_output=True, timeout=timeout, **kwargs)
+    return child_processes.run([exe, *args], capture_output=True, timeout=timeout, **kwargs)
 
 
 def _lmstudio_loaded(exe: str) -> set:
@@ -906,41 +853,36 @@ def _lmstudio_loaded(exe: str) -> set:
     return {str(item.get("modelKey") or "") for item in items if isinstance(item, dict)}
 
 
-def _lmstudio_load(model_key: str) -> bool:
+def _lmstudio_load(model_key: str, timeout=1800) -> bool:
     exe = _lmstudio_cli()
     if not exe:
         return False
     if model_key in _lmstudio_loaded(exe):
         return True
     try:
-        return _lms_command(exe, ["load", model_key], 1800).returncode == 0
+        # If the process exits before a slow server finishes loading, LM Studio
+        # can still release the idle instance itself.
+        return _lms_command(exe, ["load", model_key, "--ttl", "300"], timeout).returncode == 0
     except Exception as e:
         print(f"[模型预加载] 加载 {model_key} 失败: {e}")
         return False
 
 
 def _embedding_target(ctx) -> Optional[tuple]:
-    backend = (str(ctx.get("rag_embedding_backend", "") or "")
-               or str(ctx.get("llm_backend", "ollama") or "ollama"))
-    model = (str(ctx.get("llm_embedding_model", "") or "")
-             or str(ctx.get("rag_embedding_model", "") or ""))
-    if backend == "ollama":
-        return (model or "nomic-embed-text", backend, "http://127.0.0.1:11434", "", "embedding")
-    model = model or str(ctx.get("llm_model_name", "") or "")
-    if not model:
+    from .model_endpoints import embedding_target
+    target = embedding_target(ctx)
+    if not target.model:
         return None
-    base_url = (str(ctx.get("llm_embedding_url", "") or "").strip()
-                or str(ctx.get("llm_base_url", "") or ""))
-    return (model, backend, base_url, str(ctx.get("llm_api_key", "") or ""), "embedding")
+    return (target.model, target.backend, target.base_url, target.api_key, "embedding")
 
 
 def _startup_targets(ctx) -> List[tuple]:
     llm = (str(ctx.get("llm_backend", "ollama") or "ollama"),
            str(ctx.get("llm_base_url", "") or ""),
            str(ctx.get("llm_api_key", "") or ""))
+    vision_base = str(ctx.get("image_caption_base_url", "") or "") or llm[1]
     vision = (str(ctx.get("image_caption_backend", "") or "") or llm[0],
-              str(ctx.get("image_caption_base_url", "") or "") or llm[1],
-              str(ctx.get("image_caption_api_key", "") or "") or llm[2])
+              vision_base, service_api_key(ctx, "image_caption_api_key", vision_base))
     pairs = [(ctx.get("llm_model_name", ""), llm, "chat"),
              (ctx.get("image_caption_model_name", ""), vision, "chat")]
     roles = ctx.get("roles")
@@ -991,11 +933,46 @@ def _warmup_local_model(backend: str, base_url: str, api_key: str, model_key: st
     return _post_warmup(chat_endpoint(base, backend), payload, headers)
 
 
-def _load_local_model(backend: str, base_url: str, api_key: str, model_key: str,
-                      kind: str = "chat") -> bool:
-    if backend == "openai" and _lmstudio_load(model_key):
+def _is_lmstudio_service(base_url: str, api_key: str = "", service: str = "auto") -> bool:
+    if not _is_local_service(base_url):
+        return False
+    service = str(service or "auto").lower()
+    if service == "lmstudio":
         return True
-    return _warmup_local_model(backend, base_url, api_key, model_key, kind)
+    if service != "auto":
+        return False
+    parsed = urlsplit(base_url)
+    root = f"{parsed.scheme}://{parsed.netloc}"
+    try:
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        with httpx.Client(timeout=2, proxy=None, trust_env=False, verify=verified_context()) as client:
+            response = client.get(root + "/api/v0/models", headers=headers)
+            response.raise_for_status()
+            models = response.json().get("data", [])
+        return bool(models) and all(isinstance(item, dict) and item.get("type") in ("llm", "vlm", "embeddings")
+                                    and "state" in item and "max_context_length" in item for item in models)
+    except Exception:
+        return False
+
+
+def _load_local_model(backend: str, base_url: str, api_key: str, model_key: str,
+                      kind: str = "chat", service: str = "auto", load_timeout=1800) -> bool:
+    if child_processes.is_exiting():
+        return False
+    lmstudio = backend == "openai" and _is_lmstudio_service(base_url, api_key, service)
+
+    def load():
+        if child_processes.is_exiting():
+            return False
+        if lmstudio and _lmstudio_load(model_key, load_timeout):
+            return True
+        if child_processes.is_exiting():
+            return False
+        return _warmup_local_model(backend, base_url, api_key, model_key, kind)
+
+    if lmstudio or backend == "ollama":
+        return local_models.load("lmstudio" if lmstudio else "ollama", base_url, api_key, model_key, load)
+    return load()
 
 
 _MODEL_RELOAD_COOLDOWN = 30.0
@@ -1016,8 +993,11 @@ async def ensure_local_model_loaded(ctx, backend: str, base_url: str) -> bool:
     if now - _MODEL_RELOAD_AT.get(key, 0.0) < _MODEL_RELOAD_COOLDOWN:
         return False
     _MODEL_RELOAD_AT[key] = now
+    from .runtime_policy import limit
     ok = await asyncio.to_thread(_load_local_model, backend, base_url,
-                                 str(ctx.get("llm_api_key", "") or ""), model_key, "chat")
+                                 str(ctx.get("llm_api_key", "") or ""), model_key, "chat",
+                                 str(ctx.get("local_model_service", "auto")),
+                                 limit(ctx, "local_model_load_timeout_seconds"))
     if ok:
         print(f"[模型预加载] 请求失败，已重新加载本地模型：{model_key}")
     return ok
@@ -1032,13 +1012,18 @@ def auto_load_local_models(configs) -> None:
             if backend not in ("ollama", "openai") or not _is_local_service(base_url):
                 continue
             if (name, base_url) not in [(t[0], t[2]) for t in targets]:
-                targets.append((name, backend, base_url, api_key, kind))
+                from .runtime_policy import limit
+                service = str(ctx.get("local_model_service", "auto")) if base_url == ctx.get("llm_base_url", "") else "auto"
+                targets.append((name, backend, base_url, api_key, kind, service,
+                                limit(ctx, "local_model_load_timeout_seconds")))
     if not targets:
         return
 
     def _work():
-        for name, backend, base_url, api_key, kind in targets:
-            if _load_local_model(backend, base_url, api_key, name, kind):
+        for name, backend, base_url, api_key, kind, service, load_timeout in targets:
+            if child_processes.is_exiting():
+                return
+            if _load_local_model(backend, base_url, api_key, name, kind, service, load_timeout):
                 print(f"[模型预加载] 本地模型已加载：{name}")
             else:
                 print(f"[模型预加载] 本地模型 {name} 未能加载"
@@ -1054,8 +1039,14 @@ class RoleContext:
 
     def __init__(self, config, role: Optional[dict] = None, capabilities=None):
         self.config = config  # ConfigLoader 或任何带 .get() 的对象
-        self.role = role or {}
+        self.role = dict(role or {})
         self.capabilities = capabilities
+
+    def snapshot(self):
+        import copy
+        config = getattr(self.config, "config", self.config)
+        return RoleContext(copy.deepcopy(config), copy.deepcopy(self.role),
+                           copy.deepcopy(self.capabilities))
 
     def supports(self, feature: str) -> bool:
         caps = self.capabilities
@@ -1615,6 +1606,11 @@ def build_system_prompt(ctx: RoleContext, emotions: dict, extra_parts: Optional[
             "ja 必须与 zh 表达同一件事：同一主语与对象、同一事件、因果与语气，"
             "可以意译但禁止擅自改事件、加戏、省略内容或把谁对谁说话的关系颠倒。"
         )
+    elif tl in _ZH_TARGETS:
+        parts.append(
+            "【台词语言规则】台词直接用自然中文书写，不要夹带日文假名或韩文；"
+            "需要引用外语原词时保留原词，不要音译成中文冒充。"
+        )
     elif tl == "en":
         parts.append(
             "【台词语言规则】英文台词直接用自然英文书写，不要音译成其他文字。"
@@ -1974,9 +1970,9 @@ def _mimic_guide(mimics: dict) -> str:
 
 
 _INTIMATE_RE = re.compile(
-    r"色情|涩涩|涩图|黄色|黄段子|下流|下ネタ|情色|工口|做爱|做愛|性爱|性愛|上床|脱衣|脫衣|裸|"
+    r"色情|涩涩|涩图|黄色|黄段子|下流|下ネタ|情色|工口|做爱|做愛|性爱|性愛|上床|脱衣|脫衣|把衣服脱|裸|"
     r"胸|乳|屁股|阴|陰|射|爱液|愛液|潮吹|插入|口交|自慰|发情|發情|r18|R18|h场景|H场景|"
-    r"亲我|親我|亲亲|親親|接吻|吻我|舌吻|抱我|摸我|舔|舔我|闻|聞|调教|調教|主人想要|想要我|"
+    r"亲我|親我|亲亲|親親|接吻|吻我|舌吻|抱我|摸我|舔|舔我|闻|聞|调教|調教|你想要|想要我|想要你|"
     r"你的身体|妳的身体|怀孕|懷孕|射在|进去|進去|疼我|干我|幹我",
     re.IGNORECASE)
 
@@ -2063,13 +2059,13 @@ def image_identity_note(ctx) -> str:
     )
 
 
-_FIRST_PERSON = r"(?:我|本座|人家|咱|俺|吾|吾辈|本尊)"
+_FIRST_PERSON = r"(?:我|人家|咱|俺|吾|本人|在下|本座|本宫|本王|老夫|老娘)"
 _CLAUSE_BREAK = r"[^，。！？!?；;、\n]"
 
 _IMAGE_SELF_RE = re.compile(
     r"(?:图|图片|照片|画|表情包|人像)" + _CLAUSE_BREAK + r"{0,6}"
     r"(?:里|中|上|内)?" + _CLAUSE_BREAK + r"{0,6}"
-    r"(?:人|女孩|少女|男孩|人物|角色|形象|样子|本人|本尊)" + _CLAUSE_BREAK + r"{0,6}"
+    r"(?:人|女孩|少女|男孩|人物|角色|形象|样子|本人)" + _CLAUSE_BREAK + r"{0,6}"
     r"(?:就是|正是|是)" + _CLAUSE_BREAK + r"{0,4}" + _FIRST_PERSON
     + r"|" + _FIRST_PERSON + _CLAUSE_BREAK + r"{0,4}(?:就)?(?:是|在)(?:图|图片|照片)(?:里|中|上|片)?"
     + r"|(?:这|那)(?:张|幅|个)?(?:图|图片|照片)" + _CLAUSE_BREAK + r"{0,6}(?:就是|正是|是)"
@@ -2213,7 +2209,8 @@ def _endpoint_and_payload(ctx: RoleContext, messages: list, stream: bool, tools=
         payload["stream_options"] = {"include_usage": True}
     if sampling_on:
         payload["top_p"] = top_p
-    payload.update(_parse_extra_body(ctx))
+    payload.update({key: value for key, value in _parse_extra_body(ctx).items()
+                    if key not in {"model", "messages", "stream"}})
     if not enable_think:
         payload["enable_thinking"] = False
     if tools:
@@ -2313,6 +2310,17 @@ def record_token_usage(label: str, backend: str, data, model: str = "",
         print(f"记录 token 用量失败: {type(e).__name__}: {e}")
 
 
+def _validate_chat_response(data, endpoint: str) -> None:
+    if not isinstance(data, dict):
+        raise RuntimeError(f"模型服务返回了无效的聊天响应：{endpoint}")
+    error = data.get("error")
+    if error:
+        if isinstance(error, dict):
+            error = error.get("message") or error
+        detail = clean_error_body(error)
+        raise RuntimeError(f"模型服务请求失败（{endpoint}）：{detail}" + api_error_hint(detail))
+
+
 async def chat_once(ctx: RoleContext, messages: list, tools=None, label: str = "") -> Dict:
     backend, endpoint, payload, headers, timeout = _endpoint_and_payload(ctx, messages, False, tools)
     base_url = str(ctx.get("llm_base_url", "http://127.0.0.1:11434")).rstrip("/")
@@ -2342,7 +2350,13 @@ async def chat_once(ctx: RoleContext, messages: list, tools=None, label: str = "
                     raise RuntimeError(f"HTTP {resp.status_code} {endpoint}：{detail}"
                                        + http_error_hint(resp.status_code, detail))
                 resp.raise_for_status()
-                data = resp.json()
+                try:
+                    data = resp.json()
+                except ValueError as e:
+                    raise RuntimeError(f"模型服务返回了非 JSON 响应：{endpoint}") from e
+                _validate_chat_response(data, endpoint)
+                if backend != "ollama" and not data.get("choices"):
+                    raise RuntimeError(f"模型服务返回的聊天响应没有候选回复：{endpoint}")
             break
         except httpx.ConnectError as e:
             if attempt == 0:
@@ -2399,6 +2413,14 @@ async def _stream_chat_inner(ctx: RoleContext, messages: list,
                 raise RuntimeError(f"HTTP {resp.status_code} {endpoint}：{detail}"
                                    + http_error_hint(resp.status_code, detail))
             resp.raise_for_status()
+            if backend != "ollama" and "application/json" in resp.headers.get("content-type", "").lower():
+                await resp.aread()
+                try:
+                    data = resp.json()
+                except ValueError as e:
+                    raise RuntimeError(f"模型服务返回了无效的 JSON 响应：{endpoint}") from e
+                _validate_chat_response(data, endpoint)
+                raise RuntimeError(f"模型服务没有返回流式响应：{endpoint}")
             if backend == "ollama":
                 async for line in resp.aiter_lines():
                     if not line.strip():
@@ -2438,6 +2460,7 @@ async def _stream_chat_inner(ctx: RoleContext, messages: list,
                         chunk = json.loads(data_str)
                     except Exception:
                         continue
+                    _validate_chat_response(chunk, endpoint)
                     if chunk.get("usage"):
                         usage_seen = True
                         record_token_usage(label, backend, chunk,
@@ -2667,22 +2690,22 @@ _POKE_ACTION_WRAPPER_RE = re.compile(
     r"^[\s\u3000（）()【】\[\]「」『』“”‘’'\"]+|[\s\u3000（）()【】\[\]「」『』“”‘’'\"]+$")
 _POKE_ACTION_TEXT_RE = re.compile(
     r"^(?:轻轻地|偷偷地|悄悄地|用力地|随手|突然)?戳(?:了|一)?戳?"
-    r"(?:你|主人|他|她|对方|回去|回来)"
+    r"(?:你|他|她|对方|主人|回去|回来)"
     r"(?:一下|两下|几下)?(?:的[\u4e00-\u9fa5]{1,3})?$")
 _POKE_ACTION_INLINE_RE = re.compile(
     r"[（(【\[]\s*(?:轻轻地|偷偷地|悄悄地|用力地|随手|突然)?戳(?:了|一)?戳?"
-    r"(?:你|主人|他|她|对方|回去|回来)(?:一下|两下|几下)?(?:的[\u4e00-\u9fa5]{1,3})?\s*[）)】\]]")
+    r"(?:你|他|她|对方|回去|回来)(?:一下|两下|几下)?(?:的[\u4e00-\u9fa5]{1,3})?\s*[）)】\]]")
 _STAGE_SPAN_RE = re.compile(r"[（(【\[][^）)】\]]*[）)】\]]")
 _POKE_STAGE_ACTION_RE = re.compile(
     r"(?:戳|弹|敲)(?:了|一|下|过去|回去|回来)?[^\u3002！？，；\n]{0,6}?"
-    r"(?:你|主人|他|她|对方|回去|回来)"
-    r"|(?:你|主人|他|她|对方)[^\u3002！？，；\n]{0,6}?"
+    r"(?:你|他|她|对方|回去|回来)"
+    r"|(?:你|他|她|对方|主人)[^\u3002！？，；\n]{0,6}?"
     r"(?:戳|弹|敲)(?:了|一|下|过去|回去|回来)")
 
 _STAGE_HYPOTHETICAL_RE = re.compile(r"要是|如果|假如|真想|恨不得|差点|本来想|不然|否则|再敢")
 _STAGE_ACTION_RULES = (
     ("recall_other", re.compile(
-        r"(?:撤回|收回|撤销|撤掉)[^\u3002！？，；\n]{0,4}?(?:你|主人|他|她|别人|对方)")),
+        r"(?:撤回|收回|撤销|撤掉)[^\u3002！？，；\n]{0,4}?(?:你|他|她|别人|对方|主人)")),
     ("recall", re.compile(r"撤回|收回|撤销|撤掉")),
     ("mute", re.compile(r"禁言")),
     ("reply_to", re.compile(r"引用")),
@@ -2708,11 +2731,11 @@ _CLAIMED_ACTION_RULES = (
     ("mute", re.compile(r"已(?:经)?(?:成功)?禁言"
                         r"|已(?:经)?(?:成功)?对[^\u3002！？\n]{0,20}?禁言"
                         r"|禁言(?:好|完)了")),
-    ("poke", re.compile(r"已(?:经)?(?:成功)?戳(?:了|过|你|主人|他|她)"
-                        r"|戳(?:了|过)(?:你|主人|他|她)"
+    ("poke", re.compile(r"已(?:经)?(?:成功)?戳(?:了|过|你|他|她)"
+                        r"|戳(?:了|过)(?:你|他|她)"
                         r"|戳回去(?:啦|了)")),
     ("recall_other", re.compile(r"已(?:经)?(?:成功)?(?:撤回|收回|撤销|撤掉)"
-                                r"[^\u3002！？\n]{0,6}?(?:你|主人|他|她|别人|对方)")),
+                                r"[^\u3002！？\n]{0,6}?(?:你|他|她|别人|对方)")),
 )
 _CLAIMED_CLAUSE_SPLIT = re.compile(r"[。！？\n]+")
 
@@ -2957,10 +2980,10 @@ _MUTE_WANT_RE = re.compile(
     rf"(?:把|给|替)[^。！？!?]{{0,8}}{_MUTE_VERB}"
     rf"|{_MUTE_VERB}\s*(?:@|\[@)"
     rf"|^[^。！？!?\n]{{0,4}}{_MUTE_VERB}[了啊吧呀哦～~！!]{{0,2}}$"
-    rf"|^[^。！？!?\n]{{0,4}}{_MUTE_VERB}(?:他|她|它|我|本座)[了啊吧呀哦～~]?$"
-    rf"|^[^。！？!?\n]{{0,8}}{_MUTE_VERB}(?:他|她|它|我|本座)?\s*\d+\s*(?:个?小时|分钟|分|秒|天)$")
+    rf"|^[^。！？!?\n]{{0,4}}{_MUTE_VERB}(?:他|她|它|我)[了啊吧呀哦～~]?$"
+    rf"|^[^。！？!?\n]{{0,8}}{_MUTE_VERB}(?:他|她|它|我)?\s*\d+\s*(?:个?小时|分钟|分|秒|天)$")
 _MUTE_SELF_RE = re.compile(
-    rf"{_MUTE_VERB}(?:我|本座|自己)|把(?:我|本座|自己)[^。！？!?]{{0,4}}{_MUTE_VERB}")
+    rf"{_MUTE_VERB}(?:我|自己)|把(?:我|自己)[^。！？!?]{{0,4}}{_MUTE_VERB}")
 _MUTE_DURATION_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(个?小时|分钟|分|秒|天)")
 _MUTE_UNIT_SECONDS = {"小时": 3600, "分钟": 60, "分": 60, "秒": 1, "天": 86400}
 
@@ -3592,11 +3615,12 @@ def normalize_sentences(content: str, ctx: RoleContext, emotions: dict, user_tex
     sentences = _drop_bilingual_duplicates(sentences, text_lang)
     sentences = _drop_repeated_lang_blocks(sentences, text_lang)
     normalized = [normalize_single(s, ctx, emotions, user_text) for s in sentences]
+    action_sources = list(normalized)
     normalized = [s for s in normalized if real_text(s.get("zh")) or real_text(s.get("display"))]
     result = _merge_short_sentences(split_multi_clause_sentences(normalized, ctx))
     # 归一化结果放最前：动作键以清洗后的值为准（原始句里的秒数可能是字符串/布尔）
     meta_sources = [wrapper] if isinstance(wrapper, dict) else []
-    meta_sources.extend(normalized)
+    meta_sources.extend(action_sources)
     meta_sources.extend(s for s in sentences if isinstance(s, dict))
     result_meta = merge_sentence_actions(meta_sources)
     if not result and (result_meta.get("poke") is True
@@ -3890,7 +3914,7 @@ _TOOL_NEED_RE = re.compile(
     r"最新|新闻|时事|进展|近况|价格|多少钱|多少钱|攻略|教程|推荐|评价|评测|"
     r"版本|更新|发售|上线|下载|官网|网址|链接|地址|在哪|怎么走|"
     r"odds|weather|forecast|temperature|search|who is|what is", re.I)
-_TOOL_NEED_PREFIX_RE = re.compile(r"^(?:你|妳|您|主人|人家|本座|咱|俺)?(?:能不能|可以|能|可以|会)")
+_TOOL_NEED_PREFIX_RE = re.compile(r"^(?:你|妳|您|人家|咱|俺)?(?:能不能|可以|能|可以|会)")
 _PURE_CHATTER_RE = re.compile(
     r"^(?:嗯+|哦+|好+|行|是|对|在吗|在么|在不在|早安|早上好|午安|晚安|晚上好|"
     r"你好|您好|哈喽|hi|hello|嗨|抱抱|摸摸|亲亲|贴贴|么么|爱你|喜欢你|想你|"
@@ -4086,7 +4110,7 @@ def _answer_admits_unknown(text: str) -> bool:
 
 
 _PROMISE_LOOKUP_RE = re.compile(
-    r"(?:我|人家|本座|咱)(?:这就|马上|立刻|现在|先)?(?:去|来)?(?:帮你|给你|替主人|为主人)?"
+    r"(?:我|人家|咱)(?:这就|马上|立刻|现在|先)?(?:去|来)?(?:帮你|给你)?"
     r"(?:查|搜|找)(?!了|过)"
     r"|(?:等我|让我|稍等(?:一下)?|等一下)(?:一下)?[，,。！!～~\s]*(?:我)?(?:去)?(?:查|搜|找)(?!了|过)"
     r"|(?:查|搜)(?:一下|一查|一搜)(?:再|就|马上|稍后|等会|待会)(?:告诉|说|回复)"
@@ -4131,7 +4155,7 @@ _NAME_STATE = (r"穿|戴|脱|睡|起床|心情|感受|在做什么|在干嘛|干
                r"在想|现在在|今天在|刚才在")
 
 _ROLEPLAY_SELF_RE = re.compile(
-    r"(?:你|妳|您|自己|本座|人家|咱|俺)[^，。！!？?]{0,6}(?:" + _PRIVATE_STATE + r")"
+    r"(?:你|妳|您|自己|人家|咱|俺)[^，。！!？?]{0,6}(?:" + _PRIVATE_STATE + r")"
     r"|(?:穿|戴|脱)[^，。！!？?]{0,8}(?:什么|啥|哪个|哪种)")
 
 _ROLEPLAY_LORE_RE = re.compile(
@@ -4154,7 +4178,7 @@ def _is_roleplay_search(query: str, ctx) -> bool:
             continue
         if re.search(re.escape(name) + r"[^，。！!？?]{0,4}(?:" + _NAME_STATE + r")", q):
             return True
-        if re.search(r"(?:你|妳|您|本座|自己)[^，。！!？?]{0,4}" + re.escape(name), q):
+        if re.search(r"(?:你|妳|您|自己)[^，。！!？?]{0,4}" + re.escape(name), q):
             return True
     return False
 
@@ -4514,14 +4538,14 @@ def _drop_invented_dates_in_args(arguments: dict, user_text: str) -> dict:
 
 
 _DIALOGUE_HEAD_RE = re.compile(
-    r"^(?:用户|主人|我|你|妳|您|咱|俺|本座|人家|抱歉|对不起|无法|不能|请|谢谢|好的|嗯|哦|"
+    r"^(?:用户|我|你|妳|您|咱|俺|人家|抱歉|对不起|无法|不能|请|谢谢|好的|嗯|哦|"
     r"那个|这样|不是|没有)")
 _SENTENCE_PUNCT_RE = re.compile(r"[。！？!?；;]|，.*，")
 _EXPLANATION_RE = re.compile(
     r"(?:无法|不能|没有|抱歉|作为|意思是|指的是|也就是|例如|建议|可以搜索|请告诉我|"
     r"用户想|你想|查询词是|关键词是)")
 _DIALOGUE_MARK_RE = re.compile(
-    r"[你我妳您]|主人|本座|人家|咱|俺|吾辈|[哦呀嘛啦咯哟喔呢哇哼]|嘻嘻|哈哈|么么")
+    r"[你我妳您]|人家|咱|俺|[哦呀嘛啦咯哟喔呢哇哼]|嘻嘻|哈哈|么么")
 _SENTENCE_HEAD_RE = re.compile(
     r"^(?:这|那|它|他|她|它们)?(?:就是|是|不是|有|没有|会|能|可以|要|想|应该|需要|正在|"
     r"已经|还没|别|不要|请)")
@@ -5057,7 +5081,7 @@ async def vision_chat_once(ctx, prompt_text: str, images: list, *,
                    "temperature": _cfg_num(ctx, "temperature", 0.7),
                    "max_tokens": max_tokens}
         endpoint = chat_endpoint(base_url, "openai")
-        api_key = ctx.get("image_caption_api_key", "") or ctx.get("llm_api_key", "")
+        api_key = service_api_key(ctx, "image_caption_api_key", endpoint)
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     start = time.time()
     async with httpx.AsyncClient(timeout=timeout, verify=verified_context()) as client:

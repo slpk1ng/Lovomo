@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+from . import process_lifecycle as child_processes
+
 import array
 import math
 import os
@@ -49,7 +51,7 @@ def probe_duration(path) -> Optional[float]:
     ffprobe = _ffprobe()
     if ffprobe:
         try:
-            proc = subprocess.run(
+            proc = child_processes.run(
                 [ffprobe, "-v", "error", "-show_entries", "format=duration",
                  "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
@@ -72,7 +74,7 @@ def _wav_duration(path) -> Optional[float]:
 
 
 def _run_ffmpeg(exe: str, args) -> None:
-    proc = subprocess.run([exe, "-y", "-hide_banner", "-loglevel", "error"] + args,
+    proc = child_processes.run([exe, "-y", "-hide_banner", "-loglevel", "error"] + args,
                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                           encoding="utf-8", errors="replace",
                           timeout=FFMPEG_TIMEOUT_SECONDS, **no_window_kwargs())

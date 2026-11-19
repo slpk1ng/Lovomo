@@ -1,4 +1,6 @@
 import asyncio
+from . import process_lifecycle as child_processes
+
 import base64
 import dataclasses
 import json
@@ -7,6 +9,7 @@ import random
 import subprocess
 import tempfile
 import time
+from weakref import WeakValueDictionary
 from pathlib import Path
 from urllib.parse import quote
 
@@ -14,6 +17,7 @@ import aiohttp
 
 from napcat import (At, GroupMessageEvent, Image, MessageSender, PrivateMessageEvent,
                     Record, Text)
+from .wechat_outbox import MAX_MESSAGES_PER_TARGET, WeChatOutbox
 
 ILINK_BASE = "https://ilinkai.weixin.qq.com"
 ILINK_CDN_BASE = "https://novac2c.cdn.weixin.qq.com/c2c"
@@ -33,7 +37,7 @@ ILINK_TYPING_CANCEL = 2
 ILINK_ACK_ID_KEYS = ("message_id", "msg_id", "server_id", "id")
 ILINK_SESSION_TIMEOUT = -14
 ILINK_STALE_CONTEXT = -2
-ILINK_PENDING_LIMIT = 3
+ILINK_PENDING_LIMIT = MAX_MESSAGES_PER_TARGET
 QQ_TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"
 QQ_API_BASE = "https://api.sgroup.qq.com"
 QQ_SANDBOX_API_BASE = "https://sandbox.api.sgroup.qq.com"
@@ -252,6 +256,17 @@ async def ilink_login_status(qrcode: str, base: str = ILINK_BASE,
     return _as_json(text)
 
 
+class DeliveryUnconfirmed(RuntimeError):
+    """The request may have been accepted without a usable response."""
+
+
+def delivery_unconfirmed(error):
+    return isinstance(error, (DeliveryUnconfirmed, TimeoutError, aiohttp.ClientPayloadError)) or (
+        isinstance(error, (aiohttp.ClientConnectionError, ConnectionError))
+        and not isinstance(error, (aiohttp.ClientConnectorError, ConnectionRefusedError))
+    )
+
+
 class ILinkSessionExpired(RuntimeError):
     pass
 
@@ -336,6 +351,40 @@ class ILinkClient:
         saved = self.connection.get("context_tokens")
         self._contexts = dict(saved) if isinstance(saved, dict) else {}
         self._pending = {}
+        self._pending_metadata = {}
+        self._pending_receipts = {}
+        self._pending_rejected_context = {}
+        self._outbox = None
+        self.outbox_persisted = False
+        self._send_locks = WeakValueDictionary()
+
+    def enable_outbox(self, data_path):
+        account = self.bot_id or self.token
+        channel = str(self.connection.get("id") or "")
+        if not channel or not account:
+            return
+        self._outbox = WeChatOutbox(data_path, channel, account)
+        for target, entries in self._outbox.load().items():
+            if entries:
+                self._pending[target] = [entry[0] for entry in entries]
+                self._pending_metadata[target] = [tuple(entry[1:]) for entry in entries]
+                # Restored credentials may still be the ones that were refused.
+                self._pending_rejected_context[target] = self._contexts.get(target, "")
+        self.outbox_persisted = self._outbox.writable
+
+    def pending_count(self):
+        return sum(map(len, self._pending.copy().values()))
+
+    def has_legacy_outbox(self):
+        return self._outbox is not None and self._outbox.legacy_path.is_file()
+
+    def _save_outbox(self):
+        if self._outbox is None:
+            return
+        entries = {target: [[text, client_id, timestamp] for text, (client_id, timestamp)
+                            in zip(texts, self._pending_metadata[target])]
+                   for target, texts in self._pending.items()}
+        self.outbox_persisted = self._outbox.save(entries)
 
     # ---- 生命周期 ----
     async def __aenter__(self):
@@ -358,6 +407,8 @@ class ILinkClient:
                                       headers=ilink_headers(self.token),
                                       timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
             text = await resp.text()
+        if resp.status >= 500 and path.endswith('/sendmessage'):
+            raise DeliveryUnconfirmed(f"iLink 发送返回 HTTP {resp.status}，投递结果未知")
         data = _as_json(text)
         ret = int(data.get("ret") or 0)
         errcode = int(data.get("errcode") or 0)
@@ -539,55 +590,132 @@ class ILinkClient:
         self._typing_tasks.add(task)
         task.add_done_callback(self._typing_tasks.discard)
 
-    def _hold_pending(self, user_id: str, text: str) -> None:
+    def _hold_pending(self, user_id: str, text: str, client_id=None, *, receipt=None) -> bool:
+        from .wechat_outbox import MAX_TARGETS, MAX_TEXT
         target = str(user_id)
+        if len(text) > MAX_TEXT or (target not in self._pending and len(self._pending) >= MAX_TARGETS):
+            print("[微信补发] 待发送内容或会话数超限，新消息未加入队列")
+            return False
         box = self._pending.setdefault(target, [])
+        if not box:
+            self._pending_metadata[target] = []
+        metadata = self._pending_metadata[target]
         box.append(str(text))
+        client_id = client_id or os.urandom(16).hex()
+        metadata.append((client_id, time.time()))
+        if receipt is not None:
+            self._pending_receipts[client_id] = receipt
         dropped = 0
         while len(box) > ILINK_PENDING_LIMIT:
             box.pop(0)
+            dropped_id, _ = metadata.pop(0)
+            self._finish_pending(dropped_id, "failed", reason="queue_overflow")
             dropped += 1
-        print(f"微信 ClawBot：{_preview(text)} 没投递到微信，先留着等对方下一条消息（刷新 context_token）后补发，待补发 {len(box)} 条"
+        self._save_outbox()
+        print(f"微信 ClawBot：回复进入补发队列，等待对方消息刷新 context_token，待补发 {len(box)} 条"
               + (f"（更早的 {dropped} 条已丢弃）" if dropped else ""))
+        return True
+
+    def _finish_pending(self, client_id, status, *, reason=None):
+        receipt = self._pending_receipts.pop(client_id, None)
+        if receipt is not None:
+            receipt(status, reason=reason)
+
+    def _target_send_lock(self, target):
+        lock = self._send_locks.get(target)
+        if lock is None:
+            lock = self._send_locks[target] = asyncio.Lock()
+        return lock
 
     async def _flush_pending(self, user_id: str) -> None:
         target = str(user_id)
+        async with self._target_send_lock(target):
+            await self._flush_pending_locked(target)
+
+    async def _flush_pending_locked(self, target: str) -> None:
+        from .wechat_outbox import MAX_AGE
         box = self._pending.get(target)
         context = self._contexts.get(target, "")
-        if not box or not context:
+        if not box:
             return
+        metadata = self._pending_metadata[target]
         while box:
-            try:
-                data = await self._send_text(target, box[0], context)
-            except ILinkStaleContext:
-                return              # token 还是不行：留着下回再试
-            except Exception as e:
-                print(f"微信 ClawBot：补发失败（{type(e).__name__}: {e}），留到下次再试。")
+            client_id, added = metadata[0]
+            expired = time.time() - added > MAX_AGE
+            if not expired and (not context or self._pending_rejected_context.get(target) == context):
                 return
-            if not _first(data, *ILINK_ACK_ID_KEYS):
-                return
-            box.pop(0)
-        self._pending.pop(target, None)
 
-    async def send_private_msg(self, user_id, message):
+            # Remove the durable entry before the request leaves this process.
+            # A crash during an in-flight request must not enqueue it on restart.
+            text = box.pop(0)
+            metadata.pop(0)
+            if not box:
+                self._pending.pop(target, None)
+                self._pending_metadata.pop(target, None)
+
+            def restore():
+                self._pending[target] = box
+                self._pending_metadata[target] = metadata
+                box.insert(0, text)
+                metadata.insert(0, (client_id, added))
+
+            self._save_outbox()
+            if self._outbox is not None and self._outbox.writable and not self.outbox_persisted:
+                restore()
+                return
+            if expired:
+                self._finish_pending(client_id, "failed", reason="queue_expired")
+                if not box:
+                    self._pending_rejected_context.pop(target, None)
+                continue
+            self._pending_rejected_context.pop(target, None)
+            receipt = self._pending_receipts.get(client_id)
+            if receipt:
+                receipt("retrying")
+            try:
+                data = await self._send_text(target, text, context, client_id)
+            except ILinkStaleContext:
+                restore()
+                self._pending_rejected_context[target] = context
+                self._save_outbox()
+                if receipt:
+                    receipt("waiting")
+                return
+            except asyncio.CancelledError:
+                self._finish_pending(client_id, "unconfirmed", reason="send_error")
+                raise
+            except Exception as error:
+                status = "unconfirmed" if delivery_unconfirmed(error) else "failed"
+                self._finish_pending(client_id, status, reason="send_error")
+            else:
+                self._finish_pending(client_id, "acknowledged" if _first(data, *ILINK_ACK_ID_KEYS)
+                                     else "unconfirmed")
+
+    async def send_private_msg(self, user_id, message, *, receipt=None):
         text = segments_to_text(message).strip()
         if not text:
             return
         target = str(user_id)
-        await self._flush_pending(target)
-        context = self._contexts.get(target, "")
-        try:
-            data = await self._send_text(target, text, context)
-        except ILinkStaleContext as e:
-            print(f"微信 ClawBot：{target} 的 context_token 已被拒绝，改用不带 token 的方式重试一次（{e}）")
-            data = await self._send_text(target, text, "")
-        if not _first(data, *ILINK_ACK_ID_KEYS):
-            self._hold_pending(target, text)
-        return data
+        async with self._target_send_lock(target):
+            client_id = os.urandom(16).hex()
+            await self._flush_pending_locked(target)
+            if self._pending.get(target):
+                return {"lovomo_queued": self._hold_pending(target, text, client_id, receipt=receipt)}
+            context = self._contexts.get(target, "")
+            if receipt is not None:
+                receipt("sending", attempt=1)
+            try:
+                data = await self._send_text(target, text, context, client_id)
+            except ILinkStaleContext:
+                if not self._hold_pending(target, text, client_id, receipt=receipt):
+                    raise
+                self._pending_rejected_context[target] = context
+                return {"lovomo_queued": True}
+            return data
 
-    async def _send_text(self, user_id, text: str, context: str):
+    async def _send_text(self, user_id, text: str, context: str, client_id=None):
         msg = {"from_user_id": "", "to_user_id": str(user_id),
-               "client_id": os.urandom(16).hex(),
+               "client_id": client_id or os.urandom(16).hex(),
                "message_type": 2, "message_state": 2,
                "item_list": [{"type": 1, "text_item": {"text": text}}]}
         if context:
@@ -599,7 +727,7 @@ class ILinkClient:
         if message_id:
             print(f"[微信 ClawBot] 已发送（message_id={message_id}）：{_preview(text)}")
         else:
-            print("微信 ClawBot：服务端收下了却没返回 message_id，这条多半没投递到微信；去接入方式里重新扫码登录（重建绑定）。")
+            print("微信 ClawBot：服务端未返回 message_id，投递结果未知。")
             print(f"微信 ClawBot：发送载荷字段：{_describe_fields(msg)}")
             print(f"微信 ClawBot：发送响应字段：{_describe_fields(data)}")
         return data
@@ -661,7 +789,7 @@ def _to_16k_mono_wav(path: str) -> str:
     if not ffmpeg:
         raise RuntimeError("找不到 ffmpeg，语音没法转成 silk")
     target = str(Path(path).with_name(f"qq_voice_{time.time_ns()}.wav"))
-    proc = subprocess.run(
+    proc = child_processes.run(
         [ffmpeg, "-y", "-loglevel", "error", "-i", str(path),
          "-ar", str(QQ_VOICE_SAMPLE_RATE), "-ac", "1", target],
         capture_output=True, text=True, timeout=120, **no_window_kwargs())
@@ -963,6 +1091,8 @@ class QQBotClient:
             status = resp.status
             text = await resp.text()
         data = _as_json(text)
+        if status >= 500 and method == 'POST' and path.endswith('/messages'):
+            raise DeliveryUnconfirmed(f"QQ 发送返回 HTTP {status}，投递结果未知")
         if status >= 400:
             raise RuntimeError(f"QQ 接口 {path} 失败 {status}: {text[:200]}")
         return data

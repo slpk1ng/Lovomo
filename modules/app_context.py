@@ -29,6 +29,7 @@ sticker_mgr = None
 tool_registry = None
 profile_mgr = None
 lexicon_mgr = None
+lexicon_managers = {}
 rag_mgr = None
 todo_mgr = None
 job_mgr = None

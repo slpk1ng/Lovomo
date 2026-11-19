@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import re
+import json
 import sys
 import threading
 from pathlib import Path
@@ -26,7 +27,7 @@ def update_dir() -> Path:
 
 
 def parse_installer_version(filename) -> str:
-    match = re.match(r"^Lovomo_Setup[_-]?v?(\d[\d.]*)$", Path(filename).stem, re.I)
+    match = re.match(r"^Lovomo_Setup[_-]?v?(\d+(?:\.\d+)*(?:[-+][A-Za-z0-9.-]+)?)$", Path(filename).stem, re.I)
     return match.group(1).rstrip(".") if match else ""
 
 
@@ -47,6 +48,8 @@ def find_ready_installer() -> dict:
             size = path.stat().st_size
         except OSError:
             size = 0
+        if not verified_installer(path, check_hash=False):
+            continue
         best = {"version": version, "path": str(path), "size": size}
     return best
 
@@ -103,7 +106,43 @@ def log_progress(text: str) -> None:
 
 
 def is_own_release_asset(url: str) -> bool:
-    head = str(url or "").lower()
-    return (head.startswith(f"https://github.com/{_APP_RELEASE_REPO.lower()}/releases/download/")
-            or head.startswith("https://objects.githubusercontent.com/")
-            or head.startswith("https://github-releases.githubusercontent.com/"))
+    from urllib.parse import urlsplit
+    parsed = urlsplit(str(url or ""))
+    return (parsed.scheme == "https" and parsed.netloc.lower() == "github.com"
+            and parsed.path.lower().startswith(f"/{_APP_RELEASE_REPO.lower()}/releases/download/")
+            and not parsed.query and not parsed.fragment)
+
+
+def record_verified_installer(path, version, source, digest):
+    from .jsonio import save_json
+    from .security import _encrypt_value
+    from .updater import sha256_file, trusted_digest
+    path = Path(path).resolve()
+    if path.parent != update_dir().resolve() or not is_own_release_asset(source):
+        raise ValueError("安装包路径或来源非法")
+    trusted_digest(digest)
+    record = {"path": path.name, "version": version, "source": source,
+              "source_digest": digest, "sha256": sha256_file(path),
+              "size": path.stat().st_size}
+    save_json(path.with_suffix(".verified.json"), {"record": _encrypt_value(json.dumps(record))})
+
+
+def verified_installer(path, *, check_hash=True):
+    from .jsonio import load_json_ex
+    from .security import _decrypt_value
+    from .updater import sha256_file, trusted_digest
+    path = Path(path).resolve()
+    if path.parent != update_dir().resolve() or path.suffix.lower() != ".exe":
+        return False
+    try:
+        raw, readable = load_json_ex(path.with_suffix(".verified.json"), {})
+        if not readable or not str(raw.get("record", "")).startswith("enc3:"):
+            return False
+        record = json.loads(_decrypt_value(raw["record"]))
+        trusted_digest(record["source_digest"])
+        return (record["path"] == path.name and record["size"] == path.stat().st_size
+                and record["version"] == parse_installer_version(path.name)
+                and is_own_release_asset(record["source"])
+                and (not check_hash or record["sha256"] == sha256_file(path)))
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return False

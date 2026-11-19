@@ -2,7 +2,34 @@ import json
 import re
 import time
 import uuid
+import hashlib
+import threading
+import copy
+import asyncio
+from functools import wraps
 from pathlib import Path
+
+def _locked(method):
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return call
+
+
+def _transaction(method):
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        with self._lock:
+            before = copy.deepcopy((self.terms, self.pending, self.learning_state,
+                                    self._revision, self._saved_content))
+            try:
+                return method(self, *args, **kwargs)
+            except BaseException:
+                (self.terms, self.pending, self.learning_state,
+                 self._revision, self._saved_content) = before
+                raise
+    return call
 
 from .llm_helpers import generate_json_reply, role_names, speaker_labeled_lines
 
@@ -18,7 +45,7 @@ _RULE_EXCLUDE_CHARACTER = (
     "（换个角色、换一群人就没有意义）。\n"
 )
 _RULE_GENERIC_MEANING = (
-    "8. 含义必须通用：这本词典是所有角色、所有会话共用的，"
+    "8. 含义必须通用：这本词典仅供当前角色使用，"
     "meaning 要写成脱离本次对话、换一个角色、换一群人也成立的说法。"
     "禁止出现角色名、昵称、外号，禁止出现「用户1」「角色1」这类编号；"
     "禁止出现「本次对话」「这次对话里」「被角色拒绝」这类只对某一次互动成立的说法；"
@@ -87,7 +114,7 @@ DEFAULT_INJECT_TEMPLATE = (
 )
 
 _LEGACY_GENERIC_MEANING = (
-    "8. 含义必须通用：这本词典是所有角色、所有会话共用的，"
+    "8. 含义必须通用：这本词典全角色共用，"
     "meaning 要写成脱离本次对话、换一个角色、换一群人也成立的说法。"
     "禁止出现角色名、昵称、外号，禁止出现「用户1」「角色1」这类编号；"
     "禁止出现「此处」「本次对话」「这次对话里」「被角色拒绝」这类只对某一次互动成立的说法；"
@@ -167,31 +194,76 @@ def _clean(value, limit: int) -> str:
 
 
 class LexiconManager:
-    def __init__(self, config, data_path: Path):
+    def __init__(self, config, data_path: Path, role_key: str = ""):
         self.config = config
         self.data_path = Path(data_path)
         self.data_path.mkdir(parents=True, exist_ok=True)
-        self.file = self.data_path / "learned_terms.json"
+        self.role_key = str(role_key or config.get("active_character", "")
+                            or config.get("character_key", "") or "default").strip()
+        self._lock = threading.RLock()
+        self.file = self.data_path / "learned_terms" / f"{hashlib.sha256(self.role_key.encode()).hexdigest()}.json"
+        self.legacy_file = self.data_path / "learned_terms.json"
         self.terms = {}
         self.pending = []
+        self.learning_state = {}
+        self._learning_lock = asyncio.Lock()
+        self._revision = 0
+        self._saved_content = ({}, [])
         self._load_failed = False
+        self._migrate_legacy_once()
         self.load()
 
+    def _migrate_legacy_once(self):
+        from .jsonio import file_lock, load_json_ex, save_json
+        active = str(self.config.get("active_character", "")
+                     or self.config.get("character_key", "") or "default").strip()
+        if self.role_key != active:
+            return
+        with file_lock(self.legacy_file):
+            if self.file.exists() or not self.legacy_file.is_file():
+                return
+            marker = self.file.parent / "legacy_owner.json"
+            owner, readable = load_json_ex(marker, {})
+            if not readable or (owner and owner.get("role_key") != self.role_key):
+                return
+            data, readable = load_json_ex(self.legacy_file, {})
+            if not readable or not isinstance(data, dict):
+                raise OSError("旧词典暂时不可读，已停止迁移")
+            save_json(marker, {"role_key": self.role_key})
+            save_json(self.file, {**data, "role_key": self.role_key})
+            self.legacy_file.replace(self.legacy_file.with_name(
+                f"learned_terms.legacy.{uuid.uuid4().hex}.json"))
+            print(f"黑话词典：旧的全局词典已一次性归档到角色 {self.role_key}，其他角色不会继承。")
+
     # ---------------- 存取 ----------------
+    @_locked
     def load(self):
         from .jsonio import load_json_ex
         data, readable = load_json_ex(self.file, {})
         self._load_failed = not readable
-        if not isinstance(data, dict):
-            data = {}
+        if not isinstance(data, dict) or (data.get("role_key") and data["role_key"] != self.role_key):
+            self._load_failed = True
+            raise ValueError("角色词典格式或归属不匹配，保留原文件")
+        if (not readable or not isinstance(data.get("terms", {}), dict)
+                or not isinstance(data.get("pending", []), list)
+                or not isinstance(data.get("learning_state", {}), dict)
+                or any(not isinstance(item, dict) for item in data.get("terms", {}).values())
+                or any(not isinstance(item, dict) for item in data.get("pending", []))
+                or any(not isinstance(item, dict) for item in data.get("learning_state", {}).values())):
+            self._load_failed = True
+            raise ValueError("角色词典不可读或内容格式错误，保留原文件")
         terms = data.get("terms")
         self.terms = terms if isinstance(terms, dict) else {}
         pending = data.get("pending")
         self.pending = pending if isinstance(pending, list) else []
+        self.learning_state = data.get("learning_state", {})
+        if not isinstance(self.learning_state, dict):
+            self.learning_state = {}
         changed = self._restore_no_longer_bound()
         changed = self._quarantine_character_bound() or changed
         if changed:
             self.save()
+        self._saved_content = copy.deepcopy((self.terms, self.pending))
 
     def _restore_no_longer_bound(self) -> bool:
         names = role_names(self.config)
@@ -241,15 +313,20 @@ class LexiconManager:
               "（这类含义换个角色不适用，可改成通用含义后采纳）")
         return True
 
+    @_locked
     def save(self):
         if self._load_failed:
-            print("黑话词典本次未能读取，已跳过保存以免覆盖磁盘上的原有内容。")
-            return
+            raise OSError("黑话词典本次未能读取，已停止保存以免覆盖原有内容")
         try:
             from .jsonio import save_json
-            save_json(self.file, {"terms": self.terms, "pending": self.pending})
+            save_json(self.file, {"role_key": self.role_key, "terms": self.terms, "pending": self.pending,
+                                  "learning_state": self.learning_state})
+            content = (self.terms, self.pending)
+            if content != self._saved_content:
+                self._revision += 1
+                self._saved_content = copy.deepcopy(content)
         except Exception as e:
-            print(f"保存黑话词典失败: {e}")
+            raise OSError(f"保存黑话词典失败: {e}") from e
 
     @property
     def enabled(self) -> bool:
@@ -267,7 +344,39 @@ class LexiconManager:
         return count > 0 and count % every == 0
 
     # ---------------- 学习 ----------------
+    async def observe_and_learn(self, ctx, history, session_id):
+        """Count only this role's observed user messages; persist deduplication across restarts."""
+        async with self._learning_lock:
+            filtered = history_for_role(ctx, history)
+            fingerprints = [hashlib.sha256(json.dumps(
+                {key: msg.get(key) for key in ("timestamp", "message_id", "sender_id", "content")},
+                sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+                for msg in filtered if msg.get("role") == "user"]
+            due = self._observe(fingerprints, session_id)
+            return await self.learn_from_history(ctx, filtered, session_id) if due else {}
+
+    @_transaction
+    def _observe(self, fingerprints, session_id):
+        if not self.enabled:
+            return False
+        state = self.learning_state.setdefault(str(session_id), {"count": 0, "seen": []})
+        seen = set(state.get("seen", []))
+        new = list(dict.fromkeys(value for value in fingerprints if value not in seen))
+        if not new:
+            return False
+        state["count"] = int(state.get("count", 0)) + len(new)
+        state["seen"] = list(dict.fromkeys([*state.get("seen", []), *new]))[-512:]
+        every = _as_int(self.config.get("learning_trigger_messages"), 20)
+        due = state["count"] - int(state.get("last_learn_count", 0)) >= every
+        if due:
+            state["last_learn_count"] = state["count"]
+        self.save()
+        return due
+
     async def learn_from_history(self, ctx, history: list, session_id: str = "") -> dict:
+        if str(getattr(ctx, "character_key", "")) != self.role_key:
+            raise ValueError("学习上下文与词典角色不一致")
+        history = history_for_role(ctx, history)
         if not self.enabled or not history:
             return {}
         limit = _as_int(self.config.get("learning_history_lines"), 30, minimum=4)
@@ -275,8 +384,13 @@ class LexiconManager:
         if len(lines) < 2:
             return {}
         prompt = str(self.config.get("learning_prompt", "") or DEFAULT_LEARN_PROMPT)
-        system = (f"{prompt}\n已有词典（判断 action 用）："
-                  f"{json.dumps(self._prompt_terms(), ensure_ascii=False)}")
+        with self._lock:
+            revision = self._revision
+            brief = self._prompt_terms()
+        system = (f"{prompt}\n【学习范围】本词典仅属于当前角色 {self.role_key}，"
+                  "仅根据输入的该角色对话学习，不得假定其他角色拥有相同记忆或含义。"
+                  "下文已有词典也仅来自此角色。\n已有词典（判断 action 用）："
+                  f"{json.dumps(brief, ensure_ascii=False)}")
         user_prompt = "对话：\n" + "\n".join(lines)
         try:
             data = await generate_json_reply(ctx, system, user_prompt, max_tokens=512,
@@ -286,13 +400,17 @@ class LexiconManager:
             return {}
         if not isinstance(data, dict) or not isinstance(data.get("learned"), list):
             return {}
-        result = self.apply_items(data["learned"])
+        with self._lock:
+            if revision != self._revision:
+                return {}  # 管理页或另一次学习已修改词典，旧结果不覆盖新决定。
+            result = self.apply_items(data["learned"])
         if any(result.values()):
             print(f"黑话学习：新增 {result['added']}、更新 {result['updated']}、"
                   f"删除 {result['removed']}、待确认 {result['held']}、"
                   f"跳过（含义绑定具体角色）{result['skipped']}")
         return result
 
+    @_transaction
     def apply_items(self, items: list) -> dict:
         threshold = _as_float(self.config.get("learning_min_confidence"), 0.6)
         names = role_names(self.config)
@@ -346,9 +464,11 @@ class LexiconManager:
         return result
 
     # ---------------- 待确认 ----------------
+    @_locked
     def list_pending(self) -> list:
-        return sorted(self.pending, key=lambda p: p.get("created_at", 0), reverse=True)
+        return sorted(copy.deepcopy(self.pending), key=lambda p: p.get("created_at", 0), reverse=True)
 
+    @_transaction
     def confirm(self, pending_id: str, term=None, meaning=None, category=None) -> bool:
         item = next((p for p in self.pending if p.get("id") == pending_id), None)
         if item is None:
@@ -373,6 +493,7 @@ class LexiconManager:
         self.save()
         return True
 
+    @_transaction
     def reject(self, pending_id: str) -> bool:
         before = len(self.pending)
         self.pending = [p for p in self.pending if p.get("id") != pending_id]
@@ -409,9 +530,11 @@ class LexiconManager:
         return len(self.pending) != before
 
     # ---------------- 词条维护 ----------------
+    @_locked
     def list_terms(self) -> list:
-        return sorted(self.terms.values(), key=lambda t: t.get("updated_at", 0), reverse=True)
+        return sorted(copy.deepcopy(list(self.terms.values())), key=lambda t: t.get("updated_at", 0), reverse=True)
 
+    @_transaction
     def upsert_term(self, term, meaning, category="") -> bool:
         final_term = _clean(term, MAX_TERM_CHARS)
         final_meaning = _clean(meaning, MAX_MEANING_CHARS)
@@ -434,6 +557,7 @@ class LexiconManager:
         self.save()
         return True
 
+    @_transaction
     def delete_term(self, term) -> bool:
         key = _clean(term, MAX_TERM_CHARS)
         if self.terms.pop(key, None) is None:
@@ -452,6 +576,7 @@ class LexiconManager:
             self.terms.pop(item.get("term"), None)
 
     # ---------------- 注入 ----------------
+    @_locked
     def build_injection(self) -> str:
         if not self.enabled or not self.terms:
             return ""
@@ -483,3 +608,54 @@ class LexiconManager:
     def _category(value) -> str:
         text = str(value or "").strip()
         return text if text in CATEGORIES else CATEGORIES[0]
+
+
+_REGISTRY_LOCK = threading.RLock()
+
+
+def history_for_role(ctx, history):
+    """Copy the user's messages and assistant messages with unambiguous role ownership."""
+    key = str(ctx.character_key)
+    name = str(ctx.character_name or "")
+    config = getattr(ctx, "config", None)
+    roles = getattr(config, "roles", None)
+    if roles is None:
+        roles = config.get("roles", {}) if config is not None else {}
+    roles = roles or {}
+    values = roles.values() if isinstance(roles, dict) else roles
+    unique_name = bool(name) and sum(1 for role in values
+        if isinstance(role, dict) and role.get("character_name") == name) == 1
+    return copy.deepcopy([msg for msg in history or [] if isinstance(msg, dict) and (
+        msg.get("role") == "user" or (msg.get("role") == "assistant" and (
+            msg.get("character_key") == key or (not msg.get("character_key") and unique_name
+            and msg.get("speaker") == name))))])
+
+
+def manager_for_role(role_key: str, config=None, data_path=None):
+    """Return one persistent learner per data directory and stable character key."""
+    from modules import app_context
+    key = str(role_key or "").strip()
+    if not key:
+        raise ValueError("学习操作必须指定角色")
+    config = config if config is not None else app_context.global_config
+    if config is None:
+        return None
+    root = data_path or getattr(app_context.memory_manager, "data_path", None)
+    if root is None:
+        return None
+    identity = (str(Path(root).resolve()), key)
+    with _REGISTRY_LOCK:
+        registry = app_context.lexicon_managers
+        manager = registry.get(identity)
+        if manager is None:
+            manager = LexiconManager(config, root, role_key=key)
+            registry[identity] = manager
+        manager.config = config
+        return manager
+
+
+def manager_for_context(ctx):
+    key = str(getattr(ctx, "character_key", "") or "").strip()
+    if not key:
+        raise ValueError("当前学习上下文缺少角色标识")
+    return manager_for_role(key, config=ctx)

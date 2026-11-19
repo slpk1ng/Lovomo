@@ -3,9 +3,10 @@
 import asyncio
 import time
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 
 from modules import app_context
+from modules.delivery_state import active_trace, record_stage
 from modules.adapters import make_event, client_supports
 from modules.affection import SCORE_MAX, commitment_warning, looks_like_acceptance
 from modules.companion_tasks import (background_ready, mood_diary_note,
@@ -178,6 +179,7 @@ def _merge_event_info(pending: dict, info: dict) -> dict:
         if fid not in forward_ids:
             forward_ids.append(fid)
     return {"session_id": info["session_id"], "event": info["event"], "client": info["client"],
+            "trace": pending.get("trace") or info.get("trace"),
             "text": "\n".join(texts),
             "has_image": bool(pending.get("has_image") or info.get("has_image") or urls),
             "image_urls": urls, "image_file_ids": fids,
@@ -191,6 +193,7 @@ def _merge_event_info(pending: dict, info: dict) -> dict:
 
 def _merged_payload(pending: dict) -> dict:
     return {"text": pending["text"], "has_image": pending["has_image"],
+            "trace": pending.get("trace"),
             "image_urls": pending["image_urls"], "image_file_ids": pending["image_file_ids"],
             "has_voice": pending.get("has_voice", False),
             "voice_sources": pending.get("voice_sources", []),
@@ -394,12 +397,17 @@ async def _dispatch_message_event(event, client):
     info = _extract_event_info(event, client)
     if info is None:
         return
+    delivery = getattr(app_context.sender, "delivery", None)
+    if delivery is not None:
+        info["trace"] = (delivery, delivery.receive(getattr(client, "platform", "napcat")))
     incoming_mid = str(getattr(event, "message_id", "") or "")
     if incoming_mid:
         _SESSION_LAST_INCOMING[info["session_id"]] = incoming_mid
     if app_context.sender is not None:
         app_context.sender.remember_session(info.get("session_id"), client)
     if info.get("silent"):
+        if info.get("trace"):
+            delivery.record(info["trace"][1], "message", "not_addressed")
         silent_session = info["session_id"]
         silent_sender = getattr(event.sender, "user_id", None) or "0"
         silent_name = getattr(event.sender, "nickname", None) or ""
@@ -420,12 +428,16 @@ async def _dispatch_message_event(event, client):
     session_id = info["session_id"]
     lock = app_context._SESSION_LOCKS.setdefault(session_id, asyncio.Lock())
     if lock.locked():
+        if info.get("trace"):
+            delivery.record(info["trace"][1], "message", "queued")
         pending = _SESSION_PENDING.get(session_id)
         if pending is None:
             _SESSION_PENDING[session_id] = info
             _touch_pending(session_id)
             print(f"会话 {session_id} 正在处理上一条消息，本条已排队，处理完后立即跟进。")
         elif pending.get("sender_id") == info.get("sender_id"):
+            if info.get("trace") and pending.get("trace"):
+                delivery.record(info["trace"][1], "message", "merged")
             _SESSION_PENDING[session_id] = _merge_event_info(pending, info)
             _touch_pending(session_id)
             print(f"会话 {session_id} 连发消息，已合并待处理内容。")
@@ -533,8 +545,8 @@ async def _send_sulk_sticker_later(role: dict, ctx, session_type: str, target_id
     if app_context.sticker_mgr is None or not config.get("stickers_enabled", False) \
             or not config.get("sulk_sticker_enabled", True):
         return
-    client = app_context.sender.session_client(session_id) or app_context.sender._active_client()
-    if client is not None and not client_supports(client, "sticker"):
+    client = app_context.sender.active_session_client(session_id)
+    if client is None or not client_supports(client, "sticker"):
         return
     emotions = get_role_emotions(role)
     want = str(config.get("sulk_sticker_emotion", "生气") or "生气")
@@ -548,7 +560,7 @@ async def _send_sulk_sticker_later(role: dict, ctx, session_type: str, target_id
     with app_context.sender.for_session(session_id):
         if not await app_context.sender.send_text(session_type, target_id, "", sticker=sticker):
             print("冷处理：收尾表情发送失败。")
-        return
+            return
     try:
         spath = Path(str(sticker))
         if spath.is_file():
@@ -633,7 +645,7 @@ async def _speak_first_after_silence(role: dict, session_type: str, target_id: s
         return
     if app_context.last_user_activity.get(session_id, 0) >= sent_at:
         return  # 等待期内对方回过话（正常应已取消，这里兜底）
-    client = app_context.sender.session_client(session_id) or app_context.sender._active_client()
+    client = app_context.sender.active_session_client(session_id)
     if client is None:
         print(f"先开口：[{target_id}] 当前没有可用接入方式，本轮放弃。")
         return
@@ -700,7 +712,7 @@ async def _speak_first_after_silence(role: dict, session_type: str, target_id: s
         parts = [zh_text]
     for index, part in enumerate(parts):
         entry = {"role": "assistant", "content": part, "timestamp": time.time(),
-                 "speaker": speaker,
+                 "speaker": speaker, "character_key": character_key,
                  "emotion": reply["sentences"][0].get("emotion", "")}
         if index == len(parts) - 1:
             entry["action_notes"] = "先开口打破沉默"
@@ -712,6 +724,25 @@ async def _speak_first_after_silence(role: dict, session_type: str, target_id: s
 
 
 async def _process_message_event(event, client, merged: Optional[dict] = None):
+    trace = (merged or {}).get("trace")
+    token = active_trace.set(trace)
+    try:
+        record_stage("message", "processing")
+        await _process_message(event, client, merged)
+    except asyncio.CancelledError:
+        record_stage("message", "interrupted")
+        raise
+    except Exception:
+        record_stage("message", "failed")
+        raise
+    else:
+        if trace:
+            trace[0].finish(trace[1])
+    finally:
+        active_trace.reset(token)
+
+
+async def _process_message(event, client, merged: Optional[dict] = None):
     app_context.napcat_client = client
 
     is_private = isinstance(event, PrivateMessageEvent)
@@ -880,7 +911,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
     history = data.get("history", [])
     meta = data.get("meta", {})
 
-    handled, plugin_reply = _dispatch_plugin_command(user_text, session_type, target_id,
+    handled, plugin_reply = await asyncio.to_thread(_dispatch_plugin_command, user_text, session_type, target_id,
                                                      session_id, sender_id,
                                                      sender_name, event)
     if handled:
@@ -949,6 +980,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
     total_replies = 0
     first_reply_done = False
     replied: Dict = {}
+    learning_contexts: Dict = {}
     mute_state: Dict = {"done_ids": []}
 
     def _dispatch_reply_done(info: dict) -> None:
@@ -1167,7 +1199,8 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                 if p:
                     extra_parts.append(p)
             if app_context.lexicon_mgr is not None:
-                lex = app_context.lexicon_mgr.build_injection()
+                from .lexicon import manager_for_context
+                lex = manager_for_context(ctx).build_injection()
                 if lex:
                     extra_parts.append(lex)
             if app_context.rag_mgr and app_context.active_config().get("rag_enabled", False):
@@ -1264,11 +1297,15 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
             if diary_note:
                 extra_parts.append(diary_note)
 
-            if app_context.recall_mgr is not None and app_context.recall_mgr.enabled():
-                topics_block = app_context.recall_mgr.open_topics_block(session_id)
+            from .recall import recall_for_context
+            recall = recall_for_context(ctx)
+            if recall is not None and recall.enabled():
+                topics_block = recall.open_topics_block(session_id)
                 if topics_block:
                     extra_parts.append(topics_block)
-                recall_block = await _take_recall_block(recall_task)
+                own_task = asyncio.create_task(recall.recall_context(
+                    session_id, user_text, exclude_after_ts=recall_exclude_ts))
+                recall_block = await _take_recall_block(own_task)
                 if recall_block:
                     extra_parts.append(recall_block)
 
@@ -1314,13 +1351,16 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
 
             reply_started = time.time()
             timed_out = False
+            record_stage("model", "started")
             try:
                 reply = await _generate(ctx, use_history, extra_parts,
                                         sink.on_sentence if sink else None)
             except asyncio.TimeoutError:
+                record_stage("model", "timeout")
                 timed_out = True
                 print(f"回复生成超出预算（{gen_budget:.0f}s），本轮放弃以释放会话锁。")
             except BaseException as e:
+                record_stage("model", "interrupted" if isinstance(e, asyncio.CancelledError) else "failed")
                 if sink is not None:
                     await sink.abort()
                 if isinstance(e, Exception) and total_replies <= 0:
@@ -1332,6 +1372,9 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                     except Exception as send_error:
                         print(f"报错内容发送失败: {type(send_error).__name__}: {send_error}")
                 raise
+            else:
+                if reply and reply.get("sentences"):
+                    record_stage("model", "ready")
             _log_mood_commit(commit_mood(ctx, app_context.mood_mgr, session_id, verdict, mood_user), verdict)
             if timed_out:
                 if sink is not None:
@@ -1352,6 +1395,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                     reply = {"sentences": sink.sent_sentences, "llm_ms": 0, "tool_trace": []}
                 tts_ms = sink.tts_ms
             if not reply or not reply.get("sentences"):
+                record_stage("model", "no_reply")
                 return False
 
             zh_now = "".join(s.get("zh", "") for s in reply["sentences"]).strip()
@@ -1570,7 +1614,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
             if sent_now:
                 record_sent_links(session_id, sent_now)
 
-            for extra in _dispatch_plugin_message({
+            for extra in await asyncio.to_thread(_dispatch_plugin_message, {
                     "session_type": session_type, "target_id": target_id,
                     "session_id": session_id, "sender_id": sender_id,
                     "sender_name": sender_name, "text": user_text,
@@ -1580,7 +1624,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                 except Exception as e:
                     print(f"[插件] 追加回复发送失败: {type(e).__name__}: {e}")
 
-            _dispatch_reply_done({
+            await asyncio.to_thread(_dispatch_reply_done, {
                 "session_type": session_type, "target_id": target_id,
                 "session_id": session_id, "sentences": reply["sentences"],
                 "emotions": emotions, "role": role, "reply": reply,
@@ -1603,6 +1647,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
             for index, part in enumerate(parts):
                 entry = {"role": "assistant", "content": part, "timestamp": time.time(),
                          "speaker": speaker,
+                         "character_key": ctx.character_key,
                          "emotion": reply["sentences"][0].get("emotion", "")}
                 if tool_notes and index == len(parts) - 1:
                     entry["tool_notes"] = tool_notes
@@ -1621,7 +1666,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                             stem = spath.stem[:40]
                             history.append({"role": "assistant", "content": f"[表情包: {stem}]",
                                             "image": sname, "timestamp": time.time(),
-                                            "speaker": speaker, "emotion": ""})
+                                            "speaker": speaker, "character_key": ctx.character_key, "emotion": ""})
             except Exception as e:
                 print(f"表情包缓存失败: {type(e).__name__}: {e}")
             if sulk_hit is not None:
@@ -1678,6 +1723,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
             })
             first_reply_done = True
             total_replies += 1
+            learning_contexts[ctx.character_key] = ctx.snapshot()
             return True
 
     async def _continue_unfinished_action():
@@ -1726,7 +1772,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
                     "mute_done_ids": list(mute_state["done_ids"])}):
                 return
 
-    recall_task = None
+    recall_exclude_ts = 0.0
     if app_context.recall_mgr is not None and app_context.recall_mgr.enabled():
         try:
             win = max(0, int(app_context.active_config().get("history_length", 8) or 0))
@@ -1734,8 +1780,7 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
             win = 8
         recent = [m for m in (history[-win:] if win else []) if isinstance(m, dict)]
         exclude_ts = float(recent[0].get("timestamp") or 0) if recent else 0.0
-        recall_task = asyncio.create_task(
-            app_context.recall_mgr.recall_context(session_id, user_text, exclude_after_ts=exclude_ts))
+        recall_exclude_ts = exclude_ts
 
     typing = typing_client(client)
     if typing is not None:
@@ -1776,7 +1821,10 @@ async def _process_message_event(event, client, merged: Optional[dict] = None):
     await asyncio.to_thread(app_context.memory_manager.cleanup_voice_cache,
                             app_context.active_config().get("max_voice_cache", 20))
     if total_replies > 0:
-        _spawn(post_reply_context_tasks(session_id, get_active_ctx()))
+        import copy
+        snapshot = copy.deepcopy(history)
+        for index, ctx in enumerate(learning_contexts.values()):
+            _spawn(post_reply_context_tasks(session_id, ctx, snapshot, maintain_shared=index == 0))
     else:
         data["history"] = history
         data["meta"] = meta

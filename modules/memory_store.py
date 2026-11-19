@@ -3,6 +3,9 @@ import json
 import os
 import re
 from pathlib import Path
+from urllib.parse import quote, unquote
+
+from .jsonio import file_lock, load_json_ex, save_json
 
 from .adapters import friendly_user_label
 from .app_paths import _resolve_data_dir
@@ -19,59 +22,87 @@ class MemoryManager:
                      or config.get("active_character", "") or "")
         role = roles.get(active) or (next(iter(roles.values())) if roles else {}) or {}
         key = str(role.get("character_key") or config.get("character_key", "") or "").strip()
-        self.character_key = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", key) or "default"
+        self.character_key = key or "default"
         self.character_name = str(role.get("character_name")
                                   or config.get("character_name", "")
                                   or self.character_key)
         self.isolated_session = config.get("isolated_session", False)
 
     def get_memory_file(self, session_id: str) -> Path:
-        safe_session = re.sub(r'[^A-Za-z0-9_\-]', '_', session_id)
-        return self.data_path / f"{self.character_key}_{safe_session}.json"
+        # Percent encoding is reversible; punctuation and Unicode no longer collide.
+        safe_session = quote(str(session_id), safe="")
+        return self.data_path / f"{_encode_role_key(self.character_key)}_{safe_session}.json"
+
+    def _migrate_session_file(self, session_id: str, target: Path):
+        if target.exists():
+            return
+        legacy_id = re.sub(r'[^A-Za-z0-9_\-]', '_', session_id)
+        legacy_key = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", self.character_key)
+        legacy = self.data_path / f"{legacy_key}_{legacy_id}.json"
+        if legacy == target or not legacy.is_file():
+            return
+        with file_lock(legacy):
+            raw, readable = load_json_ex(legacy, {})
+            if not readable:
+                raise OSError(f"旧会话文件不可读，已停止写入：{legacy.name}")
+            recorded_id = raw.get("session_id") if isinstance(raw, dict) else None
+            if legacy_key != _encode_role_key(self.character_key) and raw.get("character_key") != self.character_key:
+                raise ValueError(f"旧会话角色名存在歧义，已保留原文件：{legacy.name}")
+            known_id = restore_session_id(legacy_id)
+            if recorded_id != session_id and not (known_id != legacy_id and known_id == session_id):
+                # Unknown lossy filenames cannot safely be assigned to a conversation.
+                raise ValueError(f"旧会话文件名存在歧义，需确认归属后迁移：{legacy.name}")
+            save_json(target, raw)
+            legacy.unlink()
 
     def load_session_data(self, session_id: str) -> dict:
         file_path = self.get_memory_file(session_id)
-        if file_path.exists():
-            try:
-                data = json.loads(file_path.read_text(encoding='utf-8'))
-                if isinstance(data, dict):
-                    if not isinstance(data.get("history"), list):
-                        data["history"] = []
-                    else:
-                        data["history"] = [m for m in data["history"] if isinstance(m, dict)]
-                    if not isinstance(data.get("meta"), dict):
-                        data["meta"] = {}
-                    return data
-            except Exception as e:
-                try:
-                    os.replace(str(file_path), str(file_path) + ".corrupt")
-                    print(f"会话文件损坏已备份为 {file_path.name}.corrupt：{e}")
-                except Exception:
-                    pass
-        return {"character_name": self.character_name, "history": [], "meta": {}}
+        with file_lock(file_path):
+            self._migrate_session_file(session_id, file_path)
+            data, readable = load_json_ex(file_path, {})
+            if not readable:
+                raise OSError(f"会话文件暂时不可读，已停止本次读写：{file_path.name}")
+            if not isinstance(data, dict):
+                raise ValueError(f"会话文件格式错误，已保留原文件：{file_path.name}")
+            if "history" in data and not isinstance(data["history"], list):
+                raise ValueError(f"会话历史格式错误：{file_path.name}")
+            if "meta" in data and not isinstance(data["meta"], dict):
+                raise ValueError(f"会话元数据格式错误：{file_path.name}")
+            data.setdefault("character_name", self.character_name)
+            data.setdefault("history", [])
+            data.setdefault("meta", {})
+            data["history"] = [m for m in data["history"] if isinstance(m, dict)]
+            return data
 
     def save_session_data(self, session_id: str, data: dict):
         file_path = self.get_memory_file(session_id)
-        data["character_name"] = data.get("character_name", self.character_name)
-        data.setdefault("meta", {})
-        from modules.jsonio import save_json
-        save_json(file_path, data)
+        with file_lock(file_path):
+            # Refuse to replace a file that cannot currently be read.
+            self.load_session_data(session_id)
+            payload = dict(data)
+            payload.setdefault("character_name", self.character_name)
+            payload.setdefault("meta", {})
+            payload["session_id"] = session_id
+            payload["character_key"] = self.character_key
+            save_json(file_path, payload)
 
     def load_history(self, session_id: str) -> list:
         return self.load_session_data(session_id).get("history", [])
 
     def save_history(self, session_id: str, history: list):
-        data = self.load_session_data(session_id)
-        data["history"] = history
-        self.save_session_data(session_id, data)
+        with file_lock(self.get_memory_file(session_id)):
+            data = self.load_session_data(session_id)
+            data["history"] = history
+            self.save_session_data(session_id, data)
 
     def get_meta(self, session_id: str) -> dict:
         return self.load_session_data(session_id).get("meta", {})
 
     def update_meta(self, session_id: str, **kwargs):
-        data = self.load_session_data(session_id)
-        data.setdefault("meta", {}).update(kwargs)
-        self.save_session_data(session_id, data)
+        with file_lock(self.get_memory_file(session_id)):
+            data = self.load_session_data(session_id)
+            data.setdefault("meta", {}).update(kwargs)
+            self.save_session_data(session_id, data)
 
     def cleanup_voice_cache(self, max_cache: int = 20):
         try:
@@ -95,20 +126,26 @@ class MemoryManager:
             print(f"清理语音缓存失败: {e}")
 
     def migrate_legacy_memory(self, session_id: str):
-        legacy_file = self.data_path / f"{self.character_key}DATA.json"
+        legacy_file = self.data_path / f"{_encode_role_key(self.character_key)}DATA.json"
         if not legacy_file.exists():
             return
         current_file = self.get_memory_file(session_id)
         if current_file.exists():
             return
         try:
-            with open(legacy_file, 'r', encoding='utf-8') as f:
-                legacy_data = json.load(f)
-            history = legacy_data.get("history", [])
-            character_name = legacy_data.get("character_name", self.character_name)
-            with open(current_file, 'w', encoding='utf-8') as f:
-                json.dump({"character_name": character_name, "history": history}, f, ensure_ascii=False, indent=2)
-            legacy_file.unlink()
+            with file_lock(current_file), file_lock(legacy_file):
+                if current_file.exists():
+                    return
+                legacy_data, readable = load_json_ex(legacy_file, {})
+                if not readable or not isinstance(legacy_data, dict):
+                    raise ValueError("旧记忆不可读或格式错误")
+                history = legacy_data.get("history", [])
+                if not isinstance(history, list):
+                    raise ValueError("旧记忆 history 格式错误")
+                self.save_session_data(session_id, {
+                    "character_name": legacy_data.get("character_name", self.character_name),
+                    "history": history, "meta": legacy_data.get("meta", {})})
+                legacy_file.unlink()
             print(f"已迁移旧记忆文件到 {current_file.name}，并删除旧文件。")
         except Exception as e:
             print(f"迁移旧记忆文件失败: {e}")
@@ -154,9 +191,10 @@ class MemoryManager:
                 if not _is_memory_filename(f.name):
                     continue
                 try:
-                    role_name = f.name.split("_")[0] if "_" in f.name else "未知"
                     with open(f, 'r', encoding='utf-8') as fh:
                         data = json.load(fh)
+                    role_name = str(data.get("character_key") or _memory_role_key(f.name))
+                    session_id = str(data.get("session_id") or _memory_session_id(f.name))
                     character_name = self._display_name_of(
                         role_name, data.get("character_name"), role_display)
                     history = data.get("history", [])
@@ -165,8 +203,8 @@ class MemoryManager:
                         if msg.get("role") == "assistant":
                             last_sentence = str(msg.get("content", ""))[:50]
                             break
-                    if "private_" in f.name:
-                        sender_id = f.name.split("private_")[-1].replace(".json", "")
+                    if session_id.startswith("private_"):
+                        sender_id = session_id[len("private_"):]
                         sender_name = None
                         for msg in reversed(history):
                             if msg.get("role") == "user" and msg.get("sender_name"):
@@ -177,7 +215,7 @@ class MemoryManager:
                         display_name = (f"{character_name}和"
                                         f"{friendly_user_label('', str(sender_name))}的聊天")
                     else:
-                        group_id = f.name.split("group_")[-1].replace(".json", "")
+                        group_id = session_id[len("group_"):]
                         group_name = f"群聊{group_id}"
                         display_name = f"{character_name}在{group_name}的聊天"
                     memories.append({
@@ -204,7 +242,7 @@ class MemoryManager:
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            role_key = filename.split("_")[0] if "_" in filename else ""
+            role_key = _memory_role_key(filename)
             character_name = self._display_name_of(
                 role_key, data.get("character_name"), self._role_display_names()) or "未知"
             return {"success": True, "character_name": character_name, "history": data.get("history", [])}
@@ -234,24 +272,24 @@ class MemoryManager:
         if not file_path.exists():
             return {"success": False, "error": "文件不存在"}
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            history = data.get("history", [])
-            valid_indices = sorted(set(indices), reverse=True)
-            deleted_count = 0
-            for idx in valid_indices:
-                if 0 <= idx < len(history):
-                    history.pop(idx)
-                    deleted_count += 1
-            data["history"] = history
-            from modules.jsonio import save_json
-            save_json(file_path, data)
-            return {"success": True, "deleted_count": deleted_count}
+            with file_lock(file_path):
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                history = data.get("history", [])
+                valid_indices = sorted(set(indices), reverse=True)
+                deleted_count = 0
+                for idx in valid_indices:
+                    if 0 <= idx < len(history):
+                        history.pop(idx)
+                        deleted_count += 1
+                data["history"] = history
+                save_json(file_path, data)
+                return {"success": True, "deleted_count": deleted_count}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
 
-_MEMORY_FILE_RE = re.compile(r'^[^\\/:*?"<>|]+?_(private|group)_[A-Za-z0-9_\-]+\.json$')
+_MEMORY_FILE_RE = re.compile(r'^[^\\/:*?"<>|]+?_(private|group)_[A-Za-z0-9_%~.\-]+\.json$')
 
 
 def _is_memory_filename(name) -> bool:
@@ -265,6 +303,8 @@ _SANITIZED_ID_SUFFIXES = (("_im_wechat", "@im.wechat"),
 
 def restore_session_id(session_id: str) -> str:
     text = str(session_id or "")
+    if "%" in text:
+        return unquote(text)
     for safe, real in _SANITIZED_ID_SUFFIXES:
         if text.endswith(safe):
             return text[: -len(safe)] + real
@@ -285,11 +325,25 @@ def merge_restored_keys(raw, combine=max):
     return out
 
 
+def _memory_role_key(filename: str) -> str:
+    match = re.match(r"^(.+?)_((?:private|group)_.+)\.json$", str(filename or ""))
+    key = match.group(1) if match else ""
+    if key.startswith("~r~"):
+        try:
+            return bytes.fromhex(key[3:]).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            pass
+    return key
+
+
+def _encode_role_key(key):
+    key = str(key or "default")
+    if (re.search(r'[\\/:*?"<>|\r\n\t]', key) or "_private_" in key
+            or "_group_" in key or key.startswith("~r~")):
+        return "~r~" + key.encode("utf-8").hex()
+    return key
+
+
 def _memory_session_id(filename: str) -> str:
-    """murasame_private_10001.json → private_10001"""
-    stem = str(filename or "").rsplit(".", 1)[0]
-    for tag in ("private_", "group_"):
-        idx = stem.find(tag)
-        if idx >= 0:
-            return restore_session_id(stem[idx:])
-    return ""
+    match = re.match(r"^(.+?)_((?:private|group)_.+)\.json$", str(filename or ""))
+    return restore_session_id(match.group(2)) if match else ""

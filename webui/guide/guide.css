@@ -1,0 +1,114 @@
+.guide-setting {
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 12px;
+}
+
+#guide-ui {
+    --guide-accent: #bc2567;
+    --guide-soft: #fff0f7;
+    --guide-ring: #e34b91;
+    color: #292333;
+}
+
+#guide-ui [hidden] { display: none; }
+#lovomo-guide {
+    position: fixed;
+    inset: 0;
+    margin: auto;
+    width: min(730px, calc(100vw - 30px));
+    max-width: none;
+    max-height: calc(100dvh - 24px);
+    padding: 0;
+    border: 0;
+    overflow: auto;
+    color: inherit;
+    background: transparent;
+    font: inherit;
+}
+#lovomo-guide::backdrop { background: rgb(23 19 32 / 64%); }
+.guide-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    padding: 8px;
+}
+.guide-card, .guide-tip, .guide-reminder {
+    border: 1px solid #f1dce7;
+    border-radius: var(--radius-card, 14px);
+    background: #fff;
+    box-shadow: 0 8px 28px rgb(32 18 38 / 19%);
+}
+.guide-card {
+    grid-column: 1;
+    grid-row: 1;
+    padding: clamp(16px, 4vw, 30px);
+}
+.guide-portrait {
+    grid-column: 2;
+    grid-row: 1;
+    display: block;
+    width: min(28vw, 220px, 40dvh);
+    height: auto;
+    margin-left: 12px;
+    user-select: none;
+}
+.guide-progress { font-size: 13px; color: #655e6d; }
+#guide-title { margin: 8px 0 12px; color: var(--guide-accent); line-height: 1.25; }
+#guide-description, .guide-tip-text { margin: 0; line-height: 1.6; overflow-wrap: anywhere; }
+.guide-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 14px;
+}
+#guide-ui button {
+    cursor: pointer;
+    padding: 6px 10px;
+    min-height: 34px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-ctl, 8px);
+    background: var(--guide-soft);
+    color: #863450;
+    font: inherit;
+    font-size: 13px;
+}
+#guide-ui button.guide-primary { background: var(--guide-accent); color: #fff; font-weight: 600; }
+#guide-ui button:focus-visible { outline: 2px solid var(--guide-accent); outline-offset: 2px; }
+.guide-spot {
+    position: fixed;
+    z-index: 4900;
+    pointer-events: none;
+    box-sizing: border-box;
+    border: 2px solid var(--guide-ring);
+    border-radius: 8px;
+    box-shadow: 0 0 0 2px rgb(227 75 145 / 21%);
+}
+.guide-tip, .guide-reminder {
+    position: fixed;
+    z-index: 4901;
+    box-sizing: border-box;
+    padding: 11px 13px;
+}
+.guide-tip { width: min(345px, calc(100vw - 24px)); font-size: 14px; }
+.guide-tip-title { display: block; margin-bottom: 4px; color: var(--guide-accent); }
+.guide-tip .guide-actions { margin-top: 8px; }
+.guide-reminder {
+    right: 12px;
+    bottom: max(12px, env(safe-area-inset-bottom));
+    width: min(490px, calc(100vw - 24px));
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    font-size: 13px;
+}
+.guide-notice { flex: 1 0 160px; line-height: 1.5; }
+@media (max-width: 500px) {
+    .guide-layout { grid-template-columns: minmax(0, 1fr) auto; padding: 4px; }
+    .guide-portrait { width: min(23vw, 34dvh); margin-left: 5px; }
+    #guide-title { font-size: 20px; }
+    #guide-description { font-size: 14px; }
+}

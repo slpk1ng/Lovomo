@@ -5,6 +5,7 @@ import json
 import random
 import re
 import time
+from functools import partial
 from pathlib import Path
 from typing import List, Optional
 
@@ -14,10 +15,13 @@ from .llm_helpers import (MENTION_PLACEHOLDER, RoleContext, segment_for_tts, lan
 from .tts import synthesize_sentence, merge_wavs, get_audio_duration
 from .tts_service import check_tts_service
 from .stickers import resize_for_output
-from .adapters import client_supports, client_reply_limit
+from .adapters import ILinkClient, client_supports, client_reply_limit, ILINK_ACK_ID_KEYS, delivery_unconfirmed
+from .delivery_state import DeliveryState, trace_voice
+from .jsonio import save_json
 
 
 _CURRENT_CLIENT = contextvars.ContextVar("lovomo_send_client", default=None)
+_OFFLINE_CLIENT = object()
 
 _VOICE_LOCKS: dict = {}
 
@@ -279,7 +283,21 @@ class MessageSender:
         self._recent_sent = {}
         self._sent_group = 0
         self.last_send_uncertain = False
-        self._send_once = False
+        self.delivery = DeliveryState()
+
+    def delivery_snapshot(self):
+        clients = {id(client): client for client in (self.client, *self.channel_clients.copy().values())
+                   if isinstance(client, ILinkClient)}
+        waiting = 0
+        unpersisted = 0
+        for client in clients.values():
+            pending = client.pending_count()
+            waiting += pending
+            if not client.outbox_persisted:
+                unpersisted += pending
+        return {**self.delivery.snapshot(), "wechat_waiting": waiting,
+                "wechat_unpersisted": unpersisted,
+                "wechat_legacy_outbox": any(client.has_legacy_outbox() for client in clients.values())}
 
     def _session_channels_path(self) -> Optional[Path]:
         data_path = getattr(self.memory_manager, "data_path", None)
@@ -305,9 +323,7 @@ class MessageSender:
         if path is None:
             return
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(self._session_channels, ensure_ascii=False, indent=1),
-                            encoding="utf-8")
+            save_json(path, self._session_channels)
         except OSError as e:
             print(f"会话接入方式映射保存失败（忽略）: {type(e).__name__}: {e}")
 
@@ -328,6 +344,10 @@ class MessageSender:
         key = str(channel_key or "").strip()
         if not key:
             return
+        previous = self.channel_clients.get(key)
+        if previous is not None and previous is not client:
+            self.session_clients = {sid: bound for sid, bound in self.session_clients.items()
+                                    if bound is not previous}
         if client is None:
             self.channel_clients.pop(key, None)
         else:
@@ -391,7 +411,8 @@ class MessageSender:
         if client is None:
             self._load_session_channels()
             key = self._session_channels.get(sid, "")
-            client = self.channel_clients.get(key) if key else None
+            if key:
+                return self.channel_clients.get(key)
         if client is None:
             platform = self.platform_of_session(sid)
             client = self._client_for_platform(platform)
@@ -400,9 +421,21 @@ class MessageSender:
                 self.remember_session(sid, client)
         return client
 
+    def _resolve_session_client(self, session_id: str):
+        client = self.session_client(session_id)
+        if client is None and (self.session_channel_key(session_id) or self.platform_of_session(session_id)):
+            return _OFFLINE_CLIENT
+        return client
+
+    def active_session_client(self, session_id: str):
+        client = self._resolve_session_client(session_id)
+        if client is _OFFLINE_CLIENT:
+            return None
+        return client if client is not None else self._active_client()
+
     @contextlib.contextmanager
     def for_session(self, session_id: str):
-        with self.using_client(self.session_client(session_id)):
+        with self.using_client(self._resolve_session_client(session_id)):
             yield
 
     # ---------------- 连接选择 ----------------
@@ -433,34 +466,50 @@ class MessageSender:
             _CURRENT_CLIENT.reset(token)
 
     def _active_client(self):
-        return _CURRENT_CLIENT.get() or self.client
-
-    @contextlib.contextmanager
-    def send_once(self):
-        prev = self._send_once
-        self._send_once = True
-        try:
-            yield
-        finally:
-            self._send_once = prev
+        client = _CURRENT_CLIENT.get()
+        if client is _OFFLINE_CLIENT:
+            return None
+        return client or self.client
 
     # ---------------- 基础发送 ----------------
     async def send_segments(self, session_type: str, target_id, segments: list,
                             group=None) -> bool:
+        from napcat import Record, Text
+
         self.last_send_uncertain = False
         client = self._active_client()
+        self.last_message_id = ""
+        platform = getattr(client, "platform", "napcat") if client is not None else "none"
+        kinds = tuple(kind for kind, cls in (("text", Text), ("voice", Record))
+                      if any(isinstance(segment, cls) for segment in segments))
+        kind = "+".join(kinds) or "other"
+        receipt = self.delivery.start(platform, kind, dispatch=False)
         if client is None:
-            print("发送失败：NapCat 客户端尚未连接")
+            self.delivery.mark(receipt, "failed", reason="offline")
+            print("发送失败：消息客户端尚未连接")
             return False
         session_type, target_id = _normalize_target(session_type, target_id)
-        self.last_message_id = ""
         try:
-            result = await self._send_with_retry(session_type, target_id, segments)
+            result = await self._send_to_platform(client, session_type, target_id, segments, receipt)
             self.last_message_id = _extract_message_id(result)
+            if not self.last_message_id and platform == "wechat_clawbot" and isinstance(result, dict):
+                self.last_message_id = next((str(result[key]) for key in ILINK_ACK_ID_KEYS if result.get(key)), "")
             self._remember_sent(session_type, target_id, self.last_message_id, group)
+            if self.last_message_id:
+                self.delivery.mark(receipt, "acknowledged")
+            elif platform == "wechat_clawbot" and isinstance(result, dict) and result.get("lovomo_queued"):
+                self.delivery.mark(receipt, "waiting")
+            else:
+                self.last_send_uncertain = True
+                self.delivery.mark(receipt, "unconfirmed")
             return True
+        except asyncio.CancelledError:
+            self.delivery.mark(receipt, "unconfirmed", reason="cancelled")
+            raise
         except Exception as e:
-            self.last_send_uncertain = isinstance(e, (asyncio.TimeoutError, TimeoutError))
+            self.last_send_uncertain = delivery_unconfirmed(e)
+            self.delivery.mark(receipt, "unconfirmed" if self.last_send_uncertain else "failed",
+                               reason="timeout" if isinstance(e, TimeoutError) else "send_error")
             print(f"发送消息失败 ({session_type} {target_id}): {type(e).__name__}: {e}")
             return False
 
@@ -480,23 +529,16 @@ class MessageSender:
         items.append((now, mid, self.new_message_group() if group is None else group))
         self._recent_sent[key] = items[-RECENT_SENT_MAX:]
 
-    async def _send_with_retry(self, session_type: str, target_id, segments: list):
-        client = self._active_client()
-        retries = 0 if self._send_once else max(0, int(self.config.get("send_retry", 1) or 0))
-        for attempt in range(retries + 1):
-            try:
-                if session_type == "private":
-                    return await client.send_private_msg(user_id=_as_target(target_id),
-                                                         message=segments)
-                return await client.send_group_msg(group_id=_as_target(target_id),
-                                                   message=segments)
-            except (asyncio.TimeoutError, TimeoutError):
-                if attempt >= retries:
-                    raise
-                delay = 2.0 * (attempt + 1)
-                print(f"发送超时 ({session_type} {target_id})，{delay:.0f}s 后重试 "
-                      f"({attempt + 1}/{retries})")
-                await asyncio.sleep(delay)
+    async def _send_to_platform(self, client, session_type, target_id, segments, receipt):
+        # A timeout may arrive after acceptance. Only a definite rejection
+        # can be queued by the adapter for a later dispatch.
+        if session_type == "private" and isinstance(client, ILinkClient):
+            return await client.send_private_msg(user_id=_as_target(target_id), message=segments,
+                                                 receipt=partial(self.delivery.mark, receipt))
+        self.delivery.mark(receipt, "sending", attempt=1)
+        if session_type != "private":
+            return await client.send_group_msg(group_id=_as_target(target_id), message=segments)
+        return await client.send_private_msg(user_id=_as_target(target_id), message=segments)
 
     async def send_text(self, session_type: str, target_id, text: str,
                         sticker=None, reply_id=None, at_ids=None, group=None) -> bool:
@@ -909,10 +951,10 @@ class MessageSender:
             synth_sem = asyncio.Semaphore(2)
             async def _synthesize(s):
                 async with synth_sem:
-                    return await synthesize_sentence(ctx, s["lang"], s.get("emotion", ""), emotions,
+                    return await trace_voice(synthesize_sentence(ctx, s["lang"], s.get("emotion", ""), emotions,
                                                      data_path, stats=self.stats,
                                                      mimic=s.get("mimic", ""),
-                                                     mimics=available_mimics(ctx))
+                                                     mimics=available_mimics(ctx)))
             async with voice_lock():
                 results = await asyncio.gather(*[_synthesize(s) for s in sentences],
                                                return_exceptions=True)

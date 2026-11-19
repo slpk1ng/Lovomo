@@ -1,3 +1,4 @@
+from .lexicon import manager_for_context, history_for_role
 # -*- coding: utf-8 -*-
 import asyncio
 import random
@@ -9,7 +10,7 @@ from modules.jobs import generate_proactive_text
 from modules.llm_helpers import (RoleContext, POKE_MESSAGE_TEXT, chat_once,
                                  strip_thinking, extract_json,
                                  speaker_labeled_lines)
-from modules.memory_store import _is_memory_filename, _memory_session_id
+from modules.memory_store import _is_memory_filename, _memory_session_id, _memory_role_key
 from modules.mood import MoodManager, affection_enabled
 from modules.promises import extract_promise
 from modules.proactive_state import (save_proactive_state,
@@ -20,11 +21,12 @@ from modules.session_context import (get_active_ctx, get_active_role, reply_ctx_
                                      role_memory, get_active_emotions,
                                      get_role_emotions, parse_session_target,
                                      _in_quiet_hours, _parse_jitter_minutes,
-                                     _session_whitelisted, memory_for_session)
+                                     _session_whitelisted, memory_for_session,
+                                     list_known_sessions)
 from modules.stickers import StickerManager
 
 
-_SELF_REFERENCE_RE = r"本座|本尊|吾輩|吾辈|本小姐|本大爷"
+_SELF_REFERENCE_RE = r"在下|老夫|老身|小女子|敝人|本小姐|本大爷|本座|吾辈|吾輩"
 _ATTRIBUTED_SELF_RE = re.compile(
     rf"(?:自称|被称(?:为|作)|自居为?|管自己叫)\s*[「『“‘\"']?(?:{_SELF_REFERENCE_RE})[」』”’\"']?")
 
@@ -215,7 +217,7 @@ async def recheck_profile(ctx: RoleContext, history: list, user_id: str):
 async def recheck_lexicon(ctx: RoleContext, history: list, session_id: str):
     if app_context.lexicon_mgr is None:
         return
-    await app_context.lexicon_mgr.learn_from_history(ctx, history, session_id)
+    await manager_for_context(ctx).learn_from_history(ctx, history, session_id)
 
 
 async def context_recheck(session_id: str, ctx: RoleContext, history: list, meta: dict):
@@ -259,12 +261,14 @@ async def _take_recall_block(task) -> str:
         return ""
 
 
-async def post_reply_context_tasks(session_id: str, ctx: RoleContext):
+async def post_reply_context_tasks(session_id: str, ctx: RoleContext, history_snapshot=None,
+                                  maintain_shared=True):
     try:
         mem = memory_for_session(session_id) or app_context.memory_manager
         data = mem.load_session_data(session_id)
-        history = data.get("history", [])
+        history = history_snapshot if history_snapshot is not None else data.get("history", [])
         meta = data.get("meta", {})
+        original_meta = dict(meta)
         valid_messages = [m for m in history if isinstance(m, dict)
                           and m.get("role") in ("user", "assistant")
                           and str(m.get("content", "")).strip()]
@@ -274,7 +278,7 @@ async def post_reply_context_tasks(session_id: str, ctx: RoleContext):
         changed = False
         summary_updated = False
         # 上下文自动摘要
-        if app_context.global_config.get("summary_enabled", False):
+        if maintain_shared and app_context.global_config.get("summary_enabled", False):
             try:
                 threshold = int(app_context.global_config.get("summary_threshold", 20))
             except (TypeError, ValueError):
@@ -299,7 +303,7 @@ async def post_reply_context_tasks(session_id: str, ctx: RoleContext):
                     summary_updated = True
                     print(f"已更新会话 {session_id} 的上下文摘要。")
         # 话题检测
-        if app_context.global_config.get("dynamic_context_enabled", False):
+        if maintain_shared and app_context.global_config.get("dynamic_context_enabled", False):
             try:
                 every = max(2, int(app_context.global_config.get("topic_summary_every_n", 10)))
             except (TypeError, ValueError):
@@ -322,29 +326,33 @@ async def post_reply_context_tasks(session_id: str, ctx: RoleContext):
                     changed = True
                     print(f"已更新会话 {session_id} 的当前话题：{topic[:50]}")
         if app_context.lexicon_mgr is not None:
+            await manager_for_context(ctx).observe_and_learn(ctx, history, session_id)
+        from .recall import recall_for_context
+        recall = recall_for_context(ctx)
+        if recall is not None and recall.enabled():
             try:
-                user_msg_count = int(meta.get("user_msg_count", 0))
-            except (TypeError, ValueError):
-                user_msg_count = 0
-            if app_context.lexicon_mgr.should_learn(user_msg_count):
-                await app_context.lexicon_mgr.learn_from_history(ctx, history, session_id)
-        if app_context.recall_mgr is not None and app_context.recall_mgr.enabled():
-            try:
-                await app_context.recall_mgr.refresh(session_id, history)
-                await app_context.recall_mgr.update_open_topics(ctx, session_id, history)
+                own_history = history_for_role(ctx, history)
+                await recall.refresh(session_id, own_history)
+                await recall.update_open_topics(ctx, session_id, own_history)
             except Exception as e:
                 print(f"会话回忆维护失败（忽略）: {type(e).__name__}: {e}")
         if summary_updated and _recheck_due(meta):
             meta["recheck_at"] = time.time()
             changed = True
-            await context_recheck(session_id, ctx, history, meta)
+            await context_recheck(session_id, ctx, history_for_role(ctx, history), meta)
         if changed:
-            fresh = mem.load_session_data(session_id)
-            fresh.setdefault("meta", {})
-            for key in ("summary", "topic", "recheck_at"):
-                if key in meta:
-                    fresh["meta"][key] = meta[key]
-            mem.save_session_data(session_id, fresh)
+            from .jsonio import file_lock
+            with file_lock(mem.get_memory_file(session_id)):
+                fresh = mem.load_session_data(session_id)
+                current_history = fresh.get("history", [])
+                # A cleared/replaced conversation must not receive an old background result.
+                if not history or not any(msg == history[-1] for msg in current_history):
+                    return
+                fresh.setdefault("meta", {})
+                for key in ("summary", "topic", "recheck_at"):
+                    if key in meta and fresh["meta"].get(key) == original_meta.get(key):
+                        fresh["meta"][key] = meta[key]
+                mem.save_session_data(session_id, fresh)
     except Exception as e:
         print(f"上下文维护任务异常: {e}")
 
@@ -624,13 +632,12 @@ def _private_sessions_of(role: dict) -> list:
     mem = role_memory(role)
     if mem is None:
         return []
-    prefix = f"{mem.character_key}_private_"
     out = []
     for f in sorted(mem.data_path.glob("*.json")):
-        if not f.name.startswith(prefix) or not _is_memory_filename(f.name):
+        if _memory_role_key(f.name) != mem.character_key or not _is_memory_filename(f.name):
             continue
         session_id = _memory_session_id(f.name)
-        if session_id and session_id not in out:
+        if session_id.startswith("private_") and session_id not in out:
             out.append(session_id)
     return out
 
@@ -809,7 +816,7 @@ async def deliver_mood_diaries() -> int:
             if not diary_text:
                 continue
             # 重发一次对方就会收到两篇同样的日记
-            with app_context.sender.for_session(session_id), app_context.sender.send_once():
+            with app_context.sender.for_session(session_id):
                 ok = await app_context.sender.speak_and_send(
                     session_type, target_id, f"【日记】{diary_text}",
                     get_role_emotions(role), ctx, use_voice=False, sticker=False,
@@ -1090,18 +1097,8 @@ def session_history_block(session_key: str, ctx=None) -> str:
 
 
 def _known_sessions() -> list:
-    out = []
-    seen = set()
-    try:
-        for f in app_context.memory_manager.data_path.glob("*.json"):
-            m = re.match(r"^[A-Za-z0-9_\-]+_(private|group)_([A-Za-z0-9_\-]+)\.json$", f.name)
-            if not m or (m.group(1), m.group(2)) in seen:
-                continue
-            seen.add((m.group(1), m.group(2)))
-            out.append((m.group(1), m.group(2)))
-    except Exception as e:
-        print(f"解析已知会话列表失败: {e}")
-    return out
+    return [(item["session_type"], item["session_id"])
+            for item in list_known_sessions()]
 
 
 async def greeting_daily_check() -> int:
@@ -1240,8 +1237,8 @@ def hot_reload_managers():
             app_context.sender.sticker_manager = app_context.sticker_mgr
     app_context._role_emotions_cache.clear()
     app_context._role_mimics_cache.clear()
-    if app_context.lexicon_mgr is not None:
-        app_context.lexicon_mgr.config = app_context.global_config
+    for manager in app_context.lexicon_managers.values():
+        manager.config = app_context.global_config
     if app_context.recall_mgr is not None:
         app_context.recall_mgr.config = app_context.global_config
     if app_context.encounter_mgr is not None:

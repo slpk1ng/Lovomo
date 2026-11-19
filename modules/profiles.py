@@ -11,10 +11,10 @@ DEFAULT_EXTRACT_PROMPT = (
     "只提取关于【对话中用户本人】的长期稳定信息，绝不能把角色信息当成用户信息。\n"
     "铁律：\n"
     "1. nickname 只记录「用户希望被怎么称呼」或「用户自称、角色常称呼用户的昵称」；"
-    "用户对角色说的称呼、给角色起的外号（如角色名、{role}、主人、AI）以及角色自称（如本座、吾辈）"
+    "用户对角色说的称呼、给角色起的外号（如角色名、{role}、AI）以及角色自称"
     "都不是用户昵称，禁止收录。\n"
     "2. likes/dislikes 只记录用户本人的喜好与厌恶；角色在回复里提到的角色自己的喜好与厌恶"
-    "（如角色喜欢甜食、害怕幽灵）一律忽略，不得写入。\n"
+    "（如角色自己的口味与害怕的东西）一律忽略，不得写入。\n"
     "3. birthday、notes 只记录用户本人明确说出的生日与重要安排。\n"
     "4. 拿不准就不存，宁可少存不可错存；没有可提取内容时输出空对象。\n"
     "5. 若用户明确表示旧画像信息已过时或改口（如“我现在不喜欢猫了”“别再说我爱吃辣”），"
@@ -27,23 +27,6 @@ DEFAULT_EXTRACT_PROMPT = (
     '"likes_remove": ["已过时的旧喜好"], "notes_remove": ["已过时备注"]}，'
     "不需要的字段可省略，禁止输出任何其它文字。"
 )
-
-LEGACY_ROLE_NAME_PHRASES = (
-    ("（如角色名、丛雨、主人、AI）", "（如角色名、{role}、主人、AI）"),
-)
-
-
-def migrate_extract_prompt(config) -> bool:
-    raw = str(config.get("profiles_extract_prompt", "") or "")
-    if not raw:
-        return False
-    new = raw
-    for old, repl in LEGACY_ROLE_NAME_PHRASES:
-        new = new.replace(old, repl)
-    if new == raw:
-        return False
-    config["profiles_extract_prompt"] = new
-    return True
 
 
 def _role_names(ctx) -> set:

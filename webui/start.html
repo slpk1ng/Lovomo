@@ -6045,8 +6045,47 @@
 
         }
 
+        /* Diagnostics uses the same surface, spacing and controls as other panels. */
+        #panel-system.active { display: grid; gap: var(--sp-4); align-content: start; }
+        .system-section h3 { margin-top: 0; }
+        .system-actions, .system-setup-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); }
+        .system-actions { margin: var(--sp-3) 0; }
+        .system-overview { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(215px, 100%), 1fr));
+            gap: var(--sp-2); padding: 0; list-style: none; }
+        .system-overview > li, .system-setup-row { padding: var(--sp-3); border: 1px solid var(--line);
+            border-radius: var(--radius-ctl); background: var(--surface-2); color: var(--ink-2); }
+        .system-setup { display: grid; gap: var(--sp-2); padding: 0; list-style: none; }
+        .system-setup-row label { margin-right: var(--sp-1); }
+        .system-setup-row select { min-width: 110px; }
+        .system-voice-fields { flex-basis: 100%; display: grid; gap: var(--sp-2);
+            grid-template-columns: repeat(auto-fit, minmax(min(160px, 100%), 1fr)); }
+        .system-voice-fields label, .system-voice-text { display: grid; gap: var(--sp-1); min-width: 0; }
+        .system-voice-fields label { margin: 0; }
+        .system-voice-fields [hidden] { display: none; }
+        .system-voice-fields select, .system-voice-text textarea { width: 100%; min-width: 0; box-sizing: border-box; }
+        .system-voice-text { flex-basis: 100%; margin: 0 0 var(--sp-1); }
+        .system-disclosure { margin-top: var(--sp-2); border: 1px solid var(--line);
+            border-radius: var(--radius-ctl); padding: var(--sp-2) var(--sp-3); }
+        .system-disclosure summary { cursor: pointer; padding: var(--sp-1) 0; overflow-wrap: anywhere; }
+        .system-disclosure > ul { padding-inline-start: var(--sp-5); overflow-wrap: anywhere; }
+        #system-activity ol { margin-block: var(--sp-1) var(--sp-3); padding-inline-start: var(--sp-5); }
+        #system-activity li::marker { color: var(--brand); }
+        #system-tts-audio { max-width: 100%; }
+        .system-status:empty { display: none; }
+        .system-file { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); }
+        .system-file input { max-width: 100%; }
+        .test-compare { margin-top: var(--sp-4); padding: var(--sp-3); background: var(--surface-2);
+            border-radius: var(--radius-ctl); border: 1px solid var(--line); }
+        .memory-source { margin-inline-start: var(--sp-2); }
+        #modal-body .msg-row:focus { outline: 2px solid var(--accent, #dc6f9e); outline-offset: -2px; }
+        .test-compare summary { cursor: pointer; font-weight: var(--fw-medium); }
+        .test-compare label { display: block; margin-top: var(--sp-2); }
+        .test-compare input, .test-compare textarea { display: block; width: 100%; box-sizing: border-box; }
+        .test-compare textarea { min-height: 80px; }
+        .compare-replies { white-space: pre-wrap; overflow-wrap: anywhere; }
     </style>
 
+    <link rel="stylesheet" href="/webui/guide/guide.css">
 </head>
 
 <body>
@@ -6117,6 +6156,7 @@
 
         <div class="menu-item" data-panel="advanced" data-icon="sparkles">高级功能</div>
 
+        <div class="menu-item" data-panel="system" data-icon="settings">运行诊断与备份</div>
         <div class="menu-item" data-panel="logs" data-icon="terminal">日志输出</div>
 
         <div class="menu-item" data-panel="tutorial" data-icon="book">使用教程</div>
@@ -6143,6 +6183,15 @@
 
             <div class="config-form">
 
+                <div class="guide-setting">
+                    <button type="button" class="btn btn-gray" id="guide-reopen" data-icon="book">重新查看新手引导</button>
+                </div>
+                <div class="card" id="config-quick-tools" style="margin-bottom:12px;">
+                    <label for="config-search">搜索设置</label>
+                    <input id="config-search" type="search" placeholder="例如：不回消息、语音太慢">
+                    <button type="button" class="btn btn-gray" id="config-undo" disabled>撤销上次设置保存</button>
+                    <ul id="config-search-results" hidden></ul>
+                </div>
                 <div id="config-groups"></div>
 
             </div>
@@ -6371,7 +6420,7 @@
 
                     <div class="field" style="flex:0 0 auto;">
 
-                        <button class="btn" id="role-insert-default-btn" data-icon="sparkles">插入丛雨默认提示词</button>
+                        <button class="btn" id="role-insert-default-btn" data-icon="sparkles">插入默认提示词</button>
 
                     </div>
 
@@ -7580,6 +7629,11 @@
                     </div>
 
                     <div class="field" style="flex:0 0 auto;">
+                        <label for="test-model-select">聊天模型</label>
+                        <select id="test-model-select"><option value="auto">按角色选择接入方式</option></select>
+                    </div>
+
+                    <div class="field" style="flex:0 0 auto;">
 
                         <button class="btn btn-gray" id="test-clear-btn">清空测试对话</button>
 
@@ -7607,6 +7661,19 @@
 
                 </div>
 
+                <details id="test-draft" class="test-compare">
+                    <summary>用未保存的人设试聊</summary>
+                    <p class="sub-desc">用同一句消息比较已保存人设和当前草稿。试聊仅在此显示，可将满意的草稿带到角色管理后保存。</p>
+                    <label for="test-draft-persona">人设草稿</label>
+                    <textarea id="test-draft-persona" maxlength="16000"></textarea>
+                    <label for="test-draft-input">同一句测试消息</label>
+                    <input id="test-draft-input" type="text" maxlength="4000">
+                    <div class="system-actions">
+                        <button type="button" class="btn" id="test-draft-run" disabled>隔离试聊</button>
+                        <button type="button" class="btn btn-gray" id="test-draft-edit" disabled>带到角色管理</button>
+                    </div>
+                    <div id="test-draft-result" class="compare-replies" role="status"></div>
+                </details>
             </div>
 
         </div>
@@ -8079,7 +8146,9 @@
 
                 <div class="sub-desc">开启后定期从对话学习黑话、俚语与专有表达；低把握或绑定角色的词条进入「待确认」，确认后才生效。总开关见「配置文件 → 自主学习」。</div>
 
-                <div id="term-message" class="muted"></div>
+                <div class="field"><label for="terms-role">管理角色</label><select id="terms-role"></select></div>
+<div class="sub-desc">每个角色分别学习和使用自己的词典。旧词典只迁入升级时的当前角色，其余角色从空词典开始。</div>
+<div id="term-message" class="muted"></div>
 
                 <h4 style="margin:14px 0 4px;">待确认</h4>
 
@@ -8095,6 +8164,73 @@
 
             </div>
 
+        </div>
+
+        <div class="panel" id="panel-system">
+            <section class="card section-block system-section" aria-labelledby="system-diagnosis-title">
+                <h3 id="system-diagnosis-title">运行诊断</h3>
+                <p class="sub-desc">模型服务的可达状态来自网络连接检查。验证模型、生成回复和试听请使用下方的测试入口。</p>
+                <div class="system-actions">
+                    <button type="button" class="btn" id="system-refresh" data-icon="refresh">刷新状态</button>
+                    <button type="button" class="btn btn-gray" id="system-diagnostics" data-icon="download">导出脱敏诊断</button>
+                </div>
+                <ul id="system-health" class="system-overview" aria-live="polite"></ul>
+                <details class="system-disclosure">
+                    <summary id="system-activity-summary">消息排障</summary>
+                    <p class="muted">发一条测试消息，再刷新状态。如果对应时间没有收件记录，先检查通道连接和平台权限。</p>
+                    <ul id="system-activity"></ul>
+                </details>
+                <details class="system-disclosure"><summary>最近投递</summary><ul id="system-delivery"></ul></details>
+            </section>
+            <section class="card section-block system-section" aria-labelledby="system-checks-title">
+                <h3 id="system-checks-title">服务自检</h3>
+                <div class="system-setup">
+                    <div class="system-setup-row">
+                        <button type="button" class="btn btn-gray" data-system-panel="models">设置模型服务</button>
+                        <button type="button" class="btn btn-gray" id="system-model-test">验证已选模型</button>
+                        <button type="button" class="btn btn-gray" data-system-panel="connections">设置接入方式</button>
+                        <button type="button" class="btn btn-gray" data-system-panel="test-chat">测试文字回复</button>
+                    </div>
+                    <div class="system-setup-row">
+                        <div class="system-voice-fields">
+                            <label>合成模型
+                                <select id="system-tts-model" disabled><option value="">当前配置</option></select>
+                            </label>
+                            <label id="system-tts-voice-field" hidden>参考音色
+                                <select id="system-tts-voice"></select>
+                            </label>
+                            <label>试听语言
+                                <select id="system-tts-language">
+                                    <option value="zh">中文</option><option value="ja">日语</option><option value="en">英语</option>
+                                    <option value="yue">粤语</option><option value="ko">韩语</option>
+                                </select>
+                            </label>
+                        </div>
+                        <label class="system-voice-text">试听文本
+                            <textarea id="system-tts-text" rows="2" maxlength="500" placeholder="留空使用所选语言的默认台词"></textarea>
+                        </label>
+                        <button type="button" class="btn" id="system-tts-test" disabled>合成并试听</button>
+                        <button type="button" class="btn btn-gray" data-system-panel="audio">检查情绪音频</button>
+                    </div>
+                </div>
+                <p id="system-setup-result" class="system-status" aria-live="polite"></p>
+                <audio id="system-tts-audio" controls hidden></audio>
+            </section>
+            <section class="card section-block system-section" aria-labelledby="system-backup-title">
+                <h3 id="system-backup-title">数据备份与恢复</h3>
+                <p class="sub-desc">备份含配置、角色、会话记忆和知识库，可能含私人聊天和文档。平台凭据、运行缓存、语音模型和统计数据库另行管理。单包上限 20 MB。</p>
+                <div class="system-actions">
+                    <button type="button" class="btn" id="system-backup-export" data-icon="download">导出备份</button>
+                </div>
+                <div class="system-actions">
+                    <label class="system-file">备份包 <input type="file" id="system-backup-file" accept=".zip,application/zip"></label>
+                    <button type="button" class="btn btn-gray" id="system-backup-preview">预览恢复</button>
+                    <button type="button" class="btn" id="system-backup-stage" disabled>确认并安排恢复</button>
+                    <button type="button" class="btn btn-gray" id="system-backup-cancel" hidden>取消待恢复</button>
+                </div>
+                <p id="system-backup-result" class="system-status" aria-live="polite"></p>
+                <details class="system-disclosure" id="system-backup-details" hidden><summary>查看受影响的文件</summary><ul id="system-backup-files"></ul></details>
+            </section>
         </div>
 
         <div class="panel" id="panel-logs">
@@ -8237,7 +8373,7 @@
 
                    也可以填「自定义情绪判定补充规则」，
 
-                   例如"只要主人夸我可爱，就必须用 haixiu"。</p>
+                   例如"只要用户夸我可爱，就必须用 haixiu"。</p>
 
                                 <p><strong>· 难度调高以后她还是很难靠近</strong>：设计如此。想让她好说话就调「简单」，想保留好感节奏就调「普通」。</p>
 
@@ -8403,9 +8539,7 @@
 
                 <p>「分开发送」关闭时，「语音分开发送」「文本分开发送」等选项会自动隐藏。</p>
 
-                <p>黑话词典全角色共用：只收通用写法，含角色名或仅单次对话成立的说法不入库，
-
-                   已有的这类旧词条会移进「待确认」。</p>
+                <p>黑话词典按角色独立存储、学习和使用；不确定或仅单次对话成立的词条进入「待确认」。</p>
 
                 <p>用户画像昵称默认取对方 QQ 昵称，自动提取不改写，对方明确要求才变。</p>
 
@@ -8492,6 +8626,7 @@
             <div class="modal-tools">
 
                 <button id="chatClearImgBtn" style="margin-right:auto;">清空图片缓存</button>
+                <button type="button" id="chat-recall-btn">角色回忆</button>
 
                 <span class="modal-filename" id="modal-filename" title=""></span>
 
@@ -8506,6 +8641,7 @@
             </div>
 
             <div class="modal-body" id="modal-body"></div>
+            <div class="modal-body" id="chat-recall-panel" hidden></div>
 
         </div>
 
@@ -8810,6 +8946,242 @@
 
 
         const I18N_EN = {
+            "运行诊断与备份": "Diagnostics & backup",
+            "重新查看新手引导": "Restart Quick Start",
+            "搜索设置": "Search settings",
+            "例如：不回消息、语音太慢": "For example: not replying, slow voice",
+            "撤销上次设置保存": "Undo the last settings save",
+            "没有匹配的设置": "No matching settings",
+            "请先开启此设置的上级选项。": "Enable the parent setting first.",
+            "确认设置改动": "Review setting changes",
+            "撤销会恢复本次页面中上次保存前的普通设置。凭据和接入信息保留当前值。": "Undo restores ordinary settings from before the last save on this page. Credentials and connection details keep their current values.",
+            "已恢复上次保存前的设置": "Settings restored",
+            "请先保存或放弃当前改动。": "Save or discard your current edits first.",
+            "隔离试聊": "Isolated Preview",
+            "角色回忆": "Character Memories",
+            "返回聊天记录": "Back to chat history",
+            "仅管理当前角色在本会话中的回忆索引，原始聊天记录保留。": "Manage this character’s recall index for this conversation. The original chat history is kept.",
+            "会话还没有可管理的回忆片段。": "This conversation has no indexed memories to manage yet.",
+            "置顶回忆": "Pin memory",
+            "取消置顶": "Unpin memory",
+            "修改回忆": "Edit memory",
+            "忘掉这段回忆": "Forget this memory",
+            "确定从回忆检索中移除这段内容？": "Remove this memory from recall?",
+            "只显示最近 100 条回忆。": "Showing the 100 most recent memories.",
+            "输入一句话，对比已保存人设与当前草稿。两次回复都从空白对话开始。": "Enter a message to compare the saved character and your draft. Both replies start from a blank conversation.",
+            "已保存人设": "Saved character",
+            "当前草稿": "Current draft",
+            "模型没有返回内容": "The model returned no content",
+            "试聊失败，请检查模型服务": "Preview failed. Check Model Services.",
+            "正在生成两版回复…": "Generating both versions…",
+            "消息排障": "Message Troubleshooting",
+            "本次运行暂无收件记录": "No incoming messages recorded during this run",
+            "收到消息": "Message received",
+            "等前一条消息处理完成": "Waiting for the previous message",
+            "已并入前一条消息": "Merged into the previous message",
+            "群消息未呼叫角色": "Group message did not address the character",
+            "开始处理消息": "Started processing",
+            "本条未触发回复": "No reply was triggered",
+            "消息处理失败": "Message processing failed",
+            "消息处理已中断": "Message processing interrupted",
+            "正在生成回复": "Generating reply",
+            "回复已生成": "Reply generated",
+            "模型未生成可发送内容": "Model returned no usable reply",
+            "模型生成超时": "Model generation timed out",
+            "模型生成失败": "Model generation failed",
+            "模型生成已中断": "Model generation interrupted",
+            "正在合成语音": "Synthesizing voice",
+            "语音已生成": "Voice generated",
+            "未生成语音": "No audio generated",
+            "语音合成已中断": "Voice synthesis interrupted",
+            "文字投递": "Text delivery",
+            "语音投递": "Voice delivery",
+            "其他投递": "Other delivery",
+            "更早的处理中间步骤已折叠": "Earlier processing steps omitted",
+            "首条文字开始发送": "First text send started",
+            "已触发回复，正在生成": "Reply triggered; generating",
+            "首句文字已生成": "First sentence generated",
+            "文字与语音投递": "Text and voice delivery",
+            "本次运行暂无收件记录。发消息后若仍无记录，请检查接入方式。": "No incoming messages recorded during this run. If a test message does not appear, check Connections.",
+            "发一条测试消息，再刷新状态。如果对应时间没有收件记录，先检查通道连接和平台权限。": "Send a test message and refresh. If no incoming entry appears at that time, check the channel connection and platform permissions.",
+            "收到消息到首条文字发送": "Time to first text send",
+            "收到消息到首段语音发送": "Time to first voice send",
+            "排队等待": "Queue wait",
+            "生成首句文字": "Time to generate the first sentence",
+            "合成首段语音": "First voice synthesis",
+            "文字发送到平台确认": "Text send to acknowledgment",
+            "语音发送到平台确认": "Voice send to acknowledgment",
+            "已保留旧版本的微信待补发记录。由于无法确认投递结果，程序不会自动发送这些消息。": "Previous WeChat queue records were kept but will not be sent automatically because their delivery could not be verified.",
+            "查看来源": "View source",
+            "已修改（不显示具体值）": "Changed (value hidden)",
+            "空白": "Blank",
+            "首段语音开始发送": "First voice send started",
+            "试听语言": "Preview language",
+            "合成模型": "Synthesis model",
+            "参考音色": "Reference voice",
+            "当前配置": "Current configuration",
+            "配置文件 · {0}": "Configuration · {0}",
+            "接入方式 · {0}": "Connection · {0}",
+            "云端 TTS · {0}": "Cloud TTS · {0}",
+            "配置默认音色": "Configured default voice",
+            "试听文本": "Preview text",
+            "留空使用所选语言的默认台词": "Leave blank to use the default line for the selected language",
+            "读取合成模型失败，请刷新状态后重试。": "Could not load synthesis models. Refresh the status and try again.",
+            "试听参数无效": "Invalid voice preview settings",
+            "试听文本最多 500 字符": "Preview text is limited to 500 characters",
+            "请选择已保存的合成模型": "Select a saved synthesis model",
+            "请选择可用的参考音色": "Select an available reference voice",
+            "没有找到该音色的参考音频": "No reference audio was found for this voice",
+            "服务自检": "Service Checks",
+            "试听已就绪。": "Voice preview is ready.",
+            "正在生成试听音频…": "Preparing voice preview…",
+            "用未保存的人设试聊": "Try an unsaved persona",
+            "使用当前配置": "Use current configuration",
+            "按角色选择接入方式": "Choose connection by character",
+            "请选择接入方式或聊天模型": "Select a connection or chat model",
+            "用同一句消息比较已保存人设和当前草稿。试聊仅在此显示，可将满意的草稿带到角色管理后保存。": "Compare the saved persona and your draft using the same message. Results stay here. Open the draft in Character Management to save it.",
+            "粤语": "Cantonese",
+            "人设草稿": "Persona draft",
+            "同一句测试消息": "Same test message",
+            "带到角色管理": "Open in Character Manager",
+
+            "运行诊断": "Diagnostics",
+            "模型服务的可达状态来自网络连接检查。验证模型、生成回复和试听请使用下方的测试入口。": "Connectivity checks verify that a port responds. Use the tests below to verify your model, generate a reply, or preview a voice.",
+            "刷新状态": "Refresh status",
+            "导出脱敏诊断": "Export diagnostic report",
+            "最近投递": "Recent delivery",
+            "首次使用": "Getting started",
+            "设置模型服务": "Configure model provider",
+            "验证已选模型": "Verify selected model",
+            "设置接入方式": "Configure connections",
+            "完成绑定后运行投递自检。": "Run a delivery self-check after linking your account.",
+            "测试文字回复": "Test text replies",
+            "向角色发一条消息。": "Send a message to your character.",
+            "检查情绪音频": "Check emotion audio",
+            "合成并试听": "Generate voice preview",
+            "数据备份与恢复": "Backup & restore",
+            "备份含配置、角色、会话记忆和知识库，可能含私人聊天和文档。平台凭据、运行缓存、语音模型和统计数据库另行管理。单包上限 20 MB。": "Backups include settings, characters, conversation memory and knowledge-base data. They may contain private chats and documents. Credentials, caches, voice models and statistics are managed separately. Maximum size: 20 MB.",
+            "导出备份": "Export backup",
+            "备份包": "Backup file",
+            "预览恢复": "Preview restore",
+            "确认并安排恢复": "Schedule restore",
+            "取消待恢复": "Cancel scheduled restore",
+            "查看受影响的文件": "View affected files",
+            "端口可达": "Port reachable",
+            "无法连接，请检查服务和地址": "Unreachable. Check the service and address.",
+            "尚未配置": "Not configured",
+            "本地引擎": "Local engine",
+            "未连接，请检查接入设置": "Disconnected. Check connection settings.",
+            "进入补发队列": "Queued for retry",
+            "未确认": "Unconfirmed",
+            "平台已回执": "Acknowledged by platform",
+            "检查时间 {0}": "Checked at {0}",
+            "语言模型 · {0} · {1}": "Language model · {0} · {1}",
+            "已选择模型": "Model selected",
+            "请选择模型": "Select a model",
+            "语音合成 · {0}": "Speech synthesis · {0}",
+            "语音识别 · {0}": "Speech recognition · {0}",
+            "插件 · {0}": "Plugins · {0}",
+            "已加载 {0} 个": "{0} loaded",
+            "定时任务 · {0}": "Scheduler · {0}",
+            "尚未启动": "Not started",
+            "微信待补发 · {0} 条": "WeChat retry queue · {0}",
+            "微信待补发中有 {0} 条尚未保存到磁盘，重启后可能丢失。": "{0} WeChat messages in the retry queue could not be saved to disk and may be lost on restart.",
+            "通道离线": "Connection offline",
+            "请求超时": "Request timed out",
+            "发送出错": "Send error",
+            "补发已过期": "Queued message expired",
+            "补发队列已满": "Retry queue is full",
+            "投递 · {0} · {1} · {2}（{3}）": "Delivery · {0} · {1} · {2} ({3})",
+            "投递 · {0} · {1} · {2}": "Delivery · {0} · {1} · {2}",
+            "本次运行暂无投递记录": "No delivery records for this run",
+            "检查失败：{0}": "Check failed: {0}",
+            "请先选择 ZIP 备份包": "Choose a ZIP backup first",
+            "备份包超过 20 MB": "The backup exceeds 20 MB",
+            "无法读取或校验备份包。请选择 20 MB 以内的 Lovomo 备份并重新预览。": "Could not validate this backup. Select a Lovomo ZIP under 20 MB and preview again.",
+            "在服务的模型列表中找到了已选模型。可继续到「聊天测试」生成一条回复。": "The selected model is listed. Open Test Chat to generate a reply.",
+            "请先保存模型服务地址和模型。": "Save the provider address and model first.",
+            "正在生成试听音频…": "Generating a voice preview…",
+            "试听已就绪。": "Voice preview is ready.",
+            "请先设置角色和音色": "Configure a character and voice first",
+            "已有试听正在运行": "A preview is already running",
+            "合成失败，请检查语音服务和角色音色": "Synthesis failed. Check the voice service and character voice.",
+            "正在校验备份…": "Validating backup…",
+            "共 {0} 个文件，其中 {1} 个将覆盖。": "{0} files in total. {1} will replace existing files.",
+            "覆盖 · {0} · {1} KB": "Replace · {0} · {1} KB",
+            "新增 · {0} · {1} KB": "Add · {0} · {1} KB",
+            "已取消待恢复任务。": "Scheduled restore cancelled.",
+            "下次完整启动时应用备份并覆盖预览中的已有文件。是否继续？": "Apply the backup on the next full launch and replace the existing files shown in the preview?",
+            "已安排恢复。请从托盘完全退出 Lovomo 后重新启动。": "Restore scheduled. Exit Lovomo from the tray, then relaunch it.",
+            "插件内容无法校验": "Could not verify plugin content",
+            "信任并启用插件「{0}」？Python 插件代码拥有当前用户权限。仅启用你信任的来源；内容更新后需重新确认。": "Trust and enable plugin “{0}”? Python plugin code runs with your permissions. Enable only trusted plugins and review them again after updates.",
+            "允许此插件通过 Lovomo 发送文字与语音？也可稍后在插件详情修改。": "Allow this plugin to send text and voice through Lovomo? You can change this in plugin details.",
+            "消息发送权限": "Message sending permission",
+            "撤销消息发送": "Revoke message sending",
+            "允许消息发送": "Allow message sending",
+            "发送中": "Sending",
+            "重试中": "Retrying",
+            "运行中": "Running",
+            "已关闭": "Off",
+            "正在获取模型列表…": "Checking model list…",
+            "无法验证模型": "Could not verify the model",
+            "读不到模型列表，请检查服务地址，或在「聊天测试」实测。": "Could not read the model list. Check the provider address or try Test Chat.",
+            "服务没有列出已选模型。请在模型服务页重新选择。": "The selected model is not listed. Select it again in Model Providers.",
+            "服务拒绝访问，请检查模型服务的凭据。": "The provider rejected access. Check the model provider credentials.",
+            "每份配置文件是一套完整配置，接入方式可各选一份。default 即主配置，不可删除或重命名。 接入方式列表属于主配置，不随配置文件切换。 密钥与密码只在设置页管理，本页不改动。": "Each profile contains a complete configuration and can be selected per connection. The default profile cannot be deleted or renamed. Connections belong to the main profile. Manage credentials on the Settings page.",
+            "模型的接口地址、API Key 与模型名在此统一配置，全局生效。 配置文件页与聊天测试仅选择服务；密钥保存后只显示打码预览，密文存于 data/model_library.json。": "Manage model endpoints, API keys and model names here. Profiles and Chat Test select these services. Saved keys are masked in the interface and encrypted in data/model_library.json.",
+            "角色的人设、提示词、语音目录与默认情绪在此维护；配置文件页选择启用的角色。 这里改动保存后立即热生效。": "Manage character prompts, voice directories and default emotions here. Select enabled characters in Profiles. Saved changes take effect immediately.",
+            "插件可加新功能或换外观，安装前自动安全扫描， 高危插件需确认后才会安装。": "Plugins add features or change the appearance. Packages are scanned before installation; high risk findings require confirmation.",
+            "）的插件才会出现在下面的列表里 —— 别人的插件不会显示，直接调接口也发不出去。": ") appear below. Plugins owned by others cannot be published, including through the API.",
+            "用文字描述创建自定义音色，可填入「云 TTS 默认音色」。 驱动模型取自上一步填的「云 TTS 模型」，两者必须一致。": "Describe a custom voice, then select it as the default cloud TTS voice. Use the same cloud TTS model for creation and synthesis.",
+            "选好图片或文件夹后点「开始识别」，模型判断分类并命名， 自动归档到「表情包目录」对应文件夹，结果建议手动检查。": "Choose images or a folder and start recognition. The model names, classifies and files images in the sticker directory. Review the results manually.",
+            "上传一段或多段音频克隆音色，可填入「云 TTS 默认音色」。 驱动模型须与「云 TTS 模型」一致，且用声音复刻类模型。": "Upload audio to clone a voice and use it as the default cloud TTS voice. Select a voice cloning model and use the same model for synthesis.",
+            "0 个会话": "0 sessions",
+            "0 个已启用": "0 enabled",
+            "管理角色": "Manage characters",
+            "每个角色分别学习和使用自己的词典。旧词典只迁入升级时的当前角色，其余角色从空词典开始。": "Each character learns and uses its own lexicon. The existing lexicon is migrated only to the active character at upgrade; other characters start with an empty lexicon.",
+            "按「先配通、再调优、出问题怎么查」的顺序整理。 所有功能都必须先打开对应开关才会生效。": "Start with setup, then tune behavior and troubleshoot as needed. Enable each feature before using it.",
+            "—— 上传自己的 .zip 包、打开插件目录、刷新在线市场；自己写的插件也用这一页的 「发布到市场」上架。 安装前自动安全扫描，高危插件需确认后安装。": " — Upload ZIP packages, open the plugin directory or refresh the market. Publish your plugins from this page. Packages are scanned before installation; high risk findings require confirmation.",
+            "——所有安装的插件都在这里， 可启用/停用/卸载；带功能页的插件点卡片空白处进入设置； 点插件名进其 webui 页（无 webui 则进功能页）。 左侧栏「插件」下会展开名单，只列": " — Enable, disable or uninstall installed plugins here. Click a card to open its settings or the plugin name to open its page. The sidebar lists only",
+            "， 点名字直接跳转该插件页面。 右下角「检查插件更新」列出新版本插件并一键替换。": ". Click a name to open its page. Check for Plugin Updates lists new versions and lets you replace installed packages.",
+            "），文件夹里放参考音频，文字按音频同名 txt 填写 （可用「一键识别」自动生成；某段音频没单独填写时，用文件夹里的": "), containing reference audio and a matching TXT transcript for each clip. Recognition can generate transcripts. When a clip has no transcript, use the folder's",
+            "， 再没有就用配置里的「默认参考音频文本」兜底）。 模型/其他杂物目录不会被误识别成情绪。": ", then the configured default reference text. Model folders and unrelated directories are excluded.",
+            "：保存配置后看日志——启动时会打印 LLM 连通性探测结果、扫到的情绪数量、 调度任务注册情况。级别为「警告」或「错误」的行先解决，再谈调优。": ": after saving, check startup logs for LLM connectivity, detected emotions and scheduled jobs. Resolve warnings and errors before tuning.",
+            "：「历史消息条数」控制模型能看到的对话长度（默认 8）； 「回复生成超时」别设太小。": ": History Length controls conversation context (default: 8 messages). Allow enough time for reply generation.",
+            "。 两者内容字不一致时日志会明确写出「清洗前后内容字不一致」。 「交叉渐变长度」不要超过单句时长。": ". Logs report changes to the spoken content during cleanup. Keep crossfade shorter than each sentence.",
+            "：打开「TTS 台词清洗与日志」里的 「移除非台词内容」（默认开）。括号里的动作、表情与颜文字只留在文本， 不进语音；引号里的台词不受影响。": ": enable Remove Non-dialogue Content under TTS Cleanup and Logs (enabled by default). Parenthesized actions and expressions stay in text but are omitted from speech. Quoted dialogue is preserved.",
+            "：打开「情绪判定规则引导」（默认开）。 也可以填「自定义情绪判定补充规则」， 例如\"只要用户夸我可爱，就必须用 haixiu\"。": ": enable Emotion Rule Guidance (enabled by default), or add a custom rule, such as using haixiu when the user compliments the character.",
+            "： 「LLM 判断是否需要回复」可能让模型直接不回； 「记录角色心情值」只更新心情，": ": Reply Judgement may suppress a reply. Record Character Mood only updates mood and does",
+            "拦任何回复。 想保留心情值又不想漏回消息：只开心情值、关掉回复审判。 心情值影响回复概率的参数仅在两个开关都开时显示。": "block replies. Enable mood tracking and disable reply judgement to keep mood without skipping replies. Mood probability settings appear when both are enabled.",
+            "： 「主动消息/问候携带的历史条数」（默认 6）把最近几条对话发给模型， 更早内容用摘要压缩，建议同时打开「对话上下文自动摘要」。 设为 0 则不携带历史。": ": proactive messages and greetings include recent history (default: 6 messages). Enable automatic summaries for older context. Set the history count to 0 to omit it.",
+            "：聊天记录页能看到回复，说明 App 已发出； iLink 服务端可能收下请求但不投递，日志里的": ": a reply in Chat History was sent by the app. iLink may accept a request without delivering it; the log's",
+            "仍然显示 ret=0， 去「接入方式」重新扫码登录一次即可重建绑定， 恢复后先发一条消息试试。": "may still show ret=0. Scan the login QR code again in Connections to refresh the binding, then try a message.",
+            "：确认「主动消息（闲置唤醒）」已开， 并注意三个限制：闲置阈值、静默时段、单会话每日上限； 若开了「回复前不再主动」，用户没回复之前不会再开口。 启动时日志会打印\"已恢复 N 个会话的闲置计时\"。": ": enable proactive idle messages and check the idle threshold, quiet hours and daily limit. Wait for Reply prevents another proactive message until the user responds. Startup logs show restored idle timers.",
+            "：日志出现\"分段音频合并已降级为…\"即走了兜底路径 ；出现\"TTS 合成失败\"则去查 TTS 服务本身。": ": an audio merge fallback message indicates a fallback path; a TTS synthesis failure requires checking the TTS service.",
+            "：对方发来的语音会先用「配置文件 → 更多 → 语音识别」 里的设置转成文字再处理；转不出时日志会写\"这条语音没转出文字\"： 本地通道需要 GPT-SoVITS 的 ASR 环境（首次会下载模型），线上通道需要填好密钥与模型名。": ": incoming voice is transcribed using Profiles → More → Speech Recognition. Empty transcriptions are logged. Local recognition requires the GPT-SoVITS ASR environment; online recognition requires a key and model name.",
+            "：开启「分开发送」后，QQ 里发了几条， 记录页就记几条；关闭时按整段记一条。气泡颜色可区分角色与不同用户。": ": Split Messages records each sent message separately; otherwise, a full reply is one entry. Bubble colors distinguish characters and users.",
+            "：「工具调用」分组里的「工具调用 (Function Calling)」； 每个工具还要在「高级功能 → 工具调用」里单独启用。": ": enable Function Calling in the Tools group, then enable individual tools under Advanced Features → Tools.",
+            "先判断消息是否需要客观信息（时间/计算/天气/搜索/链接等）， 闲聊消息直接跳过工具流程；": "checks whether objective information is needed (time, calculation, weather, search or links); casual conversation skips tools;",
+            "不做门控，模型可能什么都调，一般不建议。": "has no trigger gate and may call tools for any message; generally discouraged.",
+            "自己猜一个城市。 想让它在用户没说地点时也能查，请在工具编辑里填「默认城市」。": "guess a city. Set Default City in the tool editor to allow weather lookups without an explicit location.",
+            "连低俗、暗示的站点与内容一并过滤。 给支持安全搜索的引擎（SearXNG/Bing/Google News/Brave）带上相应参数。 结果变少属正常，日志会写明过滤了几条。": "also filters suggestive content and sends safe search parameters to supported engines (SearXNG, Bing, Google News and Brave). Logs show the number of filtered results.",
+            "：一次搜索给模型的全部结果受 「搜索总字数预算」限制（默认 4000 字），超预算的结果会被": ": search results are limited by the total character budget (default: 4,000). Results beyond that budget are",
+            "省略 ，并在结果里注明\"因长度限制省略 N 条\"。 想看到更多条：把「每次搜索返回条数」和「搜索总字数预算」一起调大 （条数 × 每条约 300 字 ≤ 预算），或在「显示完整日志」下查看——完整模式不会被截断 （极端情况有 40 万字符兜底上限）。": "omitted with a count. Increase both result count and character budget for more content, or enable full logs. Full logs have a final 400,000 character limit.",
+            "：先看日志有没有\"收到私聊/群聊 …\"。 没有 → 检查 NapCat 连接与「群聊需要@才回复」；有 → 看后面是\"回复审判决定不回复\"还是请求超时。 识图失败会降级为普通文本回复，日志里会写\"识图失败，降级为普通文本回复\"。": ": check whether logs show an incoming message. If absent, check NapCat and the group mention setting. Otherwise, check reply judgement and timeouts. Failed image recognition falls back to a text reply and is logged.",
+            "：图片若被判定为\"无需回复\"，系统仍会把画面描述写进历史， 用户随后追问时会重新识图；日志里会有 \"本条消息指向刚才那张未被真正看过的图片\"的提示。": ": image descriptions are saved even when no reply is needed. A follow-up can trigger recognition again; this is recorded in logs.",
+            "： LLM 提取模式会结合最近对话还原真正事项（如\"睡觉\"）； 正则模式无上下文，空指令会被丢弃（日志有记录）。 想更准就把「待办提取方式」设为": ": LLM extraction uses recent conversation to resolve the intended task. Regex extraction has no context and discards empty tasks. For better accuracy, set the extraction method to",
+            "：绝对时刻（\"23点\"）由本地解析成\"最近一次到来的该时刻\"， 日志会打印解析结果与触发时刻，可直接核对。": ": absolute times such as 23:00 resolve to the next occurrence. Check the parsed time and trigger time in logs.",
+            "：日志里搜索\"问候补发\"。 常见原因：程序启动时还没到问候时刻、处于静默时段、事件没有目标会话、 或等待 NapCat 连接超时（可调「补发等待 NapCat 的超时」）。": ": search logs for greeting catch-up. Common causes include a future greeting time, quiet hours, no target session or a NapCat connection timeout.",
+            "；界面按级别着色， 和": "; colors indicate severity and match the prefixes in",
+            "里写的是同一套前缀。 默认\"精简模式\"（只回尾部若干行）；勾选「显示完整日志」看全部输出。 排查时建议打开它，并按关键词搜索：": ". Compact mode shows only recent lines. Enable full logs and search by keyword when troubleshooting:",
+            "黑话词典按角色独立存储、学习和使用；不确定或仅单次对话成立的词条进入「待确认」。": "Each character stores, learns and uses its own lexicon. Uncertain entries and meanings limited to one conversation go to Pending.",
+            "会话摘要更新后会复核一遍（每会话最多每 10 分钟一次，日志搜\"回检\"）： 检查关系确认、画像遗漏、新词条；只补漏不改写。": "Summary updates trigger a review at most once per session every 10 minutes. It fills missing relationship, profile and lexicon information without replacing existing facts.",
+            "待办提取的「触发关键词」是门槛：消息不含任一关键词就不会被提取， 删掉「叫我」会导致\"8点半叫我起床\"这类消息被跳过。": "Task extraction requires a trigger keyword. Removing a keyword can cause otherwise valid reminders to be skipped.",
+            "· 问候、每日陪伴检查、主动开口这几件事会排队执行： 保证一次发多条时每条都有语音。": "· Greetings, daily companion checks and proactive messages are queued so each message can include speech.",
+            "心情日记按当天真实对话来写，没有对话就不写；写好后发给对应用户/群， 角色不会主动提这件事。": "Mood diaries use that day's actual conversations. No conversation means no diary. Entries are sent to the relevant user or group.",
+            "「攻略进度」的好感只是熟悉程度；定关系还看好感以外的东西， 单方面送礼、说情话不会直接推进关系。": "Affection represents familiarity. Relationship decisions also depend on other factors; gifts and romantic remarks alone do not establish a relationship.",
+            "：如果你修改了本程序，并把它作为网络服务提供给他人使用 （如自建服务端），": ": if you modify this program and offer it to others as a network service,",
+            "： 不关闭会占用 exe 与日志文件，安装/卸载会失败或只删一半。 先请求正常退出，几秒内未退出则直接结束进程。": ": close the app before installation or removal to release executable and log files. Request a normal exit first; terminate the process if it does not exit within a few seconds.",
             "默认使用哪个角色": "Default character for replies.",
             "私聊与未提及角色的消息由它回复。": "Replies to private chats and messages not mentioning any character.",
             "【配好参数后可选】隐藏高级 GSV 参数": "Optionally hide advanced GSV parameters.",
@@ -9000,15 +9372,15 @@
             "在提示词中写明各情绪的使用时机": "Explain emotion timing in the prompt.",
             "强烈建议开启；亲密语境强制优先 haixiu。": "Strongly recommended; intimate contexts prefer haixiu.",
             "追加到情绪判定规则后的自定义说明": "Extra notes appended to emotion rules.",
-            "自定义规则，如：主人夸我可爱就必须用 haixiu；留空不追加。": "Custom rules; blank adds nothing.",
+            "自定义规则，如：用户夸我可爱就必须用 haixiu；留空不追加。": "Custom rules; blank adds nothing.",
             "语气渐变": "Voice transition.",
             "开启后，不同情绪句子之间将平滑过渡。": "Smooth transitions between emotion sentences.",
             "呼吸间隙（毫秒）": "Breathing gap in milliseconds.",
             "前一句说完后的停顿时间，默认 100。": "Pause after each sentence, default 100.",
             "交叉渐变长度（毫秒）": "Crossfade length in milliseconds.",
             "两句话重叠过渡的时长，默认 300。": "Overlap duration between sentences, default 300.",
-            "是否启用插件默认的丛雨语气": "Enable built-in Moyu emotions.",
-            "开启：在默认丛雨语气的基础上，额外添加你配置的新语气。": "Adds your custom emotions on top of the defaults.",
+            "是否启用插件默认语气": "Enable built-in Moyu emotions.",
+            "开启：在默认语气的基础上，额外添加你配置的新语气。": "Adds your custom emotions on top of the defaults.",
             "为每句评估情绪强度并调整语音变化": "Assess per-sentence emotion intensity for voice variation.",
             "关闭则所有句子使用相同的语音变化幅度。": "Off uses the same voice variation for all sentences.",
             "情绪越强语音随机性越高": "Map emotion intensity to voice randomness.",
@@ -9811,7 +10183,7 @@
 
             "· 问候、每日陪伴检查、主动开口会排队执行，每条消息都有各自语音。": "· Greetings, the daily companion check and proactive starts are queued so every message gets its own voice.",
 
-            "· 黑话词典全角色共用，只收通用含义；角色专属或仅单次对话成立的词条会移入「待确认」。": "· The slang lexicon is shared by all characters and only keeps general meanings; character-specific entries move to “Pending”.",
+            "· 黑话词典按角色独立存储和学习；仅单次对话成立的词条会移入「待确认」。": "· Each character learns and stores its own lexicon; uncertain entries move to “Pending”.",
 
             "——所有插件都在这里，一行三张卡片，可启用/停用/卸载；点卡片空白进功能页，点插件名进 webui 页；左侧栏「插件」下还会展开名单。": "—— all installed plugins, three cards per row, enable/disable/uninstall; click the card for the function page, the name for the webui page. The sidebar “Plugin” entry also expands a list of",
 
@@ -10021,7 +10393,7 @@
 
             "独占接入方式": "Dedicated connection",
 
-            "插入丛雨默认提示词": "Insert the default Murasame prompt",
+            "插入默认提示词": "Insert the default prompt",
 
             "插件市场": "Plugin Market",
 
@@ -10579,7 +10951,7 @@
 
             "· 情绪老是\"平静\"": "· The emotion is always “calm”",
 
-            "：开启「情绪判定规则引导」（默认开）；也可填「自定义情绪判定补充规则」，如\"主人夸我可爱，就必须用 haixiu\"。": ": keep Emotion Rule Guidance on (default); or fill Custom Emotion Rules, e.g. “user says I am cute, use haixiu”.",
+            "：开启「情绪判定规则引导」（默认开）；也可填「自定义情绪判定补充规则」，如\"用户夸我可爱，就必须用 haixiu\"。": ": keep Emotion Rule Guidance on (default); or fill Custom Emotion Rules, e.g. “user says I am cute, use haixiu”.",
 
             "· 角色漏回消息": "· The character misses messages",
 
@@ -11426,7 +11798,7 @@
 
 
 
-            "启用默认丛雨语气": "Enable the built-in Murasame tone",
+            "启用默认语气": "Enable the built-in default tone",
 
 
 
@@ -12291,7 +12663,7 @@
 
             "手动添加": "Add Manually",
 
-            "开启后定期从对话学习黑话、俚语与专有表达；低把握或绑定角色的词条进入「待确认」，确认后才生效。总开关见「配置文件 → 自主学习」。": "Once enabled, recent conversations are scanned to learn slang and jargon automatically. Entries are shared by all; unsure or character-bound ones go to the “Pending” list below, unused until confirmed. Master switch under “Configuration → Self-learning”.",
+            "开启后定期从对话学习黑话、俚语与专有表达；低把握或绑定角色的词条进入「待确认」，确认后才生效。总开关见「配置文件 → 自主学习」。": "Once enabled, recent conversations are scanned to learn slang and jargon automatically. Each character has its own lexicon; unsure or character-bound entries go to the “Pending” list below, unused until confirmed. Master switch under “Configuration → Self-learning”.",
 
             "待确认": "Pending",
 
@@ -12514,7 +12886,7 @@
 
             "保存": "Save",
 
-            "例如：现在是早上八点，用丛雨的语气叫主人起床": "For example: it is eight in the morning, wake the master up in Murasame's tone",
+            "例如：现在是早上八点，用角色的语气叫用户起床": "For example: it is eight in the morning, wake the master up in the character's tone",
 
             "未命名任务": "Unnamed task",
 
@@ -12786,7 +13158,7 @@
 
             "文件已选择": "File selected",
 
-            "插件界面加载失败（可能不同源）。": "The plugin page could not establish a bridge (it may not be same-origin).",
+            "插件界面加载失败。": "The plugin page could not load.",
 
             "正在打开图片选择…": "Opening the image picker…",
 
@@ -12862,7 +13234,7 @@
 
             "默认城市（可选，仅天气查询用）": "Default city (optional, weather queries only)",
 
-            "留空 = 主人未说地点时角色会反问": "Empty: the character asks back for the location instead of guessing",
+            "留空 = 用户未说地点时角色会反问": "Empty: the character asks back for the location instead of guessing",
 
             "✔ 已启用（保存后生效）": "✔ Enabled (takes effect after saving)",
 
@@ -12998,7 +13370,7 @@
 
             "{0}添加条目": "{0}Add Entry",
 
-            "{1}插入丛雨默认提示词": "{0}Insert Murasame Default Prompt",
+            "{1}插入默认提示词": "{0}Insert Default Prompt",
 
             "角色条目 {0}": "Character entry {0}",
 
@@ -13755,6 +14127,7 @@
         let configDirty = false;
 
         let configBaseline = null;
+        let configUndo = null;
 
         let selectedFiles = new Set();
 
@@ -14189,6 +14562,7 @@
         const configGroups = [
 
             /* ===== 基础连接 ===== */
+            { title: '运行限额与启动策略', keys: ['tts_ready_timeout_seconds', 'tts_ready_poll_seconds', 'tts_weight_timeout_seconds', 'asr_local_timeout_seconds', 'local_model_load_timeout_seconds', 'todo_retry_delay_seconds', 'plugin_callback_timeout_seconds', 'startup_free_ram_mb', 'startup_free_vram_mb', 'startup_gpu_device'] },
 
             { title: 'WebUI 设置', keys: ['webui_enabled', 'webui_host', 'webui_port', 'webui_access_info', 'webui_https', 'webui_cert_file', 'webui_key_file', 'webui_force_password', 'webui_password', 'webui_auth_ttl_minutes', 'webui_second_password', 'webui_second_unlock_minutes', 'webui_log_buffer_lines', 'webui_log_tail_lines', 'webui_log_hide_patterns', 'log_max_size_mb', 'image_cache_max_mb'] },
 
@@ -14198,7 +14572,7 @@
 
             { title: '语音与回复', tree: true, children: [
 
-                { title: 'TTS 服务与模型', keys: ['tts_backend', 'auto_start_tts', 'tts_start_script', 'client_base_url', 'model_dir', 'ref_audio_root', 'timeout_seconds', 'device', 'media_type', 'prompt_text', 'prompt_lang', 'text_lang', 'tts_auto_lang'] },
+                { title: 'TTS 服务与模型', keys: ['tts_backend', 'auto_start_tts', 'tts_start_script', 'client_base_url', 'model_dir', 'tts_gpt_weights', 'tts_sovits_weights', 'ref_audio_root', 'timeout_seconds', 'device', 'media_type', 'prompt_text', 'prompt_lang', 'text_lang', 'tts_auto_lang'] },
 
                 { title: 'TTS 推理参数', keys: ['top_k', 'top_p', 'temperature', 'text_split_method', 'batch_size', 'batch_threshold', 'split_bucket', 'speed_factor', 'fragment_interval', 'streaming_mode', 'seed', 'parallel_infer', 'repetition_penalty'] },
 
@@ -14450,7 +14824,7 @@
 
             'timeout_seconds': { label: 'TTS 超时时间（秒）', description: 'TTS 超时时间', hint: '单位秒。防止超时导致插件一直等待。', required: false, type: 'int', default: 120 },
 
-            'prompt_text': { label: '默认参考音频文本', description: '默认参考音频文本', hint: '参考音频无自带文本且无 asr.txt 时使用。', required: false, type: 'string', default: 'ふむ、おぬしが我輩のご主人か?' },
+            'prompt_text': { label: '默认参考音频文本', description: '默认参考音频文本', hint: '参考音频无自带文本且无 asr.txt 时使用。', required: false, type: 'string', default: '' },
 
             'prompt_lang': { label: '参考音频文本语言', description: '参考音频文本语言', hint: '参考音频文本的语言代码，如 ja 或 zh。', required: false, type: 'string', default: 'ja' },
 
@@ -14522,6 +14896,18 @@
 
             'auto_start_tts': { label: '自动启动 TTS 服务', description: '【推荐开启】一键启动本地 TTS 服务', hint: '自动检测并启动后台 TTS 服务。', required: false, type: 'boolean', condition: { tts_backend: 'local' }, default: true },
 
+            'tts_ready_timeout_seconds': {label: 'TTS 启动等待上限（秒）', description: '可调运行限额', hint: '范围 5–3600，超出时按边界执行。', type: 'number', default: 300},
+            'tts_ready_poll_seconds': {label: 'TTS 就绪检查间隔（秒）', description: '可调运行限额', hint: '范围 0.1–30，超出时按边界执行。', type: 'number', default: 5},
+            'tts_weight_timeout_seconds': {label: 'TTS 权重切换时限（秒）', description: '可调运行限额', hint: '范围 1–120，超出时按边界执行。', type: 'number', default: 30},
+            'asr_local_timeout_seconds': {label: '本地识别总时限（秒）', description: '可调运行限额', hint: '范围 10–7200，超出时按边界执行。', type: 'number', default: 3600},
+            'local_model_load_timeout_seconds': {label: '本地模型加载时限（秒）', description: '可调运行限额', hint: '范围 10–7200，超出时按边界执行。', type: 'number', default: 1800},
+            'todo_retry_delay_seconds': {label: '待办重试基础间隔（秒）', description: '可调运行限额', hint: '范围 5–3600，超出时按边界执行。', type: 'number', default: 120},
+            'plugin_callback_timeout_seconds': {label: '插件回调时限（秒）', description: '可调运行限额', hint: '范围 0.1–30，超出时按边界执行。', type: 'number', default: 5},
+            'startup_free_ram_mb': {label: '先启动 TTS 的空闲内存阈值（MB）', description: '可调运行限额', hint: '范围 0–262144，超出时按边界执行。', type: 'number', default: 4096},
+            'startup_free_vram_mb': {label: '先启动 TTS 的空闲显存阈值（MB）', description: '可调运行限额', hint: '范围 0–262144，超出时按边界执行。', type: 'number', default: 3072},
+            'startup_gpu_device': {label: '启动探测 GPU 编号', description: '填 nvidia-smi 显示的设备编号', hint: 'auto 会参考所有显卡中最少的空闲显存；无法探测时显示未知。', type: 'string', default: 'auto'},
+            'tts_gpt_weights': {label: 'GPT 权重文件', description: '多个候选文件时必须明确选择', hint: '填模型目录下的相对路径或完整 .ckpt 路径；仅一个候选时可留空。', type: 'path', default: ''},
+            'tts_sovits_weights': {label: 'SoVITS 权重文件', description: '多个候选文件时必须明确选择', hint: '填模型目录下的相对路径或完整 .pth 路径；仅一个候选时可留空。', type: 'path', default: ''},
             'tts_start_script': { label: 'TTS 启动脚本路径', description: '【必填】TTS 后端启动命令', hint: '填 api_v2.py 所在的文件夹路径。', required: true, type: 'path', condition: { auto_start_tts: true, tts_backend: 'local' } },
 
             'device': { label: 'TTS 合成设备', description: 'TTS 合成设备', hint: '选择 CUDA 使用显卡（GPU），选择 CPU 使用处理器。', required: false, type: 'string', options: ['cuda', 'cpu'], condition: { auto_start_tts: true, tts_backend: 'local' }, default: 'cuda' },
@@ -14542,7 +14928,7 @@
 
             'emotion_guide_enabled': { label: '情绪判定规则引导', description: '在提示词中写明各情绪的使用时机', hint: '强烈建议开启；亲密语境强制优先 haixiu。', required: false, type: 'boolean', default: true },
 
-            'emotion_guide_extra': { label: '自定义情绪判定补充规则', description: '追加到情绪判定规则后的自定义说明', hint: '自定义规则，如：主人夸我可爱就必须用 haixiu；留空不追加。', required: false, type: 'text' },
+            'emotion_guide_extra': { label: '自定义情绪判定补充规则', description: '追加到情绪判定规则后的自定义说明', hint: '自定义规则，如：用户夸我可爱就必须用 haixiu；留空不追加。', required: false, type: 'text' },
 
             'voice_transition': { label: '语气渐变', description: '语气渐变', hint: '开启后，不同情绪句子之间将平滑过渡。', required: false, type: 'boolean', default: true },
 
@@ -14550,7 +14936,7 @@
 
             'crossfade_ms': { label: '交叉渐变长度（毫秒）', description: '交叉渐变长度（毫秒）', hint: '两句话重叠过渡的时长，默认 300。', required: false, type: 'int', condition: { voice_transition: true }, default: 300 },
 
-            'enable_default_emotions': { label: '启用默认丛雨语气', description: '是否启用插件默认的丛雨语气', hint: '开启：在默认丛雨语气的基础上，额外添加你配置的新语气。', required: false, type: 'boolean', default: true },
+            'enable_default_emotions': { label: '启用默认语气', description: '是否启用插件默认语气', hint: '开启：在默认语气的基础上，额外添加你配置的新语气。', required: false, type: 'boolean', default: true },
 
             'llm_emotion_intensity': { label: '允许 LLM 自动判断情绪强度', description: '为每句评估情绪强度并调整语音变化', hint: '关闭则所有句子使用相同的语音变化幅度。', required: false, type: 'boolean', default: true },
 
@@ -14994,6 +15380,7 @@
 
             if (m) {
 
+                window.lovomoGuide?.setAuthorized(false);
                 m.classList.add('active');
 
                 const inp = document.getElementById('auth-pass');
@@ -15288,6 +15675,278 @@
 
         }
 
+        const STATUS_LABELS = {
+            reachable: '端口可达', unreachable: '无法连接，请检查服务和地址',
+            missing: '尚未配置', local: '本地引擎', disabled: '已关闭',
+            connected: '已连接', disconnected: '未连接，请检查接入设置',
+            sending: '发送中', failed: '失败', waiting: '进入补发队列', retrying: '重试中',
+            unconfirmed: '结果未知', acknowledged: '平台已回执'
+        };
+        const statusLabel = value => STATUS_LABELS[value] || String(value || '未知');
+        const systemElement = id => document.getElementById(`system-${id}`);
+        function fillSystemList(element, lines) {
+            element.replaceChildren(...lines.map(line => {
+                const item = document.createElement('li');
+                item.textContent = line;
+                return item;
+            }));
+        }
+        const DELIVERY_REASONS = {offline: '通道离线', timeout: '请求超时', cancelled: '已取消',
+            send_error: '发送出错', queue_expired: '补发已过期', queue_overflow: '补发队列已满'};
+        const ACTIVITY_STAGES = {
+            message: {received: '收到消息', queued: '等前一条消息处理完成', merged: '已并入前一条消息',
+                not_addressed: '群消息未呼叫角色', processing: '开始处理消息', no_reply: '本条未触发回复',
+                failed: '消息处理失败', interrupted: '消息处理已中断'},
+            model: {started: '已触发回复，正在生成', first_sentence: '首句文字已生成', ready: '回复已生成', no_reply: '模型未生成可发送内容',
+                timeout: '模型生成超时', failed: '模型生成失败', interrupted: '模型生成已中断'},
+            voice: {started: '正在合成语音', ready: '语音已生成', no_audio: '未生成语音', interrupted: '语音合成已中断'},
+        };
+        function activityStep(step) {
+            if (step.stage !== 'delivery') return t(ACTIVITY_STAGES[step.stage]?.[step.status] || '未知');
+            const kind = {text: '文字投递', voice: '语音投递', 'text+voice': '文字与语音投递', other: '其他投递'};
+            const reason = DELIVERY_REASONS[step.reason];
+            return `${t(kind[step.kind] || kind.other)} · ${t(statusLabel(step.status))}${reason ? ` · ${t(reason)}` : ''}`;
+        }
+        const MESSAGE_TIMINGS = {
+            first_text_ms: '收到消息到首条文字发送', first_voice_ms: '收到消息到首段语音发送',
+            queue_ms: '排队等待', inference_ms: '生成首句文字', synthesis_ms: '合成首段语音',
+            send_text_ms: '文字发送到平台确认', send_voice_ms: '语音发送到平台确认',
+        };
+        function latestActivity(steps) {
+            const receipts = new Map();
+            for (const step of steps) {
+                if (step.stage === 'delivery') receipts.set(step.delivery_id, step);
+            }
+            // A streamed model can finish after a send. Keep outstanding
+            // delivery states visible even when the last step is model progress.
+            const deliveries = [...receipts.values()].reverse();
+            return deliveries.find(step => ['unconfirmed', 'waiting', 'retrying', 'failed'].includes(step.status))
+                || steps.at(-1);
+        }
+        function renderMessageActivity(rows) {
+            const list = systemElement('activity');
+            const openIds = new Set(Array.from(list.querySelectorAll('details[open]'), item => item.dataset.id));
+            if (!rows.length) {
+                fillSystemList(list, [t('本次运行暂无收件记录。发消息后若仍无记录，请检查接入方式。')]);
+                return;
+            }
+            list.replaceChildren(...rows.map(row => {
+                const item = document.createElement('li');
+                const details = document.createElement('details');
+                details.dataset.id = row.id;
+                details.open = openIds.has(row.id);
+                const summary = document.createElement('summary');
+                summary.textContent = `${new Date(row.received_at * 1000).toLocaleTimeString()} · ${row.platform} · ${activityStep(latestActivity(row.steps))}`;
+                const steps = document.createElement('ol');
+                const timings = Object.entries(MESSAGE_TIMINGS)
+                    .filter(([key]) => Number.isFinite(row[key])).map(([key, label]) => `${t(label)} · ${row[key]} ms`);
+                fillSystemList(steps, [...timings,
+                    ...(row.truncated ? [t('更早的处理中间步骤已折叠')] : []),
+                    ...row.steps.map(step => `+${step.elapsed_ms} ms · ${activityStep(step)}${Number.isFinite(step.duration_ms) ? ` (${step.duration_ms} ms)` : ''}`)]);
+                details.append(summary, steps);
+                item.append(details);
+                return item;
+            }));
+        }
+        async function refreshSystemHealth() {
+            const list = systemElement('health');
+            fillSystemList(list, ['检查中…']);
+            try {
+                const state = await apiGetUncached('api/system/health');
+                const delivery = state.delivery || {};
+                fillSystemList(list, [
+                    `检查时间 ${new Date(state.checked_at * 1000).toLocaleString()}`,
+                    `语言模型 · ${statusLabel(state.llm.status)} · ${state.llm.model_configured ? '已选择模型' : '请选择模型'}`,
+                    `语音合成 · ${statusLabel(state.tts.status)}`,
+                    `语音识别 · ${statusLabel(state.asr.status)}`,
+                    ...(state.connections || []).map(connection => `${connection.platform} · ${statusLabel(connection.status)}`),
+                    `插件 · ${state.plugins.enabled ? `已加载 ${state.plugins.loaded} 个` : '已关闭'}`,
+                    `定时任务 · ${state.scheduler.active ? '运行中' : state.scheduler.enabled ? '尚未启动' : '已关闭'}`,
+                    `微信待补发 · ${delivery.wechat_waiting || 0} 条`,
+                    ...(delivery.wechat_legacy_outbox ? [t('已保留旧版本的微信待补发记录。由于无法确认投递结果，程序不会自动发送这些消息。')] : []),
+                    ...(delivery.wechat_unpersisted
+                        ? [`微信待补发中有 ${delivery.wechat_unpersisted} 条尚未保存到磁盘，重启后可能丢失。`] : [])
+                ]);
+                renderMessageActivity(delivery.activity || []);
+                const recent = (delivery.recent || []).map(item => {
+                    const reason = DELIVERY_REASONS[item.reason];
+                    return `投递 · ${new Date(item.checked_at * 1000).toLocaleTimeString()} · ${item.platform} · ${statusLabel(item.status)}${reason ? `（${reason}）` : ''}`;
+                });
+                fillSystemList(systemElement('delivery'), recent.length ? recent : ['本次运行暂无投递记录']);
+                const backup = await apiGetUncached('api/backup/status');
+                systemElement('backup-cancel').hidden = !backup.pending;
+            } catch (error) {
+                fillSystemList(list, [`检查失败：${error.message}`]);
+            }
+        }
+        let backupPreview = null;
+        const backupFile = systemElement('backup-file');
+        const backupStage = systemElement('backup-stage');
+        const backupResult = systemElement('backup-result');
+        function resetBackupPreview() {
+            backupPreview = null;
+            backupStage.disabled = true;
+            systemElement('backup-details').hidden = true;
+        }
+        async function submitBackup(path, file, digest) {
+            if (!file) throw new Error('请先选择 ZIP 备份包');
+            if (file.size > 20 * 1024 * 1024) throw new Error('备份包超过 20 MB');
+            const headers = {'Content-Type': 'application/zip'};
+            if (digest) headers['X-Lovomo-Backup-SHA256'] = digest;
+            const response = await fetchGuarded(`${API_BASE}/api/backup/${path}`, {method:'POST', headers, body:file});
+            authOrThrow(response);
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+            return result;
+        }
+        backupFile.addEventListener('change', () => {
+            resetBackupPreview();
+            backupResult.textContent = '';
+        });
+        const previewModel = systemElement('tts-model');
+        const previewVoice = systemElement('tts-voice');
+        const previewButton = systemElement('tts-test');
+        let previewModels = [];
+        let previewBusy = false;
+        function renderPreviewVoices(preferred = '') {
+            const model = previewModels.find(item => item.id === previewModel.value);
+            systemElement('tts-voice-field').hidden = !model?.voices.length;
+            previewVoice.replaceChildren(new Option('配置默认音色', ''),
+                ...(model?.voices || []).map(voice => new Option(voice, voice)));
+            previewVoice.value = model?.voices.includes(preferred) ? preferred : '';
+        }
+        async function loadVoicePreviewOptions() {
+            try {
+                const {models} = await apiGet('api/system/sample-tts/options');
+                const oldModel = previewModel.value;
+                const oldVoice = previewVoice.value;
+                previewModels = models;
+                const labels = {profile: '配置文件 · {0}', connection: '接入方式 · {0}', cloud: '云端 TTS · {0}'};
+                previewModel.replaceChildren(...models.map(model => new Option(
+                    model.source === 'current' ? '当前配置' : labels[model.source].replace('{0}', model.name), model.id)));
+                previewModel.value = models.some(model => model.id === oldModel) ? oldModel : '';
+                renderPreviewVoices(previewModel.value === oldModel ? oldVoice : '');
+                previewModel.disabled = previewBusy;
+                previewButton.disabled = previewBusy;
+                const result = systemElement('setup-result');
+                if (result.dataset.optionsError) {
+                    delete result.dataset.optionsError;
+                    result.textContent = '';
+                }
+            } catch {
+                if (!previewModels.length) {
+                    const result = systemElement('setup-result');
+                    result.dataset.optionsError = '1';
+                    result.textContent = '读取合成模型失败，请刷新状态后重试。';
+                }
+            }
+        }
+        previewModel.addEventListener('change', () => renderPreviewVoices());
+        const loadSystemPanel = () => Promise.all([refreshSystemHealth(), loadVoicePreviewOptions()]);
+        systemElement('refresh').addEventListener('click', loadSystemPanel);
+        systemElement('model-test').addEventListener('click', async (event) => {
+            const button = event.currentTarget;
+            const result = systemElement('setup-result');
+            button.disabled = true;
+            result.textContent = '正在获取模型列表…';
+            const labels = {
+                model_listed: '在服务的模型列表中找到了已选模型。可继续到「聊天测试」生成一条回复。',
+                model_missing: '服务没有列出已选模型。请在模型服务页重新选择。',
+                model_list_unavailable: '读不到模型列表，请检查服务地址，或在「聊天测试」实测。',
+                credentials_rejected: '服务拒绝访问，请检查模型服务的凭据。',
+                missing: '请先保存模型服务地址和模型。'
+            };
+            try {
+                const response = await apiPost('api/system/verify-model', {});
+                result.textContent = labels[response.status] || '无法验证模型';
+            } catch (error) { result.textContent = error.message; }
+            finally { button.disabled = false; }
+        });
+        systemElement('tts-test').addEventListener('click', async (event) => {
+            const button = event.currentTarget;
+            const result = systemElement('setup-result');
+            const player = systemElement('tts-audio');
+            if (player.src) URL.revokeObjectURL(player.src);
+            player.removeAttribute('src');
+            player.hidden = true;
+            previewBusy = true;
+            button.disabled = true;
+            const fields = [previewModel, previewVoice, systemElement('tts-language'), systemElement('tts-text')];
+            fields.forEach(field => { field.disabled = true; });
+            result.textContent = '正在生成试听音频…';
+            try {
+                const language = systemElement('tts-language').value;
+                const text = systemElement('tts-text').value.trim();
+                const response = await fetchGuarded(`${API_BASE}/api/system/sample-tts`, {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({language, model: previewModel.value, voice: previewVoice.value, text}),
+                });
+                authOrThrow(response);
+                if (!response.ok) throw new Error((await response.json()).error || `HTTP ${response.status}`);
+                if (player.src.startsWith('blob:')) URL.revokeObjectURL(player.src);
+                player.src = URL.createObjectURL(await response.blob());
+                player.hidden = false;
+                result.textContent = t('试听已就绪。');
+                window.lovomoGuide?.signal('voice-ready');
+                player.play().catch(() => {});
+            } catch (error) { result.textContent = error.message; }
+            finally {
+                previewBusy = false;
+                button.disabled = false;
+                fields.forEach(field => { field.disabled = false; });
+            }
+        });
+        document.querySelectorAll('[data-system-panel]').forEach(button => {
+            button.addEventListener('click', () => switchPanel(button.dataset.systemPanel));
+        });
+        systemElement('diagnostics').addEventListener('click', async () => {
+            try { await downloadFile(`${API_BASE}/api/system/diagnostics`); }
+            catch (error) { backupResult.textContent = error.message; }
+        });
+        systemElement('backup-export').addEventListener('click', async () => {
+            try { await downloadFile(`${API_BASE}/api/backup/export`); }
+            catch (error) { backupResult.textContent = error.message; }
+        });
+        systemElement('backup-preview').addEventListener('click', async () => {
+            resetBackupPreview();
+            const file = backupFile.files[0];
+            backupResult.textContent = '正在校验备份…';
+            try {
+                const report = await submitBackup('preview', file);
+                if (file !== backupFile.files[0]) return;
+                backupPreview = {file, digest: report.sha256};
+                backupResult.textContent = `共 ${report.count} 个文件，其中 ${report.replace_count} 个将覆盖。`;
+                fillSystemList(systemElement('backup-files'), report.files.map(item =>
+                    `${item.exists ? '覆盖' : '新增'} · ${item.name} · ${Math.ceil(item.bytes / 1024)} KB`));
+                systemElement('backup-details').hidden = false;
+                backupStage.disabled = false;
+            } catch (error) {
+                if (file === backupFile.files[0]) backupResult.textContent = error.message;
+            }
+        });
+        systemElement('backup-cancel').addEventListener('click', async () => {
+            try {
+                await apiPost('api/backup/cancel', {});
+                systemElement('backup-cancel').hidden = true;
+                backupResult.textContent = '已取消待恢复任务。';
+            } catch (error) { backupResult.textContent = error.message; }
+        });
+        backupStage.addEventListener('click', async () => {
+            const preview = backupPreview;
+            if (!preview || !await uiConfirm('下次完整启动时应用备份并覆盖预览中的已有文件。是否继续？')) return;
+            if (backupPreview !== preview) return;
+            backupStage.disabled = true;
+            try {
+                await submitBackup('stage', preview.file, preview.digest);
+                resetBackupPreview();
+                systemElement('backup-cancel').hidden = false;
+                backupResult.textContent = '已安排恢复。请从托盘完全退出 Lovomo 后重新启动。';
+            } catch (error) {
+                if (backupPreview === preview) backupStage.disabled = false;
+                backupResult.textContent = error.message;
+            }
+        });
+
         const PANEL_LOADERS = {
 
             chat: () => loadChatList(),
@@ -15297,6 +15956,8 @@
             audio: () => loadAudioPage(),
 
             tasks: () => loadTasksPage(),
+
+            system: loadSystemPanel,
 
             stats: () => loadStatsPage(),
 
@@ -17559,6 +18220,7 @@
             }
 
             startScanOrShowBound(conn);
+            if (!conn) window.lovomoGuide?.signal('connection-form');
 
         }
 
@@ -17571,6 +18233,7 @@
             const el = document.getElementById('connection-modal');
 
             if (el) el.classList.remove('active');
+            window.lovomoGuide?.signal('connection-cancelled');
 
         }
 
@@ -18073,7 +18736,11 @@
 
         async function switchPanel(panelId) {
 
-            if (!panelId || panelId === activePanelId) return;
+            if (!panelId) return;
+            if (panelId === activePanelId) {
+                window.lovomoGuide?.panelChanged(panelId);
+                return;
+            }
 
             if (activePanelId === 'plugin-page' && panelId !== 'plugin-page'
 
@@ -18117,6 +18784,7 @@
 
             // 用户填了一半的配置会被静默丢弃
 
+            let panelLoad;
             if (panelId === 'config' && !configDirty) {
 
                 Promise.resolve(loadConfig()).then(() => restorePanelScroll(panelId));
@@ -18131,13 +18799,17 @@
 
             if (panelId === 'models' && !modelsDirty) {
 
-                Promise.resolve(loadModelsPanel()).then(() => restorePanelScroll(panelId));
+                panelLoad = loadModelsPanel().then(() => {
+                    if (activePanelId === panelId) restorePanelScroll(panelId);
+                });
 
             }
 
             if (panelId === 'roles' && !rolesDirty) {
 
-                Promise.resolve(loadRolesPanel()).then(() => restorePanelScroll(panelId));
+                panelLoad = loadRolesPanel().then(() => {
+                    if (activePanelId === panelId) restorePanelScroll(panelId);
+                });
 
             }
 
@@ -18170,6 +18842,8 @@
             else stopLogPolling();
 
             if (panelId !== 'stats') stopPerfPolling();
+            window.lovomoGuide?.panelChanged(panelId);
+            return panelLoad;
 
         }
 
@@ -18464,6 +19138,75 @@
             return JSON.stringify(Object.keys(data).sort().map(k => [k, data[k]]));
 
         }
+
+        const configSearch = document.getElementById('config-search');
+        const configSearchResults = document.getElementById('config-search-results');
+        const configUndoButton = document.getElementById('config-undo');
+        const configSubgroups = new WeakMap();
+
+        configSearch.addEventListener('input', () => {
+            const query = configSearch.value.toLowerCase().trim();
+            configSearchResults.replaceChildren();
+            configSearchResults.hidden = !query;
+            if (!query) return;
+            const aliases = [
+                {pattern: /不回|没回|not reply|not responding/, keys: ['smart_reply_enabled', 'reply_judge_enabled', 'reply_probability_enabled']},
+                {pattern: /语音.{0,4}慢|slow (voice|speech)/, keys: ['tts_reply_enabled', 'timeout_seconds', 'streaming_enabled', 'speed_factor']},
+            ];
+            const suggested = new Set(aliases.filter(alias => alias.pattern.test(query)).flatMap(alias => alias.keys));
+            const rows = [...document.querySelectorAll('#config-groups [data-field-key]')];
+            const matches = rows.filter(row => {
+                const key = row.dataset.fieldKey;
+                const meta = configMeta[key];
+                const parts = [key, meta.label, meta.description, t(meta.label), t(meta.description)].filter(Boolean);
+                return suggested.has(key) || parts.join(' ').toLowerCase().includes(query);
+            }).slice(0, 10);
+            for (const row of matches) {
+                const meta = configMeta[row.dataset.fieldKey];
+                const item = document.createElement('li');
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.className = 'btn btn-gray';
+                button.textContent = t(meta.label);
+                button.onclick = () => {
+                    const reveal = candidate => {
+                        const subgroup = configSubgroups.get(candidate);
+                        if (subgroup) setSubgroupOpen(subgroup, true);
+                    };
+                    reveal(row);
+                    const parentKey = Object.keys(meta.condition || {})[0];
+                    const visible = !!row.getClientRects().length;
+                    const parent = parentKey && document.querySelector(`#config-groups [data-field-key="${parentKey}"]`);
+                    const target = visible ? row : parent;
+                    if (!visible) showConfigMessage(t('请先开启此设置的上级选项。'));
+                    if (target) reveal(target);
+                    if (!target?.getClientRects().length) return;
+                    target.scrollIntoView({block: 'center'});
+                    target.querySelector('input:not([type="hidden"]), select, textarea, button')?.focus({preventScroll: true});
+                };
+                item.append(button);
+                configSearchResults.append(item);
+            }
+            if (!matches.length) fillSystemList(configSearchResults, [t('没有匹配的设置')]);
+        });
+
+        configUndoButton.addEventListener('click', async () => {
+            if (!configUndo) return;
+            if (configDirty) { await uiAlert('请先保存或放弃当前改动。'); return; }
+            if (!await uiConfirm('撤销会恢复本次页面中上次保存前的普通设置。凭据和接入信息保留当前值。')) return;
+            configUndoButton.disabled = true;
+            try {
+                const result = await apiPost('api/config/save', {...configUndo.before, expected_values: configUndo.after});
+                if (!result.success) throw new Error(result.error || '保存失败');
+                configUndo = null;
+                await loadConfig();
+                showConfigMessage(t('已恢复上次保存前的设置'), 'success');
+            } catch (error) {
+                showConfigMessage(error.message, 'error');
+            } finally {
+                configUndoButton.disabled = !configUndo;
+            }
+        });
 
 
 
@@ -20173,6 +20916,8 @@
 
                 const entry = { title: sub.title, head, rows };
 
+                rows.forEach(row => configSubgroups.set(row, entry));
+
                 setSubgroupOpen(entry, false);
 
                 head.addEventListener('click', () => setSubgroupOpen(entry, !head.classList.contains('open')));
@@ -20466,7 +21211,7 @@
 
         function providerKindControlRow(p, kind) {
 
-            if (kind === 'chat' || kind === 'caption') {
+            if (kind === 'chat' || kind === 'caption' || kind === 'embedding') {
 
                 const cur = String(p.backend || (kind === 'chat' ? 'ollama' : ''));
 
@@ -20476,7 +21221,10 @@
 
                     + `<option value="openai"${cur === 'openai' ? ' selected' : ''}>openai（OpenAI 兼容）</option>`
 
-                    + `</select></div></div>`;
+                    + `</select></div></div>`
+                    + (kind === 'chat' ? `<div class="form-row"><label>本地模型服务</label><div class="field-wrapper"><select data-pkey="service">`
+                        + [['auto','自动识别'],['lmstudio','LM Studio（允许自动启动）'],['openai','通用 OpenAI 兼容服务'],['ollama','Ollama']].map(([value,label]) => `<option value="${value}"${String(p.service || 'auto') === value ? ' selected' : ''}>${label}</option>`).join('')
+                        + `</select><div class="field-hint">LM Studio 未运行时需明确选择，通用兼容服务仅发送预热请求。</div></div></div>` : '');
 
             }
 
@@ -20823,6 +21571,7 @@
                 await loadModelsPanel();
 
                 modelsMsg('已保存并立即生效。');
+                window.lovomoGuide?.signal('models-saved');
 
             } catch (e) {
 
@@ -20910,9 +21659,27 @@
 
                     <div class="form-row"><label>独占接入方式</label><div class="field-wrapper"><select data-role-key="connection_id">${roleConnectionOptions(r.connection_id)}</select></div></div>
 
+                    ${r.id ? `<div class="form-row"><label>${t('隔离试聊')}</label><div class="field-wrapper">
+                        <p class="muted">${t('输入一句话，对比已保存人设与当前草稿。两次回复都从空白对话开始。')}</p>
+                        <input class="role-compare-input" type="text" maxlength="4000" aria-label="${t('隔离试聊')}">
+                        <button class="btn btn-gray role-compare-btn" type="button">${t('隔离试聊')}</button>
+                        <div class="role-compare-result" role="status" style="white-space:pre-wrap;overflow-wrap:anywhere;"></div>
+                    </div></div>` : ''}
+
                 </details>`;
 
             const delBtn = div.querySelector('.lib-role-delete-btn');
+
+            const compare = div.querySelector('.role-compare-btn');
+            if (compare) compare.addEventListener('click', async () => {
+                const input = div.querySelector('.role-compare-input');
+                const result = div.querySelector('.role-compare-result');
+                const text = input.value.trim();
+                if (!text) { input.focus(); return; }
+                const fields = ['personality_prompt', 'json_prompt', 'supplement_prompt', 'text_lang', 'prompt_lang'];
+                const draft = Object.fromEntries(fields.map(key => [key, div.querySelector(`[data-rkey="${key}"]`).value]));
+                await comparePersona(r.character_key, text, draft, compare, result, {connection_id: ''});
+            });
 
             if (delBtn) delBtn.addEventListener('click', async (e) => {
 
@@ -20946,7 +21713,7 @@
 
             if (!rolesDraft.length) {
 
-                box.innerHTML = '<div class="muted">还没有角色，点「新建角色」或「插入丛雨默认提示词」。</div>';
+                box.innerHTML = '<div class="muted">还没有角色，点「新建角色」或「插入默认提示词」。</div>';
 
             }
 
@@ -21056,7 +21823,7 @@
 
             if (addModel) addModel.addEventListener('click', async () => {
 
-                const out = await uiForm([
+                const modelForm = uiForm([
 
                     {key: 'kind', label: '用途', type: 'select', value: 'chat',
 
@@ -21071,8 +21838,12 @@
                 ], {title: '新建模型服务', okText: '创建',
 
                     message: '先填最基本的几项，密钥、采样参数建好后在卡片里补。'});
-
-                if (!out) return;
+                window.lovomoGuide?.signal('model-form');
+                const out = await modelForm;
+                if (!out) {
+                    window.lovomoGuide?.signal('model-cancelled');
+                    return;
+                }
 
                 const kind = String(out.kind || 'chat');
 
@@ -21109,6 +21880,7 @@
                 modelsMsg(`已新建「${name || MODEL_KIND_LABELS[kind] || kind}」，填好参数后点「保存全部」生效。`);
 
                 flashLastCard('models-list');
+                window.lovomoGuide?.signal('model-created', modelsDraft.length - 1);
 
             });
 
@@ -21144,9 +21916,9 @@
 
                 const out = await uiForm([
 
-                    {key: 'name', label: '角色名称', placeholder: '例如 丛雨'},
+                    {key: 'name', label: '角色名称', placeholder: '例如 小鲸鱼'},
 
-                    {key: 'key', label: '角色标识符', placeholder: '例如 murasame',
+                    {key: 'key', label: '角色标识符', placeholder: '例如 whale',
 
                      hint: '会话记忆、语音目录都按它归属，建好后不建议再改。留空自动生成。'},
 
@@ -22051,16 +22823,52 @@
 
 
         async function saveConfig(restart_tts = false) {
-
+            const saveButtons = [document.getElementById('save-only-btn'), document.getElementById('save-restart-btn')];
+            if (saveButtons[0].disabled || configBaseline === null) return;
+            saveButtons.forEach(button => { button.disabled = true; });
             try {
 
                 const formData = collectFormData(document.getElementById('config-groups'), currentConfig);
-
-                formData['restart_tts'] = restart_tts;
-
-
-
-                await apiPost('api/config/save', formData);
+                const baseline = Object.fromEntries(JSON.parse(configBaseline || '[]'));
+                const keys = Object.keys(formData).filter(key => JSON.stringify(formData[key]) !== JSON.stringify(baseline[key]));
+                const previous = currentConfig;
+                const select = (source, list) => Object.fromEntries(list.map(key => [key, source[key]]));
+                const privateField = key => !!configMeta[key]?.password || /password|secret|key|token|path|root|url|connection|command|host|port/i.test(key);
+                const shown = value => typeof value === 'boolean' ? t(value ? '已开启' : '已关闭')
+                    : value === '' || value == null ? t('空白')
+                    : t(String(value)).replace(/\s+/g, ' ').slice(0, 80);
+                if (keys.length) {
+                    const labels = keys.map(key => {
+                        const old = baseline[key];
+                        const next = formData[key];
+                        const label = t(configMeta[key]?.label || key);
+                        if (privateField(key) || (old !== null && typeof old === 'object') || (next !== null && typeof next === 'object')) {
+                            return `${label}: ${t('已修改（不显示具体值）')}`;
+                        }
+                        return `${label}: ${shown(old)} → ${shown(next)}`;
+                    });
+                    if (!await uiConfirm(labels.join('\n'), '确认设置改动')) return;
+                }
+                if (!keys.length && !restart_tts) return;
+                const undoKeys = keys.filter(key => configMeta[key] && typeof previous?.[key] !== 'object'
+                    && previous?.[key] !== undefined && !privateField(key));
+                const result = await apiPost('api/config/save', {...select(formData, keys), restart_tts,
+                    expected_values: select(previous, undoKeys)});
+                if (!result.success) throw new Error(result.error || '保存失败');
+                if (keys.length) {
+                    configUndo = null;
+                    configUndoButton.disabled = true;
+                    try {
+                        const applied = await apiGetUncached('api/config');
+                        currentConfig = applied;
+                        const appliedKeys = undoKeys.filter(key => JSON.stringify(applied[key]) === JSON.stringify(formData[key])
+                            && JSON.stringify(previous[key]) !== JSON.stringify(applied[key]));
+                        if (appliedKeys.length) {
+                            configUndo = {before: select(previous, appliedKeys), after: select(applied, appliedKeys)};
+                            configUndoButton.disabled = false;
+                        }
+                    } catch { /* Save succeeded even if read-back is temporarily unavailable. */ }
+                }
 
                 configDirty = false;
 
@@ -22073,9 +22881,9 @@
                 showToast(restart_tts ? '配置已保存，TTS 服务正在重启' : '配置已保存');
 
             } catch (e) {
-
                 showConfigMessage('保存失败: ' + e.message, 'error');
-
+            } finally {
+                saveButtons.forEach(button => { button.disabled = false; });
             }
 
         }
@@ -22737,6 +23545,7 @@
         async function openChatDetail(filename) {
 
             currentFilename = filename;
+            setRecallPanel(false);
 
             try {
 
@@ -22773,6 +23582,85 @@
             }
 
         }
+
+        const chatRecallButton = document.getElementById('chat-recall-btn');
+        const chatRecallPanel = document.getElementById('chat-recall-panel');
+
+        function setRecallPanel(open) {
+            chatRecallPanel.hidden = !open;
+            document.getElementById('modal-body').hidden = open;
+            chatRecallButton.textContent = t(open ? '返回聊天记录' : '角色回忆');
+            document.getElementById('chat-modal').classList.toggle('recall-open', open);
+        }
+
+        async function loadRecallPanel(change = {}) {
+            const filename = currentFilename;
+            chatRecallPanel.textContent = t('加载中…');
+            try {
+                const data = await apiPost('api/memory/recall', {filename, ...change});
+                if (currentFilename !== filename || chatRecallPanel.hidden) return;
+                if (!data.success) throw new Error(data.error);
+                const note = document.createElement('p');
+                note.textContent = t('仅管理当前角色在本会话中的回忆索引，原始聊天记录保留。');
+                chatRecallPanel.replaceChildren(note);
+                if (!data.memories.length) chatRecallPanel.append(t('会话还没有可管理的回忆片段。'));
+                if (data.total > 100) chatRecallPanel.append(t('只显示最近 100 条回忆。'));
+                for (const item of data.memories) {
+                    const card = document.createElement('section');
+                    card.className = 'card';
+                    card.style.marginBottom = '10px';
+                    const heading = document.createElement('p');
+                    heading.textContent = item.ts ? new Date(item.ts * 1000).toLocaleString() : '';
+                    const sourceIndex = item.ts > 0
+                        ? currentChatHistory.findIndex(message => Number(message.timestamp) === item.ts) : -1;
+                    if (sourceIndex >= 0) {
+                        const source = document.createElement('button');
+                        source.type = 'button';
+                        source.className = 'btn btn-gray btn-sm memory-source';
+                        source.textContent = t('查看来源');
+                        source.onclick = () => {
+                            setRecallPanel(false);
+                            const row = document.querySelector(`#modal-body .msg-row[data-index="${sourceIndex}"]`);
+                            if (!row) return;
+                            row.tabIndex = -1;
+                            row.scrollIntoView({block: 'center'});
+                            row.focus({preventScroll: true});
+                        };
+                        heading.append(' ', source);
+                    }
+                    const field = document.createElement('textarea');
+                    field.setAttribute('aria-label', t('修改回忆'));
+                    field.rows = 3;
+                    field.style.width = '100%';
+                    field.value = item.text;
+                    field.maxLength = 600;
+                    card.append(heading, field);
+                    for (const [action, label] of [['edit', '修改回忆'], ['pin', item.pinned ? '取消置顶' : '置顶回忆'],
+                        ['forget', '忘掉这段回忆']]) {
+                        const button = document.createElement('button');
+                        button.type = 'button';
+                        button.className = 'btn btn-gray';
+                        button.textContent = t(label);
+                        button.onclick = async () => {
+                            if (action === 'forget' && !await uiConfirm('确定从回忆检索中移除这段内容？')) return;
+                            if (action === 'edit' && !field.value.trim()) { field.focus(); return; }
+                            if (currentFilename !== filename || chatRecallPanel.hidden) return;
+                            await loadRecallPanel({id: item.id, action, ...(action === 'edit' ? {text: field.value} : {})});
+                        };
+                        card.append(button);
+                    }
+                    chatRecallPanel.append(card);
+                }
+            } catch (error) {
+                if (currentFilename === filename && !chatRecallPanel.hidden) chatRecallPanel.textContent = error.message;
+            }
+        }
+
+        chatRecallButton.onclick = () => {
+            const open = chatRecallPanel.hidden;
+            setRecallPanel(open);
+            if (open) loadRecallPanel();
+        };
 
 
 
@@ -22933,6 +23821,7 @@
                 const row = document.createElement('div');
 
                 row.className = 'msg-row ' + (msg.role === 'user' ? 'user' : 'bot');
+                row.dataset.index = idx;
 
                 const isUser = msg.role === 'user';
 
@@ -24490,7 +25379,7 @@
 
                     <div class="field wide" id="job-llm-field" style="display:none;"><label>LLM 生成指令</label>
 
-                        <textarea id="job-llm" placeholder="例如：现在是早上八点，用丛雨的语气叫主人起床">${esc(a.llm_prompt || '')}</textarea></div>
+                        <textarea id="job-llm" placeholder="例如：现在是早上八点，用角色的语气叫用户起床">${esc(a.llm_prompt || '')}</textarea></div>
 
                     <div class="field"><label style="font-weight:normal;"><input type="checkbox" id="job-voice" ${a.use_voice ? 'checked' : ''}> 附带语音</label></div>
 
@@ -25734,6 +26623,111 @@
 
 
 
+        function testChatRouting() {
+            const value = document.getElementById('test-model-select').value;
+            if (value.startsWith('connection:')) return {connection_id: value.slice('connection:'.length)};
+            if (value === 'main') return {connection_id: ''};
+            if (value.startsWith('model:')) return {chat_provider: value.slice('model:'.length)};
+            return {};
+        }
+
+        async function comparePersona(roleKey, message, draft, button, result, routing = {}) {
+            if (button.disabled) return;
+            button.disabled = true;
+            result.textContent = t('正在生成两版回复…');
+            try {
+                const data = await apiPost('api/test/compare', {character_key: roleKey, text: message, draft, ...routing});
+                const fallback = {empty: '模型没有返回内容', timeout: '模型生成超时', failed: '试聊失败，请检查模型服务'};
+                result.textContent = ['saved', 'draft'].map((name, i) => {
+                    const label = t(i ? '当前草稿' : '已保存人设');
+                    const reply = data[name];
+                    return `${label}\n${reply.text || reply.error || t(fallback[reply.status])}`;
+                }).join('\n\n');
+            } catch (error) { result.textContent = error.message; }
+            finally { button.disabled = false; }
+        }
+
+        const testDrafts = new Map();
+        let testDraftRole;
+        const testDraftPart = id => document.getElementById(`test-draft-${id}`);
+        async function loadTestDraft() {
+            if (!document.getElementById('test-draft').open) return;
+            const roleKey = document.getElementById('test-char-select').value;
+            if (!roleKey || testDraftRole === roleKey) return;
+            const persona = testDraftPart('persona');
+            const result = testDraftPart('result');
+            persona.disabled = testDraftPart('run').disabled = testDraftPart('edit').disabled = true;
+            testDraftRole = roleKey;
+            result.textContent = t('加载中…');
+            try {
+                let draft = testDrafts.get(roleKey);
+                if (draft === undefined) {
+                    const data = await apiGetUncached(`api/test/persona?character_key=${encodeURIComponent(roleKey)}`);
+                    draft = data.personality_prompt || '';
+                    if (!testDrafts.has(roleKey)) testDrafts.set(roleKey, draft);
+                }
+                if (testDraftRole !== roleKey) return;
+                persona.value = testDrafts.get(roleKey);
+                result.textContent = '';
+                persona.disabled = testDraftPart('run').disabled = testDraftPart('edit').disabled = false;
+            } catch (error) {
+                if (testDraftRole === roleKey) {
+                    testDraftRole = undefined;
+                    result.textContent = error.message;
+                }
+            }
+        }
+        document.getElementById('test-draft').addEventListener('toggle', loadTestDraft);
+        testDraftPart('persona').addEventListener('input', event => {
+            if (testDraftRole) testDrafts.set(testDraftRole, event.target.value);
+        });
+        testDraftPart('run').addEventListener('click', async event => {
+            const roleKey = testDraftRole;
+            const input = testDraftPart('input');
+            const message = input.value.trim();
+            if (!roleKey || !message) { input.focus(); return; }
+            const selector = document.getElementById('test-char-select');
+            selector.disabled = true;
+            const persona = testDraftPart('persona');
+            testDraftPart('edit').disabled = persona.disabled = true;
+            try {
+                await comparePersona(roleKey, message, {personality_prompt: persona.value},
+                                     event.currentTarget, testDraftPart('result'), testChatRouting());
+            } finally { selector.disabled = testDraftPart('edit').disabled = persona.disabled = false; }
+        });
+        testDraftPart('edit').addEventListener('click', async () => {
+            const roleKey = testDraftRole;
+            const draft = testDraftPart('persona').value;
+            await switchPanel('roles');
+            const field = [...document.querySelectorAll('#roles-list [data-rkey="character_key"]')]
+                .find(el => el.value === roleKey)?.closest('.role-item')?.querySelector('[data-rkey="personality_prompt"]');
+            if (!field) {
+                rolesMsg(t('未找到角色，请先新建角色。'), true);
+                return;
+            }
+            if (rolesDirty && field.value !== draft && !await uiConfirm('将试聊草稿带到角色管理？这会替换当前卡片里尚未保存的人设。')) return;
+            field.closest('details').open = true;
+            field.value = draft;
+            rolesDirty = true;
+            field.focus();
+        });
+
+        let testChatConnections = [];
+        let testChatMain = '';
+
+        function updateTestChatRouting() {
+            const role = document.getElementById('test-char-select').value;
+            const select = document.getElementById('test-model-select');
+            const automatic = select.querySelector('option[value="auto"]');
+            if (!automatic) return;
+            const matches = testChatConnections.filter(channel => channel.character_key === role);
+            const candidates = matches.length ? matches : testChatConnections;
+            const [channel] = candidates;
+            automatic.textContent = candidates.length === 1
+                ? `${t('自动')} · ${channel.name}${channel.model ? ' · ' + channel.model : ''}`
+                : candidates.length ? t('请选择接入方式或聊天模型') : `${t('自动')} · ${testChatMain}`;
+        }
+
         async function loadTestChat() {
 
             const sel = document.getElementById('test-char-select');
@@ -25750,7 +26744,7 @@
 
                     sel.dataset.bound = '1';
 
-                    sel.addEventListener('change', loadTestHistory);
+                    sel.addEventListener('change', () => { updateTestChatRouting(); loadTestHistory(); loadTestDraft(); });
 
                     document.getElementById('test-send-btn').addEventListener('click', sendTestChat);
 
@@ -25780,11 +26774,30 @@
 
                 }
 
+                const currentRole = sel.value;
                 sel.innerHTML = roles.map(r =>
 
                     `<option value="${esc(r.character_key)}">${esc(r.character_name)}</option>`).join('');
+                if (roles.some(role => role.character_key === currentRole)) sel.value = currentRole;
+
+                const modelSelect = document.getElementById('test-model-select');
+                const currentModel = modelSelect.value;
+                const library = await loadModelLibrary();
+                testChatConnections = data.connections || [];
+                testChatMain = t('主配置') + (data.main_model ? ` · ${data.main_model}` : '');
+                modelSelect.replaceChildren(new Option(t('按角色选择接入方式'), 'auto'),
+                    ...testChatConnections.map(channel => new Option(
+                        `${t('接入方式')} · ${channel.name}${channel.model ? ' · ' + channel.model : ''}`,
+                        `connection:${channel.id}`)),
+                    new Option(testChatMain, 'main'),
+                    ...(library.providers || []).filter(provider => provider.kind === 'chat')
+                        .map(provider => new Option(provider.name, `model:${provider.id}`)));
+                modelSelect.value = Array.from(modelSelect.options).some(option => option.value === currentModel)
+                    ? currentModel : 'auto';
+                updateTestChatRouting();
 
                 loadTestHistory();
+                loadTestDraft();
 
             } catch (e) { testState('角色列表加载失败: ' + e.message, true); }
 
@@ -25810,7 +26823,7 @@
 
             try {
 
-                const r = await apiPost('api/test/chat', { character_key: sel.value, text });
+                const r = await apiPost('api/test/chat', {character_key: sel.value, text, ...testChatRouting()});
 
                 if (!r.success) throw new Error(r.error || '生成失败');
 
@@ -25818,7 +26831,8 @@
 
                 await loadTestHistory();
 
-                testState('');
+                testState(r.model ? `${t('聊天模型')} · ${r.model}` : '');
+                if ((r.sentences || []).some(sentence => sentence.zh?.trim())) window.lovomoGuide?.signal('chat-sent');
 
             } catch (e) { testState('发送失败: ' + e.message, true); }
 
@@ -26036,7 +27050,10 @@
 
                 try {
 
-                    if (await saveConnection(connectionDialogPayload())) closeConnectionDialog();
+                    if (await saveConnection(connectionDialogPayload())) {
+                        window.lovomoGuide?.signal('connection-saved');
+                        closeConnectionDialog();
+                    }
 
                 } finally {
 
@@ -27216,6 +28233,11 @@
 
                     <div class="perf-item"><b>${p.tts ? p.tts.avg : 0} ms</b>TTS 平均耗时 (最近 ${p.tts ? p.tts.count : 0} 次)</div>
 
+                    ${Object.entries(MESSAGE_TIMINGS).map(([key, label]) => {
+                        const timing = p.message_timing?.[key];
+                        return `<div class="perf-item"><b>${timing ? `${timing.avg} ms` : '—'}</b>${t(label)}${timing ? ` · ${timing.count} ${t('次')}` : ''}</div>`;
+                    }).join('')}
+
                     <div class="perf-item"><b>${h}时${m}分</b>持续运行</div>
 
                 `;
@@ -28168,6 +29190,17 @@
 
             try {
 
+                if (enabled) {
+                    const state = await apiGet('api/plugins/list');
+                    const plugin = (state.plugins || []).find(p => p.id === id);
+                    if (!plugin) throw new Error('插件不存在');
+                    if (!plugin.trusted) {
+                        if (!plugin.digest) throw new Error('插件内容无法校验');
+                        if (!await uiConfirm(`信任并启用插件「${plugin.name || id}」？Python 插件代码拥有当前用户权限。仅启用你信任的来源；内容更新后需重新确认。`)) return;
+                        const send_messages = await uiConfirm('允许此插件通过 Lovomo 发送文字与语音？也可稍后在插件详情修改。', '消息发送权限');
+                        await apiPost('api/plugins/approve', {id, digest: plugin.digest, send_messages});
+                    }
+                }
                 await apiPost('api/plugins/toggle', {id, enabled});
 
                 pluginMsg(enabled ? `已启用 ${id}` : `已停用 ${id}`);
@@ -29930,17 +30963,17 @@
 
 
 
-        async function applyPluginSettings() {
+        async function applyPluginSettings(id = pluginPageId, settingsOverride = null, pageState = null) {
 
-            const p = pluginCache.find(x => x.id === pluginPageId);
+            const p = pluginCache.find(x => x.id === id);
 
             if (!p) { pluginMsg('插件已不存在', true); return; }
 
-            const settings = (pluginDraft && pluginDraft.id === p.id)
+            const settings = settingsOverride || ((pluginDraft && pluginDraft.id === p.id)
 
                 ? pluginDraft.settings
 
-                : Object.assign({}, p.settings || {});
+                : Object.assign({}, p.settings || {}));
 
             const btn = document.getElementById('plugin-apply-btn');
 
@@ -29950,7 +30983,8 @@
 
             try {
 
-                const saved = await apiPost('api/plugins/settings', {id: p.id, settings});
+                const target = {id: p.id, ...(pageState ? {page_state: pageState} : {})};
+                const saved = await apiPost('api/plugins/settings', {...target, settings});
 
                 if (saved && saved.success === false) {
 
@@ -29958,21 +30992,23 @@
 
                 }
 
-                const res = await apiPost('api/plugins/reload', {id: p.id});
+                const res = await apiPost('api/plugins/reload', target);
+                if (res && res.success === false) throw new Error(res.error || '重载插件失败');
 
                 const applied = (res && res.settings) || settings;
 
                 p.settings = Object.assign({}, applied);
 
-                pluginDraft = null;
-
-                pluginApplied = Object.assign({}, applied);
+                if (pluginPageId === p.id) {
+                    pluginDraft = null;
+                    pluginApplied = Object.assign({}, applied);
+                    if (!settingsOverride) renderPluginPage(p.id);
+                }
 
                 applyPluginTheme();
 
-                renderPluginPage(p.id);
-
                 pluginMsg('已保存并重载，设置已生效');
+                return applied;
 
             } catch (e) {
 
@@ -30065,6 +31101,7 @@
                         <button class="btn btn-gray" data-page-act="history">查看历史更新</button>
 
                         <button class="btn btn-gray" data-page-act="readme">查看README</button>
+                        ${p.trusted && p.digest ? `<button class="btn btn-gray" data-page-act="message-permission">${p.send_messages ? '撤销消息发送' : '允许消息发送'}</button>` : ''}
 
                     </div>
 
@@ -30438,6 +31475,14 @@
 
                     }
 
+                    if (act === 'message-permission') {
+                        try {
+                            await apiPost('api/plugins/approve', {id:p.id, digest:p.digest, send_messages:!p.send_messages});
+                            await renderPluginPage(p.id);
+                        } catch (error) { pluginMsg(error.message, true); }
+                        return;
+                    }
+
                     if (act === 'toggle') {
 
                         await doTogglePlugin(p.id, btn.dataset.enabled === '1');
@@ -30710,82 +31755,101 @@
 
 
 
-        window.lovomoHost = {
-
-            log: (id, args) => pluginMsg(`${pluginLabel(id)}: ${(args || []).join(' ')}`),
-
-            toast: (id, text, isErr) => pluginMsg(String(text || ''), !!isErr),
-
-            save: (id, patch) => {
-
-                const p = (pluginCache || []).find(x => x.id === id);
-
-                if (!p) return null;
-
-                const merged = Object.assign({}, p.settings || {}, patch || {});
-
-                stagePluginSetting(p, merged, '');
-
-                return merged;
-
-            },
-
-            apply: () => applyPluginSettings(),
-
-            dirty: () => pluginDirty(),
-
-            close: () => (activePanelId === 'plugin-webui' ? closePluginWebui() : closePluginPage()),
-
-            login: (message) => {
-
-                if (typeof showLoginOverlay !== 'function') return false;
-
-                showLoginOverlay(message);
-
-                return true;
-
-            },
-
-        };
-
-
-
-        function pluginLabel(id) {
-
-            const p = (pluginCache || []).find(x => x.id === id);
-
-            return p ? (p.name || p.id) : id;
-
-        }
-
-
+        const pluginFrames = new WeakMap();
+        window.addEventListener('message', event => {
+            const frameState = event.source && pluginFrames.get(event.source);
+            const data = event.data;
+            const port = event.ports[0];
+            if (!frameState || event.origin !== 'null' || !frameState.active()
+                || !port || data?.type !== 'lovomo:connect' || data.token !== frameState.token) return;
+            frameState.connect(port);
+        });
 
         function mountPluginFrame(host, p, src) {
-
             if (!host) return;
-
             const frame = document.createElement('iframe');
-
             frame.className = 'plugin-panel-frame';
-
-            frame.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-forms allow-modals');
-
+            frame.title = p.name || p.id;
+            frame.setAttribute('sandbox', 'allow-scripts allow-modals');
+            const panel = activePanelId;
+            const pageState = {digest: p.digest, enabled: !!p.enabled};
+            const token = Array.from(crypto.getRandomValues(new Uint8Array(16)),
+                                     byte => byte.toString(16).padStart(2, '0')).join('');
+            const active = () => frame.isConnected && activePanelId === panel
+                && (panel === 'plugin-webui' ? webuiPluginId : pluginPageId) === p.id;
+            let port;
+            let draft = null;
+            let applying = false;
+            const state = () => {
+                const root = document.documentElement;
+                return {
+                    theme: {skinOn: root.classList.contains('skin-on'),
+                            accent: getComputedStyle(root).getPropertyValue('--skin-accent').trim()},
+                    dirty: draft !== null || (panel === 'plugin-page' && pluginDirty()),
+                };
+            };
+            const connect = incoming => {
+                if (port) port.close();
+                port = incoming;
+                incoming.postMessage({state: state()});
+                incoming.onmessage = async ({data}) => {
+                    if (!active() || incoming !== port || !data || typeof data.op !== 'string') return;
+                    const plugin = pluginCache.find(x => x.id === p.id && x.trusted && x.digest === pageState.digest
+                        && !!x.enabled === pageState.enabled);
+                    if (!plugin) {
+                        incoming.postMessage({seq: data.seq, error: 'Plugin changed; reopen its page'});
+                        return;
+                    }
+                    let result;
+                    let error;
+                    try {
+                        if (data.op === 'save') {
+                            const patch = data.value;
+                            if (!patch || typeof patch !== 'object' || Array.isArray(patch)
+                                || JSON.stringify(patch).length > 65536) throw new Error('Invalid plugin settings');
+                            const safe = Object.fromEntries(Object.entries(patch).filter(([key]) =>
+                                !['__proto__', 'prototype', 'constructor'].includes(key)));
+                            if (panel === 'plugin-page') {
+                                stagePluginSetting(plugin, safe, '');
+                                result = pluginDraft.settings;
+                            } else {
+                                draft = {...(draft || plugin.settings || {}), ...safe};
+                                result = draft;
+                            }
+                        } else if (data.op === 'apply') {
+                            if (applying) throw new Error('Plugin settings are already being applied');
+                            applying = true;
+                            try {
+                                result = await applyPluginSettings(plugin.id, draft || {...plugin.settings}, pageState);
+                                if (!result) throw new Error('Could not apply plugin settings');
+                                draft = null;
+                            } finally {
+                                applying = false;
+                            }
+                        } else if (data.op === 'log' || data.op === 'toast') {
+                            const values = Array.isArray(data.value) ? data.value : [];
+                            const text = data.op === 'log'
+                                ? `${plugin.name}: ${values.slice(0, 20).filter(x => typeof x === 'string').join(' ')}`
+                                : typeof values[0] === 'string' ? values[0] : '';
+                            pluginMsg(text.slice(0, 2000), data.op === 'toast' && values[1] === true);
+                        } else if (data.op === 'close') {
+                            if (panel === 'plugin-webui') closePluginWebui();
+                            else await closePluginPage();
+                        } else {
+                            return;
+                        }
+                    } catch (e) {
+                        error = e.message;
+                    }
+                    if (active() && incoming === port) incoming.postMessage({seq: data.seq, state: state(), result, error});
+                };
+            };
+            frame.src = `${src}&digest=${encodeURIComponent(pageState.digest || '')}&enabled=${pageState.enabled}#lovomo-frame=${token}`;
             host.appendChild(frame);
-
-
-
-            frame.addEventListener('load', () => {
-
-                if (!frame.contentWindow || !frame.contentWindow.lovomo) {
-
-                    host.innerHTML = '<div class="plugin-empty">插件界面加载失败（可能不同源）。</div>';
-
-                }
-
-            });
-
-            frame.src = src;
-
+            pluginFrames.set(frame.contentWindow, {token, active, connect});
+            setTimeout(() => {
+                if (!port && active()) host.textContent = t('插件界面加载失败。');
+            }, 10000);
         }
 
 
@@ -31514,7 +32578,7 @@
 
                     <div class="field wide" id="tool-location-field" style="display:none;"><label>默认城市（可选，仅天气查询用）</label>
 
-                        <input id="tool-location" value="${esc(t.default_location || '')}" placeholder="留空 = 主人未说地点时角色会反问"></div>
+                        <input id="tool-location" value="${esc(t.default_location || '')}" placeholder="留空 = 用户未说地点时角色会反问"></div>
 
                 </div>
 
@@ -31986,6 +33050,14 @@
 
         // ---- 自主学习 ----
 
+        let lexiconRole = '';
+        let lexiconLoadSeq = 0;
+        document.getElementById('terms-role').addEventListener('change', e => {
+            lexiconRole = e.target.value;
+            document.getElementById('term-editor').classList.remove('active');
+            loadLexicon();
+        });
+
         const TERM_CATEGORIES = ['网络黑话', '俚语', '专有表达', '指代称呼'];
 
 
@@ -32012,7 +33084,12 @@
 
             try {
 
-                const data = await apiGet('api/lexicon');
+                const seq = ++lexiconLoadSeq;
+                const data = await apiGet('api/lexicon' + (lexiconRole ? '?role=' + encodeURIComponent(lexiconRole) : ''));
+                if (seq !== lexiconLoadSeq) return;
+                lexiconRole = data.role;
+                const selector = document.getElementById('terms-role');
+                selector.innerHTML = (data.roles || []).map(r => `<option value="${esc(r.character_key)}"${r.character_key === lexiconRole ? ' selected' : ''}>${esc(r.character_name || r.character_key)}</option>`).join('');
 
                 renderPendingTerms(data.pending || []);
 
@@ -32029,6 +33106,7 @@
 
 
         function renderPendingTerms(pending) {
+            const role = lexiconRole;
 
             const wrap = document.getElementById('terms-pending-wrap');
 
@@ -32074,13 +33152,13 @@
 
                 wrap.querySelectorAll('.term-accept').forEach(b => b.addEventListener('click', () => {
 
-                    postTerm('api/lexicon/confirm', { id: b.dataset.id }, '已采纳');
+                    postTerm('api/lexicon/confirm', { id: b.dataset.id, role }, '已采纳');
 
                 }));
 
                 wrap.querySelectorAll('.term-reject').forEach(b => b.addEventListener('click', () => {
 
-                    postTerm('api/lexicon/reject', { id: b.dataset.id }, '已丢弃');
+                    postTerm('api/lexicon/reject', { id: b.dataset.id, role }, '已丢弃');
 
                 }));
 
@@ -32088,7 +33166,7 @@
 
                     const p = pending.find(x => String(x.id) === b.dataset.id);
 
-                    if (p) openTermEditor({ term: p.term, meaning: p.meaning, category: p.category, pending_id: p.id });
+                    if (p) openTermEditor({ term: p.term, meaning: p.meaning, category: p.category, pending_id: p.id, role });
 
                 }));
 
@@ -32099,6 +33177,7 @@
 
 
         function renderLearnedTerms(terms) {
+            const role = lexiconRole;
 
             const wrap = document.getElementById('terms-table-wrap');
 
@@ -32142,7 +33221,7 @@
 
                     const t = terms.find(x => String(x.term) === b.dataset.term);
 
-                    if (t) openTermEditor(t);
+                    if (t) openTermEditor({...t, role});
 
                 }));
 
@@ -32150,7 +33229,7 @@
 
                     if (!await uiConfirm(`删除词条「${b.dataset.term}」？`)) return;
 
-                    postTerm('api/lexicon/delete', { term: b.dataset.term }, '已删除');
+                    postTerm('api/lexicon/delete', { term: b.dataset.term, role }, '已删除');
 
                 }));
 
@@ -32161,6 +33240,8 @@
 
 
         function openTermEditor(item) {
+            const role = item.role || lexiconRole;
+            if (!role) return;
 
             const ed = document.getElementById('term-editor');
 
@@ -32197,6 +33278,7 @@
             document.getElementById('tm-save-btn').addEventListener('click', async () => {
 
                 const payload = {
+                    role,
 
                     term: document.getElementById('tm-term').value.trim(),
 
@@ -32238,7 +33320,7 @@
 
             try {
 
-                const r = await apiPost(path, payload);
+                const r = await apiPost(path, {...payload, role: payload.role || lexiconRole});
 
                 if (r && r.success === false) throw new Error('服务端未处理该操作');
 
@@ -32444,6 +33526,7 @@
 
             (async () => {
 
+                let guideAuthorized = false;
                 try {
 
                     const resp = await fetch(`${API_BASE}/api/auth/status`);
@@ -32451,6 +33534,7 @@
                     if (resp.ok && resp.status === 200) {
 
                         const st = await resp.json();
+                        guideAuthorized = !!st && (!st.enabled || st.authed);
 
                         if (st && st.version) {
 
@@ -32772,6 +33856,11 @@
 
                 initConnectionsUI();
 
+                window.lovomoGuide?.init({navigate: async panel => {
+                    await switchPanel(panel);
+                    closeMobileNav();
+                }, panel: activePanelId, authorized: guideAuthorized});
+
                 loadChatList();
 
                 bindPublishUi();
@@ -32790,7 +33879,7 @@
 
     </script>
 
+    <script src="/webui/guide/guide.js" defer></script>
 </body>
 
 </html>
-

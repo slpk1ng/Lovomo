@@ -3,7 +3,7 @@ import time
 from pathlib import Path
 from typing import List
 
-from .jsonio import load_json_ex, save_json
+from .jsonio import load_json_ex, save_json, file_lock
 
 PRESET_DIR_NAME = "config_presets"
 DEFAULT_PROFILE = "default"
@@ -89,12 +89,17 @@ def save_profile(data_path, name, config, rename_from="") -> dict:
     payload.pop("connections", None)
     path = profile_path(data_path, target)
     source = str(rename_from or "").strip()
-    if source and source != target:
-        old = profile_path(data_path, source)
-        if old.is_file():
-            old.unlink()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    save_json(path, payload)
+    with file_lock(preset_dir(data_path)):
+        old = profile_path(data_path, source) if source and source != target else None
+        if old is not None and path.exists():
+            raise ConfigPresetError("目标配置文件已存在，不能覆盖重命名")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        save_json(path, payload)
+        if old is not None and old.is_file():
+            try:
+                old.unlink()
+            except OSError:
+                raise ConfigPresetError("新配置已保存，但旧文件未能删除，请稍后重试")
     return _entry(target, path)
 
 

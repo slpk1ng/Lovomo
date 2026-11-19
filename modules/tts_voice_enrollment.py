@@ -1,4 +1,6 @@
 import base64
+from . import process_lifecycle as child_processes
+
 import re
 import shutil
 import subprocess
@@ -51,7 +53,7 @@ def _run_ffmpeg(exe: str, inputs: List[Path], out: Path) -> None:
     args += ["-filter_complex", f"{chain}concat=n={len(inputs)}:v=0:a=1[out]",
              "-map", "[out]", "-ar", str(TARGET_SAMPLE_RATE), "-ac", "1",
              "-c:a", "pcm_s16le", str(out)]
-    proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    proc = child_processes.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                           text=True, encoding="utf-8", errors="replace",
                           timeout=FFMPEG_TIMEOUT_SECONDS, **no_window_kwargs())
     if proc.returncode != 0 or not out.exists():

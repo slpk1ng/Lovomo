@@ -4,7 +4,7 @@ import time
 from typing import List, Optional
 
 from modules import app_context
-from modules.memory_store import MemoryManager, _MEMORY_FILE_RE, restore_session_id
+from modules.memory_store import MemoryManager, _memory_session_id, restore_session_id
 from modules.llm_helpers import RoleContext
 from modules.emotion_voices import EmotionManager
 from modules.config_loader import CONNECTION_PLATFORMS, CONNECTION_PLATFORM_NAMES
@@ -17,14 +17,10 @@ def list_known_sessions() -> list:
     if app_context.memory_manager is None:
         return sessions
     for f in sorted(app_context.memory_manager.data_path.glob("*.json")):
-        m = _MEMORY_FILE_RE.match(f.name)
-        if not m:
+        sid = _memory_session_id(f.name)
+        if not sid:
             continue
-        stype = m.group(1)
-        rest = f.name.rsplit(".json", 1)[0].split(f"{stype}_", 1)[-1]
-        if stype == "group":
-            rest = rest.split("_")[0]
-        rest = restore_session_id(rest)
+        stype, rest = parse_session_target(sid)
         if not rest:
             continue
         item = {"session_type": stype, "session_id": rest}
@@ -62,12 +58,8 @@ def _session_whitelisted(target_id) -> bool:
     s = str(target_id)
     if s in allowed:
         return True
-    for prefix in ("private_", "group_"):
-        if s.startswith(prefix):
-            s = s[len(prefix):]
-            break
-    if "_" in s:
-        s = s.split("_", 1)[0]
+    if s.startswith(("private_", "group_")):
+        _, s = parse_session_target(s)
     return s in allowed
 
 
@@ -130,7 +122,7 @@ def role_memory(role: dict) -> Optional[MemoryManager]:
     if not key:
         return None
     mem = MemoryManager(app_context.global_config)
-    mem.character_key = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", key) or "default"
+    mem.character_key = key
     mem.character_name = str((role or {}).get("character_name") or mem.character_key)
     return mem
 
@@ -202,7 +194,10 @@ def parse_session_target(session_id: str):
     if text.startswith("private_"):
         return "private", text[len("private_"):]
     if text.startswith("group_"):
-        return "group", text[len("group_"):].split("_", 1)[0]
+        target = text[len("group_"):]
+        # Only legacy numeric QQ sessions encode a member after an underscore.
+        isolated = re.fullmatch(r"(\d+)_(\d+)", target)
+        return "group", isolated.group(1) if isolated else target
     return "private", text
 
 

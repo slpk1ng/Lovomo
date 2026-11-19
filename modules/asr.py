@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+from . import process_lifecycle as child_processes
+
 import asyncio
 import base64
 import os
@@ -15,7 +17,7 @@ from typing import Dict, List, Optional, Tuple
 
 import httpx
 
-from .llm_helpers import chat_endpoint
+from .model_endpoints import chat_endpoint, service_api_key
 from .tls import verified_context
 from .tts_service import no_window_kwargs
 
@@ -76,8 +78,8 @@ def whisper_model_size(config) -> str:
 
 
 def asr_api_key(config) -> str:
-    return (str(config.get("asr_api_key", "") or "").strip()
-            or str(config.get("llm_api_key", "") or "").strip())
+    base = str(config.get("asr_base_url", "") or "").strip() or config.get("llm_base_url", "")
+    return service_api_key(config, "asr_api_key", base)
 
 
 def asr_model_name(config, style=None) -> str:
@@ -230,11 +232,15 @@ def transcribe_local(config, targets: List[Tuple[str, Path]], lang: str,
             cmd += ["-s", local_whisper_size(config)]
 
         def run_once(env):
-            proc = subprocess.Popen(cmd, cwd=str(root), stdout=subprocess.PIPE,
+            from .runtime_policy import limit
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("本地语音识别已超过总时间预算")
+            proc = child_processes.popen(cmd, cwd=str(root), stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, text=True,
                                     encoding="utf-8", errors="replace", env=env,
                                     **no_window_kwargs())
-            watchdog = threading.Timer(LOCAL_TIMEOUT_SECONDS, proc.kill)
+            watchdog = threading.Timer(remaining, lambda: child_processes.stop_tree(proc, timeout=0))
             watchdog.daemon = True
             watchdog.start()
             tail = deque(maxlen=8)
@@ -243,13 +249,16 @@ def transcribe_local(config, targets: List[Tuple[str, Path]], lang: str,
                     tail.append(line.rstrip())
                     if log:
                         log(line)
-                proc.wait(timeout=LOCAL_TIMEOUT_SECONDS)
+                proc.wait(timeout=max(0.1, deadline - time.monotonic()))
             finally:
                 watchdog.cancel()
                 if proc.poll() is None:
-                    proc.kill()
+                    child_processes.stop_tree(proc, timeout=0)
+                proc.wait(timeout=2)
             return proc.returncode, tail
 
+        from .runtime_policy import limit
+        deadline = time.monotonic() + limit(config, "asr_local_timeout_seconds")
         mode = local_device_mode(config)
         plans = [(True, True)] if mode == "cpu" \
             else ([(False, True), (True, True)] if mode == "auto" else [(False, True)])

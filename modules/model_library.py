@@ -3,9 +3,10 @@ import copy
 import json
 import os
 import uuid
+from functools import wraps
 from pathlib import Path
 
-from .jsonio import load_json_ex
+from .jsonio import file_lock, load_json_ex, save_json
 from .security import _decrypt_value, _encrypt_value, _is_kept_secret
 from .tts_cloud import LOCAL_BACKEND as TTS_BACKEND_LOCAL, CLOUD_BACKEND as TTS_BACKEND_CLOUD
 
@@ -16,6 +17,14 @@ PRESET_DIR_NAME = "config_presets"
 
 # 库版本：结构与迁移逻辑变化时递增
 LIBRARY_VERSION = 1
+
+
+def _library_locked(method):
+    @wraps(method)
+    def call(data_path, *args, **kwargs):
+        with file_lock(library_path(data_path)):
+            return method(data_path, *args, **kwargs)
+    return call
 
 # ---------------- 用途 ----------------
 PROVIDER_KINDS = ("chat", "caption", "embedding", "cloud_tts", "asr")
@@ -30,6 +39,7 @@ KIND_LABELS = {
 PROVIDER_FIELD_MAP = {
     "chat": {
         "backend": "llm_backend",
+        "service": "local_model_service",
         "base_url": "llm_base_url",
         "api_key": "llm_api_key",
         "model": "llm_model_name",
@@ -50,7 +60,9 @@ PROVIDER_FIELD_MAP = {
         "timeout": "image_caption_timeout",
     },
     "embedding": {
+        "backend": "rag_embedding_backend",
         "base_url": "llm_embedding_url",
+        "api_key": "rag_embedding_api_key",
         "model": "llm_embedding_model",
     },
     "cloud_tts": {
@@ -70,7 +82,7 @@ PROVIDER_FIELD_MAP = {
     },
 }
 
-PROVIDER_FIELDS = ("backend", "base_url", "api_key", "model", "num_ctx",
+PROVIDER_FIELDS = ("backend", "service", "base_url", "api_key", "model", "num_ctx",
                    "enable_think", "sampling_enabled", "top_p", "top_k",
                    "repeat_penalty", "extra_body", "timeout", "protocol",
                    "voice", "voice_map", "api_style", "lang")
@@ -94,15 +106,6 @@ _ROLE_LIBRARY_FIELDS = {
     "prompt_lang": "prompt_lang",
     "connection_id": "connection_id",
 }
-
-def _normalize_role(item: dict) -> dict:
-    entry = {}
-    entry["id"] = _text(item.get("id")) or _new_id("r")
-    for field in ROLE_FIELDS:
-        entry[field] = str(item.get(field, "") or "")
-    entry["name"] = _text(item.get("name")) or _text(item.get("character_name")) \
-        or _text(entry.get("character_key")) or "未命名角色"
-    return entry
 
 _MIGRATED_DIRS = set()
 
@@ -149,9 +152,18 @@ def _dedupe_role_keys(lib: dict) -> bool:
     return changed
 
 
+@_library_locked
 def load_library(data_path) -> dict:
     data, readable = load_json_ex(library_path(data_path), None)
-    if not readable or not isinstance(data, dict):
+    if not readable:
+        raise OSError("模型库暂时无法读取，已停止本次修改并保留原文件")
+    if data is not None and not isinstance(data, dict):
+        raise ValueError("模型库格式错误，已保留原文件")
+    if isinstance(data, dict) and any(not isinstance(data.get(key, []), list)
+            or any(not isinstance(item, dict) for item in data.get(key, []))
+            for key in ("roles", "providers")):
+        raise ValueError("模型库条目格式错误，已保留原文件")
+    if data is None:
         lib = _empty_library()
     else:
         lib = _empty_library()
@@ -160,8 +172,9 @@ def load_library(data_path) -> dict:
         lib["providers"] = [p for p in (data.get("providers") or []) if isinstance(p, dict)]
     for provider in lib["providers"]:
         key = provider.get("api_key")
-        if isinstance(key, str) and key.startswith(("enc:", "enc2:")):
-            provider["api_key"] = _decrypt_value(key) or ""
+        if isinstance(key, str) and key.startswith(("enc:", "enc2:", "enc3:")):
+            plain = _decrypt_value(key)
+            provider["api_key"] = key if plain is None else plain
     if _dedupe_role_keys(lib):
         try:
             save_library(data_path, lib)
@@ -170,6 +183,7 @@ def load_library(data_path) -> dict:
     return lib
 
 
+@_library_locked
 def save_library(data_path, lib: dict) -> None:
     payload = copy.deepcopy(lib)
     for provider in payload.get("providers") or []:
@@ -178,29 +192,28 @@ def save_library(data_path, lib: dict) -> None:
             provider["api_key"] = _encrypt_value(key)
     path = library_path(data_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = Path(str(path) + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(str(tmp), str(path))
+    save_json(path, payload)
     _LIB_CACHE.pop(str(path.resolve()), None)
 
 
 _LIB_CACHE = {}
 
 
+@_library_locked
 def load_library_cached(data_path) -> dict:
     path = library_path(data_path)
     try:
         st = path.stat()
         stamp = (st.st_mtime_ns, st.st_size)
-    except OSError:
+    except FileNotFoundError:
         return _empty_library()
     key = str(path.resolve())
     hit = _LIB_CACHE.get(key)
     if hit is not None and hit[0] == stamp:
-        return hit[1]
+        return copy.deepcopy(hit[1])
     lib = load_library(data_path)
     _LIB_CACHE[key] = (stamp, lib)
-    return lib
+    return copy.deepcopy(lib)
 
 
 def connection_overrides(conn: dict, lib: dict) -> dict:
@@ -407,11 +420,10 @@ def _read_preset_file(path: Path):
 
 
 def _write_preset_file(path: Path, cfg: dict) -> None:
-    tmp = Path(str(path) + ".tmp")
-    tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(str(tmp), str(path))
+    save_json(path, cfg)
 
 
+@_library_locked
 def ensure_migrated(data_path, config_loader=None) -> dict:
     root = Path(data_path)
     key = str(root.resolve())
@@ -420,9 +432,12 @@ def ensure_migrated(data_path, config_loader=None) -> dict:
     lib = load_library(root)
     if not lib.get("migrated"):
         try:
+            config_update = None
+            preset_updates = []
             if config_loader is not None and isinstance(config_loader.config, dict):
-                if migrate_config_dict(config_loader.config, lib, "主配置"):
-                    config_loader._atomic_save(config_loader.config)
+                snapshot = copy.deepcopy(config_loader.config)
+                if migrate_config_dict(snapshot, lib, "主配置"):
+                    config_update = snapshot
             work = preset_dir(root)
             if work.is_dir():
                 for path in sorted(work.glob("*.json")):
@@ -430,13 +445,21 @@ def ensure_migrated(data_path, config_loader=None) -> dict:
                     if cfg is None:
                         continue
                     if migrate_config_dict(cfg, lib, path.stem):
-                        _write_preset_file(path, cfg)
+                        preset_updates.append((path, cfg))
+            # Persist referenced objects before removing their old inline copies.
+            # Leave the marker false until every referencing file is committed.
+            save_library(root, lib)
+            if config_update is not None:
+                config_loader.commit(config_update)
+            for path, cfg in preset_updates:
+                _write_preset_file(path, cfg)
             lib["migrated"] = True
             save_library(root, lib)
             print(f"[模型库] 已把角色与模型配置集中到 {library_path(root).name}："
                   f"{len(lib.get('roles') or [])} 个角色、{len(lib.get('providers') or [])} 条模型服务。")
         except Exception as e:
             print(f"[模型库] 迁移失败（本次沿用旧配置形态，下次启动再试）：{type(e).__name__}: {e}")
+            return lib
     _MIGRATED_DIRS.add(key)
     return lib
 
@@ -513,7 +536,7 @@ def _normalize_role(item: dict) -> dict:
     entry["id"] = rid or _new_id("r")
     for field in ROLE_FIELDS:
         entry[field] = str(item.get(field, "") or "")
-    entry["name"] = _text(item.get("name")) or _text(entry.get("character_name")) \
+    entry["name"] = _text(item.get("name")) or _text(item.get("character_name")) \
         or _text(entry.get("character_key")) or "未命名角色"
     return entry
 

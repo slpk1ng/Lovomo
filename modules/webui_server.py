@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import asyncio
+import copy
 import hashlib
 import io
 import ipaddress
@@ -54,6 +55,7 @@ from modules.tools import ToolRegistry
 from modules.profiles import UserProfileManager
 from modules.lexicon import LexiconManager
 from modules.rag import RAGManager, extract_text_from_file
+from modules.upload_limits import read_upload, read_field, bounded_multipart, MAX_REQUEST_BYTES
 from modules.recall import HistoryRecallManager
 from modules.todo_manager import TodoManager
 from modules.jobs import ScheduledJobManager, generate_proactive_text
@@ -142,7 +144,7 @@ from modules.plugin_publisher import (publish_plugin as _publish_to_github,
 from modules.session_context import (
     list_known_sessions, get_active_role, get_active_ctx, reply_ctx_of,
     role_memory, get_active_emotions, get_active_mimics, get_role_emotions,
-    get_role_mimics, connections_of, connection_role_key,
+    get_role_mimics, connections_of, connection_role_key, config_for_connection,
     role_connection_snapshot, build_connection_profiles, resolve_target_roles,
     _fetch_member_name, whitelist_ids,
     _log_hidden, _log_hide_patterns,
@@ -169,33 +171,62 @@ MARKET_SOURCE_REPOS_MAX = 20
 PLUGIN_BRIDGE_TEMPLATE = """<script>
 (function () {
   var info = /*__LOVOMO_INFO__*/ null;
-  var host = (parent !== window && parent.lovomoHost) ? parent.lovomoHost : null;
+  var token = new URLSearchParams(location.hash.slice(1)).get('lovomo-frame');
+  var channel = token && parent !== window ? new MessageChannel() : null;
+  var next = 0, pending = new Map();
+  var state = {theme: {skinOn: false, accent: ''}, dirty: false};
+  if (channel) {
+    channel.port1.onmessage = function (event) {
+      var data = event.data || {};
+      if (data.state) { state = data.state; }
+      var call = pending.get(data.seq);
+      if (!call) { return; }
+      pending.delete(data.seq);
+      clearTimeout(call.timer);
+      if (data.error) { call.reject(new Error(data.error)); }
+      else { call.resolve(data.result); }
+    };
+    parent.postMessage({type: 'lovomo:connect', token: token}, location.origin, [channel.port2]);
+  }
+  function notify(op, value) {
+    if (channel) { channel.port1.postMessage({op: op, value: value}); }
+  }
+  function request(op, value) {
+    if (!channel) { return Promise.resolve(null); }
+    return new Promise(function (resolve, reject) {
+      var seq = ++next;
+      channel.port1.postMessage({op: op, value: value, seq: seq});
+      var timer = setTimeout(function () {
+        pending.delete(seq);
+        reject(new Error('Plugin host did not respond'));
+      }, 15000);
+      pending.set(seq, {resolve: resolve, reject: reject, timer: timer});
+    });
+  }
   var api = Object.assign({}, info, {
     asset: function (name) {
       return '/api/plugins/asset?id=' + encodeURIComponent(info.id)
            + '&name=' + encodeURIComponent(name || '');
     },
-    theme: function () {
-      var root = parent.document.documentElement;
-      return {skinOn: root.classList.contains('skin-on'),
-              accent: parent.getComputedStyle(root).getPropertyValue('--skin-accent').trim()};
-    },
+    theme: function () { return Object.assign({}, state.theme); },
     log: function () {
-      if (host) { host.log(info.id, Array.prototype.slice.call(arguments)); }
+      if (channel) { notify('log', Array.prototype.slice.call(arguments, 0, 20).map(String)); }
       else { console.log.apply(console, arguments); }
     },
-    toast: function (text, isErr) { if (host) { host.toast(info.id, text, isErr); } },
+    toast: function (text, isErr) { notify('toast', [String(text || ''), !!isErr]); },
     save: function (patch) {
-      if (!host) { return Promise.resolve(api.settings); }
-      return Promise.resolve(host.save(info.id, patch)).then(function (merged) {
+      return request('save', patch).then(function (merged) {
         if (merged) { api.settings = merged; }
         return api.settings;
       });
     },
-    apply: function () { return host ? host.apply(info.id) : null; },
-    dirty: function () { return host ? host.dirty(info.id) : false; },
+    apply: function () { return request('apply').then(function (applied) {
+      if (applied) { api.settings = applied; }
+      return applied;
+    }); },
+    dirty: function () { return state.dirty; },
     reload: function () { return api.settings; },
-    close: function () { if (host) { host.close(info.id); } }
+    close: function () { notify('close'); }
   });
   window.lovomo = api;
   document.addEventListener('DOMContentLoaded', function () {
@@ -204,6 +235,21 @@ PLUGIN_BRIDGE_TEMPLATE = """<script>
 })();
 </script>
 """
+PLUGIN_PAGE_HEADERS = {
+    "Content-Security-Policy": (
+        "sandbox allow-scripts allow-modals; default-src 'none'; "
+        "script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; "
+        "form-action 'none'; base-uri 'none'; frame-ancestors 'self'"
+    ),
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "Cache-Control": "no-store",
+}
+PLUGIN_ASSET_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": "sandbox; default-src 'none'; frame-ancestors 'none'",
+}
 
 
 _CONNECTION_LOGIN_STATE: dict = {}
@@ -423,16 +469,14 @@ class WebUIServer:
             config.roles = config._parse_roles()
         except Exception as e:
             print(f"[模型库] 初始化失败（沿用配置自带值）：{type(e).__name__}: {e}")
-        self.app = web.Application(client_max_size=200 * 1080 * 1080)
+        self.app = web.Application(client_max_size=MAX_REQUEST_BYTES)
         self._update_state_file = memory_manager.data_path / "update_check.json"
+        self._document_upload_slots = asyncio.Semaphore(2)
         self._update_checked_this_run = False
         self._update_last_result = None
         self._auth_file = memory_manager.data_path / "webui_auth.json"
         self._password = ""
-        self._auth_token = None
         self._second_password = ""
-        self._second_unlocked_until = 0.0
-        self._second_once = 0
         self._plugins_root = user_data_dir() / "plugins"
         self.plugin_manager = PluginManager(
             self._plugins_root,
@@ -457,86 +501,52 @@ class WebUIServer:
         self.app.router.add_post("/api/update/download", self.handle_update_download)
         self.app.router.add_get("/api/update/progress", self.handle_update_progress)
         self.app.router.add_post("/api/update/install", self.handle_update_install)
+        from .system_routes import register_system_routes
+        register_system_routes(self)
 
     def _refresh_auth_state(self):
-        import secrets
-        password = str(self.config.get("webui_password", "") or "")
-        self._password = password
-        second = str(self.config.get("webui_second_password", "") or "")
-        if second != self._second_password:
-            self._second_unlocked_until = 0.0
-            self._second_once = 0
-        self._second_password = second
-        if not password:
-            self._auth_token = None
-            return
-        phash = hashlib.sha256(password.encode("utf-8")).hexdigest()
-        remembered = None
-        try:
-            if self._auth_file.exists():
-                data = json.loads(self._auth_file.read_text(encoding="utf-8"))
-                if isinstance(data, dict) and data.get("password_hash") == phash \
-                        and float(data.get("expires_at", 0)) > time.time():
-                    remembered = str(data.get("secret", "") or "") or None
-        except Exception:
-            remembered = None
-        if remembered and remembered == getattr(self, "_auth_token", None):
-            return
-        self._auth_token = remembered or secrets.token_hex(16)
+        from .auth_sessions import AuthRateLimiter, AuthSessions
+        if not hasattr(self, "_auth_limiter"):
+            self._auth_limiter = AuthRateLimiter()
+        self._password = str(self.config.get("webui_password", "") or "")
+        self._second_password = str(self.config.get("webui_second_password", "") or "")
+        if not hasattr(self, "_auth_sessions") or self._auth_sessions.path != self._auth_file:
+            self._auth_sessions = AuthSessions(self._auth_file, self._password, self._second_password)
+        else:
+            self._auth_sessions.refresh(self._password, self._second_password)
 
-    def _second_unlocked(self) -> bool:
-        if self._second_unlocked_until and time.time() < self._second_unlocked_until:
-            return True
-        if self._second_once:
-            self._second_once -= 1
-            return True
-        return False
+    def _auth_session(self, request):
+        return self._auth_sessions.status(request.cookies.get("lovomo_auth"))
 
-    def _auth_remember(self) -> float:
-        try:
-            if self._auth_file.exists():
-                data = json.loads(self._auth_file.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    return float(data.get("expires_at", 0))
-        except Exception:
-            pass
-        return 0.0
-
-    def _auth_remember_save(self, minutes: int):
-        try:
-            expires = time.time() + minutes * 60 if minutes > 0 else 0
-            self._auth_file.write_text(json.dumps({
-                "expires_at": expires,
-                "secret": self._auth_token,
-                "password_hash": hashlib.sha256(
-                    (self._password or "").encode("utf-8")).hexdigest(),
-            }), encoding="utf-8")
-        except Exception:
-            pass
+    def _second_unlocked(self, request) -> bool:
+        return self._auth_sessions.consume_second(request.cookies.get("lovomo_auth"))
 
     async def handle_auth_status(self, request):
         from modules.updater import APP_VERSION
-        version = APP_VERSION
-        second = {"second_enabled": bool(self._second_password)}
-        if not self._password:
-            return web.json_response({"enabled": False, "authed": False,
-                                      "version": version, **second})
-        remaining = self._auth_remember() - time.time()
-        has_valid_cookie = bool(self._auth_token) \
-            and request.cookies.get("lovomo_auth") == self._auth_token
-        if remaining > 0 and has_valid_cookie:
-            return web.json_response({"enabled": True, "authed": True,
-                                      "expires_at": self._auth_remember(),
-                                      "version": version, **second})
-        return web.json_response({"enabled": True, "authed": False,
-                                  "version": version, **second})
+        session = self._auth_session(request)
+        authed = bool(session and session.get("primary"))
+        return web.json_response({"enabled": bool(self._password), "authed": authed,
+                                  "expires_at": session["expires"] if authed else 0,
+                                  "version": APP_VERSION,
+                                  "second_enabled": bool(self._second_password)})
 
     async def handle_auth_login(self, request):
         try:
             payload = await request.json()
+            if not isinstance(payload, dict):
+                raise ValueError("expected object")
         except Exception:
             return web.json_response({"success": False, "error": "参数错误"}, status=400)
+        if not self._password:
+            return web.json_response({"success": True})
+        rate_key = f"primary:{request.remote or 'unknown'}"
+        retry_after = self._auth_limiter.retry_after(rate_key)
+        if retry_after:
+            return web.json_response(
+                {"success": False, "error": "登录尝试过多，请稍后再试"}, status=429,
+                headers={"Retry-After": str(retry_after)})
         if _password_matches(payload.get("password", ""), self._password):
+            self._auth_limiter.success(rate_key)
             try:
                 raw = payload.get("remember_minutes")
                 if raw is None or raw == "":
@@ -544,24 +554,40 @@ class WebUIServer:
                 minutes = max(0, min(int(raw or 0), 60 * 24 * 30))
             except (TypeError, ValueError):
                 minutes = max(0, int(self.config.get("webui_auth_ttl_minutes", 30) or 30))
-            self._auth_remember_save(minutes)
+            token = self._auth_sessions.create(minutes, primary=True,
+                                               replaces=request.cookies.get("lovomo_auth"))
             resp = web.json_response({"success": True})
-            resp.set_cookie("lovomo_auth", self._auth_token,
+            resp.set_cookie("lovomo_auth", token,
                             max_age=minutes * 60 if minutes > 0 else None,
-                            samesite="Lax", httponly=True)
+                            samesite="Strict", httponly=True, secure=request.secure)
             return resp
+        if self._auth_limiter.failure(rate_key):
+            print("[WebUI] 访问密码失败次数达到限额，已暂时限制对应客户端")
         return web.json_response({"success": False, "error": "密码错误"}, status=401)
 
     async def handle_auth_second(self, request):
         if not self._second_password:
             return web.json_response({"success": True, "unlocked": False,
                                       "second_enabled": False})
+        if self._password and not (self._auth_session(request) or {}).get("primary"):
+            return web.json_response({"success": False, "error": "需要密码"}, status=401)
         try:
             payload = await request.json()
+            if not isinstance(payload, dict):
+                raise ValueError("expected object")
         except Exception:
             return web.json_response({"success": False, "error": "参数错误"}, status=400)
+        rate_key = f"second:{request.remote or 'unknown'}"
+        retry_after = self._auth_limiter.retry_after(rate_key)
+        if retry_after:
+            return web.json_response(
+                {"success": False, "error": "二级密码尝试过多，请稍后再试"}, status=429,
+                headers={"Retry-After": str(retry_after)})
         if not _password_matches(payload.get("password", ""), self._second_password):
+            if self._auth_limiter.failure(rate_key):
+                print("[WebUI] 二级密码失败次数达到限额，已暂时限制对应客户端")
             return web.json_response({"success": False, "error": "二级密码错误"}, status=401)
+        self._auth_limiter.success(rate_key)
         try:
             raw = payload.get("minutes")
             if raw is None or raw == "":
@@ -569,14 +595,18 @@ class WebUIServer:
             minutes = max(0, min(int(raw or 0), 60 * 24 * 30))
         except (TypeError, ValueError):
             minutes = max(0, int(self.config.get("webui_second_unlock_minutes", 30) or 0))
-        if minutes > 0:
-            self._second_unlocked_until = time.time() + minutes * 60
-            self._second_once = 0
-        else:
-            self._second_unlocked_until = 0.0
-            self._second_once = 1
-        return web.json_response({"success": True, "unlocked": True,
+        token = request.cookies.get("lovomo_auth")
+        created = False
+        if not self._auth_sessions.status(token):
+            token = self._auth_sessions.create(primary=False)
+            created = True
+        self._auth_sessions.grant(token, minutes)
+        resp = web.json_response({"success": True, "unlocked": True,
                                   "minutes": minutes, "second_enabled": True})
+        if created:
+            resp.set_cookie("lovomo_auth", token, samesite="Strict", httponly=True,
+                            secure=request.secure)
+        return resp
 
     def _update_cache(self) -> dict:
         try:
@@ -655,35 +685,24 @@ class WebUIServer:
         if not self.config.get("update_check_enabled", True):
             return web.json_response({"ok": False, "error": "更新检查已在配置里关闭"},
                                      status=400)
-        with _UPDATE_LOCK:
-            if _UPDATE_STATE["active"]:
-                return web.json_response({"ok": True, "already": True,
-                                          **self._update_download_payload()})
         ready = find_ready_installer()
-        if ready:
+        with _UPDATE_LOCK:
+            already = _UPDATE_STATE["active"] or bool(ready)
+            if not already:
+                _UPDATE_STATE.update({"active": True, "phase": "准备中", "error": "",
+                                      "received": 0, "total": 0, "finished": False,
+                                      "started_at": time.time(), "source": ""})
+        if already:
             return web.json_response({"ok": True, "already": True,
                                       **self._update_download_payload()})
-        with _UPDATE_LOCK:
-            _UPDATE_STATE.update({"active": True, "phase": "准备中", "error": "",
-                                  "received": 0, "total": 0, "finished": False,
-                                  "started_at": time.time(), "source": ""})
-        asyncio.create_task(self._update_download_task())
+        self._update_task = asyncio.create_task(self._update_download_task())
         return web.json_response({"ok": True, "started": True})
 
     async def _race_mirrors(self, url: str):
         from modules import updater as U
         from modules.ghmirror import candidates
-        from modules.tls import is_cert_error
-        urls = candidates(url, self._github_mirrors())
-        try:
-            winner, elapsed = await U.race_candidates(urls, verify=True)
-            return winner, elapsed, False
-        except Exception as e:
-            if not is_cert_error(e):
-                raise
-            print("[更新] 证书校验失败，改用不校验证书的方式测速（本机可能装了自签根证书的安全软件/加速器）")
-            winner, elapsed = await U.race_candidates(urls, verify=False)
-            return winner, elapsed, True
+        winner, elapsed = await U.race_candidates(candidates(url, self._github_mirrors()), verify=True)
+        return winner, elapsed, False
 
     async def _update_download_task(self):
         from modules import updater as U
@@ -703,6 +722,10 @@ class WebUIServer:
                 expected = int(installer.get("size") or 0)
             except (TypeError, ValueError):
                 expected = 0
+            digest = str(installer.get("digest") or "")
+            U.trusted_digest(digest)
+            if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._+-]{0,99}", version):
+                raise ValueError("官方发布版本号格式非法")
             kind = str(installer.get("kind") or "exe")
             suffix = ".zip" if kind == "archive" else ".exe"
             update_dir().mkdir(parents=True, exist_ok=True)
@@ -736,7 +759,7 @@ class WebUIServer:
 
             started = time.time()
             size = await U.download_asset(winner, dest, expected_size=expected,
-                                          verify=not insecure, on_progress=on_progress)
+                                          verify=True, expected_digest=digest, on_progress=on_progress)
             used = max(0.001, time.time() - started)
             await asyncio.to_thread(U.check_downloaded_head, dest, kind)
             print(f"[更新] 下载完成：{dest.name}（{size / 1048576:.1f} MB，"
@@ -756,16 +779,20 @@ class WebUIServer:
                 except OSError as e:
                     print(f"[更新] 删除压缩包失败：{e}")
                 dest, size = target, info["size"]
+            from .updater_tools import record_verified_installer
+            await asyncio.to_thread(record_verified_installer, dest, version, url, digest)
             with _UPDATE_LOCK:
                 _UPDATE_STATE.update({"active": False, "finished": True,
                                       "received": size, "total": size, "error": "",
                                       "phase": "已完成", "path": str(dest)})
-        except Exception as e:
+        except BaseException as e:
             with _UPDATE_LOCK:
                 _UPDATE_STATE.update({"active": False, "finished": False,
                                       "phase": "失败",
                                       "error": f"{type(e).__name__}: {e}"})
             print(f"[更新] 下载失败：{type(e).__name__}: {e}")
+            if isinstance(e, asyncio.CancelledError):
+                raise
 
     async def handle_update_install(self, request):
         try:
@@ -773,10 +800,10 @@ class WebUIServer:
         except Exception:
             payload = {}
         path = str(payload.get("path") or "").strip()
-        ready = find_ready_installer()
+        ready = await asyncio.to_thread(find_ready_installer)
         if not path:
             path = str(ready.get("path") or "")
-        if not path or not Path(path).is_file():
+        if not ready or Path(path).resolve() != Path(ready["path"]).resolve():
             return web.json_response({"ok": False, "error": "安装包不存在（可能已被删除）"},
                                      status=400)
         hook = _APP_HOOKS.get("install_update")
@@ -796,36 +823,20 @@ class WebUIServer:
     async def _github_fetch(self, url: str, kind: str = "json", *,
                             timeout: float = 10.0, headers=None):
         from modules.ghmirror import candidates, mirror_label, note_success
-        from modules.tls import verified_context, unverified_context, is_cert_error
-        hdrs = headers or {}
         last_err = None
-        insecure = False
         for cand in candidates(url, self._github_mirrors()):
-            for ctx, unverified in ((verified_context(), False),
-                                    (unverified_context(), True)):
-                try:
-                    async with httpx.AsyncClient(timeout=timeout, proxy=None,
-                                                 trust_env=False,
-                                                 follow_redirects=True,
-                                                 verify=ctx) as client:
-                        resp = await client.get(cand, headers=hdrs)
-                        resp.raise_for_status()
-                        if kind == "json":
-                            data = resp.json()
-                        elif kind == "text":
-                            data = resp.text
-                        else:
-                            data = resp.content
-                except Exception as e:
-                    last_err = e
-                    if not unverified and is_cert_error(e):
-                        continue
-                    break
-                insecure = insecure or unverified
-                if note_success(url, cand):
-                    print("[GitHub] " + (f"直连不可用，改用镜像 {mirror_label(cand, url)}"
-                                         if cand != url else "直连已恢复"))
-                return data, insecure
+            try:
+                async with httpx.AsyncClient(timeout=timeout, proxy=None, trust_env=False,
+                                             follow_redirects=True, verify=verified_context()) as client:
+                    resp = await client.get(cand, headers=headers or {})
+                    resp.raise_for_status()
+                    data = resp.json() if kind == "json" else resp.text if kind == "text" else resp.content
+            except Exception as e:
+                last_err = e
+                continue
+            if note_success(url, cand):
+                print("[GitHub] " + (f"直连不可用，改用镜像 {mirror_label(cand, url)}" if cand != url else "直连已恢复"))
+            return data, False
         raise last_err if last_err else RuntimeError("没有可用的 GitHub 地址")
 
     async def _fetch_releases(self, api_url: str):
@@ -841,10 +852,17 @@ class WebUIServer:
         from modules.updater import APP_VERSION, is_newer, pick_latest_release
         include_pre = bool(self.config.get("update_include_prerelease", False))
         try:
-            repo = "slpk1ng/Lovomo"
+            repo = _APP_RELEASE_REPO
             api_url = f"https://api.github.com/repos/{repo}/releases?per_page=30"
             release_home = f"https://github.com/{repo}/releases/latest"
-            releases, insecure = await self._fetch_releases(api_url)
+            # Release metadata must originate from GitHub over verified TLS.
+            async with httpx.AsyncClient(timeout=20, proxy=None, trust_env=False,
+                                         follow_redirects=False, verify=verified_context()) as client:
+                response = await client.get(api_url, headers={"Accept": "application/vnd.github+json",
+                                                              "User-Agent": "lovomo-update-check"})
+                response.raise_for_status()
+                releases = response.json()
+            insecure = False
             items = releases if isinstance(releases, list) else ([releases] if releases else [])
             visible = [r for r in items if isinstance(r, dict) and not r.get("draft")]
             seen = len(visible)
@@ -895,6 +913,7 @@ class WebUIServer:
         r.add_get("/api/user/avatar", self.handle_user_avatar)
         r.add_post("/api/delete", self.handle_delete)
         r.add_post("/api/history/delete_messages", self.handle_delete_messages)
+        r.add_post("/api/memory/recall", self.handle_recall_memory)
         r.add_get("/api/config", self.handle_get_config)
         r.add_post("/api/config/save", self.handle_save_config)
         r.add_get("/api/config/export", self.handle_export_config)
@@ -912,6 +931,7 @@ class WebUIServer:
         r.add_post("/api/plugins/upload", self.handle_plugins_upload)
         r.add_post("/api/plugins/inspect", self.handle_plugins_inspect)
         r.add_post("/api/plugins/toggle", self.handle_plugins_toggle)
+        r.add_post("/api/plugins/approve", self.handle_plugins_approve)
         r.add_post("/api/plugins/pin", self.handle_plugins_pin)
         r.add_post("/api/github/mirrors/test", self.handle_github_mirror_test)
         r.add_post("/api/plugins/delete", self.handle_plugins_delete)
@@ -977,7 +997,9 @@ class WebUIServer:
         r.add_get("/api/companion/diary", self.handle_companion_diary)
         # 聊天测试台
         r.add_get("/api/test/roles", self.handle_test_roles)
+        r.add_get("/api/test/persona", self.handle_test_persona)
         r.add_post("/api/test/chat", self.handle_test_chat)
+        r.add_post("/api/test/compare", self.handle_test_compare)
         r.add_get("/api/test/history", self.handle_test_history)
         r.add_post("/api/test/chat/clear", self.handle_test_chat_clear)
         # 角色档案导出 / 导入
@@ -1035,6 +1057,7 @@ class WebUIServer:
         r.add_post("/api/stickers/delete", self.handle_stickers_delete)
         r.add_get("/api/stickers/file", self.handle_stickers_file)
         r.add_get("/favicon.ico", self.handle_favicon)
+        r.add_get(r"/webui/guide/{name:guide\.(?:css|js|webp)}", self.handle_guide_asset)
         r.add_get("/", self.handle_index)
         r.add_post("/api/clear-ui-cache", self.handle_clear_ui_cache)
 
@@ -1067,6 +1090,15 @@ class WebUIServer:
         if self.html_path.exists():
             return web.FileResponse(self.html_path, headers={"Cache-Control": "no-store"})
         return web.Response(text="WebUI 页面未找到", status=404)
+
+    async def handle_guide_asset(self, request):
+        name = request.match_info["name"]
+        path = self.html_path.parent / "guide" / name
+        if not path.is_file():
+            return web.Response(status=404)
+        mime = {"guide.css": "text/css", "guide.js": "text/javascript", "guide.webp": "image/webp"}
+        return web.FileResponse(path, headers={"Content-Type": mime[name], "Cache-Control": "no-cache",
+                                               "X-Content-Type-Options": "nosniff"})
 
     # ---------------- 配置 ----------------
     async def handle_get_config(self, request):
@@ -1148,19 +1180,18 @@ class WebUIServer:
             model_library.apply_library(merged, lib)
         except Exception as lib_err:
             print(f"[模型库] 导入配置迁移失败（沿用导入内容）：{type(lib_err).__name__}: {lib_err}")
-        self.config.config = merged
-        self.config._atomic_save(merged)
+        self.config.commit(merged)
         self._after_config_reload()
 
     async def handle_import_config(self, request):
         try:
             ctype = request.content_type or ""
             if "multipart" in ctype:
-                reader = await request.multipart()
+                reader = bounded_multipart(request)
                 data = None
                 async for part in reader:
                     if part.name == "file":
-                        raw = await part.read(decode=False)
+                        raw = await read_upload(part, request)
                         data = json.loads(raw.decode("utf-8"))
                         break
             else:
@@ -1328,6 +1359,9 @@ class WebUIServer:
         try:
             items = self.plugin_manager.list_plugins()
             for it in items:
+                it["digest"] = await asyncio.to_thread(self.plugin_manager.content_digest, it["id"])
+                it["trusted"] = self.plugin_manager.is_trusted(it["id"])
+                it["send_messages"] = it["trusted"] and self.plugin_manager.message_granted(it["id"])
                 if it.get("skin") or it.get("features") or it.get("panel"):
                     it["settings"] = self.plugin_manager.plugin_settings(it["id"])
             return web.json_response({
@@ -1338,7 +1372,7 @@ class WebUIServer:
                                  if self.config.get("plugins_enabled", True) else []),
                 "loaded": sorted((self._plugin_runtime.loaded.keys()
                                   if self._plugin_runtime else [])),
-                "commands": (self._plugin_runtime.command_names()
+                "commands": (await asyncio.to_thread(self._plugin_runtime.command_names)
                              if self._plugin_runtime else []),
             })
         except Exception as e:
@@ -1346,22 +1380,22 @@ class WebUIServer:
 
     async def handle_plugins_upload(self, request):
         try:
-            reader = await request.multipart()
+            reader = bounded_multipart(request)
             data = None
             force = False
             file_name = ""
             async for part in reader:
                 if part.name == "file":
                     file_name = part.filename or ""
-                    data = await part.read(decode=False)
+                    data = await read_upload(part, request)
                 elif part.name == "force":
-                    force = (await part.text()).strip().lower() in ("1", "true", "yes")
+                    force = (await read_field(part, request)).strip().lower() in ("1", "true", "yes")
             if not data:
                 return web.json_response({"success": False, "error": "没有收到文件"}, status=400)
             if file_name and not file_name.lower().endswith(".zip"):
                 return web.json_response(
                     {"success": False, "error": "插件包必须是 .zip 格式"}, status=400)
-            result = self.plugin_manager.install_zip(data, force=force)
+            result = await asyncio.to_thread(self.plugin_manager.install_zip, data, force=force)
             if result.get("success"):
                 print(f"[插件] 已安装：{result.get('name')} "
                       f"(id={result.get('id')}, 覆盖={result.get('replaced')})")
@@ -1372,14 +1406,14 @@ class WebUIServer:
 
     async def handle_plugins_inspect(self, request):
         try:
-            reader = await request.multipart()
+            reader = bounded_multipart(request)
             data = None
             async for part in reader:
                 if part.name == "file":
-                    data = await part.read(decode=False)
+                    data = await read_upload(part, request)
             if not data:
                 return web.json_response({"success": False, "error": "没有收到文件"}, status=400)
-            report = self.plugin_manager.inspect_zip(data)
+            report = await asyncio.to_thread(self.plugin_manager.inspect_zip, data)
             return web.json_response({"success": bool(report.get("ok")),
                                       "report": report},
                                      status=200 if report.get("ok") else 400)
@@ -1395,8 +1429,22 @@ class WebUIServer:
             info = self.plugin_manager.get(pid)
             if not info:
                 return web.json_response({"success": False, "error": "插件不存在"}, status=404)
-            self.plugin_manager.set_enabled(pid, enabled)
+            await asyncio.to_thread(self.plugin_manager.set_enabled, pid, enabled)
             return web.json_response({"success": True, "id": pid, "enabled": enabled})
+        except Exception as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
+
+    async def handle_plugins_approve(self, request):
+        try:
+            payload = await request.json()
+            pid = str(payload.get("id") or "").strip()
+            info = self.plugin_manager.get(pid)
+            if not info:
+                return web.json_response({"success": False, "error": "插件不存在"}, status=404)
+            digest = str(payload.get("digest") or "").strip()
+            if not self.plugin_manager.approve(pid, digest, send_messages=payload.get("send_messages") is True):
+                return web.json_response({"success": False, "error": "插件内容已变化，请重新检查并确认"}, status=409)
+            return web.json_response({"success": True, "id": pid, "digest": digest})
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
@@ -1519,7 +1567,8 @@ class WebUIServer:
             mime = {".png": "image/png", ".jpg": "image/jpeg",
                     ".svg": "image/svg+xml", ".ico": "image/x-icon"}.get(
                 f.suffix.lower(), "application/octet-stream")
-            return web.Response(body=f.read_bytes(), content_type=mime)
+            return web.Response(body=f.read_bytes(), content_type=mime,
+                                headers=PLUGIN_ASSET_HEADERS)
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
@@ -1539,7 +1588,11 @@ class WebUIServer:
             f, mime = self.plugin_manager.asset_file(pid, name)
             if f is None:
                 return web.Response(status=404, text="not found")
-            return web.Response(body=f.read_bytes(), content_type=mime)
+            if (not self.plugin_manager.is_trusted(pid) and
+                    mime not in {"image/png", "image/jpeg", "image/gif", "image/webp", "image/x-icon"}):
+                return web.Response(status=403, text="插件当前版本尚未获得信任授权")
+            return web.Response(body=await asyncio.to_thread(f.read_bytes), content_type=mime,
+                                headers=PLUGIN_ASSET_HEADERS)
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
@@ -1554,13 +1607,24 @@ class WebUIServer:
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
+    def _plugin_page_matches(self, pid, info, page_state):
+        if not isinstance(page_state, dict) or not self.config.get("plugins_enabled", True):
+            return False
+        digest = page_state.get("digest")
+        return (bool(digest) and page_state.get("enabled") is info["enabled"]
+                and self.plugin_manager.content_digest(pid) == digest
+                and self.plugin_manager.is_trusted(pid))
+
     async def handle_plugins_settings_set(self, request):
         try:
             payload = await request.json()
             pid = str(payload.get("id") or "").strip()
-            if not self.plugin_manager.get(pid):
+            info = self.plugin_manager.get(pid)
+            if not info:
                 return web.json_response({"success": False, "error": "插件不存在"},
                                          status=404)
+            if "page_state" in payload and not self._plugin_page_matches(pid, info, payload["page_state"]):
+                return web.json_response({"success": False, "error": "插件状态已变更，请重新打开页面"}, status=409)
             settings = payload.get("settings")
             if not isinstance(settings, dict):
                 return web.json_response({"success": False, "error": "settings 必须是对象"},
@@ -1575,21 +1639,27 @@ class WebUIServer:
 
     async def handle_plugins_reload(self, request):
         try:
-            pid = ""
             try:
                 payload = await request.json()
-                pid = str(payload.get("id") or "").strip()
             except Exception:
-                pid = ""
-            if pid and not self.plugin_manager.get(pid):
+                payload = {}
+            pid = str(payload.get("id") or "").strip()
+            info = self.plugin_manager.get(pid) if pid else None
+            if pid and not info:
                 return web.json_response({"success": False, "error": "插件不存在"},
                                          status=404)
+            if "page_state" in payload and (not info or not self._plugin_page_matches(pid, info, payload["page_state"])):
+                return web.json_response({"success": False, "error": "插件状态已变更，请重新打开页面"}, status=409)
             if not self.config.get("plugins_enabled", True):
                 return web.json_response({"success": False,
                                           "error": "插件系统已在配置里关闭"},
                                          status=400)
             self.plugin_manager.commit_settings(pid or None)
-            self._on_plugins_changed()
+            if pid:
+                if self._plugin_runtime is not None:
+                    await asyncio.to_thread(self._plugin_runtime.reload_one, pid)
+            else:
+                await asyncio.to_thread(self._on_plugins_changed)
             return web.json_response({
                 "success": True,
                 "id": pid,
@@ -1597,7 +1667,7 @@ class WebUIServer:
                 "active_skins": self.plugin_manager.active_skin_ids(),
                 "loaded": sorted(self._plugin_runtime.loaded.keys()
                                  if self._plugin_runtime else []),
-                "commands": (self._plugin_runtime.command_names()
+                "commands": (await asyncio.to_thread(self._plugin_runtime.command_names)
                              if self._plugin_runtime else []),
             })
         except Exception as e:
@@ -1609,6 +1679,12 @@ class WebUIServer:
             info = self.plugin_manager.get(pid)
             if not info:
                 return web.Response(status=404, text="plugin not found")
+            if not self.plugin_manager.is_trusted(pid):
+                return web.Response(status=403, text="请先确认信任当前版本的插件内容")
+            if "digest" in request.query and not self._plugin_page_matches(pid, info, {
+                "digest": request.query["digest"], "enabled": request.query.get("enabled") == "true",
+            }):
+                return web.Response(status=409, text="插件状态已变更，请重新打开页面")
             name = str(request.query.get("name") or "").strip() or default_name
             if not name:
                 return web.Response(status=404, text="no page file")
@@ -1618,7 +1694,7 @@ class WebUIServer:
             body = f.read_bytes()
             if name == default_name and "html" in mime:
                 body = self._inject_plugin_bridge(body, pid, info)
-            return web.Response(body=body, content_type=mime)
+            return web.Response(body=body, content_type=mime, headers=PLUGIN_PAGE_HEADERS)
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
@@ -1805,7 +1881,7 @@ class WebUIServer:
         return str(data.get("default_branch") or "").strip() or "main"
 
     async def _market_sources(self, repo: str, path: str) -> list:
-        from modules.market import RAW_TMPL, parse_market_repos
+        from modules.market import RAW_TMPL
         branch = await self._market_default_branch(repo)
         url = RAW_TMPL.format(repo=repo, branch=branch, path=path)
         try:
@@ -1915,7 +1991,7 @@ class WebUIServer:
 
     async def _plugins_market_payload(self, force: bool = False, sort: str = "latest",
                                       market: str = "official") -> dict:
-        from modules.market import SORT_KEYS, parse_market_repos, sort_entries
+        from modules.market import SORT_KEYS, sort_entries
         kind = "thirdparty" if str(market or "").strip().lower() == "thirdparty" \
             else "official"
         raw_sources = str(self.config.get("plugin_market_thirdparty", "") or "")
@@ -2074,11 +2150,9 @@ class WebUIServer:
         except Exception:
             return web.json_response({"success": False, "error": "请求体不是合法 JSON"},
                                      status=400)
-        from modules.market import parse_market_repos
         text = str(payload.get("text") or "").strip()
         markets = parse_market_repos(text)
-        self.config.config["plugin_market_thirdparty"] = text
-        self.config._atomic_save(self.config.config)
+        self.config.commit({**self.config.config, "plugin_market_thirdparty": text})
         self._plugin_market_cache.clear()
         print(f"[插件市场] 第三方市场地址已保存：识别到 {len(markets)} 个"
               + (f"（{'、'.join(markets)}）" if markets else ""))
@@ -2275,18 +2349,17 @@ class WebUIServer:
             info = await _verify_github_token(token)
         except _PublishError as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
-        self.config.config["plugin_publish_token"] = token
-        self.config.config["plugin_publish_login"] = info.get("login", "")
-        self.config.config["plugin_publish_name"] = info.get("name", "")
-        self.config._atomic_save(self.config.config)
+        self.config.commit({**self.config.config, "plugin_publish_token": token,
+                            "plugin_publish_login": info.get("login", ""),
+                            "plugin_publish_name": info.get("name", "")})
         return web.json_response({"success": True, "login": info.get("login", ""),
                                   "name": info.get("name", "")})
 
     async def handle_plugins_publish_token_clear(self, request):
-        self.config.config.pop("plugin_publish_token", None)
-        self.config.config.pop("plugin_publish_login", None)
-        self.config.config.pop("plugin_publish_name", None)
-        self.config._atomic_save(self.config.config)
+        new_config = dict(self.config.config)
+        for key in ("plugin_publish_token", "plugin_publish_login", "plugin_publish_name"):
+            new_config.pop(key, None)
+        self.config.commit(new_config)
         return web.json_response({"success": True})
 
     def _publish_state_get(self) -> dict:
@@ -2910,6 +2983,12 @@ class WebUIServer:
         try:
             new_config = await request.json()
             restart_tts = new_config.pop("restart_tts", False)
+            expected = new_config.pop("expected_values", None)
+            if expected is not None:
+                live = self.config.config or {}
+                if (not isinstance(expected, dict) or not set(expected).issubset(new_config)
+                        or any(live.get(key) != value for key, value in expected.items())):
+                    return web.json_response({"success": False, "error": "设置已变更，请刷新后再操作"}, status=409)
             for key in _API_KEY_KEYS + _WEBUI_PASSWORD_KEYS:
                 masked_value = new_config.get(key)
                 if isinstance(masked_value, dict):
@@ -2928,8 +3007,7 @@ class WebUIServer:
                     new_config, model_library.load_library(self._config_preset_dir()))
             except Exception as lib_err:
                 print(f"[模型库] 保存时投影失败（沿用配置自带值）：{type(lib_err).__name__}: {lib_err}")
-            self.config.config = new_config
-            self.config._atomic_save(new_config)
+            self.config.commit(new_config)
             try:
                 self._after_config_reload()
             except Exception as reload_err:
@@ -2962,7 +3040,7 @@ class WebUIServer:
                     tts_restart_message = f"配置已保存，但 TTS 服务未重启：{error_msg}"
                 else:
                     print("检测到 TTS 相关配置变化或用户强制重启，正在重启 TTS 服务...")
-                    process_manager.shutdown_all()
+                    await asyncio.to_thread(process_manager.shutdown_all)
                     threading.Thread(target=auto_start_and_switch_tts, args=(app_context.global_config,), daemon=True).start()
                     tts_restart_message = "TTS 服务正在重启，请稍候..."
             elif tts_changed:
@@ -3223,7 +3301,8 @@ class WebUIServer:
         if app_context.promise_mgr is not None:
             app_context.promise_mgr.drop_session(sid)
         if app_context.recall_mgr is not None:
-            app_context.recall_mgr.drop_session(sid)
+            from .recall import drop_session_all_roles
+            drop_session_all_roles(sid)
         if clean_affection is None:
             clean_affection = stype == "private"
         if clean_affection and app_context.affection_mgr is not None:
@@ -3257,17 +3336,20 @@ class WebUIServer:
         return purged
 
     def _deleted_session_scopes(self, filenames: list) -> dict:
+        from .memory_store import _memory_role_key
+        from .session_context import parse_session_target
         out = {}
         for name in filenames:
-            m = re.match(r'^([A-Za-z0-9_\-]+)_(private|group)_(.+)\.json$', str(name))
-            if not m:
+            character_key = _memory_role_key(name)
+            sid = _memory_session_id(name)
+            if not character_key or not sid:
                 continue
-            character_key, stype, rest = m.group(1), m.group(2), m.group(3)
+            stype, target = parse_session_target(sid)
             if stype == "private":
-                uid = self._session_user_id(name, rest)
-                out[name] = (character_key, f"private_{uid}", "private", uid)
+                uid = self._session_user_id(name, target)
+                out[name] = (character_key, sid, "private", uid)
             else:
-                out[name] = (character_key, f"group_{rest}", "group", rest.split("_")[0])
+                out[name] = (character_key, sid, "group", target)
         return out
 
     def _session_user_id(self, filename: str, fallback: str) -> str:
@@ -3293,6 +3375,41 @@ class WebUIServer:
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
+    async def handle_recall_memory(self, request):
+        from .memory_store import _memory_role_key
+        from .recall import recall_for_context
+
+        try:
+            data = await request.json()
+            filename = data["filename"]
+            action = data.get("action", "list")
+            if not isinstance(filename, str) or not _is_memory_filename(filename) or action not in {
+                "list", "edit", "pin", "forget",
+            }:
+                raise ValueError
+            role = self._test_role(_memory_role_key(filename))
+            session_id = _memory_session_id(filename)
+            if not role or not session_id or not self.memory_manager.get_history(filename).get("success"):
+                return web.json_response({"success": False, "error": "未找到角色或会话"}, status=404)
+            identifier = data.get("id", "")
+            text = ""
+            if action == "edit":
+                text = data["text"].strip()
+                if not text or len(text) > 600:
+                    raise ValueError
+            manager = recall_for_context(RoleContext(self.config.config, role))
+            if manager is None:
+                return web.json_response({"success": False, "error": "回忆服务尚未就绪"}, status=503)
+            if action != "list" and not manager.change_memory(session_id, identifier, action, text):
+                return web.json_response({"success": False, "error": "回忆已变更，请刷新"}, status=409)
+            rows = manager.list_memories(session_id)
+            return web.json_response({"success": True, "memories": rows[:100], "total": len(rows)},
+                                     headers={"Cache-Control": "no-store"})
+        except (TypeError, ValueError, KeyError, AttributeError):
+            return web.json_response({"success": False, "error": "回忆参数不正确"}, status=400)
+        except OSError as error:
+            return web.json_response({"success": False, "error": str(error)}, status=500)
+
     async def handle_memory_export(self, request):
         filename = request.query.get("filename", "")
         result = self.memory_manager.get_history(filename)
@@ -3311,13 +3428,14 @@ class WebUIServer:
 
     async def handle_memory_import(self, request):
         try:
-            reader = await request.multipart()
+            reader = bounded_multipart(request)
             imported = []
             skipped = []
             async for part in reader:
                 if not part.filename or not part.filename.endswith(".json"):
+                    await read_upload(part, request)
                     continue
-                raw = await part.read(decode=False)
+                raw = await read_upload(part, request)
                 data = json.loads(raw.decode("utf-8"))
                 if not isinstance(data, dict) or "history" not in data:
                     continue
@@ -3478,21 +3596,21 @@ class WebUIServer:
 
     async def handle_emotions_upload(self, request):
         try:
-            reader = await request.multipart()
+            reader = bounded_multipart(request)
             role = emotion = None
             kind = ""
             file_data = None
             file_name = ""
             async for part in reader:
                 if part.name == "role":
-                    role = (await part.text()).strip()
+                    role = (await read_field(part, request)).strip()
                 elif part.name == "kind":
-                    kind = (await part.text()).strip()
+                    kind = (await read_field(part, request)).strip()
                 elif part.name == "emotion":
-                    emotion = (await part.text()).strip()
+                    emotion = (await read_field(part, request)).strip()
                 elif part.name == "file":
                     file_name = part.filename or ""
-                    file_data = await part.read(decode=False)
+                    file_data = await read_upload(part, request)
             root = self._role_root(role or "", kind)
             if root is None:
                 return web.json_response({"success": False, "error": "未配置情绪模仿根目录"}, status=400)
@@ -3755,9 +3873,11 @@ class WebUIServer:
 
     async def handle_performance(self, request):
         perf = app_context.stats_mgr.get_performance() if app_context.stats_mgr else {}
+        delivery = getattr(app_context.sender, "delivery", None)
+        perf["message_timing"] = delivery.performance() if delivery is not None else {}
         perf["tts_online"] = await ensure_tts_service_enabled_check()
         perf["napcat_connected"] = bool(app_context.sender and app_context.sender.client is not None)
-        perf["scheduler_jobs"] = len([j for j in app_context.scheduler.jobs.values() if j.enabled])
+        perf["scheduler_jobs"] = sum(j.enabled for j in getattr(app_context.scheduler, "jobs", {}).values())
         return web.json_response(perf)
 
     # ---------------- 聊天测试台 ----------------
@@ -3786,7 +3906,58 @@ class WebUIServer:
                 continue
             seen.add(key)
             out.append({"character_key": key, "character_name": entry.get("name") or key})
-        return web.json_response({"roles": out})
+        channels = []
+        for conn in self._test_chat_connections():
+            connection_id = str(conn["id"])
+            config = config_for_connection(connection_id)
+            channels.append({"id": connection_id, "name": conn.get("name") or connection_id,
+                             "character_key": connection_role_key(self.config, connection_id),
+                             "model": config.get("llm_model_name", "") if config else ""})
+        return web.json_response({"roles": out, "connections": channels,
+                                  "main_model": self.config.get("llm_model_name", "")})
+
+    async def handle_test_persona(self, request):
+        role = self._test_role(request.query.get("character_key", ""))
+        if role is None:
+            return web.json_response({"error": "请先保存角色"}, status=404)
+        fields = ("personality_prompt", "json_prompt", "supplement_prompt", "text_lang", "prompt_lang")
+        return web.json_response({key: str(role.get(key) or "") for key in fields},
+                                 headers={"Cache-Control": "no-store"})
+
+    def _test_chat_connections(self):
+        return [conn for conn in connections_of(self.config) if conn.get("enabled", True)]
+
+    def _test_chat_config(self, payload, character_key):
+        provider_id = payload.get("chat_provider", "")
+        connection_id = payload.get("connection_id")
+        if not isinstance(provider_id, str) or (connection_id is not None and not isinstance(connection_id, str)):
+            raise ValueError("请选择已保存的接入方式或聊天模型")
+        library = model_library.load_library(self._config_preset_dir())
+        if provider_id:
+            provider = model_library.selected_provider(library, "chat", provider_id)
+            if not provider:
+                raise ValueError("请选择已保存的聊天模型")
+            overrides = {key: provider.get(field, "")
+                         for field, key in model_library.PROVIDER_FIELD_MAP["chat"].items()}
+            return {**self.config.config, **overrides}
+        channels = self._test_chat_connections()
+        if connection_id is None:
+            matches = [conn for conn in channels
+                       if connection_role_key(self.config, conn["id"]) == character_key]
+            candidates = matches or channels
+            if len(candidates) > 1:
+                raise ValueError("有多条可用接入方式，请选择要使用的接入方式或聊天模型")
+            connection_id = str(candidates[0]["id"]) if candidates else ""
+        if not connection_id:
+            return self.config.config
+        conn = next((conn for conn in channels if str(conn["id"]) == connection_id), None)
+        if conn is None:
+            raise ValueError("接入方式已停用或删除，请重新选择")
+        picked = conn.get("chat_provider")
+        if picked and not model_library.selected_provider(library, "chat", picked):
+            raise ValueError("接入方式绑定的聊天模型已删除，请在接入方式里重新选择")
+        config = config_for_connection(connection_id)
+        return config.config if config is not None else self.config.config
 
     async def handle_test_chat(self, request):
         try:
@@ -3798,6 +3969,10 @@ class WebUIServer:
         role = self._test_role(character_key)
         if role is None or not text:
             return web.json_response({"success": False, "error": "参数不完整"}, status=400)
+        try:
+            test_config = self._test_chat_config(payload, character_key)
+        except ValueError as error:
+            return web.json_response({"success": False, "error": str(error)}, status=400)
         mem = role_memory(role)
         if mem is None:
             return web.json_response({"success": False, "error": "角色记忆不可用"}, status=400)
@@ -3805,7 +3980,7 @@ class WebUIServer:
         user_id = TEST_CHAT_USER
         lock = app_context._SESSION_LOCKS.setdefault(f"{session_id}::{character_key}", asyncio.Lock())
         async with lock:
-            ctx = RoleContext(self.config.config, role)
+            ctx = RoleContext(test_config, role)
             emotions = get_role_emotions(role)
             history = mem.load_history(session_id)
             extra_parts = []
@@ -3837,23 +4012,31 @@ class WebUIServer:
                                                     session_id=session_id)
                 if aff_note:
                     extra_parts.append(aff_note)
+            model = str(ctx.get("llm_model_name", "") or "")
+            token = app_context.set_active_config(test_config)
             try:
                 reply = await asyncio.wait_for(
                     generate_reply(ctx, emotions, text, history, None, extra_parts,
-                                   user_id, session_id=session_id),
-                    timeout=max(90.0, float(self.config.get("llm_timeout", 120) or 120) + 60.0))
+                                   user_id, session_id=session_id, wants_voice=False,
+                                   raise_on_model_error=True),
+                    timeout=max(90.0, float(ctx.get("llm_timeout", 120) or 120) + 60.0))
             except asyncio.TimeoutError:
-                return web.json_response({"success": False, "error": "回复生成超时"}, status=504)
+                return web.json_response({"success": False, "error": f"{model} 回复生成超时"}, status=504)
             except Exception as e:
-                return web.json_response({"success": False, "error": str(e)}, status=500)
+                return web.json_response({"success": False, "error": f"{model or '聊天模型'}：{e}"}, status=502)
+            finally:
+                app_context.reset_active_config(token)
             reply = reply or {}
             sentences = [{"zh": str(s.get("zh") or s.get("display") or ""),
                           "emotion": str(s.get("emotion") or "")}
                          for s in (reply.get("sentences") or [])]
             zh_text = "".join(s["zh"] for s in sentences)
+            if not zh_text.strip():
+                return web.json_response({"success": False, "error": f"{model} 没有返回可显示的回复"}, status=502)
             history.append({"role": "user", "content": text, "sender_id": user_id,
                             "sender_name": "测试用户", "timestamp": time.time()})
             history.append({"role": "assistant", "content": zh_text, "timestamp": time.time(),
+                            "character_key": character_key,
                             "speaker": role.get("character_name", character_key),
                             "emotion": sentences[0]["emotion"] if sentences else ""})
             mem.save_session_data(session_id, {"history": history})
@@ -3882,6 +4065,7 @@ class WebUIServer:
             return web.json_response({
                 "success": True,
                 "sentences": sentences,
+                "model": model,
                 "mood": round(float(mood_after), 1) if mood_after is not None else None,
                 "judge": judge_info,
                 "affection": ({"score": aff_rec["score"],
@@ -3891,16 +4075,62 @@ class WebUIServer:
                                "partner": aff_rec["partner"]}
                               if aff_rec is not None else None)})
 
+    async def handle_test_compare(self, request):
+        try:
+            payload = await request.json()
+            text = payload["text"].strip()
+            key = payload["character_key"].strip()
+            patch = payload["draft"]
+            if not text or len(text) > 4000 or not isinstance(patch, dict):
+                raise ValueError
+            fields = {"personality_prompt", "json_prompt", "supplement_prompt", "text_lang", "prompt_lang"}
+            if not patch or any(k not in fields or not isinstance(v, str) or len(v) > 16000 for k, v in patch.items()):
+                raise ValueError
+        except (TypeError, ValueError, KeyError, AttributeError):
+            return web.json_response({"success": False, "error": "试聊参数不正确"}, status=400)
+        try:
+            test_config = self._test_chat_config(payload, key)
+        except ValueError as error:
+            return web.json_response({"success": False, "error": str(error)}, status=400)
+        role = self._test_role(key)
+        if not role:
+            return web.json_response({"success": False, "error": "请先保存角色"}, status=404)
+        if getattr(self, "_test_compare_busy", False):
+            return web.json_response({"success": False, "error": "角色对比正在运行"}, status=409)
+
+        async def preview(entry):
+            ctx = RoleContext(test_config, entry)
+            messages = build_chat_messages(ctx, text, [], emotions, [])
+            try:
+                result = await asyncio.wait_for(chat_once(ctx, messages, label="角色隔离试聊"), timeout=90)
+                sentences = normalize_sentences(result.get("content", ""), ctx, emotions, text)
+                reply = "\n".join(str(item.get("zh") or item.get("display") or "")
+                                  for item in sentences).strip() if result.get("content") else ""
+                return {"status": "ready" if reply else "empty", "text": reply}
+            except asyncio.TimeoutError:
+                return {"status": "timeout"}
+            except Exception as error:
+                return {"status": "failed", "error": str(error)}
+
+        self._test_compare_busy = True
+        try:
+            emotions = get_role_emotions(role)
+            saved = await preview(role)
+            draft = await preview({**role, **patch})
+            return web.json_response({"success": True, "saved": saved, "draft": draft},
+                                     headers={"Cache-Control": "no-store"})
+        finally:
+            self._test_compare_busy = False
+
     # ---------------- 语音通话（打电话） ----------------
     def _call_targets(self, role) -> list:
         mem = role_memory(role)
         if mem is None:
             return []
-        prefix = str(mem.character_key or "") + "_"
         out = []
         for item in mem.list_memories():
             filename = str(item.get("filename") or "")
-            if not filename.startswith(prefix):
+            if item.get("role_name") != mem.character_key:
                 continue
             session_id = _memory_session_id(filename)
             if not session_id.startswith("private_"):
@@ -4061,6 +4291,7 @@ class WebUIServer:
                     history.append({"role": "user", "content": text, "sender_id": user_id,
                                     "sender_name": caller_name, "timestamp": time.time()})
                     history.append({"role": "assistant", "content": zh_text, "timestamp": time.time(),
+                                    "character_key": character_key,
                                     "speaker": role.get("character_name", character_key),
                                     "emotion": sentences[0]["emotion"] if sentences else ""})
                     data = mem.load_session_data(session_id)
@@ -4203,7 +4434,8 @@ class WebUIServer:
             if app_context.promise_mgr is not None:
                 cleared["promises"] = app_context.promise_mgr.drop_session(TEST_CHAT_SESSION)
             if app_context.recall_mgr is not None:
-                cleared["recall"] = app_context.recall_mgr.drop_session(TEST_CHAT_SESSION)
+                from .recall import drop_session_all_roles
+                cleared["recall"] = drop_session_all_roles(TEST_CHAT_SESSION)
         except Exception as e:
             print(f"聊天测试台清空状态失败（忽略）: {type(e).__name__}: {e}")
         return web.json_response({"success": True, "cleared": cleared})
@@ -4251,14 +4483,23 @@ class WebUIServer:
                    "memories": {}, "affection": {}, "moods": {}}
         mem = role_memory(role)
         if mem is not None and mem.data_path.exists():
-            for f in sorted(mem.data_path.glob(f"{mem.character_key}_*.json")):
-                session_part = f.name[len(mem.character_key) + 1:-len(".json")]
+            from .memory_store import _encode_role_key, _memory_role_key, _memory_session_id
+            legacy_test_name = f"{_encode_role_key(character_key)}_{TEST_CHAT_SESSION}.json"
+            for f in sorted(mem.data_path.glob("*.json")):
                 try:
                     data = json.loads(f.read_text(encoding="utf-8"))
                 except Exception:
                     continue
                 if isinstance(data, dict):
-                    payload["memories"][session_part] = data
+                    file_role = data.get("character_key") or _memory_role_key(f.name)
+                    if not file_role and f.name == legacy_test_name:
+                        file_role = character_key
+                    if file_role != character_key:
+                        continue
+                    session_part = str(data.get("session_id") or _memory_session_id(f.name)
+                                       or (TEST_CHAT_SESSION if f.name == legacy_test_name else ""))
+                    if session_part:
+                        payload["memories"][session_part] = data
         if app_context.affection_mgr is not None:
             payload["affection"] = (app_context.affection_mgr.records.get(character_key) or {})
         if app_context.mood_mgr is not None:
@@ -4299,10 +4540,11 @@ class WebUIServer:
         mem = role_memory(role)
         if mem is not None and isinstance(payload.get("memories"), dict):
             for session_part, data in payload["memories"].items():
-                safe = re.sub(r'[^A-Za-z0-9_\-]', '_', str(session_part or ""))
-                if not safe:
+                from .memory_store import restore_session_id
+                sid = str(data.get("session_id") or restore_session_id(session_part)) if isinstance(data, dict) else ""
+                if not sid.startswith(("private_", "group_")) and sid != TEST_CHAT_SESSION:
                     continue
-                mem.save_session_data(safe, data if isinstance(data, dict) else {})
+                mem.save_session_data(sid, data)
         if isinstance(payload.get("affection"), dict) and app_context.affection_mgr is not None:
             app_context.affection_mgr.records[key] = payload["affection"]
             app_context.affection_mgr.save()
@@ -4631,8 +4873,7 @@ class WebUIServer:
                 new_config["web_search_api_keys"] = merged
             if engine:
                 new_config["web_search_engine"] = engine
-            self.config.config = new_config
-            self.config._atomic_save(new_config)
+            self.config.commit(new_config)
             try:
                 self._after_config_reload()
             except Exception as reload_err:
@@ -4681,28 +4922,30 @@ class WebUIServer:
                                   "enabled": bool(self.config.get("rag_enabled", False))})
 
     async def handle_rag_upload(self, request):
+        import tempfile
         try:
+            if app_context.rag_mgr is None:
+                raise ValueError("知识库尚未初始化")
             results = []
-            reader = await request.multipart()
-            async for part in reader:
-                if not part.filename:
-                    continue
-                raw = await part.read(decode=False)
-                if len(raw) > 20 * 1024 * 1024:
-                    results.append({"file": part.filename, "success": False,
-                                    "error": "文件超过 20MB 上限，请拆分后上传"})
-                    continue
-                tmp = self.memory_manager.data_path / f"rag_upload_{int(time.time()*1000)}_{Path(part.filename).name}"
-                tmp.write_bytes(raw)
-                try:
-                    text = extract_text_from_file(tmp)
-                    r = await app_context.rag_mgr.add_document(Path(part.filename).stem, text)
-                    results.append({"file": part.filename, **r})
-                except Exception as e:
-                    results.append({"file": part.filename, "success": False, "error": str(e)})
-                finally:
-                    tmp.unlink(missing_ok=True)
-            return web.json_response({"success": True, "results": results})
+            async with self._document_upload_slots:
+                reader = bounded_multipart(request)
+                async for part in reader:
+                    raw = await read_upload(part, request)
+                    if not part.filename:
+                        continue
+                    suffix = Path(part.filename).suffix.lower()
+                    if suffix not in (".txt", ".md", ".csv", ".json", ".pdf"):
+                        raise ValueError("仅支持 txt、md、csv、json、pdf 文档")
+                    with tempfile.TemporaryDirectory(prefix="lovomo_rag_") as work:
+                        tmp = Path(work) / ("document" + suffix)
+                        await asyncio.to_thread(tmp.write_bytes, raw)
+                        try:
+                            text = await asyncio.to_thread(extract_text_from_file, tmp)
+                            result = await app_context.rag_mgr.add_document(Path(part.filename).stem, text)
+                            results.append({"file": part.filename, **result})
+                        except Exception as e:
+                            results.append({"file": part.filename, "success": False, "error": str(e)})
+            return web.json_response({"success": all(r.get("success") for r in results), "results": results})
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
@@ -4805,7 +5048,7 @@ class WebUIServer:
         conn_id = str(state.get("id") or "")
         target = None
         if conn_id:
-            data_cfg = self.config.config
+            data_cfg = copy.deepcopy(self.config.config)
             target = next((c for c in (data_cfg.get("connections") or [])
                            if str(c.get("id")) == conn_id), None)
             if target is not None:
@@ -4816,7 +5059,7 @@ class WebUIServer:
                     target["base_url"] = base_url
                 target["cursor"] = ""
                 target["context_tokens"] = {}
-                self.config._atomic_save(data_cfg)
+                self.config.commit(data_cfg)
                 _CONNECTION_LOGIN_STATE.pop(token, None)
                 return web.json_response({"success": True, "confirmed": True,
                                           "bot_id": account_id, "saved": True})
@@ -4858,13 +5101,13 @@ class WebUIServer:
         conn_id = str(state.get("id") or "")
         _CONNECTION_LOGIN_STATE.pop(token, None)
         if conn_id:
-            data_cfg = self.config.config
+            data_cfg = copy.deepcopy(self.config.config)
             target = next((c for c in (data_cfg.get("connections") or [])
                            if str(c.get("id")) == conn_id), None)
             if target is not None:
                 target["app_id"] = app_id
                 target["app_secret"] = app_secret
-                self.config._atomic_save(data_cfg)
+                self.config.commit(data_cfg)
                 return web.json_response({"success": True, "confirmed": True,
                                           "platform": "qq_official", "app_id": app_id,
                                           "saved": True})
@@ -4942,7 +5185,7 @@ class WebUIServer:
         if platform not in CONNECTION_PLATFORMS:
             return web.json_response({"success": False, "error": "不支持的接入方式"},
                                      status=400)
-        data = self.config.config
+        data = copy.deepcopy(self.config.config)
         conns = data.setdefault("connections", [])
         conn_id = str(payload.get("id") or "").strip()
         target = next((c for c in conns if str(c.get("id")) == conn_id), None)
@@ -4994,7 +5237,7 @@ class WebUIServer:
             if key in _CONNECTION_SECRET_KEYS and _is_masked_value(value):
                 continue
             target[key] = value
-        self.config._atomic_save(data)
+        self.config.commit(data)
         try:
             self.config.roles = self.config._parse_roles()
         except Exception as e:
@@ -5009,7 +5252,7 @@ class WebUIServer:
         except Exception:
             return web.json_response({"success": False, "error": "参数错误"}, status=400)
         conn_id = str(payload.get("id") or "").strip()
-        data = self.config.config
+        data = copy.deepcopy(self.config.config)
         conns = data.get("connections") or []
         keep = [c for c in conns if str(c.get("id")) != conn_id]
         if len(keep) == len(conns):
@@ -5021,7 +5264,7 @@ class WebUIServer:
         for role in roles:
             if isinstance(role, dict) and str(role.get("connection_id") or "") == conn_id:
                 role.pop("connection_id", None)
-        self.config._atomic_save(data)
+        self.config.commit(data)
         purged = 0
         if app_context.sender is not None:
             purged = self._purge_connection_sessions(
@@ -5088,17 +5331,32 @@ class WebUIServer:
             return web.json_response({"success": False, "error": str(e)}, status=400)
 
     # ---------------- 自主学习 ----------------
+    def _lexicon_for(self, role_key):
+        from .lexicon import manager_for_role
+        key = str(role_key or "").strip()
+        roles = self._all_roles()
+        if not key or key not in roles:
+            raise ValueError("请选择有效角色，学习数据按角色独立存储")
+        return manager_for_role(key, config=RoleContext(self.config, roles[key]),
+                                data_path=self.memory_manager.data_path)
+
     async def handle_lexicon(self, request):
-        if app_context.lexicon_mgr is None:
-            return web.json_response({"terms": [], "pending": [], "enabled": False})
-        return web.json_response({"terms": app_context.lexicon_mgr.list_terms(),
-                                  "pending": app_context.lexicon_mgr.list_pending(),
-                                  "enabled": app_context.lexicon_mgr.enabled})
+        roles = self._all_roles()
+        key = str(request.query.get("role") or self.config.active_character)
+        try:
+            manager = self._lexicon_for(key)
+            return web.json_response({"terms": manager.list_terms(), "pending": manager.list_pending(),
+                                      "enabled": manager.enabled, "role": key,
+                                      "roles": [{"character_key": k, "character_name": role.get("character_name", k)}
+                                                for k, role in roles.items()]})
+        except ValueError as e:
+            return web.json_response({"success": False, "error": str(e)}, status=400)
 
     async def handle_lexicon_confirm(self, request):
         try:
             payload = await request.json()
-            ok = app_context.lexicon_mgr is not None and app_context.lexicon_mgr.confirm(
+            manager = self._lexicon_for(payload.get("role"))
+            ok = manager.confirm(
                 str(payload.get("id", "")), payload.get("term"),
                 payload.get("meaning"), payload.get("category"))
             return web.json_response({"success": ok})
@@ -5108,7 +5366,8 @@ class WebUIServer:
     async def handle_lexicon_reject(self, request):
         try:
             payload = await request.json()
-            ok = app_context.lexicon_mgr is not None and app_context.lexicon_mgr.reject(str(payload.get("id", "")))
+            manager = self._lexicon_for(payload.get("role"))
+            ok = manager.reject(str(payload.get("id", "")))
             return web.json_response({"success": ok})
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
@@ -5116,7 +5375,8 @@ class WebUIServer:
     async def handle_lexicon_save(self, request):
         try:
             payload = await request.json()
-            ok = app_context.lexicon_mgr is not None and app_context.lexicon_mgr.upsert_term(
+            manager = self._lexicon_for(payload.get("role"))
+            ok = manager.upsert_term(
                 payload.get("term", ""), payload.get("meaning", ""), payload.get("category", ""))
             return web.json_response({"success": ok})
         except Exception as e:
@@ -5125,7 +5385,8 @@ class WebUIServer:
     async def handle_lexicon_delete(self, request):
         try:
             payload = await request.json()
-            ok = app_context.lexicon_mgr is not None and app_context.lexicon_mgr.delete_term(payload.get("term", ""))
+            manager = self._lexicon_for(payload.get("role"))
+            ok = manager.delete_term(payload.get("term", ""))
             return web.json_response({"success": ok})
         except Exception as e:
             return web.json_response({"success": False, "error": str(e)}, status=400)
@@ -5147,12 +5408,12 @@ class WebUIServer:
 
     async def handle_stickers_upload(self, request):
         try:
-            reader = await request.multipart()
+            reader = bounded_multipart(request)
             category = ""
             saved = []
             async for part in reader:
                 if part.name == "category":
-                    category = (await part.text()).strip()
+                    category = (await read_field(part, request)).strip()
                 elif part.filename:
                     folder = _safe_subdir(app_context.sticker_mgr.dir, category)
                     if folder is None:
@@ -5161,7 +5422,7 @@ class WebUIServer:
                     fname = safe_sticker_name(Path(part.filename).name)
                     if not fname or Path(fname).suffix.lower() not in IMAGE_EXTS:
                         continue
-                    payload_bytes = await part.read(decode=False)
+                    payload_bytes = await read_upload(part, request)
                     if len(payload_bytes) > 10 * 1024 * 1024:
                         continue
                     (folder / fname).write_bytes(payload_bytes)
@@ -5336,9 +5597,7 @@ class WebUIServer:
                         print(f"桌面窗口走本机明文通道：{self.desktop_url()}")
                 # 若使用了非默认端口，更新配置
                 if port != base_port:
-                    self.config.config["webui_port"] = port
-                    # 可选：持久化到配置文件
-                    self.config._atomic_save(self.config.config)
+                    self.config.commit({**self.config.config, "webui_port": port})
                 return
             except OSError as e:
                 print(f"端口 {port} 不可用（{e}），尝试下一个端口...")
@@ -5364,6 +5623,10 @@ class WebUIServer:
     async def shutdown(self):
         if not HAS_AIOHTTP:
             return
+        task = getattr(self, "_update_task", None)
+        if task and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         for name in ("runner", "local_runner"):
             runner = getattr(self, name, None)
             if runner is not None:

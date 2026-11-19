@@ -1,7 +1,8 @@
+import asyncio
 import ctypes
+import ipaddress
 import json
 import os
-import re
 import subprocess
 import threading
 import time
@@ -30,129 +31,11 @@ _tts_child_log = None
 
 # ============================================================ 子进程归属
 #
-_JOB_LOCK = threading.Lock()
-_JOB_STATE = {"handle": None, "tried": False}
-
-_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
-_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
-_PROCESS_SET_QUOTA = 0x0100
-_PROCESS_TERMINATE = 0x0001
-_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-
-
-class _IoCounters(ctypes.Structure):
-    _fields_ = [(name, ctypes.c_ulonglong) for name in (
-        "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
-        "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
-
-
-class _BasicLimitInformation(ctypes.Structure):
-    _fields_ = [
-        ("PerProcessUserTimeLimit", wintypes.LARGE_INTEGER),
-        ("PerJobUserTimeLimit", wintypes.LARGE_INTEGER),
-        ("LimitFlags", wintypes.DWORD),
-        ("MinimumWorkingSetSize", ctypes.c_size_t),
-        ("MaximumWorkingSetSize", ctypes.c_size_t),
-        ("ActiveProcessLimit", wintypes.DWORD),
-        ("Affinity", ctypes.c_size_t),
-        ("PriorityClass", wintypes.DWORD),
-        ("SchedulingClass", wintypes.DWORD),
-    ]
-
-
-class _ExtendedLimitInformation(ctypes.Structure):
-    _fields_ = [
-        ("BasicLimitInformation", _BasicLimitInformation),
-        ("IoInfo", _IoCounters),
-        ("ProcessMemoryLimit", ctypes.c_size_t),
-        ("JobMemoryLimit", ctypes.c_size_t),
-        ("PeakProcessMemoryUsed", ctypes.c_size_t),
-        ("PeakJobMemoryUsed", ctypes.c_size_t),
-    ]
-
-
-def _kernel32():
-    dll = ctypes.WinDLL("kernel32", use_last_error=True)
-    dll.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
-    dll.CreateJobObjectW.restype = wintypes.HANDLE
-    dll.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int,
-                                            ctypes.c_void_p, wintypes.DWORD]
-    dll.SetInformationJobObject.restype = wintypes.BOOL
-    dll.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
-    dll.AssignProcessToJobObject.restype = wintypes.BOOL
-    dll.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-    dll.OpenProcess.restype = wintypes.HANDLE
-    dll.CloseHandle.argtypes = [wintypes.HANDLE]
-    dll.CloseHandle.restype = wintypes.BOOL
-    dll.GetProcessTimes.argtypes = [wintypes.HANDLE, ctypes.c_void_p,
-                                    ctypes.c_void_p, ctypes.c_void_p,
-                                    ctypes.c_void_p]
-    dll.GetProcessTimes.restype = wintypes.BOOL
-    return dll
-
-
-def _job_handle():
-    if os.name != "nt":
-        return None
-    with _JOB_LOCK:
-        if _JOB_STATE["handle"] is not None or _JOB_STATE["tried"]:
-            return _JOB_STATE["handle"]
-        _JOB_STATE["tried"] = True
-        try:
-            k = _kernel32()
-            handle = k.CreateJobObjectW(None, None)
-            if not handle:
-                return None
-            info = _ExtendedLimitInformation()
-            info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-            if not k.SetInformationJobObject(handle, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
-                                             ctypes.byref(info), ctypes.sizeof(info)):
-                return None
-            _JOB_STATE["handle"] = handle
-            return handle
-        except Exception:
-            return None
-
-
-def bind_to_job(pid: int) -> bool:
-    handle = _job_handle()
-    if handle is None or not pid:
-        return False
-    try:
-        k = _kernel32()
-        h = k.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, int(pid))
-        if not h:
-            return False
-        try:
-            return bool(k.AssignProcessToJobObject(handle, h))
-        finally:
-            k.CloseHandle(h)
-    except Exception:
-        return False
-
-
-def process_start_time(pid: int):
-    if os.name != "nt" or not pid:
-        return None
-    try:
-        k = _kernel32()
-        h = k.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
-        if not h:
-            return None
-        try:
-            created = wintypes.FILETIME()
-            exited = wintypes.FILETIME()
-            kernel = wintypes.FILETIME()
-            user = wintypes.FILETIME()
-            ok = k.GetProcessTimes(h, ctypes.byref(created), ctypes.byref(exited),
-                                   ctypes.byref(kernel), ctypes.byref(user))
-            if not ok:
-                return None
-            return (created.dwHighDateTime << 32) | created.dwLowDateTime
-        finally:
-            k.CloseHandle(h)
-    except Exception:
-        return None
+from .process_lifecycle import (
+    _job_handle, _kernel32, bind_to_job, process_start_time,
+    _PROCESS_QUERY_LIMITED_INFORMATION,
+)
+from . import process_lifecycle
 
 
 def _child_record_path() -> Path:
@@ -215,7 +98,7 @@ def _clear_child_record() -> None:
 
 def _port_owner_pid(port: int):
     try:
-        r = subprocess.run(["netstat", "-ano", "-p", "TCP"],
+        r = process_lifecycle.run(["netstat", "-ano", "-p", "TCP"],
                            capture_output=True, text=True, errors="replace",
                            timeout=8, **no_window_kwargs())
     except Exception:
@@ -259,9 +142,13 @@ class _AdoptedProcess:
 
     def __init__(self, pid: int):
         self.pid = int(pid)
+        self._identity = process_lifecycle._identity(self.pid)
 
     def wait(self, timeout=None):
-        return None
+        return self._identity.wait(timeout) if self._identity is not None else None
+
+    def poll(self):
+        return None if self._identity is not None and process_lifecycle._live(self._identity) else 0
 
 
 # ------------------------------------------------------------ 生命周期开关
@@ -289,41 +176,46 @@ class ProcessManager:
                 if cls._instance is None:
                     cls._instance = super().__new__(cls)
                     cls._instance.processes = []
+                    cls._instance.processes_lock = threading.RLock()
         return cls._instance
 
     def register(self, proc, name=""):
-        if proc is not None:
-            self.processes.append({"proc": proc, "name": name})
-            print(f"已注册子进程: {name or 'unnamed'} (PID: {proc.pid})")
+        if proc is None:
+            return
+        with self.processes_lock:
+            ending = is_exiting() or process_lifecycle.is_exiting()
+            if not ending:
+                self.processes.append({"proc": proc, "name": name})
+        if ending:
+            process_lifecycle.stop_tree(proc, timeout=0)
+            return
+        print(f"已注册子进程: {name or 'unnamed'} (PID: {proc.pid})")
 
     def shutdown_all(self, budget: float = 6.0):
-        deadline = time.time() + max(0.5, budget)
-        for entry in self.processes:
+        invalidate_local_weights()
+        deadline = time.monotonic() + max(0.0, budget)
+        with self.processes_lock:
+            pending = list(self.processes)
+            self.processes.clear()
+        failed = []
+        # Request termination for every entry even when the waiting budget is
+        # zero. Do not hold the registry lock while processes are stopping.
+        for entry in pending:
             proc = entry["proc"]
-            name = entry["name"]
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                print(f"关闭子进程预算用尽，跳过等待（进程会随主进程退出）：{name}")
-                break
             try:
-                if os.name == 'nt':
-                    subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)],
-                                   capture_output=True, timeout=min(3, remaining),
-                                   **no_window_kwargs())
-                else:
-                    proc.terminate()
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception as e:
-                    print(f"关闭子进程 {name} 失败: {e}")
-                    continue
-            try:
-                proc.wait(timeout=max(0.2, min(1.5, deadline - time.time())))
-            except Exception:
-                pass
-        self.processes.clear()
-        _clear_child_record()
+                stopped = process_lifecycle.stop_tree(proc, timeout=0)
+                if not stopped and time.monotonic() < deadline:
+                    stopped = process_lifecycle.stop_tree(
+                        proc, timeout=max(0.0, deadline - time.monotonic()))
+                if not stopped:
+                    failed.append(entry)
+            except Exception as e:
+                failed.append(entry)
+                print(f"关闭子进程 {entry['name']} 失败: {e}")
+        with self.processes_lock:
+            self.processes.extend(failed)
+            if not self.processes:
+                _clear_child_record()
 
 
 process_manager = ProcessManager()
@@ -350,62 +242,123 @@ _ensure_fail_until = 0.0
 
 _WEIGHT_LOCK = threading.Lock()
 _APPLIED_WEIGHTS: dict = {}
+_ENDPOINT_LOCKS = {}
 
 
-def _weight_target(model_dir: str):
+def _endpoint_lock(base_url):
+    with _WEIGHT_LOCK:
+        return _ENDPOINT_LOCKS.setdefault(str(base_url).rstrip("/"), threading.Lock())
+
+
+def invalidate_local_weights(base_url=None):
+    with _WEIGHT_LOCK:
+        if base_url is None:
+            _APPLIED_WEIGHTS.clear()
+        else:
+            _APPLIED_WEIGHTS.pop(str(base_url).rstrip("/"), None)
+
+
+def _weight_target(model_dir: str, config=None):
     folder = Path(model_dir)
     if not folder.is_dir():
         return None
-    gpt_file = next((f for f in folder.iterdir() if f.suffix == ".ckpt"), None)
-    sovits_file = next((f for f in folder.iterdir() if f.suffix == ".pth"), None)
-    if gpt_file is None or sovits_file is None:
-        return None
-    return (str(gpt_file.resolve()), str(sovits_file.resolve()), gpt_file.stem)
+    selected = []
+    for suffix, key in ((".ckpt", "tts_gpt_weights"), (".pth", "tts_sovits_weights")):
+        explicit = str(config.get(key, "") or "").strip() if config else ""
+        if explicit:
+            path = Path(explicit)
+            path = path if path.is_absolute() else folder / path
+            if not path.is_file() or path.suffix.lower() != suffix:
+                raise ValueError(f"{key} 指定的模型文件不存在或格式不正确")
+        else:
+            candidates = sorted(p for p in folder.iterdir() if p.is_file() and p.suffix.lower() == suffix)
+            if not candidates:
+                return None
+            if len(candidates) != 1:
+                raise ValueError(f"模型目录有多个 {suffix}，请设置 {key} 明确选择")
+            path = candidates[0]
+        selected.append(path.resolve())
+    return str(selected[0]), str(selected[1]), selected[0].stem
 
 
-def apply_local_weights(config) -> bool:
-    """服务已在线时把权重切到这条配置的模型目录，让每个接入方式用自己的角色模型。"""
+def _apply_local_weights_unlocked(config) -> bool:
     if is_cloud_tts(config):
         return True
     model_dir = str(config.get("model_dir", "") or "").strip()
     base_url = str(config.get("client_base_url", "") or "").strip().rstrip("/")
-    if not model_dir or not base_url:
+    if not model_dir:
+        # A manually managed service can keep its own weights.
+        return not config.get("auto_start_tts", False)
+    if not base_url:
         return False
-    target = _weight_target(model_dir)
-    if target is None:
-        print(f"模型目录 {model_dir} 里没有 .ckpt / .pth，跳过权重切换。")
-        return False
-    gpt_path, sovits_path, name = target
-    with _WEIGHT_LOCK:
-        if _APPLIED_WEIGHTS.get(base_url) == (gpt_path, sovits_path):
-            return True
-    ok = True
-    for endpoint, path, label in (("set_gpt_weights", gpt_path, "GPT"),
-                                  ("set_sovits_weights", sovits_path, "SoVITS")):
-        try:
-            resp = httpx.get(f"{base_url}/{endpoint}",
-                             params={"weights_path": path.replace("\\", "/")},
-                             timeout=120, trust_env=False,
-                             verify=verified_context())
-        except Exception as e:
-            print(f"{label} 权重切换失败：{type(e).__name__}: {e}")
-            ok = False
-            continue
-        if resp.status_code != 200:
-            print(f"{label} 权重切换失败: {resp.text[:200]}")
-            ok = False
-    if ok:
+    try:
+        target = _weight_target(model_dir, config)
+        if target is None:
+            raise ValueError("模型目录中缺少 .ckpt / .pth")
+        gpt_path, sovits_path, name = target
+        signature = tuple((p, Path(p).stat().st_mtime_ns, Path(p).stat().st_size)
+                          for p in (gpt_path, sovits_path))
         with _WEIGHT_LOCK:
-            _APPLIED_WEIGHTS[base_url] = (gpt_path, sovits_path)
+            if _APPLIED_WEIGHTS.get(base_url) == signature:
+                return True
+            # A partial switch invalidates the last successful pair too.
+            _APPLIED_WEIGHTS.pop(base_url, None)
+        from .runtime_policy import limit
+        timeout = limit(config, "tts_weight_timeout_seconds")
+        for endpoint, path in (("set_gpt_weights", gpt_path), ("set_sovits_weights", sovits_path)):
+            resp = httpx.get(f"{base_url}/{endpoint}", params={"weights_path": path.replace("\\", "/")},
+                             timeout=timeout, trust_env=False, verify=verified_context())
+            if resp.status_code != 200:
+                raise RuntimeError(f"{endpoint} 返回 HTTP {resp.status_code}")
+        with _WEIGHT_LOCK:
+            _APPLIED_WEIGHTS[base_url] = signature
         print(f"[ {name} ] 已按接入方式切换 TTS 权重")
-    return ok
+        return True
+    except Exception as e:
+        invalidate_local_weights(base_url)
+        print(f"TTS 权重切换失败：{type(e).__name__}: {e}")
+        return False
+
+
+def apply_local_weights(config) -> bool:
+    with _endpoint_lock(config.get("client_base_url", "")):
+        return _apply_local_weights_unlocked(config)
+
+
+async def local_tts_request(config, params, timeout):
+    """Keep the backend's two weight switches and synthesis in one transaction."""
+    base_url = str(config.get("client_base_url", "") or "").rstrip("/")
+    lock = _endpoint_lock(base_url)
+    while not lock.acquire(blocking=False):
+        await asyncio.sleep(0.05)
+    try:
+        switch = asyncio.create_task(asyncio.to_thread(_apply_local_weights_unlocked, config))
+        try:
+            ready = await asyncio.shield(switch)
+        except asyncio.CancelledError:
+            # Do not release the backend while its switch thread is still running.
+            while not switch.done():
+                try:
+                    await asyncio.shield(switch)
+                except asyncio.CancelledError:
+                    continue
+            raise
+        if not ready:
+            raise RuntimeError("TTS 角色权重未能加载，已停止本句合成")
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False, verify=verified_context()) as client:
+            response = await client.get(f"{base_url}/tts", params=params)
+        if response.status_code >= 500:
+            invalidate_local_weights(base_url)
+        return response
+    except BaseException:
+        invalidate_local_weights(base_url)
+        raise
+    finally:
+        lock.release()
 
 
 _ADOPT_LOCK = threading.Lock()
 _ADOPT_DONE = {"value": False}
-
-# （python.exe / pythonw.exe / Windows Store 版 re-exec 出来的 python3.13.exe）
-_PYTHON_IMAGE_RE = re.compile(r"pythonw?[0-9.]*\.exe$", re.I)
 
 
 def _managed_pid(pid: int) -> bool:
@@ -414,37 +367,34 @@ def _managed_pid(pid: int) -> bool:
 
 
 def adopt_existing_tts(config) -> bool:
-    if not config.get("auto_start_tts", False):
+    if not config.get("auto_start_tts", False) or is_exiting():
+        return False
+    try:
+        parsed = urlparse(config.get("client_base_url", "http://127.0.0.1:9880"))
+        host = (parsed.hostname or "").lower()
+        if host != "localhost" and not ipaddress.ip_address(host).is_loopback:
+            return False
+        port = parsed.port or 9880
+    except (TypeError, ValueError):
         return False
     with _ADOPT_LOCK:
         if _ADOPT_DONE["value"]:
             return False
         _ADOPT_DONE["value"] = True
 
-    base_url = config.get("client_base_url", "http://127.0.0.1:9880")
-    port = urlparse(base_url).port or 9880
-
     record = _read_child_record()
-    pid = record.get("pid")
-    live_start = None
-    if pid:
-        live_start = process_start_time(int(pid))
-        if live_start is not None and record.get("started") == live_start:
-            pass                      # 记录与实物完全吻合，就是它
-        else:
-            _clear_child_record()
-            pid = None
-    if not pid:
-        candidate = _port_owner_pid(port)
-        if not candidate or candidate == os.getpid():
-            return False
-        image = _process_image(candidate)
-        if not _PYTHON_IMAGE_RE.match(Path(image).name):
-            return False
-        pid = int(candidate)
-        live_start = process_start_time(pid)
-        if live_start is None:
-            return False
+    try:
+        pid = int(record.get("pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    live_start = process_start_time(pid)
+    if live_start is None or record.get("started") != live_start:
+        _clear_child_record()
+        return False
+    if record.get("port") != port:
+        return False
 
     if int(pid) == os.getpid():
         return False
@@ -466,8 +416,8 @@ async def ensure_tts_service(config) -> bool:
     if await check_tts_service(config):
         _ensure_fail_until = 0.0
         adopt_existing_tts(config)
-        await asyncio.to_thread(apply_local_weights, config)
-        return True
+        return await asyncio.to_thread(apply_local_weights, config)
+    invalidate_local_weights(config.get("client_base_url", ""))
     if time.time() < _ensure_fail_until:
         return False  # 冷却期内直接失败，不阻塞消息管线
     if not config.get("auto_start_tts", False):
@@ -478,8 +428,7 @@ async def ensure_tts_service(config) -> bool:
         await asyncio.sleep(5)
         if await check_tts_service(config):
             _ensure_fail_until = 0.0
-            await asyncio.to_thread(apply_local_weights, config)
-            return True
+            return await asyncio.to_thread(apply_local_weights, config)
     return False
 
 
@@ -523,10 +472,11 @@ def auto_start_and_switch_tts(config):
             return
         base_url = config.get("client_base_url", "http://127.0.0.1:9880")
         try:
-            resp = httpx.get(f"{base_url}/docs", timeout=2)
+            resp = httpx.get(f"{base_url}/docs", timeout=2, trust_env=False, verify=verified_context())
             if 200 <= resp.status_code < 400:
                 print("TTS 服务已在线，跳过自动启动。")
                 adopt_existing_tts(config)
+                apply_local_weights(config)
                 return
         except Exception:
             pass
@@ -598,7 +548,7 @@ def auto_start_and_switch_tts(config):
             "-c", config_path,
         ]
         try:
-            tts_proc = subprocess.Popen(
+            tts_proc = process_lifecycle.popen(
                 cmd,
                 cwd=root_dir,
                 stdin=subprocess.DEVNULL,
@@ -619,59 +569,32 @@ def auto_start_and_switch_tts(config):
             process_manager.shutdown_all(budget=2.0)
             return
 
-        deadline = time.time() + TTS_READY_TIMEOUT_SECONDS
-        while time.time() < deadline:
-            time.sleep(TTS_READY_POLL_SECONDS)
+        from .runtime_policy import limit
+        ready_timeout = limit(config, "tts_ready_timeout_seconds")
+        poll = limit(config, "tts_ready_poll_seconds")
+        deadline = time.monotonic() + ready_timeout
+        while time.monotonic() < deadline:
+            if is_exiting() or process_lifecycle.is_exiting():
+                return
+            for _ in range(max(1, int(poll / 0.1))):
+                if is_exiting() or process_lifecycle.is_exiting():
+                    return
+                time.sleep(min(0.1, max(0, deadline - time.monotonic())))
             try:
-                resp = httpx.get(f"{base_url}/docs", timeout=2)
+                resp = httpx.get(f"{base_url}/docs", timeout=2, trust_env=False, verify=verified_context())
                 if 200 <= resp.status_code < 400:
                     print("TTS 服务已就绪，加载模型中...")
                     break
             except Exception:
                 continue
         else:
-            print(f"TTS 服务在 {TTS_READY_TIMEOUT_SECONDS} 秒内未就绪，"
+            print(f"TTS 服务在 {ready_timeout:g} 秒内未就绪，"
                   f"启动输出见 {_child_log_path()}")
             return
 
-        model_dir_path = Path(model_dir)
-        if not model_dir_path.exists():
-            print(f"模型目录不存在：{model_dir}")
-            return
-        gpt_file = sovits_file = None
-        for f in model_dir_path.iterdir():
-            if f.suffix == ".ckpt" and gpt_file is None:
-                gpt_file = f.name
-            if f.suffix == ".pth" and sovits_file is None:
-                sovits_file = f.name
-        if not gpt_file or not sovits_file:
-            print(f"模型目录 {model_dir} 中未找到 .ckpt 或 .pth 文件！")
-            return
-
-        model_gpt = f"{model_dir}/{gpt_file}".replace("\\", "/")
-        model_sovits = f"{model_dir}/{sovits_file}".replace("\\", "/")
-        model_name = Path(gpt_file).stem
-        loaded = _loaded_weight_paths(config_path, root_dir)
-        try:
-            if loaded.get("gpt") and _same_weight_path(loaded["gpt"], model_gpt):
-                print(f"[ {model_name} ] GPT 权重就是启动时加载的那份，跳过切换")
-            else:
-                resp = httpx.get(f"{base_url}/set_gpt_weights", params={"weights_path": model_gpt}, timeout=120)
-                if resp.status_code == 200:
-                    print(f"[ {model_name} ] GPT 权重切换成功！")
-                else:
-                    print(f"GPT 权重切换失败: {resp.text}")
-            if loaded.get("sovits") and _same_weight_path(loaded["sovits"], model_sovits):
-                print(f"[ {model_name} ] SoVITS 权重就是启动时加载的那份，跳过切换")
-            else:
-                resp = httpx.get(f"{base_url}/set_sovits_weights", params={"weights_path": model_sovits}, timeout=120)
-                if resp.status_code == 200:
-                    print(f"[ {model_name} ] SoVITS 权重切换成功！")
-                else:
-                    print(f"SoVITS 权重切换失败: {resp.text}")
-            print(f"[ {model_name} ] 模型加载完毕，可以开始使用了！")
-        except Exception as e:
-            print(f"调用 API 切换模型权重失败: {e}")
+        invalidate_local_weights(base_url)
+        if apply_local_weights(config):
+            print("TTS 模型已加载，可以开始使用。")
     finally:
         with _tts_started_lock:
             _tts_started_flag = False

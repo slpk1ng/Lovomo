@@ -6,7 +6,7 @@ from base64 import b64encode, b64decode
 from typing import Optional
 
 
-_API_KEY_KEYS = ("llm_api_key", "image_caption_api_key", "cloud_tts_api_key",
+_API_KEY_KEYS = ("llm_api_key", "rag_embedding_api_key", "image_caption_api_key", "cloud_tts_api_key",
                 "asr_api_key", "napcat_token", "web_search_api_keys",
                 "plugin_publish_token")
 
@@ -30,19 +30,21 @@ _SECOND_PASSWORD_PATHS = frozenset({
     "/api/rag/upload", "/api/rag/delete",
     "/api/plugins/upload", "/api/plugins/install_remote", "/api/plugins/delete",
     "/api/plugins/settings",
+    "/api/plugins/approve", "/api/plugins/toggle", "/api/plugins/reload",
+    "/api/update/install", "/api/update/download",
     "/api/plugins/publish", "/api/plugins/unpublish",
     "/api/plugins/publish_token", "/api/plugins/publish_token_clear",
     "/api/tts/voice_design/create", "/api/tts/voice_design/delete",
     "/api/tts/voice_enrollment/create", "/api/tts/voice_enrollment/delete",
 })
 
-_SECOND_PASSWORD_PREFIXES = ("/api/memory/",)
+_SECOND_PASSWORD_PREFIXES = ("/api/memory/", "/api/backup/")
 
 _CONNECTION_SECRET_KEYS = ("token", "app_secret", "bot_token")
 
 
 def _needs_second_password(path: str) -> bool:
-    return path in _SECOND_PASSWORD_PATHS or path.startswith(_SECOND_PASSWORD_PREFIXES)
+    return path != "/api/backup/status" and (path in _SECOND_PASSWORD_PATHS or path.startswith(_SECOND_PASSWORD_PREFIXES))
 
 
 def _password_matches(given, expected) -> bool:
@@ -50,7 +52,8 @@ def _password_matches(given, expected) -> bool:
                                str(expected or "").encode("utf-8"))
 
 
-_ENC_PREFIX = "enc2:"
+_ENC_PREFIX = "enc3:"
+_ENCRYPTED_PREFIXES = ("enc:", "enc2:", "enc3:")
 _ENC_KEY_CACHE = None
 
 
@@ -85,30 +88,38 @@ def _keystream(nonce: bytes, length: int) -> bytes:
 
 def _encrypt_value(value: str) -> str:
     v = str(value or "")
-    if not v or v.startswith(_ENC_PREFIX) or v.startswith("enc:"):
+    if not v or _is_masked_value(v):
         return v
-    if _is_masked_value(v):
+    if v.startswith(_ENC_PREFIX):
         return v
-    raw = v.encode("utf-8")
-    nonce = os.urandom(16)
-    checksum = hashlib.sha256(raw).digest()[:8]
-    ks = _keystream(nonce, len(raw))
-    ct = bytes(a ^ b for a, b in zip(raw, ks))
-    return _ENC_PREFIX + b64encode(nonce + checksum + ct).decode("ascii")
+    if v.startswith(("enc:", "enc2:")):
+        plain = _decrypt_value(v)
+        if plain is None:
+            return v
+        v = plain
+    from .secret_store import protect
+    return _ENC_PREFIX + b64encode(protect(v.encode("utf-8"))).decode("ascii")
 
 
 def _decrypt_value(value: str) -> Optional[str]:
     v = str(value or "")
+    if v.startswith(_ENC_PREFIX):
+        try:
+            from .secret_store import unprotect
+            return unprotect(b64decode(v[len(_ENC_PREFIX):], validate=True)).decode("utf-8")
+        except Exception:
+            print("[加密] 密文无法由当前用户解密，已保留原文，请重新填写密钥")
+            return None
     if v.startswith("enc:"):
         try:
             return b64decode(v[4:].encode("ascii")).decode("utf-8")
         except Exception as e:
             print(f"[加密] API 密钥解密失败，保留原密文：{e}")
             return None
-    if not v.startswith(_ENC_PREFIX):
+    if not v.startswith("enc2:"):
         return v
     try:
-        blob = b64decode(v[len(_ENC_PREFIX):].encode("ascii"))
+        blob = b64decode(v[len("enc2:"):].encode("ascii"))
         nonce, checksum, ct = blob[:16], blob[16:24], blob[24:]
         raw = bytes(a ^ b for a, b in zip(ct, _keystream(nonce, len(ct))))
         if hashlib.sha256(raw).digest()[:8] != checksum:
@@ -176,7 +187,7 @@ def _looks_like_plaintext_secret(value) -> bool:
     v = str(value or "").strip()
     if not v:
         return False
-    if v.startswith(_ENC_PREFIX) or v.startswith("enc:"):
+    if v.startswith(_ENCRYPTED_PREFIXES):
         return False          # 已经是密文，原样保留
     if _is_masked_value(v):
         return False          # 打码预览（****），不含真实密钥
@@ -189,7 +200,7 @@ def _scrub_value(value: str) -> Optional[str]:
     v = str(value or "")
     if not v:
         return None
-    if v.startswith(_ENC_PREFIX) or v.startswith("enc:"):
+    if v.startswith(_ENCRYPTED_PREFIXES):
         return None           # 整串已是密文
     if _is_masked_value(v):
         return None           # 打码预览，无需处理
@@ -199,7 +210,7 @@ def _scrub_value(value: str) -> Optional[str]:
     def _sub(m):
         nonlocal replaced
         token = m.group(0)
-        if token.startswith(_ENC_PREFIX) or token.startswith("enc:"):
+        if token.startswith(_ENCRYPTED_PREFIXES):
             return token
         if _is_masked_value(token):
             return token
@@ -224,7 +235,7 @@ def _scrub_plaintext_secrets(config: dict) -> dict:
             return node
         if not node:
             return node           # 空串：没填密钥，保持原样
-        if node.startswith(_ENC_PREFIX) or node.startswith("enc:"):
+        if node.startswith(_ENCRYPTED_PREFIXES):
             return node
         if _is_masked_value(node):
             return node
@@ -265,7 +276,7 @@ def _decrypt_api_keys(config: dict) -> dict:
 def _decrypt_webui_password(config: dict) -> dict:
     for key in _WEBUI_PASSWORD_KEYS:
         val = config.get(key)
-        if isinstance(val, str) and (val.startswith(_ENC_PREFIX) or val.startswith("enc:")):
+        if isinstance(val, str) and (val.startswith(_ENCRYPTED_PREFIXES)):
             plain = _decrypt_value(val)
             if plain is not None:
                 config[key] = plain

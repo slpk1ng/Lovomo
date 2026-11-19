@@ -14,10 +14,10 @@ Lovomo 软件免责声明与使用条款
 2. 生成语音（音频内容）的责任
 内容责任：由于 AI 大模型（LLM）和 TTS（语音合成）存在无法避免的“幻觉”和随机性，软件生成的语音内容可能不准确、不真实、具有冒犯性或不符合预期。您必须对您通过该软件生成、发送的所有语音内容和文本内容承担全部责任。
 严禁滥用：严禁使用该软件伪造他人声音、进行诽谤、骚扰、网络诈骗、虚假信息传播、冒充他人身份或其他任何违法违规行为。若因生成语音导致的民事侵权、行政违法或刑事犯罪，均由使用者本人承担全部法律后果，软件作者不承担任何责任。
-版权与肖像权：本项目为个人学习用途，内置角色人格提示词参考自游戏《千恋*万花》，声音相关数据请使用者自行确保获得合法授权。如涉及商用行为，请提前联系原版权方。请确保您导入的参考音频（如角色语音、他人声音）不侵犯第三方的著作权、肖像权或声音权，否则由此产生的法律纠纷由使用者负责。
+版权与肖像权：内置的默认角色人格提示词不包含任何第三方作品的设定、台词或素材。声音相关数据请使用者自行确保获得合法授权。请确保您导入的参考音频（如角色语音、他人声音）不侵犯第三方的著作权、肖像权或声音权，否则由此产生的法律纠纷由使用者负责。
 
 3. 第三方平台风险
-本软件依赖第三方开源组件（如 NapCat、GPT-SoVITS、Ollama 等）以及第三方平台（如 QQ 官方接口）。使用者应对使用这些第三方服务的行为负责。程序代码允许自由传播，但所有的参考音频、美术素材、角色名字（丛雨）的使用权归原游戏公司（柚子社）及配音演员（佐藤美柑）所有，严禁商用。
+本软件依赖第三方开源组件（如 NapCat、GPT-SoVITS、Ollama 等）以及第三方平台（如 QQ 官方接口）。使用者应对使用这些第三方服务的行为负责。程序代码允许自由传播，但使用者自行导入的参考音频与美术素材的权利归其各自权利人所有，严禁商用。
 软件作者无法控制 NapCat 或 QQ 平台的运行状态与政策。如果由于使用本软件导致您的 QQ 账号被封禁、限制功能或受到平台处罚，软件作者概不负责。
 第三方软件（如 GPT-SoVITS 等）可能随时更新或调整 API，导致本软件出现报错、无法使用或功能失效，软件作者不承担因第三方服务变更导致的任何损失。
 
@@ -56,11 +56,11 @@ Content Responsibility: Because AI large language models (LLMs) and TTS (text-to
 
 Prohibition of Abuse: It is strictly forbidden to use this software to forge another person's voice, engage in defamation, harassment, online fraud, dissemination of false information, impersonation, or any other illegal or non-compliant conduct. If the generated voice causes civil infringement, administrative violation, or criminal offense, the user shall bear all legal consequences, and the software author shall not bear any responsibility.
 
-Copyright and Portrait/Voice Rights: This project is intended for personal learning purposes. The built-in character persona prompts are based on the game Senren * Banka, and users must ensure that they have obtained legal authorization for voice-related data on their own. If commercial use is involved, please contact the original copyright holders in advance. Please ensure that any reference audio you import (such as character voices or other people's voices) does not infringe the copyright, portrait rights, or voice rights of any third party; otherwise, any legal disputes arising therefrom shall be the responsibility of the user.
+Copyright and Portrait/Voice Rights: This project is intended for personal learning purposes. The built-in default character persona prompts contain no settings, dialogue, or assets from any third-party work. Users must ensure that they have obtained legal authorization for voice-related data on their own. Please ensure that any reference audio you import (such as character voices or other people's voices) does not infringe the copyright, portrait rights, or voice rights of any third party; otherwise, any legal disputes arising therefrom shall be the responsibility of the user.
 
 3. Risks Related to Third-Party Platforms
 
-This software relies on third-party open-source components (such as NapCat, GPT-SoVITS, Ollama, etc.) and third-party platforms (such as the official QQ interface). Users shall be responsible for their own conduct when using these third-party services. The program code may be freely distributed, but the rights to all reference audio, art assets, and the character name "Murasame" belong to the original game company (Yuzusoft) and the voice actor (Mikan Sato), and commercial use is strictly prohibited.
+This software relies on third-party open-source components (such as NapCat, GPT-SoVITS, Ollama, etc.) and third-party platforms (such as the official QQ interface). Users shall be responsible for their own conduct when using these third-party services. The program code may be freely distributed, but the rights to any reference audio and art assets you import belong to their respective owners, and commercial use is strictly prohibited.
 
 The software author cannot control the operating status or policies of NapCat or the QQ platform. If your QQ account is banned, restricted, or otherwise penalized by the platform as a result of using this software, the software author shall not be held responsible.
 

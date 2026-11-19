@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import uuid
 import os
 import re
 import shutil
@@ -9,9 +11,11 @@ from typing import Tuple
 
 import httpx
 
-from .tls import unverified_context, verified_context
+from .tls import verified_context
 
-APP_VERSION = "1.2.5.1"
+MAX_INSTALLER_BYTES = 2 * 1024 ** 3
+
+APP_VERSION = "1.2.6.0"
 
 ARCHIVE_SUFFIXES = (".zip",)
 
@@ -77,10 +81,10 @@ def pick_installer_asset(release: dict) -> dict:
             continue
         low = name.lower()
         if low.endswith(".exe"):
-            return {"name": name, "url": url, "size": _asset_size(item), "kind": "exe"}
+            return {"name": name, "url": url, "size": _asset_size(item), "kind": "exe", "digest": str(item.get("digest") or "")}
         if not archive and low.endswith(ARCHIVE_SUFFIXES):
             archive = {"name": name, "url": url, "size": _asset_size(item),
-                       "kind": "archive"}
+                       "kind": "archive", "digest": str(item.get("digest") or "")}
     return archive
 
 
@@ -100,12 +104,27 @@ def extract_installer(archive_path, dest_path) -> dict:
             return (0 if base.startswith("lovomo") else 1, -member.file_size)
 
         picked = sorted(members, key=rank)[0]
-        with zf.open(picked) as src, open(dest_path, "wb") as dst:
-            shutil.copyfileobj(src, dst)
+        if picked.file_size < 1024 or picked.file_size > MAX_INSTALLER_BYTES:
+            raise RuntimeError("压缩包里的安装包大小超限")
+        tmp = dest_path.with_name(dest_path.name + "." + uuid.uuid4().hex + ".part")
+        try:
+            received = 0
+            with zf.open(picked) as src, open(tmp, "wb") as dst:
+                while True:
+                    data = src.read(256 * 1024)
+                    if not data:
+                        break
+                    received += len(data)
+                    if received > picked.file_size or received > MAX_INSTALLER_BYTES:
+                        raise RuntimeError("压缩包解压大小超限")
+                    dst.write(data)
+            if received != picked.file_size:
+                raise RuntimeError("压缩包解压不完整")
+            check_downloaded_head(tmp, "exe")
+            os.replace(tmp, dest_path)
+        finally:
+            _remove(tmp)
     size = dest_path.stat().st_size
-    if size < 1024 or open(dest_path, "rb").read(2) != b"MZ":
-        _remove(dest_path)
-        raise RuntimeError("压缩包里的 .exe 不是可执行文件")
     return {"entry": picked.filename, "size": size}
 
 
@@ -137,7 +156,9 @@ async def race_candidates(urls, *, timeout: float = 8.0, verify: bool = True) ->
     if not urls:
         raise RuntimeError("没有可用的下载地址")
     errors = []
-    ctx = verified_context() if verify else unverified_context()
+    if not verify:
+        raise ValueError("自动更新不允许关闭证书校验")
+    ctx = verified_context()
     async with httpx.AsyncClient(timeout=timeout, proxy=None, trust_env=False,
                                  follow_redirects=True, verify=ctx) as client:
         pending = {asyncio.create_task(probe_candidate(client, url)) for url in urls}
@@ -152,39 +173,62 @@ async def race_candidates(urls, *, timeout: float = 8.0, verify: bool = True) ->
         finally:
             for task in pending:
                 task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
     raise errors[-1] if errors else RuntimeError("所有下载地址都不可用")
 
 
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for data in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(data)
+    return digest.hexdigest()
+
+
+def trusted_digest(value):
+    text = str(value or "").lower()
+    if not re.fullmatch(r"sha256:[a-f0-9]{64}", text):
+        raise ValueError("官方发布未提供 SHA-256 校验值，请手动更新")
+    return text.split(":", 1)[1]
+
+
 async def download_asset(url: str, dest, *, expected_size: int = 0, verify: bool = True,
-                         timeout: float = 60.0, chunk: int = 256 * 1024,
-                         on_progress=None) -> int:
-    dest = Path(dest)
-    tmp = dest.with_name(dest.name + ".part")
-    ctx = verified_context() if verify else unverified_context()
-    received = 0
+                         expected_digest: str = "", timeout: float = 60.0,
+                         chunk: int = 256 * 1024, on_progress=None) -> int:
+    expected_hash = trusted_digest(expected_digest)
     total = int(expected_size or 0)
-    async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=min(15.0, timeout)),
-                                 proxy=None, trust_env=False, follow_redirects=True,
-                                 verify=ctx) as client:
-        async with client.stream("GET", url) as resp:
-            resp.raise_for_status()
-            try:
-                total = int(resp.headers.get("content-length") or total)
-            except (TypeError, ValueError):
-                pass
-            with open(tmp, "wb") as fh:
-                async for piece in resp.aiter_bytes(chunk):
-                    fh.write(piece)
-                    received += len(piece)
-                    if on_progress is not None:
-                        on_progress(received, total)
-    if not received:
-        raise RuntimeError("下载到的内容是空的")
-    if total and received != total:
+    if not verify or not 0 < total <= MAX_INSTALLER_BYTES:
+        raise ValueError("安装包必须使用证书校验且具有合法的官方大小")
+    dest = Path(dest)
+    tmp = dest.with_name(dest.name + "." + uuid.uuid4().hex + ".part")
+    received = 0
+    digest = hashlib.sha256()
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=min(15.0, timeout)),
+                                     proxy=None, trust_env=False, follow_redirects=True,
+                                     verify=verified_context()) as client:
+            async with client.stream("GET", url) as resp:
+                resp.raise_for_status()
+                header_size = resp.headers.get("content-length")
+                if header_size and int(header_size) != total:
+                    raise RuntimeError("下载大小与官方发布记录不一致")
+                with open(tmp, "wb") as fh:
+                    async for piece in resp.aiter_bytes(chunk):
+                        received += len(piece)
+                        if received > total:
+                            raise RuntimeError("下载大小超出官方发布记录")
+                        digest.update(piece)
+                        fh.write(piece)
+                        if on_progress is not None:
+                            on_progress(received, total)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+        if received != total or digest.hexdigest() != expected_hash:
+            raise RuntimeError("安装包完整性校验失败，已丢弃下载")
+        os.replace(tmp, dest)
+        return received
+    finally:
         _remove(tmp)
-        raise RuntimeError(f"下载不完整（{received}/{total} 字节），已丢弃")
-    os.replace(tmp, dest)
-    return received
 
 
 def check_downloaded_head(path, kind: str = "exe") -> None:

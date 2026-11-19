@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 # 管理器槽位（sticker_mgr/memory_manager/global_config/sender/mood_mgr）统一经
 # modules.app_context 读写；_PENDING_IMAGES 与 _image_cache_last_check 是本模块
+from . import process_lifecycle as child_processes
+
 import asyncio
 import hashlib
 import io
@@ -456,7 +458,7 @@ def _convert_audio_to_wav(path: str) -> str:
         return path
     target = str(Path(path).with_name(f"asr_{time.time_ns()}.wav"))
     try:
-        proc = subprocess.run(
+        proc = child_processes.run(
             [ffmpeg, "-y", "-loglevel", "error", "-i", path,
              "-ar", str(VOICE_SAMPLE_RATE), "-ac", "1", target],
             capture_output=True, text=True, timeout=60, **no_window_kwargs())

@@ -1,5 +1,23 @@
 [简体中文](update.md) · English
 
+### v1.2.6.0
+
+#### ✨ Added
+
+- Added an interactive, resumable onboarding tour and page tips.
+- Added a message troubleshooting timeline, first-reply latency and phase timings.
+- Added draft persona comparisons, settings search and undo, and character memory controls.
+- Added language selection for voice previews.
+
+#### 🛠 Fixed
+
+- Fixed automatic resends when delivery is uncertain.
+
+#### ⚡ Improved
+
+- Improved the Diagnostics & Backup layout and onboarding portrait.
+
+
 ### v1.2.5.1
 
 

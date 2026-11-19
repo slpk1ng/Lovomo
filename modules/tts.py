@@ -623,10 +623,8 @@ async def synthesize_sentence(config, text: str, emotion: str, emotions: dict,
                 print(f"正在合成: 情绪={voice_tag if use_mimic else emotion} | "
                       f"语言={lang} | 切分={variant} | "
                       f"文本={clean_text} (第 {index + 1}/{len(attempts)} 次)")
-                async with httpx.AsyncClient(timeout=timeout, trust_env=False,
-                                             verify=verified_context()) as client:
-                    resp = await client.get(f"{base_url}/tts",
-                                            params=_build_params(variant, use_mimic))
+                from .tts_service import local_tts_request
+                resp = await local_tts_request(config, _build_params(variant, use_mimic), timeout)
             except Exception as e:
                 if transient_left > 0:
                     transient_left -= 1

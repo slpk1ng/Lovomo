@@ -99,6 +99,7 @@ class SchedulerManager:
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._wakeup = asyncio.Event()
+        self._inflight = set()
 
     def add_job(self, job_id: str, name: str, trigger: dict,
                 func: Callable[..., Awaitable], args: tuple = (), enabled: bool = True) -> Job:
@@ -142,7 +143,8 @@ class SchedulerManager:
         job.run_count += 1
         job.last_run = time.time()
         if job.trigger and job.trigger.get("type") == "oneshot":
-            self.remove_job(job.id)
+            if self.jobs.get(job.id) is job:
+                self.remove_job(job.id)
 
     async def _loop(self):
         while self._running:
@@ -158,7 +160,9 @@ class SchedulerManager:
                         if job.trigger and job.trigger.get("type") == "oneshot":
                             self.jobs.pop(job.id, None)
                         job.busy = True
-                        asyncio.create_task(self._run_job(job))
+                        task = asyncio.create_task(self._run_job(job))
+                        self._inflight.add(task)
+                        task.add_done_callback(self._inflight.discard)
                         job.compute_next_run(now)
                         if job.next_run <= now:
                             job.next_run = now + 5
@@ -184,17 +188,18 @@ class SchedulerManager:
         self._running = False
         self._wakeup.set()
         task, self._task = self._task, None
-        if task is None:
-            return
-        try:
-            await asyncio.wait_for(task, timeout=3)
-        except Exception:
-            # （"Task was destroyed but it is pending"）和在途回调
+        pending = list(self._inflight)
+        if task is not None:
+            pending.append(task)
+        for task in pending:
             task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+        if pending:
+            done, alive = await asyncio.wait(pending, timeout=3)
+            for task in done:
+                if not task.cancelled():
+                    task.exception()
+            if alive:
+                raise RuntimeError(f"仍有 {len(alive)} 个调度任务未响应取消")
 
 
 _scheduler: Optional[SchedulerManager] = None

@@ -739,6 +739,11 @@ class PluginManager:
         data.setdefault("source", {})
         if not isinstance(data.get("source"), dict):
             data["source"] = {}
+        data.setdefault("trusted", {})
+        if not isinstance(data.get("trusted"), dict):
+            data["trusted"] = {}
+        if not isinstance(data.get("message_grants"), dict):
+            data["message_grants"] = {}
         data.setdefault("pinned", [])
         if not isinstance(data.get("pinned"), list):
             data["pinned"] = []
@@ -749,19 +754,67 @@ class PluginManager:
     def _save_state(self) -> None:
         try:
             self.ensure_root()
-            tmp = Path(f"{self.state_file}.{os.getpid()}.{time.time_ns()}.tmp")
-            tmp.write_text(json.dumps(self._state(), ensure_ascii=False, indent=2),
-                           encoding="utf-8")
-            os.replace(str(tmp), str(self.state_file))
+            from .jsonio import save_json
+            save_json(self.state_file, self._state())
         except Exception as e:
-            print(f"[插件] 保存启用状态失败: {e}")
+            self._state_cache = None
+            raise OSError(f"保存插件状态失败: {e}") from e
 
     def is_enabled(self, pid: str) -> bool:
-        return bool(self._state()["enabled"].get(pid))
+        return bool(self._state()["enabled"].get(pid)) and self.is_trusted(pid)
+
+    def content_digest(self, pid: str) -> str:
+        folder = self.plugin_dir(pid)
+        if folder is None or not folder.is_dir():
+            return ""
+        digest = hashlib.sha256()
+        total = count = 0
+        for path in sorted(folder.rglob("*")):
+            relative = path.relative_to(folder)
+            if relative.parts[0] == "data" or "__pycache__" in relative.parts:
+                continue
+            if path.is_symlink():
+                return ""
+            if not path.is_file():
+                continue
+            count += 1
+            total += path.stat().st_size
+            if count > MAX_FILES or total > MAX_UNPACK_BYTES:
+                return ""
+            digest.update(relative.as_posix().encode("utf-8") + b"\0")
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(256 * 1024), b""):
+                    digest.update(chunk)
+            digest.update(b"\0")
+        return digest.hexdigest()
+
+    def is_trusted(self, pid: str) -> bool:
+        current = self.content_digest(pid)
+        return bool(current) and self._state().get("trusted", {}).get(pid) == current
+
+    def message_granted(self, pid: str) -> bool:
+        state = self._state()
+        digest = state["trusted"].get(pid)
+        if not digest:
+            return False
+        # Existing approved installations keep their behavior until re-approved.
+        return state["message_grants"].get(pid, digest) == digest
+
+    def approve(self, pid: str, digest: str, *, send_messages=False) -> bool:
+        current = self.content_digest(pid)
+        if not current or not digest or current != digest:
+            return False
+        state = self._state()
+        state["trusted"][pid] = current
+        state["message_grants"][pid] = current if send_messages else ""
+        self._save_state()
+        return True
 
     def set_enabled(self, pid: str, enabled: bool) -> bool:
         if not self.get(pid):
             return False
+        if enabled and not self.is_trusted(pid):
+            raise ValueError("插件尚未获得当前内容版本的信任授权")
         self._state()["enabled"][pid] = bool(enabled)
         self._save_state()
         if callable(self._on_change):
@@ -1066,6 +1119,10 @@ class PluginManager:
             if had_old:
                 _rmtree_retry(backup)
             self._state()["enabled"].setdefault(pid, bool(enable))
+            if enable:
+                digest = self.content_digest(pid)
+                if digest:
+                    self._state().setdefault("trusted", {})[pid] = digest
             self._save_state()
             self._applied.pop(pid, None)
             self._settings_seeded.discard(pid)

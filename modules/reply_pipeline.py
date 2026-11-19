@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 from modules import app_context
 from modules.adapters import client_supports
+from modules.delivery_state import record_stage, trace_voice
 from modules.sender import (VoicePacer, voice_enabled_for, recall_delay_of,
                             mute_seconds_of, mute_target_of, sent_action_receipts,
                             DEFAULT_RECALL_DELAY_SECONDS, RECALL_DENY)
@@ -117,12 +118,13 @@ class SentenceSink:
         self.sent = 0
         self.sent_sentences: List[dict] = []
         self.sent_texts: List[str] = []
-        self.unsent: List[str] = []           # 发送失败的句子，收尾时整段重发
+        self.unsent: List[str] = []           # 仅明确失败的句子可在收尾时重发
         self._tts_ok: Optional[bool] = None
         self.tts_ms = 0.0
         self.tts_calls = 0
         self.blocked = False
         self._first_checked = False
+        self._first_sentence_seen = False
         self.pending_sticker_emotion = None
         self.pending_sticker_text = ""
         self.sticker_sent = False
@@ -150,6 +152,9 @@ class SentenceSink:
         return False
 
     async def on_sentence(self, sentence: dict):
+        if not self._first_sentence_seen:
+            self._first_sentence_seen = True
+            record_stage("model", "first_sentence")
         if self.batch_only:
             return
         if sentence.get("delivery"):
@@ -240,12 +245,12 @@ class SentenceSink:
         wav = None
         if spoken.strip() and await self._tts_available():
             start = time.time()
-            wav = await synthesize_sentence(self.ctx, await self._speech_text(sentence),
+            wav = await trace_voice(synthesize_sentence(self.ctx, await self._speech_text(sentence),
                                             sentence.get("emotion", ""),
                                             self.emotions, app_context.memory_manager.data_path,
                                             stats=app_context.stats_mgr,
                                             mimic=sentence.get("mimic", ""),
-                                            mimics=available_mimics(self.ctx))
+                                            mimics=available_mimics(self.ctx)))
             self.tts_ms += (time.time() - start) * 1000
             if wav:
                 self.tts_calls += 1
@@ -323,6 +328,9 @@ class SentenceSink:
 
     def _note_send_result(self, ok: bool, shown: str) -> None:
         if ok:
+            return
+        if getattr(app_context.sender, "last_send_uncertain", False):
+            print("流式发送：投递结果未知，不自动重发这句。")
             return
         self.unsent.append(str(shown or ""))
         print(f"流式发送：这句没发出去，已记为待重发：{str(shown or '')[:30]!r}")
@@ -722,7 +730,8 @@ async def generate_reply(ctx: RoleContext, emotions: dict, user_text: str, histo
                          user_id: str = "", on_sentence=None,
                          session_id: str = "", describe_only: bool = False,
                          speaker_labels: Optional[dict] = None,
-                         wants_voice: Optional[bool] = None) -> Optional[dict]:
+                         wants_voice: Optional[bool] = None,
+                         raise_on_model_error: bool = False) -> Optional[dict]:
     if images is not None and not str(user_text or "").strip():
         user_text = "[图片]"
     if images is not None:
@@ -789,12 +798,15 @@ async def generate_reply(ctx: RoleContext, emotions: dict, user_text: str, histo
     # 流式路径
     if app_context.active_config().get("streaming_enabled", False):
         return await generate_reply_stream(ctx, emotions, user_text, messages, on_sentence,
-                                           wants_voice=wants_voice)
+                                           wants_voice=wants_voice,
+                                           raise_on_model_error=raise_on_model_error)
 
     # 普通路径
     result = await chat_once(ctx, messages, label="回复生成")
     if app_context.stats_mgr:
         app_context.stats_mgr.record_llm(result["ms"])
+    if raise_on_model_error and not str(result.get("content") or "").strip():
+        raise RuntimeError("模型没有返回回复内容")
     sentences = normalize_sentences(result["content"], ctx, emotions, user_text)
     if wants_voice is not False and str(result["content"] or "").strip() \
             and not has_structured_sentences(result["content"]):
@@ -812,7 +824,8 @@ async def generate_reply(ctx: RoleContext, emotions: dict, user_text: str, histo
 
 async def generate_reply_stream(ctx: RoleContext, emotions: dict, user_text: str,
                                 messages: list, on_sentence=None,
-                                wants_voice: Optional[bool] = None) -> dict:
+                                wants_voice: Optional[bool] = None,
+                                raise_on_model_error: bool = False) -> dict:
     async def _consume(parser, msgs, out):
         first_token = None
         try:
@@ -860,6 +873,8 @@ async def generate_reply_stream(ctx: RoleContext, emotions: dict, user_text: str
             print(f"格式重试也没有结构化输出{why}，仍按纯文本兜底。")
 
     if error is not None and not sentences:
+        if raise_on_model_error:
+            raise error
         sentence = normalize_single({"zh": error_reply_text(error),
                                      "delivery": DELIVERY_PLAIN},
                                     ctx, emotions, user_text)

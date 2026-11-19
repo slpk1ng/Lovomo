@@ -209,7 +209,7 @@ def content_from_user_text(user_text: str) -> str:
 
 _TODO_LEADING_NOISE_RE = re.compile(
     r"^(?:嘿嘿|哈哈|嘻嘻|嗯+|哦+|那个|这个|然后|接着|而且|所以|但是|不过|就|那就|那|"
-    r"可以|能不能|能|可否|帮忙|帮我|请|麻烦|顺便|一下|我|你|主人|嘛|呀|啊|哦|"
+    r"可以|能不能|能|可否|帮忙|帮我|请|麻烦|顺便|一下|我|你|嘛|呀|啊|哦|"
     r"吧|呢|的|了|再|又|记得|别忘了)+")
 _TODO_TRAILING_NOISE_RE = re.compile(
     r"(?:嘛|吗|吧|呢|啊|呀|哦|喔|哈|啦|了|的|么|好不好|可以吗|行吗|"
@@ -660,7 +660,8 @@ class TodoManager:
             self.db.execute("UPDATE todos SET status='missed' WHERE id=?", (todo_id,))
             return
         self._retry_counts[todo_id] = attempts
-        delay = TODO_RETRY_DELAY * attempts
+        from .runtime_policy import limit
+        delay = limit(self.config, "todo_retry_delay_seconds") * attempts
         print(f"[待办提醒] #{todo_id} 将在 {delay} 秒后第 {attempts} 次重试。")
         self._schedule(todo_id, content, time.time() + delay, session_type, session_id,
                        use_voice)

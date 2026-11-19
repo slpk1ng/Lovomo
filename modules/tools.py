@@ -1,4 +1,6 @@
 import ast
+from . import process_lifecycle as child_processes
+
 import asyncio
 import ipaddress
 import json
@@ -1265,7 +1267,7 @@ _WEATHER_NOISE_WORDS = ("天气", "气温", "温度", "下雨", "降雨", "雨�
                         "降雪", "台风", "多少度", "几度", "今天", "明天", "后天", "昨天",
                         "现在", "怎么样", "如何", "怎样", "冷不冷", "热不热", "需不需",
                         "要不要", "记得", "帮我", "查一下", "查查", "看看", "一下",
-                        "主人", "会不会", "适合", "穿什么", "要穿", "出门", "外面")
+                        "会不会", "适合", "穿什么", "要穿", "出门", "外面")
 _NON_CITY_CHARS = set("了的地得吗呢吧啊呀哦喔嘛么啥谁哪怎")
 _EN_NON_CITY = {"what", "how", "when", "where", "which", "who", "why", "is", "are",
                 "the", "in", "at", "of", "today", "tomorrow", "please", "tell", "me",
@@ -1284,7 +1286,7 @@ def _clean_city_token(token: str) -> str:
             break
         if t in _VAGUE_PLACES:
             return ""
-        for word in ("今天", "明天", "后天", "昨天", "现在", "帮我", "主人", "查一下",
+        for word in ("今天", "明天", "后天", "昨天", "现在", "帮我", "查一下",
                      "查查", "看看", "我在", "我在", "你在", "他在", "我在"):
             if t.startswith(word) and len(t) - len(word) >= 2:
                 t = t[len(word):]
@@ -2266,10 +2268,10 @@ class ToolRegistry:
         def _run():
             creationflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
             if executable:
-                return subprocess.run(argv, shell=False, capture_output=True,
+                return child_processes.run(argv, shell=False, capture_output=True,
                                       timeout=timeout, creationflags=creationflags)
             quoted = subprocess.list2cmdline(argv)
-            return subprocess.run([os.environ["COMSPEC"], "/d", "/s", "/c", quoted],
+            return child_processes.run([os.environ["COMSPEC"], "/d", "/s", "/c", quoted],
                                   shell=False, capture_output=True,
                                   timeout=timeout, creationflags=creationflags)
 

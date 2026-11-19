@@ -1,4 +1,6 @@
 import hashlib
+from . import process_lifecycle as child_processes
+
 import math
 import os
 import shutil
@@ -81,7 +83,7 @@ def _source_rate(path) -> int:
         return DECODE_RATE
     probe = exe.replace("ffmpeg.exe", "ffprobe.exe").replace("ffmpeg", "ffprobe")
     try:
-        proc = subprocess.run([probe, "-v", "error", "-select_streams", "a:0",
+        proc = child_processes.run([probe, "-v", "error", "-select_streams", "a:0",
                                "-show_entries", "stream=sample_rate",
                                "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -101,7 +103,7 @@ def _decode_any(path, rate: int = 0) -> Optional[np.ndarray]:
     if rate:
         args += ["-ar", str(rate)]
     try:
-        proc = subprocess.run(args + ["-"], stdout=subprocess.PIPE,
+        proc = child_processes.run(args + ["-"], stdout=subprocess.PIPE,
                               stderr=subprocess.DEVNULL,
                               timeout=FFMPEG_TIMEOUT_SECONDS, **no_window_kwargs())
     except (OSError, subprocess.SubprocessError):

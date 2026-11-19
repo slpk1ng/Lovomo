@@ -50,6 +50,28 @@ def _is_emotion_folder(folder: Path) -> bool:
     return not entries
 
 
+def nested_voice_roots(root: str) -> dict:
+    """Find voice sets one level below the configured reference-audio root."""
+    if not root:
+        return {}
+    result = {}
+    try:
+        base = Path(resolve_tts_path(root)).resolve()
+        for candidate in sorted(base.iterdir(), key=lambda item: item.name.casefold()):
+            if not candidate.is_dir() or candidate.name in _SYSTEM_DIRS or candidate.resolve().parent != base:
+                continue
+            try:
+                if any(audio.is_file() and audio.suffix.lower() in _AUDIO_EXTS
+                       for folder in candidate.iterdir() if folder.is_dir() and folder.resolve().parent == candidate
+                       for audio in folder.iterdir()):
+                    result[candidate.name] = candidate
+            except (OSError, RuntimeError):
+                continue
+    except (OSError, RuntimeError):
+        pass
+    return result
+
+
 # 参考音频根目录下需要跳过的系统目录
 _SYSTEM_DIRS = {"WpSystem", "System Volume Information", "$Recycle.Bin",
                 "Recovery", "PerfLogs", "Config.Msi"}
@@ -232,7 +254,7 @@ class EmotionManager:
     def _discover_emotions(self):
         self.emotions = _scan_ref_root(
             self.ref_audio_root,
-            self.config.get("prompt_text", "ふむ、おぬしが我輩のご主人か?"),
+            self.config.get("prompt_text", ""),
             "参考音频根目录")
         if is_cloud_tts(self.config):
             for name in cloud_emotion_names(self.config):
@@ -253,7 +275,7 @@ class EmotionManager:
             return
         self.mimics = _scan_ref_root(
             self.mimic_root,
-            self.config.get("prompt_text", "ふむ、おぬしが我輩のご主人か?"),
+            self.config.get("prompt_text", ""),
             "情绪模仿根目录",
             collect_all=True,
             pitch_ref=_median_pitch(self.emotions))

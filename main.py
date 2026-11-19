@@ -11,6 +11,10 @@ import random
 import re
 import shutil
 import sys
+if __name__ == "__main__" and "--lovomo-plugin-worker" in sys.argv:
+    from modules.plugin_worker import run_stdio
+    run_stdio()
+    sys.exit(0)
 import threading
 import time
 import traceback
@@ -203,6 +207,7 @@ from modules.llm_helpers import (RoleContext, build_chat_messages, chat_once,
                                 available_mimics, set_mimics_provider,
                                 model_list_endpoints, looks_like_full_endpoint,
                                 error_reply_text, auto_load_local_models)
+from modules.local_model_lifecycle import local_models
 from modules.reply_pipeline import (
     _URL_RE, _LINK_REQUEST_RE, _SEARCH_ENTRY_URL_RE, _SEARCH_ENTRY_ABS_RE,
     _SEARCH_ENTRY_TITLE_RE, _USER_ECHO_MIN_CHARS, _RETRY_TEMPERATURE,
@@ -241,6 +246,9 @@ from modules.asr import (start_job as start_asr_job, get_job as get_asr_job,
 from modules.tts_service import (process_manager, ensure_tts_service,
                                  auto_start_and_switch_tts, mark_exiting)
 from modules import machine_capacity
+from modules.process_lifecycle import (
+    attach_application_job, begin_exit, python_child_executable, shutdown_all_children, spawn_detached,
+)
 from modules.tts_cloud import cloud_emotion_names, is_cloud_tts
 from modules.config_presets import (DEFAULT_PROFILE as DEFAULT_CONFIG_PROFILE,
                                     delete_profile as delete_config_profile,
@@ -300,15 +308,10 @@ from modules.webview_runtime import (
     webview_cache_key,
 )
 from modules.config_loader import (
-    CHAT_STYLE_PROMPT,
-    LEGACY_AFFECTION_PHRASES,
     CONNECTION_PLATFORMS,
     CONNECTION_PLATFORM_NAMES,
     ConfigLoader,
-    _migrate_chat_style_prompt,
-    _migrate_murasame_intimacy,
     _migrate_sticker_mode,
-    _migrate_profile_prompts,
     _migrate_emotion_prompts,
     _migrate_sticker_capture_prompt,
     _migrate_learn_prompts,
@@ -540,17 +543,18 @@ async def main(stop_event: threading.Event = None):
     preload_configs = []
     tts_first = (bool(app_context.global_config.get("auto_start_tts", False))
                  and bool(app_context.global_config.get("llm_auto_load_local", True))
-                 and machine_capacity.tts_first_recommended())
+                 and machine_capacity.tts_first_recommended(app_context.global_config))
     try:
-        preload_configs = [app_context.global_config]
         for conn in connections_of(app_context.global_config):
             if not conn.get("enabled", True):
                 continue
             cfg = config_for_connection(str(conn.get("id") or ""))
             if cfg is not None and cfg not in preload_configs:
                 preload_configs.append(cfg)
+        if not preload_configs:
+            preload_configs.append(app_context.global_config)
         if tts_first:
-            print(f"[启动顺序] {machine_capacity.summary()}：内存/显存偏紧，先启动 TTS，就绪后再加载本地模型")
+            print(f"[启动顺序] {machine_capacity.summary(app_context.global_config)}：内存/显存偏紧，先启动 TTS，就绪后再加载本地模型")
         else:
             auto_load_local_models(preload_configs)
     except Exception as e:
@@ -569,7 +573,10 @@ async def main(stop_event: threading.Event = None):
     app_context.profile_mgr = profile_mgr
     rag_mgr = RAGManager(app_context.global_config, app_context.memory_manager.data_path)
     app_context.rag_mgr = rag_mgr
-    lexicon_mgr = LexiconManager(app_context.global_config, app_context.memory_manager.data_path)
+    from modules.lexicon import manager_for_role
+    lexicon_mgr = manager_for_role(app_context.global_config.active_character,
+                                  config=app_context.global_config,
+                                  data_path=app_context.memory_manager.data_path)
     app_context.lexicon_mgr = lexicon_mgr
     recall_mgr = HistoryRecallManager(app_context.global_config, app_context.memory_manager.data_path,
                                       embedder=rag_mgr)
@@ -600,7 +607,7 @@ async def main(stop_event: threading.Event = None):
 
     if app_context.global_config.get("auto_start_tts", False):
         startup_tts_config = next(
-            (cfg for cfg in preload_configs[1:] if str(cfg.get("tts_backend") or "").strip()),
+            (cfg for cfg in preload_configs if str(cfg.get("tts_backend") or "").strip()),
             app_context.global_config)
         if tts_first and preload_configs:
             def _tts_then_models():
@@ -713,7 +720,7 @@ async def main(stop_event: threading.Event = None):
                     voice_sender=plugin_send_voice,
                     emotions_getter=get_active_emotions)
                 webui_server.attach_plugin_runtime(_plugin_rt)
-                _plugin_errors = _plugin_rt.load_all()
+                _plugin_errors = await asyncio.to_thread(_plugin_rt.load_all)
                 for _pid, _err in (_plugin_errors or {}).items():
                     print(f"[插件] {_pid} 加载失败: {_err}")
             except Exception as e:
@@ -815,6 +822,8 @@ async def main(stop_event: threading.Event = None):
             channel_key = str((profile.get("connection") or {}).get("id")
                               or f"{platform}:{label}")
             try:
+                if platform == "wechat_clawbot":
+                    client.enable_outbox(app_context.memory_manager.data_path)
                 async with client:
                     sender.set_channel_client(channel_key, client)
                     if role_key:
@@ -950,8 +959,11 @@ if __name__ == "__main__":
             pass
     if run_exe:
         try:
+            from modules.updater_tools import verified_installer
+            if not verified_installer(run_exe):
+                raise ValueError("安装包未通过来源和完整性校验")
             import subprocess
-            subprocess.Popen([run_exe], close_fds=True)
+            spawn_detached([run_exe], close_fds=True)
             print(f"[更新] 已拉起安装包：{run_exe}")
         except Exception as e:
             print(f"[更新] 拉起安装包失败：{type(e).__name__}: {e}")
@@ -977,7 +989,10 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[更新] 清理旧安装包失败：{type(e).__name__}: {e}")
 
-    config = ConfigLoader()
+    config = ConfigLoader.load_for_startup()
+
+    if os.name == "nt" and not attach_application_job():
+        print("[进程] 无法建立程序作业对象，退出时将按进程树回收")
 
     def run_backend():
         try:
@@ -1134,7 +1149,9 @@ if __name__ == "__main__":
                 pass
             try:
                 mark_exiting()
-                process_manager.shutdown_all(budget=1.0)
+                begin_exit()
+                local_models.shutdown()
+                shutdown_all_children(budget=1.0)
             except Exception:
                 pass
             os._exit(0)
@@ -1150,20 +1167,12 @@ if __name__ == "__main__":
             si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             si.wShowWindow = 0  # SW_HIDE
             kwargs["startupinfo"] = si
-        subprocess.Popen(args, env=env, close_fds=True, **kwargs)
+        spawn_detached(args, env=env, close_fds=True, **kwargs)
 
-    def _resolve_spawn_exe() -> tuple:
+    def _resolve_spawn_exe(env) -> tuple:
         if getattr(sys, "frozen", False):
             return sys.executable, []
-        exe = sys.executable
-        if os.name == "nt":
-            for name in ("pythonw.exe", "pythonw"):
-                cand = Path(exe).with_name(name)
-                if cand.exists():
-                    exe = str(cand)
-                    break
-        args = [exe, str(Path(sys.argv[0]).resolve())]
-        return args[0], args[1:]
+        return python_child_executable(env), [str(Path(sys.argv[0]).resolve())]
 
     def relaunch_console():
         if relaunch_pending["flag"]:
@@ -1182,8 +1191,8 @@ if __name__ == "__main__":
             _finalize_geometry(w)
             _finish_geometry_save()
         try:
-            exe, extra = _resolve_spawn_exe()
             env = dict(os.environ)
+            exe, extra = _resolve_spawn_exe(env)
             env["LOVOMO_WAIT_PID"] = str(os.getpid())
             _spawn_detached([exe, *extra], env)
             log_window_event("已安排重启：新实例等待本进程退出后启动")
@@ -1202,6 +1211,8 @@ if __name__ == "__main__":
                     pass
             return
         stop_event.set()
+        mark_exiting()
+        begin_exit()
         _force_quit(1.5)
         if w is not None:
             try:
@@ -1216,6 +1227,8 @@ if __name__ == "__main__":
     def quit_app():
         close_state["quitting"] = True
         close_state["quitting_at"] = time.time()
+        mark_exiting()
+        begin_exit()
         stop_event.set()
         _force_quit(1.2)
         stop_tray_icon()
@@ -1241,17 +1254,21 @@ if __name__ == "__main__":
         path = Path(str(installer_path or ""))
         if not path.is_file():
             return "安装包不存在或已被删除"
+        from modules.updater_tools import verified_installer
+        if not verified_installer(path):
+            return "安装包未通过来源和完整性校验，请重新下载"
         if relaunch_pending["flag"]:
             print("安装已在进行，跳过重复的安装请求。")
             return ""
         relaunch_pending["flag"] = True
         try:
-            exe, extra = _resolve_spawn_exe()
             env = dict(os.environ)
+            exe, extra = _resolve_spawn_exe(env)
             env["LOVOMO_WAIT_PID"] = str(os.getpid())
             env["LOVOMO_RUN_EXE"] = str(path)
             _spawn_detached([exe, *extra], env)
         except Exception as e:
+            relaunch_pending["flag"] = False
             return f"启动安装程序失败：{type(e).__name__}: {e}"
         print(f"[更新] 已安排安装：{path.name}（本程序退出后由助手拉起安装包）")
         request_quit()
@@ -1510,6 +1527,10 @@ if __name__ == "__main__":
         print("正在停止后台服务...")
         stop_event.set()
         mark_exiting()
+        begin_exit()
+        _force_quit(1.5)
         backend_thread.join(timeout=1.5)
-        process_manager.shutdown_all(budget=1.5)
+        local_models.shutdown()
+        shutdown_all_children(budget=1.5)
+        process_manager.shutdown_all(budget=0.0)
         print("程序已完全退出。")
